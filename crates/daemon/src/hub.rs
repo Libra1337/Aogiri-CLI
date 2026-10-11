@@ -730,7 +730,17 @@ impl Hub {
             session,
             json!({ "op": "user_message", "content": content, "claimed": true }),
         )
-        .inspect_err(|_| self.release_claim(session))
+        .inspect_err(|_| self.release_failed_claim(session))
+    }
+
+    /// A claimed message did not reach the session: its claim goes, and so
+    /// does the running slot of a session that is not hosted (no engine
+    /// thread clears it; a hosted one, or one ending, does it itself).
+    fn release_failed_claim(&self, session: &str) {
+        self.release_claim(session);
+        if !self.is_open(session) {
+            lock(&self.busy).remove(session);
+        }
     }
 
     /// Notifies the paired phones (see `push`).
@@ -1296,7 +1306,7 @@ impl Hub {
             &session,
             json!({ "op": "user_message", "content": delivery_text(message), "claimed": true }),
         ) {
-            self.release_claim(&session);
+            self.release_failed_claim(&session);
             return Err(error);
         }
         self.store
@@ -2062,6 +2072,26 @@ mod tests {
         assert!(lock(&hub.sessions).contains_key("s1"));
         assert!(hub.retire_idle("s1", generation, || true));
         assert!(!lock(&hub.sessions).contains_key("s1"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_message_that_cannot_reach_a_closed_session_frees_its_slot() {
+        let dir = std::env::temp_dir().join(format!(
+            "lynshen-hub-failed-send-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let hub = Hub::new(
+            Store::open(dir.join("daemon")).unwrap(),
+            Agents::open(dir.join("agents")).unwrap(),
+            "test",
+            None,
+        );
+        assert!(hub.send_to_session("gone", "hello").is_err());
+        assert!(!lock(&hub.claims).contains_key("gone"));
+        // Nothing would ever clear it, and restart_when_idle waits for none.
+        assert!(!hub.is_busy("gone"));
         let _ = fs::remove_dir_all(dir);
     }
 

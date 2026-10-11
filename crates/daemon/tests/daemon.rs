@@ -395,6 +395,46 @@ fn a_session_closed_before_its_first_message_reopens() {
 }
 
 #[test]
+fn watching_a_closed_session_opens_it_again() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-watch-closed");
+    let mut client = Client::connect(&daemon);
+    let session = client.create_session(&dir);
+    client.send(json!({ "op": "user_message", "session": session, "content": "hello there" }));
+    client.until(ready(&session));
+    // As an idle session closes while nobody watches it.
+    client.send(json!({ "op": "session_close", "session": session }));
+    client.until(|frame| frame["type"] == "session_closed");
+
+    client.send(json!({ "op": "watch", "session": session, "id": 3 }));
+    let (mut watching, mut transcript) = (false, None);
+    client.until(|frame| {
+        if frame["id"] == 3 {
+            assert_eq!(frame["type"], "watching", "{frame}");
+            watching = true;
+        }
+        if frame["type"] == "transcript" && frame["session"] == session.as_str() {
+            transcript = Some(frame["items"].clone());
+        }
+        watching && transcript.is_some()
+    });
+    assert!(transcript
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["content"] == "hello there"));
+    // It takes ops again.
+    client.send(json!({ "op": "user_message", "session": session, "content": "again" }));
+    client.until(ready(&session));
+
+    client.send(json!({ "op": "watch", "session": "no-such-session", "id": 4 }));
+    let frames = client.until(|frame| frame["id"] == 4);
+    assert_eq!(frames.last().unwrap()["type"], "error");
+}
+
+#[test]
 fn session_switching_commands_are_refused() {
     let _guard = setup();
     let daemon = start_daemon();
