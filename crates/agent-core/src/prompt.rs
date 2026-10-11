@@ -78,70 +78,95 @@ pub(crate) fn stable_prefix_len(system_prompt: &str) -> Option<usize> {
     system_prompt.find(ENV_START)
 }
 
-/// The system prompt, ordered for prompt caching: what is the same across
+/// The whole prompt, as a turn joins its parts (core::TurnPrompt).
+///
+/// The system prompt is ordered for prompt caching: what is the same across
 /// sessions and turns comes first, so providers can reuse the cached prefix.
 /// Base prompt and tool guidance (fixed per config), project instructions
 /// and skills (fixed per project), the sandbox note, then the working
 /// directory and the date (the date changes daily), plan mode (changes when
 /// the user switches mode) and last the host's text (may change every turn).
+#[cfg(test)]
 pub fn build_system_prompt(base: &str, context: &PromptContext) -> String {
+    let mut prompt = runtime_prompt(base, context);
+    prompt.push_str(&project_section(&context.project_instructions));
+    prompt.push_str(&skills_section(&context.skills));
+    prompt.push_str(&tail_section(context));
+    prompt
+}
+
+/// The base prompt and its tool guidance, fixed per config: the head of the
+/// system prompt. The runtime context (directory, date) comes after the
+/// skills, in `tail_section`, so the head stays cacheable.
+pub fn runtime_prompt(base: &str, context: &PromptContext) -> String {
     let mut prompt = base.trim_end().to_string();
     if !context.chat {
         prompt.push_str("\n\n");
         prompt.push_str(&tool_guidance(&context.edit_tools));
     }
-
-    if !context.project_instructions.is_empty() {
-        prompt.push_str("\n\n<project_context>\n");
-        prompt.push_str("Project-specific instructions and guidelines:\n\n");
-        for instruction in &context.project_instructions {
-            prompt.push_str(&format!(
-                "<project_instructions path=\"{}\">\n{}\n</project_instructions>\n\n",
-                escape_xml(&instruction.path.display().to_string()),
-                instruction.content.trim_end()
-            ));
-        }
-        prompt.push_str("</project_context>");
-    }
-
-    prompt.push_str(&skills_block(&context.skills));
-    if !context.sandbox.trim().is_empty() {
-        prompt.push_str("\n\n");
-        prompt.push_str(context.sandbox.trim_end());
-    }
-    prompt.push_str(&format!(
-        "{ENV_START}Working directory: {}\nDate: {}\n</env>",
-        context.cwd.display(),
-        context.date
-    ));
-    if context.plan_mode && !context.chat {
-        prompt.push_str("\n\n");
-        prompt.push_str(crate::plan_mode::PROMPT_ADDENDUM);
-    }
-    if !context.host.trim().is_empty() {
-        prompt.push_str("\n\n");
-        prompt.push_str(context.host.trim_end());
-    }
     prompt
 }
 
-/// The part of the system prompt that lists the skills ("" without any).
-pub fn skills_block(skills: &[SkillPromptItem]) -> String {
-    let mut block = String::new();
-    if skills.is_empty() {
-        return block;
+/// The project's instruction files (AGENTS.md, CLAUDE.md …) as the system
+/// prompt carries them; empty without any.
+pub fn project_section(instructions: &[ProjectInstruction]) -> String {
+    if instructions.is_empty() {
+        return String::new();
     }
-    block.push_str("\n\nSkills: when a task matches a skill's description, read its file first. Resolve relative paths in a skill against its directory.\n<available_skills>\n");
+    let mut section = String::from("\n\n<project_context>\n");
+    section.push_str("Project-specific instructions and guidelines:\n\n");
+    for instruction in instructions {
+        section.push_str(&format!(
+            "<project_instructions path=\"{}\">\n{}\n</project_instructions>\n\n",
+            escape_xml(&instruction.path.display().to_string()),
+            instruction.content.trim_end()
+        ));
+    }
+    section.push_str("</project_context>");
+    section
+}
+
+/// The skills list as the system prompt carries it; empty without any.
+pub fn skills_section(skills: &[SkillPromptItem]) -> String {
+    let mut section = String::new();
+    if skills.is_empty() {
+        return section;
+    }
+    section.push_str("\n\nSkills: when a task matches a skill's description, read its file first. Resolve relative paths in a skill against its directory.\n<available_skills>\n");
     for skill in skills {
-        block.push_str(&format!(
+        section.push_str(&format!(
             "<skill name=\"{}\" location=\"{}\">{}</skill>\n",
             escape_xml(&skill.name),
             escape_xml(&skill.path.display().to_string()),
             escape_xml(&skill.description)
         ));
     }
-    block.push_str("</available_skills>");
-    block
+    section.push_str("</available_skills>");
+    section
+}
+
+/// What follows the skills: the sandbox note, the working directory and the
+/// date, the plan-mode addendum and the host's text.
+pub fn tail_section(context: &PromptContext) -> String {
+    let mut tail = String::new();
+    if !context.sandbox.trim().is_empty() {
+        tail.push_str("\n\n");
+        tail.push_str(context.sandbox.trim_end());
+    }
+    tail.push_str(&format!(
+        "{ENV_START}Working directory: {}\nDate: {}\n</env>",
+        context.cwd.display(),
+        context.date
+    ));
+    if context.plan_mode && !context.chat {
+        tail.push_str("\n\n");
+        tail.push_str(crate::plan_mode::PROMPT_ADDENDUM);
+    }
+    if !context.host.trim().is_empty() {
+        tail.push_str("\n\n");
+        tail.push_str(context.host.trim_end());
+    }
+    tail
 }
 
 pub fn discover_skills(
@@ -777,5 +802,44 @@ mod tests {
             ["home-agents"]
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_prompt_is_its_sections_joined() {
+        let context = PromptContext {
+            date: "2026-10-09".to_string(),
+            cwd: PathBuf::from("/p"),
+            edit_tools: Vec::new(),
+            project_instructions: vec![ProjectInstruction {
+                path: PathBuf::from("/p/AGENTS.md"),
+                content: "Be brief.".to_string(),
+            }],
+            skills: vec![SkillPromptItem {
+                name: "pdf".to_string(),
+                description: "PDFs".to_string(),
+                path: PathBuf::from("/s/pdf/SKILL.md"),
+            }],
+            sandbox: "Sandboxed.".to_string(),
+            plan_mode: true,
+            host: "Host.".to_string(),
+            ..PromptContext::default()
+        };
+        let project = project_section(&context.project_instructions);
+        assert!(project.contains("Be brief."));
+        assert!(skills_section(&context.skills).contains("<skill name=\"pdf\""));
+        let tail = tail_section(&context);
+        assert!(tail.contains("Sandboxed.") && tail.contains(ENV_START) && tail.ends_with("Host."));
+        assert_eq!(
+            build_system_prompt("Base.", &context),
+            format!(
+                "{}{}{}{}",
+                runtime_prompt("Base.", &context),
+                project,
+                skills_section(&context.skills),
+                tail
+            )
+        );
+        assert_eq!(project_section(&[]), "");
+        assert_eq!(skills_section(&[]), "");
     }
 }

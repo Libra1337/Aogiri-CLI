@@ -143,7 +143,7 @@ pub struct OpenAiClient {
 /// A `subagent_models` entry resolved at client build: what the tool
 /// description advertises and what a child on that model runs with.
 #[derive(Clone)]
-struct SubagentModelSpec {
+pub(crate) struct SubagentModelSpec {
     name: String,
     description: String,
     reasoning_efforts: Vec<String>,
@@ -479,6 +479,205 @@ enum ParallelToolMessage {
     },
 }
 
+/// What decides the tools a request offers: the host's, MCP servers', the
+/// built-ins this engine has (edit tools, web, images), subagents, goals.
+pub(crate) struct ToolOffer<'a> {
+    pub host: Option<&'a crate::host::HostExtensions>,
+    pub mcp: &'a McpManager,
+    pub tool_state: &'a tools::ToolState,
+    pub enabled_edit_tools: &'a [String],
+    /// The subagent team this engine works in; None without one.
+    pub subagents: Option<SubagentOffer<'a>>,
+    /// The goal tools, with whether a goal is set; None without them.
+    pub goals: Option<bool>,
+    pub plan_mode: bool,
+}
+
+/// What `spawn_agent` and the team tools offer: the team's config, whether
+/// this engine may spawn, its depth, its model, effort tiers and the other
+/// models and roles it may pick.
+pub(crate) struct SubagentOffer<'a> {
+    pub config: crate::config::AgentsConfig,
+    pub may_spawn: bool,
+    pub depth: u64,
+    pub model: &'a str,
+    pub efforts: &'a [String],
+    pub models: &'a [SubagentModelSpec],
+    pub roles: &'a [Role],
+}
+
+pub(crate) fn request_tool_definitions(offer: &ToolOffer<'_>) -> Vec<Value> {
+    if let Some(host) = offer.host.filter(|host| host.exclusive) {
+        return host.tools.clone();
+    }
+    let mut definitions = tools::definitions()
+        .into_iter()
+        .filter(|definition| {
+            definition
+                .get("name")
+                .and_then(Value::as_str)
+                .is_none_or(|name| {
+                    disabled_tool_error(name, offer.tool_state, offer.enabled_edit_tools).is_none()
+                })
+        })
+        .collect::<Vec<_>>();
+    if let Some(team) = &offer.subagents {
+        // Without team v2 the team is v1's: no board.
+        let board = if team.config.team_v2 {
+            board_definitions()
+        } else {
+            Vec::new()
+        };
+        if team.may_spawn && team.config.fanout != Fanout::Off {
+            definitions.extend(subagent_definitions(
+                team.model,
+                team.efforts,
+                team.models,
+                team.roles,
+                &team.config,
+                team.depth > 0,
+            ));
+            definitions.extend(board);
+        } else if team.depth > 0 {
+            // A subagent that may not spawn can still write to its
+            // parent (and, with team v2, its siblings) and work the board.
+            definitions.push(send_message_definition(true, team.config.team_v2));
+            definitions.extend(board);
+        }
+    }
+    definitions.extend(offer.mcp.definitions());
+    if let Some(host) = offer.host {
+        definitions.extend(host.tools.iter().cloned());
+    }
+    if offer
+        .tool_state
+        .sandbox()
+        .is_some_and(|sandbox| sandbox.is_sandboxed())
+    {
+        for definition in &mut definitions {
+            let shell = definition
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| is_shell_tool(name) && name != "write_stdin");
+            if let Some(properties) = definition
+                .pointer_mut("/parameters/properties")
+                .and_then(Value::as_object_mut)
+                .filter(|_| shell)
+            {
+                properties.insert(
+                    "escalate".to_string(),
+                    json!({
+                        "type": "boolean",
+                        "description": "Run outside the sandbox; needs approval."
+                    }),
+                );
+                properties.insert(
+                    "justification".to_string(),
+                    json!({
+                        "type": "string",
+                        "description": "With escalate: why, in one line."
+                    }),
+                );
+            }
+        }
+    }
+    if let Some(has_goal) = offer.goals {
+        definitions.extend(goal_tool_definitions(has_goal));
+        definitions.push(plan_tool_definition());
+        if offer.plan_mode {
+            definitions.push(crate::plan_mode::propose_plan_definition());
+        }
+    }
+    definitions
+}
+
+/// Config-level tool gating, checked both when building the tool
+/// definitions sent to the model and when executing a call. Returns the
+/// rejection reason when `name` is an edit tool that is not enabled;
+/// None means the tool may run.
+fn disabled_tool_error(
+    name: &str,
+    tool_state: &tools::ToolState,
+    enabled_edit_tools: &[String],
+) -> Option<String> {
+    if name == crate::images::TOOL_NAME {
+        if let Err(reason) = tool_state.images() {
+            return Some(reason);
+        }
+    }
+    if name == "web_search" && !tool_state.web_search_enabled() {
+        return Some(
+            "web_search is set to a gateway engine (web_search_engine in config.json), which needs a LynShen login. Run /login, or set web_search_engine to \"local\" to search from this machine."
+                .to_string(),
+        );
+    }
+    if let Some(canonical) = crate::config::canonical_edit_tool_name(name) {
+        if !enabled_edit_tools.iter().any(|tool| tool == canonical) {
+            let enabled = if enabled_edit_tools.is_empty() {
+                "none".to_string()
+            } else {
+                enabled_edit_tools.join(", ")
+            };
+            return Some(format!(
+                "edit tool '{name}' is disabled by config (enabled edit tools: {enabled}). Add it to the edit_tools array in config.json to enable it."
+            ));
+        }
+    }
+    None
+}
+
+/// The main model's effort tiers and the other models `spawn_agent` may pick
+/// (config `subagent_models`, resolved against the configured models).
+pub(crate) fn subagent_offer(
+    main: &str,
+    provider: &str,
+    protocol: &str,
+    models: &[ModelConfig],
+    subagent_models: &[SubagentModel],
+) -> (Vec<String>, Vec<SubagentModelSpec>) {
+    let reasoning_efforts = models
+        .iter()
+        .find(|model| model.name == main)
+        .map(|model| model.reasoning_efforts.clone())
+        .unwrap_or_default();
+    // No list configured: every chat model of the provider, so the agent
+    // picks per task (and takes the one the user names).
+    let entries: Vec<SubagentModel> = if subagent_models.is_empty() {
+        models
+            .iter()
+            .filter(|model| !model.name.to_ascii_lowercase().contains("image"))
+            .map(|model| SubagentModel {
+                name: model.name.clone(),
+                description: String::new(),
+            })
+            .collect()
+    } else {
+        subagent_models.to_vec()
+    };
+    let subagent_models = entries
+        .iter()
+        .filter(|entry| entry.name != main)
+        .filter_map(|entry| {
+            let Some(model) = models.iter().find(|model| model.name == entry.name) else {
+                crate::log_warn!(
+                    "subagent",
+                    "model not configured, skipped",
+                    model = entry.name.clone()
+                );
+                return None;
+            };
+            Some(SubagentModelSpec {
+                name: model.name.clone(),
+                description: entry.description.clone(),
+                reasoning_efforts: model.reasoning_efforts.clone(),
+                max_output_tokens: model.max_output_tokens,
+                protocol: protocol_for(provider, protocol, &model.name),
+            })
+        })
+        .collect();
+    (reasoning_efforts, subagent_models)
+}
+
 impl OpenAiClient {
     pub fn from_config(config: OpenAiClientConfig<'_>) -> Result<Self, String> {
         let api_key = match config.api_key {
@@ -509,49 +708,13 @@ impl OpenAiClient {
                 config.provider
             ));
         }
-        let reasoning_efforts = config
-            .models
-            .iter()
-            .find(|model| model.name == config.model)
-            .map(|model| model.reasoning_efforts.clone())
-            .unwrap_or_default();
-        // No list configured: every chat model of the provider, so the agent
-        // picks per task (and takes the one the user names).
-        let entries: Vec<crate::config::SubagentModel> = if config.subagent_models.is_empty() {
-            config
-                .models
-                .iter()
-                .filter(|model| !model.name.to_ascii_lowercase().contains("image"))
-                .map(|model| crate::config::SubagentModel {
-                    name: model.name.clone(),
-                    description: String::new(),
-                })
-                .collect()
-        } else {
-            config.subagent_models.clone()
-        };
-        let subagent_models = entries
-            .iter()
-            .filter(|entry| entry.name != config.model)
-            .filter_map(|entry| {
-                let Some(model) = config.models.iter().find(|model| model.name == entry.name)
-                else {
-                    crate::log_warn!(
-                        "subagent",
-                        "model not configured, skipped",
-                        model = entry.name.clone()
-                    );
-                    return None;
-                };
-                Some(SubagentModelSpec {
-                    name: model.name.clone(),
-                    description: entry.description.clone(),
-                    reasoning_efforts: model.reasoning_efforts.clone(),
-                    max_output_tokens: model.max_output_tokens,
-                    protocol: protocol_for(&config.provider, &config.protocol, &model.name),
-                })
-            })
-            .collect();
+        let (reasoning_efforts, subagent_models) = subagent_offer(
+            &config.model,
+            &config.provider,
+            &config.protocol,
+            &config.models,
+            &config.subagent_models,
+        );
         let safety = config.safety_model.map(|model| SafetySpec {
             protocol: protocol_for(&config.provider, &config.protocol, &model),
             reasoning_effort: config.safety_reasoning_effort,
@@ -1160,87 +1323,23 @@ impl OpenAiClient {
     }
 
     pub(crate) fn tool_definitions(&self) -> Vec<Value> {
-        if let Some(host) = self.host.as_ref().filter(|host| host.exclusive) {
-            return host.tools.clone();
-        }
-        let mut definitions = tools::definitions()
-            .into_iter()
-            .filter(|definition| {
-                definition
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .is_none_or(|name| self.disabled_tool_error(name).is_none())
-            })
-            .collect::<Vec<_>>();
-        if let Some(manager) = &self.subagent_manager {
-            let config = manager.config();
-            // Without team v2 the team is v1's: no board.
-            let board = if config.team_v2 {
-                board_definitions()
-            } else {
-                Vec::new()
-            };
-            if self.allow_subagents && config.fanout != Fanout::Off {
-                definitions.extend(subagent_definitions(
-                    &self.model,
-                    &self.reasoning_efforts,
-                    &self.subagent_models,
-                    &self.roles,
-                    &config,
-                    self.agent_depth > 0,
-                ));
-                definitions.extend(board);
-            } else if self.agent_depth > 0 {
-                // A subagent that may not spawn can still write to its
-                // parent (and, with team v2, its siblings) and work the board.
-                definitions.push(send_message_definition(true, config.team_v2));
-                definitions.extend(board);
-            }
-        }
-        definitions.extend(self.mcp.definitions());
-        if let Some(host) = &self.host {
-            definitions.extend(host.tools.iter().cloned());
-        }
-        if self
-            .tool_state
-            .sandbox()
-            .is_some_and(|sandbox| sandbox.is_sandboxed())
-        {
-            for definition in &mut definitions {
-                let shell = definition
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| is_shell_tool(name) && name != "write_stdin");
-                if let Some(properties) = definition
-                    .pointer_mut("/parameters/properties")
-                    .and_then(Value::as_object_mut)
-                    .filter(|_| shell)
-                {
-                    properties.insert(
-                        "escalate".to_string(),
-                        json!({
-                            "type": "boolean",
-                            "description": "Run outside the sandbox; needs approval."
-                        }),
-                    );
-                    properties.insert(
-                        "justification".to_string(),
-                        json!({
-                            "type": "string",
-                            "description": "With escalate: why, in one line."
-                        }),
-                    );
-                }
-            }
-        }
-        if self.goal_tool_tx.is_some() {
-            definitions.extend(goal_tool_definitions(self.has_goal.get()));
-            definitions.push(plan_tool_definition());
-            if self.approval_mode.get() == ApprovalMode::Plan {
-                definitions.push(crate::plan_mode::propose_plan_definition());
-            }
-        }
-        definitions
+        request_tool_definitions(&ToolOffer {
+            host: self.host.as_ref(),
+            mcp: &self.mcp,
+            tool_state: &self.tool_state,
+            enabled_edit_tools: &self.enabled_edit_tools,
+            subagents: self.subagent_manager.as_ref().map(|manager| SubagentOffer {
+                config: manager.config(),
+                may_spawn: self.allow_subagents,
+                depth: self.agent_depth,
+                model: self.model.as_str(),
+                efforts: self.reasoning_efforts.as_slice(),
+                models: self.subagent_models.as_slice(),
+                roles: self.roles.as_slice(),
+            }),
+            goals: self.goal_tool_tx.is_some().then(|| self.has_goal.get()),
+            plan_mode: self.approval_mode.get() == ApprovalMode::Plan,
+        })
     }
 
     fn run_subagent_tool(
@@ -2309,30 +2408,7 @@ impl OpenAiClient {
     /// rejection reason when `name` is an edit tool that is not enabled;
     /// None means the tool may run.
     fn disabled_tool_error(&self, name: &str) -> Option<String> {
-        if name == crate::images::TOOL_NAME {
-            if let Err(reason) = self.tool_state.images() {
-                return Some(reason);
-            }
-        }
-        if name == "web_search" && !self.tool_state.web_search_enabled() {
-            return Some(
-                "web_search is set to a gateway engine (web_search_engine in config.json), which needs a LynShen login. Run /login, or set web_search_engine to \"local\" to search from this machine."
-                    .to_string(),
-            );
-        }
-        if let Some(canonical) = crate::config::canonical_edit_tool_name(name) {
-            if !self.enabled_edit_tools.iter().any(|tool| tool == canonical) {
-                let enabled = if self.enabled_edit_tools.is_empty() {
-                    "none".to_string()
-                } else {
-                    self.enabled_edit_tools.join(", ")
-                };
-                return Some(format!(
-                    "edit tool '{name}' is disabled by config (enabled edit tools: {enabled}). Add it to the edit_tools array in config.json to enable it."
-                ));
-            }
-        }
-        None
+        disabled_tool_error(name, &self.tool_state, &self.enabled_edit_tools)
     }
 
     /// Tools whose side effects warrant a user decision before they run under
