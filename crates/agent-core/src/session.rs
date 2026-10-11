@@ -1,5 +1,5 @@
 use crate::{
-    event::{TranscriptItem, TreeNodeView},
+    event::{PlanItem, TranscriptItem, TreeNodeView},
     tokens, tools,
 };
 use serde_json::{json, Value};
@@ -26,6 +26,12 @@ pub struct EntryId(u64);
 /// compaction).
 pub(crate) const COMPACTION_PREFIX: &str =
     "[Earlier conversation compacted to a summary for context efficiency]";
+/// Heads the list of changed files that ends the compaction input and is
+/// added to the summary (see `CompactionPlan::finish_summary`).
+const CHANGED_FILES_HEADING: &str = "Files changed in this session:";
+/// At most this many files are listed: the summary rides along with every
+/// later request.
+const MAX_LISTED_CHANGED_FILES: usize = 100;
 
 impl EntryId {
     pub fn display(self) -> String {
@@ -84,12 +90,29 @@ pub enum EntryKind {
 
 #[derive(Debug, Clone)]
 pub struct CompactionPlan {
-    /// Rendered text of the prior summary plus the turns being folded.
+    /// Rendered text of the prior summary plus the turns being folded, then
+    /// the files this session changed.
     pub folded_text: String,
     /// Recent context items kept verbatim after the fold point.
     pub kept_items: Vec<Value>,
     /// Id of the last entry folded into the new summary.
     pub replaced_through: u64,
+    /// Files the edit tools changed on this branch (`changed_files`).
+    pub changed_files: Vec<String>,
+}
+
+impl CompactionPlan {
+    /// The summary as stored: the model's text, then the changed files, so
+    /// the list survives whatever the model left out.
+    pub fn finish_summary(&self, summary: String) -> String {
+        if self.changed_files.is_empty() {
+            return summary;
+        }
+        format!(
+            "{summary}\n\n{}",
+            changed_files_section(&self.changed_files)
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +142,8 @@ pub struct SessionStore {
     /// The agent team's state (task board, worktrees to merge), owned by
     /// `subagents::SubagentManager::team_json`.
     team: Option<Value>,
+    /// The latest `update_plan` steps.
+    plan: Vec<PlanItem>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,6 +285,17 @@ impl SessionStore {
     /// conversation change, so `updated_at` stays.
     pub fn set_team(&mut self, team: Value) {
         self.team = Some(team);
+    }
+
+    /// The latest `update_plan` steps.
+    pub fn plan(&self) -> &[PlanItem] {
+        &self.plan
+    }
+
+    /// Records the plan; written with the next save. Not a conversation
+    /// change, so `updated_at` stays.
+    pub fn set_plan(&mut self, plan: Vec<PlanItem>) {
+        self.plan = plan;
     }
 
     pub fn goal(&self) -> Option<&ThreadGoal> {
@@ -599,6 +635,7 @@ impl SessionStore {
         &self,
         keep_recent_tokens: usize,
         model: &str,
+        cwd: &Path,
     ) -> Option<CompactionPlan> {
         let branch = self.branch();
         let (summary, keep_after) = self.compaction_view(&branch);
@@ -677,7 +714,8 @@ impl SessionStore {
         let mut folded_text = String::new();
         if let Some(summary) = &summary {
             folded_text.push_str("Earlier summary:\n");
-            folded_text.push_str(summary);
+            // Its file list is written anew below, from the whole branch.
+            folded_text.push_str(without_changed_files(summary));
             folded_text.push_str("\n\n");
         }
         for entry in fold {
@@ -685,6 +723,12 @@ impl SessionStore {
                 folded_text.push_str(&rendered);
                 folded_text.push('\n');
             }
+        }
+        let changed_files = self.changed_files(cwd);
+        if !changed_files.is_empty() {
+            folded_text.push('\n');
+            folded_text.push_str(&changed_files_section(&changed_files));
+            folded_text.push('\n');
         }
 
         let mut kept_projected = Vec::new();
@@ -695,7 +739,79 @@ impl SessionStore {
             folded_text,
             kept_items,
             replaced_through,
+            changed_files,
         })
+    }
+
+    /// Files the edit tools changed on this branch, in the order they were
+    /// first changed: the path a successful write, str_replace/edit or
+    /// hashline_edit result names, and the files an applied apply_patch's
+    /// diff names. Paths under `cwd` are given relative to it. Changes made
+    /// by shell commands are not seen.
+    pub fn changed_files(&self, cwd: &Path) -> Vec<String> {
+        let branch = self.branch();
+        let mut patches: HashMap<&str, &str> = HashMap::new();
+        let mut files: Vec<String> = Vec::new();
+        for entry in &branch {
+            match &entry.kind {
+                EntryKind::ResponseItem { item }
+                    if item.get("type").and_then(Value::as_str) == Some("function_call")
+                        && item.get("name").and_then(Value::as_str) == Some("apply_patch") =>
+                {
+                    if let (Some(call_id), Some(arguments)) = (
+                        item.get("call_id").and_then(Value::as_str),
+                        item.get("arguments").and_then(Value::as_str),
+                    ) {
+                        patches.insert(call_id, arguments);
+                    }
+                }
+                EntryKind::ToolOutput {
+                    call_id,
+                    name,
+                    output,
+                    ..
+                } if matches!(
+                    name.as_str(),
+                    "write" | "str_replace" | "edit" | "hashline_edit" | "apply_patch"
+                ) =>
+                {
+                    let Ok(Value::Object(result)) = serde_json::from_str::<Value>(output) else {
+                        continue;
+                    };
+                    if result.contains_key("error") {
+                        continue;
+                    }
+                    let paths = match name.as_str() {
+                        "write" | "str_replace" | "edit" | "hashline_edit" => result
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .map(|path| vec![path.to_string()])
+                            .unwrap_or_default(),
+                        "apply_patch" if result.get("applied") == Some(&Value::Bool(true)) => {
+                            patches
+                                .get(call_id.as_str())
+                                .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+                                .and_then(|args| {
+                                    args.get("patch").and_then(Value::as_str).map(patch_files)
+                                })
+                                .unwrap_or_default()
+                        }
+                        _ => Vec::new(),
+                    };
+                    for path in paths {
+                        let shown = Path::new(&path)
+                            .strip_prefix(cwd)
+                            .map(|relative| relative.display().to_string())
+                            .unwrap_or(path);
+                        if !files.contains(&shown) {
+                            files.push(shown);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        files
     }
 
     pub fn apply_compaction(&mut self, summary: String, replaced_through: u64) -> EntryId {
@@ -1049,7 +1165,8 @@ impl SessionStore {
             "resume_status": self.resume_summary_status.map(ThreadGoalStatus::as_str),
             "resume_summary_updated_at": self.resume_summary_updated_at,
             "goal": self.goal.as_ref().map(goal_to_json),
-            "team": self.team
+            "team": self.team,
+            "plan": plan_to_json(&self.plan)
         })
     }
 
@@ -1148,6 +1265,7 @@ impl SessionStore {
                 .get("resume_summary_updated_at")
                 .and_then(Value::as_u64),
             team: value.get("team").filter(|team| !team.is_null()).cloned(),
+            plan: value.get("plan").map(plan_from_json).unwrap_or_default(),
         };
         if store.branch_heads.is_empty() {
             store.rebuild_branch_heads();
@@ -1223,6 +1341,9 @@ impl SessionStore {
         }
         if let Some(team) = value.get("team") {
             self.team = Some(team.clone()).filter(|team| !team.is_null());
+        }
+        if let Some(plan) = value.get("plan") {
+            self.plan = plan_from_json(plan);
         }
         self.resume_summary = value
             .get("resume_summary")
@@ -1559,6 +1680,104 @@ fn sanitize_tool_pairs(items: Vec<Value>) -> Vec<Value> {
         .zip(keep)
         .filter_map(|(item, keep)| keep.then_some(item))
         .collect()
+}
+
+/// The changed-files list as it ends the compaction input and the summary.
+fn changed_files_section(files: &[String]) -> String {
+    let mut section = CHANGED_FILES_HEADING.to_string();
+    for file in files.iter().take(MAX_LISTED_CHANGED_FILES) {
+        section.push_str("\n- ");
+        section.push_str(file);
+    }
+    if files.len() > MAX_LISTED_CHANGED_FILES {
+        section.push_str(&format!(
+            "\n- and {} more",
+            files.len() - MAX_LISTED_CHANGED_FILES
+        ));
+    }
+    section
+}
+
+/// A summary without the changed-files list `finish_summary` added.
+fn without_changed_files(summary: &str) -> &str {
+    summary
+        .rfind(&format!("\n\n{CHANGED_FILES_HEADING}\n"))
+        .map_or(summary, |at| &summary[..at])
+}
+
+/// The files a unified diff's `---`/`+++` headers name (`a/`, `b/` dropped,
+/// `/dev/null` skipped), each once.
+fn patch_files(patch: &str) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for line in patch.lines() {
+        let Some(rest) = line
+            .strip_prefix("--- ")
+            .or_else(|| line.strip_prefix("+++ "))
+        else {
+            continue;
+        };
+        // `diff -u` puts a tab and a timestamp after the name.
+        let rest = rest.split('\t').next().unwrap_or(rest).trim();
+        if rest == "/dev/null" {
+            continue;
+        }
+        let file = rest
+            .strip_prefix("a/")
+            .or_else(|| rest.strip_prefix("b/"))
+            .unwrap_or(rest)
+            .to_string();
+        if !files.contains(&file) {
+            files.push(file);
+        }
+    }
+    files
+}
+
+fn plan_to_json(plan: &[PlanItem]) -> Value {
+    json!(plan
+        .iter()
+        .map(|item| json!({
+            "step": item.step,
+            "status": item.status,
+            "agent": item.agent,
+            "files": item.files,
+        }))
+        .collect::<Vec<_>>())
+}
+
+fn plan_from_json(value: &Value) -> Vec<PlanItem> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(PlanItem {
+                        step: item.get("step")?.as_str()?.to_string(),
+                        status: item
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("pending")
+                            .to_string(),
+                        agent: item
+                            .get("agent")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        files: item
+                            .get("files")
+                            .and_then(Value::as_array)
+                            .map(|files| {
+                                files
+                                    .iter()
+                                    .filter_map(|file| file.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn compaction_summary_item(summary: &str) -> Value {
@@ -2286,7 +2505,7 @@ mod tests {
         assert!(!before.compacted);
 
         let plan = session
-            .plan_compaction(80, "gpt-5")
+            .plan_compaction(80, "gpt-5", Path::new("/work"))
             .expect("older turns should be foldable");
         session.apply_compaction("ROLLED UP SUMMARY".to_string(), plan.replaced_through);
 
@@ -2307,7 +2526,7 @@ mod tests {
         let before_tokens = session.context_tokens("gpt-5");
 
         let plan = session
-            .plan_compaction(80, "gpt-5")
+            .plan_compaction(80, "gpt-5", Path::new("/work"))
             .expect("older turns should be foldable");
         assert!(plan.folded_text.contains("User: turn 0"));
         session.apply_compaction("ROLLED UP SUMMARY".to_string(), plan.replaced_through);
@@ -2419,7 +2638,7 @@ mod tests {
         // Across many keep-recent budgets the fold boundary must never leave a
         // function_call_output without its function_call.
         for keep in [10usize, 30, 60, 120, 240, 400] {
-            if let Some(plan) = session.plan_compaction(keep, "gpt-5") {
+            if let Some(plan) = session.plan_compaction(keep, "gpt-5", Path::new("/work")) {
                 assert!(
                     tool_pairs_balanced(&plan.kept_items),
                     "keep_recent={keep} produced an orphan tool output"
@@ -2730,6 +2949,200 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    fn plan_item(step: &str, status: &str) -> PlanItem {
+        PlanItem {
+            step: step.to_string(),
+            status: status.to_string(),
+            agent: None,
+            files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_plan_is_saved_and_the_latest_one_reloads() {
+        let root = test_dir("session-plan");
+        let profile = root.join("profile");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut session = SessionStore::new();
+        let session_id = session.session_id().to_string();
+        let updated_at = session.updated_at();
+        session.set_plan(vec![plan_item("Read the code", "in_progress")]);
+        assert_eq!(session.updated_at(), updated_at);
+        session.save_for_cwd(&profile, &cwd).unwrap();
+        session.append(EntryKind::User {
+            content: "go".to_string(),
+        });
+        let latest = vec![
+            plan_item("Read the code", "completed"),
+            PlanItem {
+                agent: Some("/root/fixer".to_string()),
+                files: vec!["src/lib.rs".to_string()],
+                ..plan_item("Fix the bug", "in_progress")
+            },
+        ];
+        session.set_plan(latest.clone());
+        session.save_for_cwd(&profile, &cwd).unwrap();
+        let loaded = SessionStore::load_for_cwd(&profile, &cwd, &session_id).unwrap();
+        assert_eq!(loaded.plan(), latest.as_slice());
+        // A snapshot record keeps it too.
+        assert_eq!(
+            SessionStore::from_json(&session.to_json()).unwrap().plan(),
+            latest.as_slice()
+        );
+        // A state record written before plans were saved leaves it alone.
+        let mut older = SessionStore::from_json(&session.to_json()).unwrap();
+        let mut state = session.state_json();
+        state.as_object_mut().unwrap().remove("plan");
+        older.apply_state_json(&state);
+        assert_eq!(older.plan(), latest.as_slice());
+        assert!(SessionStore::new().plan().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn call(
+        session: &mut SessionStore,
+        call_id: &str,
+        name: &str,
+        arguments: Value,
+        output: Value,
+    ) {
+        session.append(EntryKind::ResponseItem {
+            item: json!({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments.to_string(),
+            }),
+        });
+        session.append(EntryKind::ToolOutput {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            output: output.to_string(),
+            image: None,
+        });
+    }
+
+    #[test]
+    fn the_compaction_input_and_summary_list_the_files_this_session_changed() {
+        let cwd = Path::new("/work");
+        let mut session = SessionStore::new();
+        session.append(EntryKind::User {
+            content: format!("fix it {}", "x".repeat(400)),
+        });
+        call(
+            &mut session,
+            "c1",
+            "write",
+            json!({ "path": "src/new.rs", "content": "fn f() {}" }),
+            json!({ "path": "/work/src/new.rs", "written_bytes": 9, "diff": "" }),
+        );
+        // A failed edit changed nothing.
+        call(
+            &mut session,
+            "c2",
+            "str_replace",
+            json!({ "path": "src/missing.rs" }),
+            json!({ "path": "/work/src/missing.rs", "error": "not found" }),
+        );
+        // A call waiting for a person has not run.
+        call(
+            &mut session,
+            "c3",
+            "hashline_edit",
+            json!({ "path": "src/waiting.rs" }),
+            json!({ "status": "submitted for confirmation", "action_id": "act-1" }),
+        );
+        let patch = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n--- /dev/null\n+++ docs/notes.md\t2026-10-11 10:00:00\n@@ -0,0 +1 @@\n+hi\n";
+        call(
+            &mut session,
+            "c4",
+            "apply_patch",
+            json!({ "patch": patch }),
+            json!({ "command": "git apply", "exit_code": 0, "applied": true }),
+        );
+        call(
+            &mut session,
+            "c5",
+            "apply_patch",
+            json!({ "patch": "--- a/src/rejected.rs\n+++ b/src/rejected.rs\n" }),
+            json!({ "command": "git apply --check", "exit_code": 1 }),
+        );
+        call(
+            &mut session,
+            "c6",
+            "edit",
+            json!({ "path": "/elsewhere/x.rs" }),
+            json!({ "path": "/elsewhere/x.rs", "edits": 1 }),
+        );
+        call(
+            &mut session,
+            "c7",
+            "write",
+            json!({ "path": "src/new.rs", "content": "fn g() {}" }),
+            json!({ "path": "/work/src/new.rs", "written_bytes": 9 }),
+        );
+        let files = [
+            "src/new.rs",
+            "src/lib.rs",
+            "docs/notes.md",
+            "/elsewhere/x.rs",
+        ];
+        assert_eq!(session.changed_files(cwd), files);
+        session.append(EntryKind::User {
+            content: format!("now test it {}", "y".repeat(400)),
+        });
+
+        let plan = session
+            .plan_compaction(1, "gpt-5", cwd)
+            .expect("older turns should be foldable");
+        let list = "Files changed in this session:\n- src/new.rs\n- src/lib.rs\n- docs/notes.md\n- /elsewhere/x.rs";
+        assert!(plan.folded_text.contains(list), "{}", plan.folded_text);
+        let summary = plan.finish_summary("Wrote and patched files.".to_string());
+        assert_eq!(summary, format!("Wrote and patched files.\n\n{list}"));
+        session.apply_compaction(summary, plan.replaced_through);
+
+        // The next compaction lists the files once, from the whole branch.
+        call(
+            &mut session,
+            "c8",
+            "write",
+            json!({ "path": "README.md" }),
+            json!({ "path": "/work/README.md", "written_bytes": 1 }),
+        );
+        session.append(EntryKind::User {
+            content: format!("and the readme {}", "z".repeat(400)),
+        });
+        let next = session
+            .plan_compaction(1, "gpt-5", cwd)
+            .expect("foldable again");
+        assert_eq!(
+            next.folded_text
+                .matches("Files changed in this session:")
+                .count(),
+            1
+        );
+        assert!(next
+            .folded_text
+            .contains("Earlier summary:\nWrote and patched files.\n"));
+        assert!(next.folded_text.contains("- /elsewhere/x.rs\n- README.md"));
+        // Without changed files, the summary is the model's text.
+        let quiet = CompactionPlan {
+            folded_text: String::new(),
+            kept_items: Vec::new(),
+            replaced_through: 1,
+            changed_files: SessionStore::new().changed_files(cwd),
+        };
+        assert_eq!(quiet.finish_summary("Talked.".to_string()), "Talked.");
+        // A long list is cut.
+        let many = (0..MAX_LISTED_CHANGED_FILES + 3)
+            .map(|index| format!("f{index}.rs"))
+            .collect::<Vec<_>>();
+        let section = changed_files_section(&many);
+        assert_eq!(section.lines().count(), MAX_LISTED_CHANGED_FILES + 2);
+        assert!(section.ends_with("\n- f99.rs\n- and 3 more"), "{section}");
+    }
+
     #[test]
     fn journal_snapshot_preserves_branch_deletions() {
         let root = test_dir("session-journal-delete");
@@ -2950,7 +3363,7 @@ mod tests {
         // Whatever the boundary, every tool output must survive: either folded
         // into the summary text or kept verbatim with its function_call.
         for keep in [10usize, 30, 60, 120, 240, 400] {
-            let Some(plan) = session.plan_compaction(keep, "gpt-5") else {
+            let Some(plan) = session.plan_compaction(keep, "gpt-5", Path::new("/work")) else {
                 continue;
             };
             assert!(
@@ -2988,7 +3401,7 @@ mod tests {
         });
 
         let plan = session
-            .plan_compaction(1, "gpt-5")
+            .plan_compaction(1, "gpt-5", Path::new("/work"))
             .expect("older turns should be foldable");
 
         assert!(!plan.folded_text.contains("CURRENT QUESTION"));

@@ -1183,7 +1183,7 @@ impl OpenAiClient {
         mut emit_output_tokens: impl FnMut(u64) -> Result<(), String>,
     ) -> Result<String, String> {
         self.summarize_text(
-            "You compress earlier conversation history so it can replace the raw turns while letting the work continue. Write a dense summary that preserves: the user's goals and explicit requests, decisions made, important facts and constraints discovered, files and tools touched with their outcomes, and any unfinished threads. Prefer tight prose or bullet points. Output only the summary.",
+            "You compress earlier conversation history so it can replace the raw turns while letting the work continue. Write a dense summary that preserves: the user's goals and explicit requests, decisions made, important facts and constraints discovered, files and tools touched with their outcomes, and any unfinished threads. When the input ends with a list of the files changed in this session, that list is added to your summary as it is: do not copy it, but say what changed in those files where it matters. Prefer tight prose or bullet points. Output only the summary.",
             &format!("Summarize this earlier conversation:\n\n{conversation}"),
             &mut emit_output_tokens,
         )

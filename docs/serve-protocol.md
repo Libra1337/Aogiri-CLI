@@ -416,7 +416,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `usage` | `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_tokens` | Real API usage for the completed turn. |
 | `context_usage` | `tokens`, `tokenizer`, `cost` | Tokenizer-counted context size; `cost` is cumulative USD (0 when unpriced). |
 | `compaction_start` | — | Context compaction began. |
-| `compaction_end` | `summary` | Context compaction finished; the older conversation now reads as `summary`. Other engines send no `summary`. |
+| `compaction_end` | `summary` | Context compaction finished; the older conversation now reads as `summary`. When the session's edit tools changed files, `summary` ends with a blank line, `Files changed in this session:` and one `- <path>` line per file (relative to the session's directory when under it; past 100 files, a last line `- and N more`). After it, the model also gets the current `plan` again as a message. Other engines send no `summary`. |
 | `compaction_progress` | `output_tokens` | Compaction summary tokens produced so far. |
 | `compaction_failed` | `error` | Compaction failed; the session continues uncompacted. |
 | `model_view` | `models: [{model, active, context_window, max_output_tokens, reasoning_efforts}]`, `active_effort` | Model picker data (`/model`). |
@@ -424,7 +424,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `resume_view` | `items: [{id, label, active}]` | Session picker data (`/resume`). |
 | `checkpoint_view` | `items: [{id, label, detail}]` | Checkpoint picker data. |
 | `goal` | `goal: {objective, status, token_budget, tokens_used, time_used_seconds, created_at, updated_at} \| null` | Goal state; `null` clears it. |
-| `plan` | `plan: [{step, status, agent, files}]` | Goal/plan step list. `agent` (string or `null`) is the subagent doing the step, as the model named it (path or task name); `files` the files it is expected to write. |
+| `plan` | `plan: [{step, status, agent, files}]` | Goal/plan step list. `agent` (string or `null`) is the subagent doing the step, as the model named it (path or task name); `files` the files it is expected to write. Saved with the session: part of the startup batch and of a resumed session's events when the session has a plan; `/new` or `/resume` sends an empty `plan` to clear the previous session's plan when it had one and the next session has none. |
 | `transcript` | `items: [{role, ...}]` | Rendered conversation (`/transcript`); roles: `user`, `assistant`, `tool` (`name`, `output`), `branch` (`label`), `compaction` (`summary`: where the older conversation was folded). |
 | `info` | `message` | Informational line (hook output, notices, update available, loop guard warnings; see "Loop guard"). |
 | `error` | `message` | Error line. Also used for malformed commands and unknown ops, and for a turn the loop guard stopped (message starts with `loop guard:`). |

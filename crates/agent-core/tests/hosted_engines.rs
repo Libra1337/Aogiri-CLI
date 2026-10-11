@@ -1916,3 +1916,98 @@ fn the_loop_guard_stops_a_turn_whose_calls_keep_failing() {
             && message.contains("failed 6 times in a row")
     )));
 }
+
+fn plan_steps(events: &[AgentEvent]) -> Option<Vec<(String, String)>> {
+    events.iter().rev().find_map(|event| match event {
+        AgentEvent::Plan(items) => Some(
+            items
+                .iter()
+                .map(|item| (item.step.clone(), item.status.clone()))
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
+fn update_plan_call() -> String {
+    let plan = serde_json::json!({ "plan": [
+        { "step": "Read the code", "status": "completed" },
+        { "step": "Fix the bug", "status": "in_progress", "files": ["src/lib.rs"] },
+    ]});
+    format!("CALL update_plan {plan}")
+}
+
+#[test]
+fn the_plan_comes_back_when_the_session_is_reopened() {
+    let _guard = setup();
+    let dir = temp_dir("plan-reopen");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.submit_user_message(update_plan_call());
+    let events = pump(&mut core, is_ready);
+    let steps = vec![
+        ("Read the code".to_string(), "completed".to_string()),
+        ("Fix the bug".to_string(), "in_progress".to_string()),
+    ];
+    assert_eq!(plan_steps(&events), Some(steps.clone()));
+    let session = core.session_id().to_string();
+    drop(core);
+
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    assert_eq!(plan_steps(&core.state_events()), None);
+    let (_, resumed) = core.handle_command(&format!("/resume {session}"));
+    assert_eq!(plan_steps(&resumed), Some(steps.clone()));
+    // A client that attaches later gets it too.
+    assert_eq!(plan_steps(&core.state_events()), Some(steps));
+    // A new session starts without it.
+    let (_, fresh) = core.handle_command("/new");
+    assert_eq!(plan_steps(&fresh), Some(Vec::new()));
+    assert_eq!(plan_steps(&core.state_events()), None);
+}
+
+#[test]
+fn after_a_compaction_the_model_gets_its_plan_and_the_summary_lists_changed_files() {
+    let _guard = setup();
+    let dir = temp_dir("plan-compaction");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.submit_user_message(update_plan_call());
+    pump(&mut core, is_ready);
+    fs::write(dir.join("notes.txt"), "hello\n").unwrap();
+    core.submit_user_message(r#"CALL read {"path":"notes.txt"}"#.to_string());
+    pump(&mut core, is_ready);
+    let edit = serde_json::json!({
+        "path": "notes.txt",
+        "edits": [{ "op": "append", "lines": ["hi"] }],
+    });
+    core.submit_user_message(format!("CALL hashline_edit {edit}"));
+    pump(&mut core, is_ready);
+    assert_eq!(
+        fs::read_to_string(dir.join("notes.txt")).unwrap(),
+        "hello\nhi\n"
+    );
+    // Recent text big enough that the turns above are folded.
+    core.submit_user_message("lorem ipsum dolor sit amet ".repeat(6000));
+    pump(&mut core, is_ready);
+
+    let (_, mut events) = core.handle_command("/compact");
+    events.extend(pump(&mut core, is_ready));
+    let summary = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::CompactionEnd { summary } => Some(summary.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no compaction: {events:#?}"));
+    assert!(
+        summary.ends_with("\n\nFiles changed in this session:\n- notes.txt"),
+        "{summary}"
+    );
+
+    core.submit_user_message("HISTORY".to_string());
+    let history = assistant_text(&pump(&mut core, is_ready));
+    assert_eq!(history.matches("<plan_context>").count(), 1, "{history}");
+    assert!(history.contains("1. [completed] Read the code\n"));
+    assert!(history.contains("2. [in_progress] Fix the bug (files: src/lib.rs)\n"));
+    // The plan follows the summary.
+    let summary_at = history.find("Files changed in this session").unwrap();
+    assert!(summary_at < history.find("<plan_context>").unwrap());
+}

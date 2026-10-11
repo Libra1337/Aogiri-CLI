@@ -62,8 +62,8 @@ pub fn temp_dir(label: &str) -> PathBuf {
 /// arguments}, …]` with all of them in one reply; `LOOP <tool> <arguments>`
 /// makes that call again after every result (`{n}` in the arguments becomes
 /// the call's number); anything after a tool result or a deferred-action
-/// message answers with plain text naming what it saw. In a subagent's
-/// task, `[sleep:N]`
+/// message answers with plain text naming what it saw; `HISTORY` answers
+/// with every user message of the request. In a subagent's task, `[sleep:N]`
 /// waits N ms before answering and a line `RUN: <command>` runs it;
 /// `[history]` answers with every user message of the request. A message
 /// from another conversation (`<session_message …>`) is scripted by its body.
@@ -195,6 +195,18 @@ fn script(request: &Value) -> String {
                     "function": { "name": name, "arguments": arguments }
                 }] }, "finish_reason": null }] }),
                 json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] }),
+            ]);
+        }
+        if text == "HISTORY" {
+            let history = messages
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .map(|message| content_text(&message["content"]))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            return sse(&[
+                json!({ "choices": [{ "index": 0, "delta": { "content": format!("history: {history}") }, "finish_reason": null }] }),
+                json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
             ]);
         }
         if text == "SYSTEM" {

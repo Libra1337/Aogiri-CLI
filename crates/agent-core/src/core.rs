@@ -68,8 +68,8 @@ struct PendingApproval {
 
 /// What an engine holds of its session only in memory (see
 /// `AgentCore::kept_state`): the approval and sandbox modes switched for the
-/// session, its "always allow" tools and action decisions, its token and
-/// cost totals and its plan.
+/// session, its "always allow" tools and action decisions, and its token and
+/// cost totals. (The plan is saved with the session.)
 #[derive(Debug, Clone, Default)]
 pub struct KeptState {
     approval_mode: Option<ApprovalMode>,
@@ -78,7 +78,6 @@ pub struct KeptState {
     action_decisions: HashMap<String, bool>,
     /// Input, cached input and output tokens, and cost.
     totals: (u64, u64, u64, f64),
-    plan: Vec<PlanItem>,
 }
 
 /// Outcome of a deferred action approved and run on a background thread.
@@ -104,6 +103,9 @@ enum WorkerEvent {
     CompactionDone {
         summary: String,
         replaced_through: u64,
+        /// The plan message the conversation continues with after the
+        /// summary (see `compacted`).
+        plan_item: Option<Value>,
     },
     CompactionFailed(String),
     ResumeSummaryDone {
@@ -491,6 +493,9 @@ impl AgentCore {
         let board = self.subagent_manager.board_json();
         if !board.is_empty() {
             events.push(AgentEvent::TaskBoard(board));
+        }
+        if !self.plan.is_empty() {
+            events.push(AgentEvent::Plan(self.plan.clone()));
         }
         if trust::project_has_local_resources(&self.cwd)
             && self.trust.decision_for(&self.cwd).is_none()
@@ -1676,9 +1681,13 @@ impl AgentCore {
                     WorkerEvent::CompactionDone {
                         summary,
                         replaced_through,
+                        plan_item,
                     } => {
                         self.session
                             .apply_compaction(summary.clone(), replaced_through);
+                        if let Some(item) = plan_item {
+                            self.session.append(EntryKind::ResponseItem { item });
+                        }
                         events.extend(self.save_session_event());
                         events.push(AgentEvent::CompactionEnd { summary });
                         events.push(self.context_usage_event());
@@ -1828,7 +1837,11 @@ impl AgentCore {
                             && !self.overflow_retried
                             && self
                                 .session
-                                .plan_compaction(COMPACTION_KEEP_RECENT_TOKENS, &self.config.model)
+                                .plan_compaction(
+                                    COMPACTION_KEEP_RECENT_TOKENS,
+                                    &self.config.model,
+                                    &self.cwd,
+                                )
                                 .is_some() =>
                     {
                         // Over the window (unknown, or raised past what this
@@ -2491,8 +2504,11 @@ impl AgentCore {
         // The request is the conversation plus the prompt and tool definitions.
         let request_tokens = context_tokens + overhead_tokens(&overhead) as usize;
         let compaction = if forced || should_auto_compact(request_tokens, model_context_budget) {
-            self.session
-                .plan_compaction(COMPACTION_KEEP_RECENT_TOKENS, &self.config.model)
+            self.session.plan_compaction(
+                COMPACTION_KEEP_RECENT_TOKENS,
+                &self.config.model,
+                &self.cwd,
+            )
         } else {
             None
         };
@@ -2518,6 +2534,7 @@ impl AgentCore {
             None
         };
         let cwd = self.cwd.clone();
+        let plan_item = plan_context_item(&self.plan);
         let (tx, rx) = mpsc::channel();
         self.interrupt_flag = Arc::new(AtomicBool::new(false));
         let interrupt_flag = Arc::clone(&self.interrupt_flag);
@@ -2536,15 +2553,7 @@ impl AgentCore {
                                 .map_err(|error| error.to_string())
                         },
                     ) {
-                        Ok(summary) => {
-                            let _ = tx.send(WorkerEvent::CompactionDone {
-                                summary: summary.clone(),
-                                replaced_through: plan.replaced_through,
-                            });
-                            let mut items = vec![compaction_summary_item(&summary)];
-                            items.extend(plan.kept_items);
-                            items
-                        }
+                        Ok(summary) => compacted(plan, summary, plan_item, &tx),
                         Err(error) => {
                             let _ = tx.send(WorkerEvent::CompactionFailed(error));
                             request_items
@@ -2655,10 +2664,11 @@ impl AgentCore {
             )];
         }
 
-        let Some(plan) = self
-            .session
-            .plan_compaction(COMPACTION_KEEP_RECENT_TOKENS, &self.config.model)
-        else {
+        let Some(plan) = self.session.plan_compaction(
+            COMPACTION_KEEP_RECENT_TOKENS,
+            &self.config.model,
+            &self.cwd,
+        ) else {
             return vec![AgentEvent::Info(
                 "nothing old enough to compact".to_string(),
             )];
@@ -2674,6 +2684,7 @@ impl AgentCore {
         self.turn_started_at = None;
         self.turn_goal_tokens = 0;
         self.goal_continuation_running = false;
+        let plan_item = plan_context_item(&self.plan);
         let (tx, rx) = mpsc::channel();
         self.interrupt_flag = Arc::new(AtomicBool::new(false));
         self.receiver = Some(rx);
@@ -2686,10 +2697,7 @@ impl AgentCore {
                     .map_err(|error| error.to_string())
             }) {
                 Ok(summary) => {
-                    let _ = tx.send(WorkerEvent::CompactionDone {
-                        summary,
-                        replaced_through: plan.replaced_through,
-                    });
+                    compacted(plan, summary, plan_item, &tx);
                     let _ = tx.send(WorkerEvent::Done);
                 }
                 Err(error) => {
@@ -3027,7 +3035,6 @@ impl AgentCore {
                 self.total_output_tokens,
                 self.total_cost,
             ),
-            plan: self.plan.clone(),
         }
     }
 
@@ -3052,7 +3059,6 @@ impl AgentCore {
             self.total_output_tokens,
             self.total_cost,
         ) = kept.totals;
-        self.plan = kept.plan;
     }
 
     /// Marks whether a client is watching. Going unattended also converts
@@ -3818,6 +3824,9 @@ impl AgentCore {
             });
         }
         self.plan = plan;
+        // Saved with the session (poll_goal_tool_requests saves after each
+        // request), so a reopened session has its plan back.
+        self.session.set_plan(self.plan.clone());
         self.subagent_manager
             .shared()
             .set_plan_steps(self.plan.iter().map(|item| item.step.clone()).collect());
@@ -4144,6 +4153,7 @@ impl AgentCore {
         self.session = SessionStore::new();
         self.tool_state.set_session_id(self.session.session_id());
         self.reset_team();
+        let had_plan = !std::mem::take(&mut self.plan).is_empty();
         // Release the old session's lock and hold the new one.
         self.session_lock = None;
         self.session_lock =
@@ -4155,9 +4165,10 @@ impl AgentCore {
             AgentEvent::PendingMessages(Vec::new()),
             self.model_status_event(),
             self.context_usage_event(),
-            AgentEvent::Status(format!("new session {session_id}")),
         ]
         .into_iter()
+        .chain(had_plan.then(|| AgentEvent::Plan(Vec::new())))
+        .chain([AgentEvent::Status(format!("new session {session_id}"))])
         .chain(save_event)
         .collect()
     }
@@ -4737,6 +4748,8 @@ impl AgentCore {
                 // Release the previous session's lock only after the switch.
                 self.session_lock = Some(lock);
                 self.reset_team();
+                let had_plan = !self.plan.is_empty();
+                self.plan = self.session.plan().to_vec();
                 let mut events = vec![
                     AgentEvent::Transcript(self.session.transcript_items()),
                     AgentEvent::PendingMessages(Vec::new()),
@@ -4747,6 +4760,9 @@ impl AgentCore {
                 let board = self.subagent_manager.board_json();
                 if !board.is_empty() {
                     events.push(AgentEvent::TaskBoard(board));
+                }
+                if had_plan || !self.plan.is_empty() {
+                    events.push(AgentEvent::Plan(self.plan.clone()));
                 }
                 events.push(AgentEvent::Status(format!(
                     "resumed session {}",
@@ -5133,6 +5149,59 @@ impl AgentCore {
             .iter()
             .any(|effort| effort == value)
     }
+}
+
+/// A compaction's summary is in: tells the engine, which records the
+/// summary and then the plan message, and returns what the turn continues
+/// from, in the order the session will project it: the summary, the kept
+/// items, the plan.
+fn compacted(
+    plan: crate::session::CompactionPlan,
+    summary: String,
+    plan_item: Option<Value>,
+    tx: &Sender<WorkerEvent>,
+) -> Vec<Value> {
+    let summary = plan.finish_summary(summary);
+    let _ = tx.send(WorkerEvent::CompactionDone {
+        summary: summary.clone(),
+        replaced_through: plan.replaced_through,
+        plan_item: plan_item.clone(),
+    });
+    let mut items = vec![compaction_summary_item(&summary)];
+    items.extend(plan.kept_items);
+    items.extend(plan_item);
+    items
+}
+
+/// The plan, as a user message that follows a compaction: the update_plan
+/// calls that set it were folded into the summary. None without a plan. A
+/// message, not system prompt text, so the cached prompt prefix stays.
+fn plan_context_item(plan: &[PlanItem]) -> Option<Value> {
+    if plan.is_empty() {
+        return None;
+    }
+    let mut text = String::from(
+        "<plan_context>\nThe conversation was compacted. Your plan from update_plan, as it stands:\n",
+    );
+    for (index, item) in plan.iter().enumerate() {
+        text.push_str(&format!("{}. [{}] {}", index + 1, item.status, item.step));
+        let mut details = Vec::new();
+        if let Some(agent) = &item.agent {
+            details.push(format!("agent: {agent}"));
+        }
+        if !item.files.is_empty() {
+            details.push(format!("files: {}", item.files.join(", ")));
+        }
+        if !details.is_empty() {
+            text.push_str(&format!(" ({})", details.join("; ")));
+        }
+        text.push('\n');
+    }
+    text.push_str("Keep it current with update_plan.\n</plan_context>");
+    Some(json!({
+        "role": "user",
+        "content": [{ "type": "input_text", "text": text }]
+    }))
 }
 
 fn mask_key(value: Option<&str>) -> String {
@@ -5999,6 +6068,71 @@ mod approval_decision_tests {
         let decision = response_rx.recv().unwrap();
         assert!(decision.allow);
         assert!(decision.approved_hunks.is_none());
+    }
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+
+    #[test]
+    fn after_a_compaction_the_turn_continues_with_the_summary_kept_items_and_plan() {
+        assert_eq!(plan_context_item(&[]), None);
+        let plan = [
+            PlanItem {
+                step: "Read the code".to_string(),
+                status: "completed".to_string(),
+                ..PlanItem::default()
+            },
+            PlanItem {
+                step: "Fix the bug".to_string(),
+                status: "in_progress".to_string(),
+                agent: Some("/root/fixer".to_string()),
+                files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            },
+        ];
+        let item = plan_context_item(&plan).expect("a plan message");
+        assert_eq!(item["role"], "user");
+        let text = item["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("<plan_context>\n"), "{text}");
+        assert!(text.contains("1. [completed] Read the code\n"), "{text}");
+        assert!(
+            text.contains(
+                "2. [in_progress] Fix the bug (agent: /root/fixer; files: src/a.rs, src/b.rs)\n"
+            ),
+            "{text}"
+        );
+
+        let kept =
+            json!({ "role": "user", "content": [{ "type": "input_text", "text": "go on" }] });
+        let compaction = crate::session::CompactionPlan {
+            folded_text: String::new(),
+            kept_items: vec![kept.clone()],
+            replaced_through: 7,
+            changed_files: vec!["src/a.rs".to_string()],
+        };
+        let (tx, rx) = mpsc::channel();
+        let items = compacted(
+            compaction,
+            "Did things.".to_string(),
+            Some(item.clone()),
+            &tx,
+        );
+        let summary = "Did things.\n\nFiles changed in this session:\n- src/a.rs";
+        assert_eq!(
+            items,
+            [compaction_summary_item(summary), kept, item.clone()]
+        );
+        // The engine records the summary, then the plan message after it.
+        let events = rx.try_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            &events[..],
+            [WorkerEvent::CompactionDone {
+                summary: done,
+                replaced_through: 7,
+                plan_item: Some(recorded),
+            }] if done == summary && *recorded == item
+        ));
     }
 }
 
