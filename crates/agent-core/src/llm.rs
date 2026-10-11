@@ -1023,6 +1023,9 @@ impl OpenAiClient {
             }
             let allowed_requests = approved_requests;
 
+            // The checkpoints each call's edits saved, for its post-tool
+            // hooks (the parallel calls only read).
+            let mut edits = HashMap::new();
             let mut tool_results = if should_run_parallel_tools(&allowed_requests) {
                 for request in &allowed_requests {
                     emit(StreamEvent::ToolStart {
@@ -1044,8 +1047,10 @@ impl OpenAiClient {
                         call_id: request.call_id.clone(),
                         name: request.name.clone(),
                     })?;
+                    let collector = tools::collect_checkpoints();
                     let mut result =
                         self.run_tool_call(&request, cwd, input, &pending_call_ids, &mut emit);
+                    edits.insert(request.call_id.clone(), collector.take());
                     // Edit tools are never parallel-safe, so a partially
                     // approved call always lands here; tell the model exactly
                     // which hunks were applied and which the user rejected.
@@ -1065,8 +1070,14 @@ impl OpenAiClient {
             };
 
             for tool_result in &tool_results {
-                self.hooks
-                    .post_tool(&tool_result.request.name, &tool_result.result.output, cwd);
+                self.hooks.post_tool(
+                    &tool_result.request.name,
+                    &tool_result.result.output,
+                    cwd,
+                    edits
+                        .remove(&tool_result.request.call_id)
+                        .unwrap_or_default(),
+                );
             }
             tool_results.append(&mut blocked_results);
 
@@ -2087,7 +2098,7 @@ impl OpenAiClient {
             .map_err(|error| format!("invalid JSON arguments: {error}"))?;
         let group = required_str(&args, "group")?;
         let target = required_str(&args, "target")?;
-        manager.pick_attempt(&self.agent_path, group, target)
+        manager.pick_attempt(&self.agent_path, group, target, &self.tool_state)
     }
 
     fn task_create(&self, arguments: &str) -> Result<Value, String> {
@@ -2326,7 +2337,7 @@ impl OpenAiClient {
             .map_err(|error| format!("invalid JSON arguments: {error}"))?;
         let target = required_str(&args, "target")?;
         let action = required_str(&args, "action")?;
-        manager.merge_agent(&self.agent_path, target, action)
+        manager.merge_agent(&self.agent_path, target, action, &self.tool_state)
     }
 
     fn append_queued_subagent_messages(
@@ -2470,6 +2481,17 @@ impl OpenAiClient {
     fn call_needs_approval(&self, request: &ToolCallRequest) -> bool {
         if request.name == "merge_agent" && merge_action(&request.arguments) != "apply" {
             return false;
+        }
+        // Listing or taking a snapshot changes no workspace file.
+        if request.name == "checkpoint" && merge_action(&request.arguments) != "restore" {
+            return false;
+        }
+        if tools::is_forced_restore(&request.name, &request.arguments) {
+            return self.approval_tx.is_some()
+                && self
+                    .approval_mode
+                    .get()
+                    .requires_approval_for_forced_restore();
         }
         // A refused call changes nothing: nobody is asked.
         if self.team_v2_refusal(&request.name).is_some() {
@@ -3385,6 +3407,13 @@ fn approval_summary(name: &str, arguments: &str) -> String {
                 None => prompt,
             }
         }
+        "checkpoint" => match field("id") {
+            Some(id) if tools::is_forced_restore(name, arguments) => {
+                format!("restore {id}, overwriting changes made since")
+            }
+            Some(id) => format!("restore {id}"),
+            None => String::new(),
+        },
         _ => field("path").unwrap_or_default(),
     }
 }
@@ -4450,6 +4479,44 @@ mod tests {
             );
             assert!(!client.call_needs_approval(&call("discard")), "{mode:?}");
         }
+    }
+
+    #[test]
+    fn checkpoint_restore_asks_in_manual_mode_a_forced_one_in_all_but_full_access() {
+        let (tx, _rx) = mpsc::channel();
+        let call = |action: &str, force: bool| ToolCallRequest {
+            call_id: "c".to_string(),
+            name: "checkpoint".to_string(),
+            arguments: json!({ "action": action, "id": "cp-1", "force": force }).to_string(),
+        };
+        for (mode, restore, forced) in [
+            (ApprovalMode::Manual, true, true),
+            (ApprovalMode::Plan, true, true),
+            (ApprovalMode::AutoEdit, false, true),
+            (ApprovalMode::Auto, false, true),
+            (ApprovalMode::FullAccess, false, false),
+        ] {
+            let client = approval_test_client(mode, Some(tx.clone()));
+            assert_eq!(
+                client.call_needs_approval(&call("restore", false)),
+                restore,
+                "{mode:?}"
+            );
+            assert_eq!(
+                client.call_needs_approval(&call("restore", true)),
+                forced,
+                "{mode:?}"
+            );
+            assert!(!client.call_needs_approval(&call("list", true)), "{mode:?}");
+            assert!(
+                !client.call_needs_approval(&call("create", false)),
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            approval_summary("checkpoint", &call("restore", true).arguments),
+            "restore cp-1, overwriting changes made since"
+        );
     }
 
     fn call_tool(client: &OpenAiClient, name: &str, args: Value) -> Result<Value, String> {

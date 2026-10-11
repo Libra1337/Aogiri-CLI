@@ -15,7 +15,7 @@ use crate::{
     titles::{self, Turns},
     usage::{SessionInfo, Usage},
 };
-use lynshen_agent_core::KeptState;
+use lynshen_agent_core::{HookStopper, KeptState};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -102,6 +102,9 @@ struct Client {
 
 struct Hosted {
     ops: Sender<Value>,
+    /// Stops a LynShen engine's hooks that hold its thread (see
+    /// `HookStopper`); an interrupt op triggers it before it is queued.
+    hook_stopper: Option<HookStopper>,
     cwd: PathBuf,
     watchers: HashSet<u64>,
     /// Which engine thread backs this entry (see `session_ended`).
@@ -343,8 +346,14 @@ impl Hub {
         }
         let agent = agent.map(str::to_string);
         let gateway = options.gateway == Some(true);
+        let mut hook_stopper = None;
         let (id, ops, generation) = match engine {
-            None => session::spawn(Arc::clone(self), cwd.clone(), None, agent.clone())?,
+            None => {
+                let (id, ops, generation, stopper) =
+                    session::spawn(Arc::clone(self), cwd.clone(), None, agent.clone())?;
+                hook_stopper = Some(stopper);
+                (id, ops, generation)
+            }
             Some(kind) => {
                 // Claude Code takes its conversation id from us; others name it.
                 let id = match kind {
@@ -365,6 +374,7 @@ impl Hub {
             .map_err(|error| error.to_string())?;
         lock(&self.untitled).insert(id.clone());
         self.host(id.clone(), ops, cwd, generation);
+        self.set_hook_stopper(&id, hook_stopper);
         self.broadcast(&self.agents_json());
         Ok(id)
     }
@@ -435,14 +445,16 @@ impl Hub {
         };
         let kind = engines::Kind::parse(record.engine.as_deref().unwrap_or_default())?;
         let mut gateway = false;
+        let mut hook_stopper = None;
         let (ops, generation) = match kind {
             None => {
-                let (_, ops, generation) = session::spawn(
+                let (_, ops, generation, stopper) = session::spawn(
                     Arc::clone(self),
                     record.cwd.clone(),
                     Some(id.to_string()),
                     record.agent.clone(),
                 )?;
+                hook_stopper = Some(stopper);
                 (ops, generation)
             }
             Some(kind) => {
@@ -491,6 +503,7 @@ impl Hub {
                 .map_err(|error| error.to_string())?;
         }
         self.host(id.to_string(), ops, record.cwd, generation);
+        self.set_hook_stopper(id, hook_stopper);
         Ok(())
     }
 
@@ -530,12 +543,19 @@ impl Hub {
             id,
             Hosted {
                 ops,
+                hook_stopper: None,
                 cwd,
                 watchers: HashSet::new(),
                 generation,
                 opened: Instant::now(),
             },
         );
+    }
+
+    pub(crate) fn set_hook_stopper(&self, id: &str, stopper: Option<HookStopper>) {
+        if let Some(hosted) = lock(&self.sessions).get_mut(id) {
+            hosted.hook_stopper = stopper;
+        }
     }
 
     /// Closes a session whose engine thread found it idle with nobody
@@ -653,6 +673,13 @@ impl Hub {
         let hosted = sessions
             .get(session)
             .ok_or_else(|| format!("session {session} is not open"))?;
+        // The engine's thread may be held by a hook (a long stop hook) and
+        // take the op only once it ends.
+        if op["op"] == "interrupt" {
+            if let Some(stopper) = &hosted.hook_stopper {
+                stopper.stop();
+            }
+        }
         hosted
             .ops
             .send(op)

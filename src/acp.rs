@@ -56,10 +56,17 @@ pub fn run_acp(approval_mode: Option<ApprovalMode>) -> io::Result<i32> {
     let mut state = AcpState::default();
 
     let (tx, rx) = mpsc::channel::<String>();
+    let hook_stopper = core.hook_stopper();
     thread::spawn(move || {
         for line in io::stdin().lock().lines() {
             match line {
                 Ok(line) => {
+                    // A hook (a long stop hook) may hold the loop below.
+                    if serde_json::from_str::<Value>(&line)
+                        .is_ok_and(|message| message["method"] == "session/cancel")
+                    {
+                        hook_stopper.stop();
+                    }
                     if tx.send(line).is_err() {
                         break;
                     }

@@ -85,7 +85,7 @@ lynshen
 | `/permissions [模式]` | 查看或切换审批模式。`Shift+Tab` 循环切换 |
 | `/sandbox [模式]` | 查看或切换 shell 命令的沙箱 |
 | `/resume [会话 ID]` | 列出或恢复以前的会话。也可以用 `lynshen --resume <id>` 启动 |
-| `/rewind [回合 ID]` | 把对话和文件退回到之前的某一回合 |
+| `/rewind [回合 ID]` | 把对话和文件退回到之前的某一回合。只退回本会话改过的文件；之后被别的会话、你或命令改过的文件保持不动，并在结果里列出 |
 | `/tree` | 查看对话分支树 |
 | `/context`、`/compact` | 查看上下文用量；立即压缩上下文 |
 | `/skills`、`/mcp` | 管理技能和 MCP 服务器 |
@@ -178,11 +178,13 @@ lynshen daemon pair              # 打印一次性配对链接，5 分钟内在�
 
 ## 工具、技能和 MCP
 
-模型能用的工具不多：`read`、`hashline_edit`（默认唯一开启的编辑工具）、`bash`、`ripgrep`、`ls`、`outline`、`checkpoint`、`web_fetch`、`generate_image`，以及子智能体相关的 `spawn_agent` 等。`str_replace`、`write`、`apply_patch` 默认关闭，用 `config.json` 的 `edit_tools` 打开。`web_search` 不管当前对话用的是什么模型，都交给网关上一个能联网的 Claude 模型去搜（`web_search_model`，默认 `claude-haiku-5-5`），拿回摘要和来源；没有这样的模型（不是 LynShen 或 Monoize 网关，或把 `web_search_model` 设成空字符串）或它搜失败时，改从本机搜 Bing/DuckDuckGo 的网页结果。`config.json` 里把 `web_search_engine` 设成 `gateway` 才走 LynShen 网关自己的搜索，那条路要登录。文件工具只访问工作目录，以及技能目录和 `sandbox_directories` 里配置的目录。
+模型能用的工具不多：`read`、`hashline_edit`（默认唯一开启的编辑工具）、`bash`、`ripgrep`、`ls`、`outline`、`checkpoint`、`web_fetch`、`generate_image`，以及子智能体相关的 `spawn_agent` 等。`str_replace`、`write`、`apply_patch` 默认关闭，用 `config.json` 的 `edit_tools` 打开。编辑工具改一个已有文件前，智能体必须先 `read` 过它，而且读过之后文件没有被别人改过（`apply_patch` 也一样，包括只改名的补丁，新建的文件除外）。编辑只给新写入的行加换行符：用 CRLF 的文件新行用 CRLF，两种换行混用的文件新行用占多数的那种，没改的行保持原样。`web_search` 不管当前对话用的是什么模型，都交给网关上一个能联网的 Claude 模型去搜（`web_search_model`，默认 `claude-haiku-5-5`），拿回摘要和来源；没有这样的模型（不是 LynShen 或 Monoize 网关，或把 `web_search_model` 设成空字符串）或它搜失败时，改从本机搜 Bing/DuckDuckGo 的网页结果。`config.json` 里把 `web_search_engine` 设成 `gateway` 才走 LynShen 网关自己的搜索，那条路要登录。文件工具只访问工作目录，以及技能目录和 `sandbox_directories` 里配置的目录。
 
 技能从 `~/.lynshen/skills`、`~/.agents/skills` 和已信任项目的 `.lynshen/skills`、`.agents/skills` 读取。在 `config.json` 里设 `"extra_skills_source": "anthropic"`，`/skills` 就能列出和安装 [anthropics/skills](https://github.com/anthropics/skills) 里的技能。详见 [docs/skills.md](docs/skills.md)。
 
 MCP 服务器写在 `config.json` 的 `mcp_servers` 里，支持 stdio 和 HTTP。详见 [docs/mcp.md](docs/mcp.md)。
+
+钩子（hooks）写在 `~/.lynshen/hooks.json` 和已信任项目的 `.lynshen/hooks.json` 里。每个钩子可以用 `timeout` 设超时秒数。不设时，每次工具调用或提问前后跑的钩子（`pre_tool_use`、`post_tool_use`、`user_prompt_submit`）最多跑 60 秒，`session_start`、`stop`、`task_completed`、`agent_idle` 最多跑 600 秒。超时的钩子连同它启动的进程一起被停掉，按失败处理。在桌面端、`serve` 或 ACP 里中断，也会停掉正在跑的 `session_start`、`user_prompt_submit`、`stop` 钩子；TUI 里暂时不能。详见 [docs/serve-protocol.md](docs/serve-protocol.md) 的 "Hooks"。
 
 子智能体可以按角色启动。内置三个角色：`explorer` 只读调研，`worker` 在自己的 git worktree 里写代码、用 `merge_agent` 合并回来，`reviewer` 只读审查 diff。`~/.lynshen/roles/<名字>.md` 和已信任项目的 `.lynshen/roles/<名字>.md` 可以覆盖或新增角色。同时运行的数量、嵌套层数、每轮 token 预算和分派策略写在 `config.json` 的 `agents` 里，见 [docs/serve-protocol.md](docs/serve-protocol.md) 的 "Agent team"。
 

@@ -326,6 +326,7 @@ impl AgentCore {
         let subagent_manager = SubagentManager::new(config.agents.clone(), TeamShared::default());
         subagent_manager.set_config_path(config.path().to_path_buf());
         let session = SessionStore::new();
+        tool_state.set_session_id(session.session_id());
         // A fresh session id is unique, so this only fails on IO problems.
         let session_lock = SessionLock::acquire(&profile_dir()?, &cwd, session.session_id()).ok();
         let (action_tx, action_rx) = mpsc::channel();
@@ -654,7 +655,8 @@ impl AgentCore {
             ))];
         }
         self.project_trusted = self.trust.decision_for(&self.cwd).unwrap_or(trusted);
-        self.hooks = Hooks::load(self.config.profile_dir(), &self.cwd, self.project_trusted);
+        self.hooks = Hooks::load(self.config.profile_dir(), &self.cwd, self.project_trusted)
+            .with_stopper(self.hooks.stopper());
         vec![
             AgentEvent::Status(format!(
                 "{} {}",
@@ -841,6 +843,13 @@ impl AgentCore {
             ];
         }
         self.start_turn(message, images)
+    }
+
+    /// Stops the session's `session_start`, `user_prompt_submit` and `stop`
+    /// hooks while they run (see `HookStopper`): a front end that reads
+    /// input on another thread calls it with an interrupt.
+    pub fn hook_stopper(&self) -> crate::hooks::HookStopper {
+        self.hooks.stopper()
     }
 
     pub fn interrupt(&mut self) -> Vec<AgentEvent> {
@@ -2148,7 +2157,9 @@ impl AgentCore {
         if target.trim().is_empty() {
             return vec![AgentEvent::Error("merge_agent requires target".to_string())];
         }
-        let _ = self.subagent_manager.merge_agent(ROOT_PATH, target, action);
+        let _ = self
+            .subagent_manager
+            .merge_agent(ROOT_PATH, target, action, &self.tool_state);
         self.team_op_events(None)
     }
 
@@ -2179,7 +2190,7 @@ impl AgentCore {
         }
         let error = self
             .subagent_manager
-            .pick_attempt(ROOT_PATH, group, target)
+            .pick_attempt(ROOT_PATH, group, target, &self.tool_state)
             .err();
         self.team_op_events(error)
     }
@@ -2850,9 +2861,19 @@ impl AgentCore {
                 .host
                 .as_ref()
                 .and_then(|host| host.gate_of(&request.name));
+            // "Always allow checkpoint" was given for a plain restore: a
+            // forced one is asked every time.
             let allowlisted = gate != Some(crate::host::HostGate::Ask)
-                && self.approved_tools.contains(&request.name);
-            if allowlisted || !requires_approval(self.approval_mode.get(), gate, &request.name) {
+                && self.approved_tools.contains(&request.name)
+                && !crate::tools::is_forced_restore(&request.name, &request.arguments);
+            if allowlisted
+                || !requires_approval(
+                    self.approval_mode.get(),
+                    gate,
+                    &request.name,
+                    &request.arguments,
+                )
+            {
                 let _ = request.response_tx.send(ApprovalDecision::allow_all());
                 continue;
             }
@@ -3094,14 +3115,22 @@ impl AgentCore {
             let text = |key: &str| args[key].as_str().unwrap_or_default().to_string();
             let result = if action.name == "pick_attempt" {
                 if self.subagent_manager.team_v2_now() {
-                    self.subagent_manager
-                        .pick_attempt(ROOT_PATH, &text("group"), &text("target"))
+                    self.subagent_manager.pick_attempt(
+                        ROOT_PATH,
+                        &text("group"),
+                        &text("target"),
+                        &self.tool_state,
+                    )
                 } else {
                     Err(crate::llm::team_v2_off("pick_attempt"))
                 }
             } else {
-                self.subagent_manager
-                    .merge_agent(ROOT_PATH, &text("target"), &text("action"))
+                self.subagent_manager.merge_agent(
+                    ROOT_PATH,
+                    &text("target"),
+                    &text("action"),
+                    &self.tool_state,
+                )
             };
             let (output, is_error) = match result {
                 Ok(value) => (value.to_string(), false),
@@ -3126,6 +3155,7 @@ impl AgentCore {
         let host = self.host.clone().filter(|host| host.has_tool(&action.name));
         self.actions_running += 1;
         thread::spawn(move || {
+            let collector = crate::tools::collect_checkpoints();
             let result = if let Some(host) = host {
                 let (output, is_error) =
                     (host.run_tool)(&action.name, &action.arguments, &AtomicBool::new(false));
@@ -3170,7 +3200,7 @@ impl AgentCore {
                     |_| Ok(()),
                 )
             };
-            hooks.post_tool(&action.name, &result.output, &action.cwd);
+            hooks.post_tool(&action.name, &result.output, &action.cwd, collector.take());
             let _ = tx.send(ActionOutcome {
                 action,
                 output: result.model_output,
@@ -3216,7 +3246,7 @@ impl AgentCore {
             .iter()
             .filter(|(_, pending)| {
                 let gate = host.and_then(|host| host.gate_of(&pending.name));
-                !requires_approval(mode, gate, &pending.name)
+                !requires_approval(mode, gate, &pending.name, &pending.arguments)
             })
             .map(|(call, _)| call.clone())
             .collect();
@@ -4085,6 +4115,7 @@ impl AgentCore {
         self.resume_summary_running = false;
         self.resume_summary_retry_at = None;
         self.session = SessionStore::new();
+        self.tool_state.set_session_id(self.session.session_id());
         self.reset_team();
         // Release the old session's lock and hold the new one.
         self.session_lock = None;
@@ -4570,7 +4601,7 @@ impl AgentCore {
                 "failed to rewind conversation: {error}"
             ))];
         }
-        let (restored, removed) =
+        let (restored, removed, conflicts) =
             match crate::tools::restore_to_timestamp(&self.cwd, t, &self.tool_state) {
                 Ok(result) => (
                     result
@@ -4583,6 +4614,7 @@ impl AgentCore {
                         .and_then(Value::as_array)
                         .map(Vec::len)
                         .unwrap_or(0),
+                    crate::tools::restore_conflicts_note(&result),
                 ),
                 Err(error) => {
                     return vec![
@@ -4594,11 +4626,13 @@ impl AgentCore {
                 }
             };
         let save_event = self.save_session_event();
+        let mut message = format!("rewound · restored {restored} file(s), removed {removed}");
+        if let Some(conflicts) = conflicts {
+            message.push_str(&format!(" · {conflicts}"));
+        }
         vec![
             AgentEvent::Transcript(self.session.transcript_items()),
-            AgentEvent::Info(format!(
-                "rewound · restored {restored} file(s), removed {removed}"
-            )),
+            AgentEvent::Info(message),
         ]
         .into_iter()
         .chain(save_event)
@@ -4672,6 +4706,7 @@ impl AgentCore {
                 self.turn_started_at = None;
                 self.turn_goal_tokens = 0;
                 self.session = session;
+                self.tool_state.set_session_id(self.session.session_id());
                 // Release the previous session's lock only after the switch.
                 self.session_lock = Some(lock);
                 self.reset_team();
@@ -5435,9 +5470,17 @@ fn parse_hunk_id_list(list: &str) -> Result<Vec<String>, String> {
 
 /// Whether a call to `name` needs a person under `mode`: a host tool by
 /// its `gate`, any other tool by its class.
-fn requires_approval(mode: ApprovalMode, gate: Option<crate::host::HostGate>, name: &str) -> bool {
+fn requires_approval(
+    mode: ApprovalMode,
+    gate: Option<crate::host::HostGate>,
+    name: &str,
+    arguments: &str,
+) -> bool {
     match gate {
         Some(gate) => mode.requires_approval_for_host(gate),
+        None if crate::tools::is_forced_restore(name, arguments) => {
+            mode.requires_approval_for_forced_restore()
+        }
         None => mode.requires_approval(name),
     }
 }
@@ -5731,6 +5774,36 @@ mod approval_decision_tests {
                 if title == "Snake" && append == "## Goal"
         ));
     }
+
+    #[test]
+    fn the_engine_lets_a_forced_restore_through_unasked_only_in_full_access() {
+        let forced = json!({ "action": "restore", "id": "cp-1", "force": true }).to_string();
+        let plain = json!({ "action": "restore", "id": "cp-1" }).to_string();
+        for mode in [
+            ApprovalMode::Manual,
+            ApprovalMode::Plan,
+            ApprovalMode::AutoEdit,
+            ApprovalMode::Auto,
+        ] {
+            assert!(
+                requires_approval(mode, None, "checkpoint", &forced),
+                "{mode:?}"
+            );
+        }
+        assert!(!requires_approval(
+            ApprovalMode::FullAccess,
+            None,
+            "checkpoint",
+            &forced
+        ));
+        assert!(!requires_approval(
+            ApprovalMode::AutoEdit,
+            None,
+            "checkpoint",
+            &plain
+        ));
+    }
+
     use std::sync::mpsc::TryRecvError;
 
     fn pending(

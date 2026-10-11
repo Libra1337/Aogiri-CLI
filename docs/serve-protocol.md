@@ -93,6 +93,62 @@ Runs any slash command exactly as the TUI would (`/model`, `/resume`,
 Structured views come back as events (`model_view`, `resume_view`,
 `tree_view`, ...). `/quit` and `/exit` terminate the process.
 
+### Rewind
+
+`/rewind` answers with `checkpoint_view` (the user turns of the active
+branch). `/rewind <id>` cuts the conversation back to before that turn,
+restores files from `.lynshen/checkpoints`, and answers with `transcript` and
+an `info` line:
+
+```text
+rewound · restored 2 file(s), removed 1 · left 1 file(s) as they are: src/lib.rs (changed since this session last edited it (by another session, the user, or a command))
+```
+
+The part after the second `·` is there only when files were left alone.
+Several sessions often share one project, so a rewind undoes only this
+session's edits:
+
+- Every checkpoint records the session that took it (`session_id`) and, per
+  file, a hash of what the edit left there (`after`). The checkpoint is
+  written before the edit, with the content before it, so a crash during the
+  edit loses nothing; `after` is added once the edit has run. When
+  `post_tool_use` hooks run for that tool call, what they leave counts as
+  part of the edit (a formatter's rewrite), but only in a file that still
+  held what the edit left when they started: a file the user saved
+  meanwhile, during a later command of the same reply say, stays a later
+  change.
+- A merge of a subagent's worktree (`merge_agent` apply, `pick_attempt`) is
+  checkpointed as an edit of the session that merges.
+- Only files that this session's checkpoints at or after the turn captured
+  are restored, each to its content before the session's first edit in that
+  range (or deleted when it did not exist then). Files that only other
+  sessions edited are not touched. A rename made by `apply_patch` puts the
+  old file back and deletes the new one.
+- A file is left as it is, and reported as a conflict, when another
+  session's checkpoint of it follows this session's first one, or when its
+  content is no longer what this session's last edit left there (the user,
+  another session or a command changed it). A change made by one of this
+  session's own commands after its last edit counts too: bash changes are not
+  recorded.
+- A checkpoint without a session (from an older version, or taken outside a
+  session) is never restored from, since it may be another session's. A file
+  it captured gets the content of this session's own first checkpoint of it
+  (so the older edit stays); a file only such checkpoints captured, or one
+  such a checkpoint captured after this session's first, is reported as a
+  conflict.
+- The restore is recorded as a checkpoint of this session, so a second rewind
+  further back compares with what the first one wrote.
+
+The model's `checkpoint` tool follows the same rules for `restore` (its
+result carries `restored`, `removed`, `conflicts: [{path, reason}]`, and
+`skipped`/`warning` as before); it refuses another session's checkpoint and
+one without a session. `force: true` (not in the tool definition, to keep it
+short; a result with conflicts suggests it) also overwrites a change made
+since this session's last edit, never another session's checkpointed edit.
+In `manual` approval mode a `restore` asks first, like an edit; a `restore`
+with `force` asks in every mode but `full-access`, and "always allow" does
+not cover it; `list` and `create` never ask.
+
 ### `steer`
 
 ```json
@@ -560,7 +616,7 @@ them. The `pick_attempt` tool (`group`, `target`) or op keeps one.
 project), with the same entry shape:
 
 ```json
-{"task_completed": [{"command": "cargo test 2>&1 | tail -20"}],
+{"task_completed": [{"command": "cargo test 2>&1 | tail -20", "timeout": 600}],
  "agent_idle": [{"command": "./scripts/check.sh"}]}
 ```
 
@@ -582,6 +638,25 @@ as `<hook_result hook="task_completed" ok="true">…</hook_result>` and an
 nothing. A non-zero exit sends `ok="false"` with its stderr (else stdout, else
 the exit code). Hook output wakes an idle main agent like a background
 result.
+
+Every hook entry, of any event, may set `timeout` in seconds (at most a
+day). The default is 60 for the hooks around each tool call or prompt
+(`pre_tool_use`, `post_tool_use`, `user_prompt_submit`) and 600 for the others
+(`session_start`, `stop`, `task_completed`, `agent_idle`), which often run a
+build or a test suite. A hook still running then is killed with its process
+group (its process tree on Windows), so it cannot hold up the turn, and counts
+as failed
+with the message `<event> hook timed out after <n>s and was stopped:
+<command>`: a `pre_tool_use` hook blocks the tool, a `user_prompt_submit`
+hook blocks the prompt, `task_completed` and `agent_idle` report it with
+`ok="false"`, `session_start` and `stop` show it as `hook (<event>): …`, and
+`post_tool_use` ignores it. Once a hook has exited, output that a process it
+left running keeps open is read for at most another half second. A hook still
+running when the engine process exits is stopped with the tool commands. An
+`interrupt` op (ACP: `session/cancel`) also stops a running `session_start`,
+`user_prompt_submit` or `stop` hook, which holds the session until it ends; it
+reports `<event> hook was stopped by an interrupt: <command>`. The TUI cannot
+stop one yet: it reads keys on the thread the hook holds.
 
 ### Worktree confinement
 

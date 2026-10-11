@@ -125,6 +125,47 @@ fn ready(session: &str) -> impl Fn(&Value) -> bool + '_ {
 }
 
 #[test]
+fn an_interrupt_stops_a_long_stop_hook_that_holds_the_session() {
+    if cfg!(windows) {
+        return;
+    }
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-stop-hook");
+    fs::create_dir_all(dir.join(".lynshen")).unwrap();
+    fs::write(
+        dir.join(".lynshen/hooks.json"),
+        json!({ "stop": [{ "command": "echo started > hook.txt; sleep 30" }] }).to_string(),
+    )
+    .unwrap();
+    let mut client = Client::connect(&daemon);
+    let session = client.create_session(&dir);
+    client.send(json!({ "op": "command", "session": session, "input": "/trust yes" }));
+    client.until(|frame| {
+        frame["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("trusted"))
+    });
+
+    client.send(json!({ "op": "user_message", "session": session, "content": "hello" }));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !dir.join("hook.txt").exists() {
+        assert!(Instant::now() < deadline, "the stop hook never ran");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let interrupted = Instant::now();
+    client.send(json!({ "op": "interrupt", "session": session }));
+    let frames = client.until(ready(&session));
+    assert!(interrupted.elapsed() < Duration::from_secs(10));
+    assert!(
+        frames.iter().any(|frame| frame["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("stop hook was stopped by an interrupt"))),
+        "{frames:#?}"
+    );
+}
+
+#[test]
 fn a_wrong_token_is_refused() {
     let _guard = setup();
     let daemon = start_daemon();

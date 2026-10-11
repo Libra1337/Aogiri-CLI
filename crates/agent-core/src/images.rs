@@ -331,11 +331,13 @@ fn save(
         crate::tools::write_target(cwd, &path.to_string_lossy(), state)?;
     }
     // Every target is new: rewinding the turn deletes them again.
-    let _ = crate::tools::create_checkpoint(cwd, "auto-generate-image", &paths);
-    for (path, bytes) in paths.iter().zip(&generated.images) {
-        write_new(path, bytes)?;
-    }
-    Ok(paths)
+    let checkpoint = crate::tools::begin_checkpoint(cwd, "auto-generate-image", &paths, state);
+    let written = paths
+        .iter()
+        .zip(&generated.images)
+        .try_for_each(|(path, bytes)| write_new(path, bytes));
+    let _ = checkpoint.and_then(crate::tools::PendingCheckpoint::finish);
+    written.map(|()| paths)
 }
 
 /// The request cannot be cancelled and is billed anyway: wait for it on its

@@ -58,7 +58,9 @@ pub fn temp_dir(label: &str) -> PathBuf {
 }
 
 /// A scripted model: a user message `RUN: <command>` answers with one bash
-/// call; anything after a tool result or a deferred-action message answers
+/// call, `CALL <name> <arguments>` with that call, `CALLS [{name,
+/// arguments}, …]` with all of them in one reply; anything after a tool
+/// result or a deferred-action message answers
 /// with plain text naming what it saw. In a subagent's task, `[sleep:N]`
 /// waits N ms before answering and a line `RUN: <command>` runs it;
 /// `[history]` answers with every user message of the request. A message
@@ -161,6 +163,25 @@ fn script(request: &Value) -> String {
             .and_then(|rest| rest.split_once(">\n"))
             .map(|(_, body)| body.split("\n</session_message>").next().unwrap_or(body))
             .unwrap_or(&text);
+        if let Some(calls) = text
+            .strip_prefix("CALLS ")
+            .and_then(|calls| serde_json::from_str::<Vec<Value>>(calls).ok())
+        {
+            let tool_calls = calls
+                .iter()
+                .enumerate()
+                .map(|(index, call)| {
+                    json!({
+                        "index": index, "id": format!("call_{}", index + 1), "type": "function",
+                        "function": { "name": call["name"], "arguments": call["arguments"].to_string() }
+                    })
+                })
+                .collect::<Vec<_>>();
+            return sse(&[
+                json!({ "choices": [{ "index": 0, "delta": { "tool_calls": tool_calls }, "finish_reason": null }] }),
+                json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] }),
+            ]);
+        }
         if let Some(call) = text.strip_prefix("CALL ") {
             let (name, arguments) = call.split_once(' ').unwrap_or((call, "{}"));
             return sse(&[

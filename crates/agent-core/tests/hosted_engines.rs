@@ -1652,3 +1652,177 @@ fn context_breakdown_counts_the_prompt_tools_and_conversation_by_kind() {
     assert_eq!(tokens("Memory files"), None);
     assert!(memory_files.is_empty());
 }
+
+#[test]
+fn a_rewind_takes_a_post_tool_hooks_rewrite_for_the_sessions_own_edit() {
+    let _guard = setup();
+    let dir = temp_dir("rewind-hook");
+    fs::write(dir.join("notes.txt"), "v0\n").unwrap();
+    fs::create_dir_all(dir.join(".lynshen")).unwrap();
+    // A formatter that rewrites what the edit wrote.
+    fs::write(
+        dir.join(".lynshen/hooks.json"),
+        serde_json::json!({
+            "post_tool_use": [{ "command": "echo formatted> notes.txt", "tools": ["hashline_edit"] }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.handle_command("/trust yes");
+
+    core.submit_user_message(r#"CALL read {"path":"notes.txt"}"#.to_string());
+    pump(&mut core, is_ready);
+    let edit = serde_json::json!({
+        "path": "notes.txt",
+        "edits": [{ "op": "replace", "pos": 1, "lines": ["v1"] }]
+    });
+    core.submit_user_message(format!("CALL hashline_edit {edit}"));
+    pump(&mut core, is_ready);
+    assert!(fs::read_to_string(dir.join("notes.txt"))
+        .unwrap()
+        .starts_with("formatted"));
+
+    let info = rewind_to(&mut core, "CALL read");
+    assert_eq!(info, "rewound · restored 1 file(s), removed 0");
+    assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "v0\n");
+}
+
+/// `/rewind` to the first user turn that starts with `label`; the `info`
+/// line it answers with.
+fn rewind_to(core: &mut AgentCore, label: &str) -> String {
+    let (_, events) = core.handle_command("/rewind");
+    let turn = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::CheckpointView(turns) => turns
+                .iter()
+                .find(|turn| turn.label.starts_with(label))
+                .map(|turn| turn.id.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no turn {label}: {events:#?}"));
+    let (_, events) = core.handle_command(&format!("/rewind {turn}"));
+    events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::Info(text) if text.starts_with("rewound") => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("not rewound: {events:#?}"))
+}
+
+fn write_hooks(dir: &Path, hooks: serde_json::Value) {
+    fs::create_dir_all(dir.join(".lynshen")).unwrap();
+    fs::write(dir.join(".lynshen/hooks.json"), hooks.to_string()).unwrap();
+}
+
+fn replace_first_line(path: &str, line: &str) -> serde_json::Value {
+    serde_json::json!({ "path": path, "edits": [{ "op": "replace", "pos": 1, "lines": [line] }] })
+}
+
+#[test]
+fn a_rewind_leaves_a_file_the_user_saved_during_a_later_call_of_the_same_reply() {
+    if cfg!(windows) {
+        return;
+    }
+    let _guard = setup();
+    // Without a post_tool_use hook, and with one that leaves the file as it is.
+    for hook in [None, Some("true")] {
+        let dir = temp_dir("rewind-user-save");
+        fs::write(dir.join("notes.txt"), "v0\n").unwrap();
+        if let Some(command) = hook {
+            write_hooks(
+                &dir,
+                serde_json::json!({
+                    "post_tool_use": [{ "command": command, "tools": ["hashline_edit"] }]
+                }),
+            );
+        }
+        let mut core = open(&dir, ApprovalMode::FullAccess);
+        core.handle_command("/trust yes");
+        core.submit_user_message(r#"CALL read {"path":"notes.txt"}"#.to_string());
+        pump(&mut core, is_ready);
+
+        // The user saves the file while the command after the edit runs.
+        let path = dir.join("notes.txt");
+        let user = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while fs::read_to_string(&path).unwrap_or_default() != "v1\n" {
+                assert!(Instant::now() < deadline, "the edit never ran");
+                thread::sleep(Duration::from_millis(5));
+            }
+            fs::write(&path, "the user's change\n").unwrap();
+        });
+        let calls = serde_json::json!([
+            { "name": "hashline_edit", "arguments": replace_first_line("notes.txt", "v1") },
+            { "name": "bash", "arguments": { "command": "sleep 2" } }
+        ]);
+        core.submit_user_message(format!("CALLS {calls}"));
+        pump(&mut core, is_ready);
+        user.join().unwrap();
+
+        let info = rewind_to(&mut core, "CALLS");
+        assert!(
+            info.starts_with(
+                "rewound · restored 0 file(s), removed 0 · left 1 file(s) as they are: notes.txt"
+            ),
+            "{hook:?}: {info}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("notes.txt")).unwrap(),
+            "the user's change\n"
+        );
+    }
+}
+
+#[test]
+fn a_deferred_action_running_beside_a_turn_leaves_the_turns_hook_rewrite_to_it() {
+    if cfg!(windows) {
+        return;
+    }
+    let _guard = setup();
+    let dir = temp_dir("rewind-action-beside-turn");
+    fs::write(dir.join("notes.txt"), "v0\n").unwrap();
+    // A slow formatter.
+    write_hooks(
+        &dir,
+        serde_json::json!({
+            "post_tool_use": [{ "command": "sleep 2; echo formatted > notes.txt", "tools": ["hashline_edit"] }]
+        }),
+    );
+    let mut core = open(&dir, ApprovalMode::AutoEdit);
+    core.handle_command("/trust yes");
+    // Outside the sandbox a command is asked for, so it is deferred.
+    core.handle_command("/sandbox full-access");
+    core.set_attended(false);
+    core.submit_user_message(r#"CALL read {"path":"notes.txt"}"#.to_string());
+    pump(&mut core, is_ready);
+    core.submit_user_message("RUN: sleep 1".to_string());
+    let action = pump(&mut core, is_ready)
+        .into_iter()
+        .find_map(|event| match event {
+            AgentEvent::ActionDeferred(action) => Some(action),
+            _ => None,
+        })
+        .expect("the command is deferred");
+
+    // The action runs on its thread while the next turn edits the file and
+    // its hook rewrites it.
+    core.decide_action(&action.id, true);
+    let edit = replace_first_line("notes.txt", "v1");
+    core.submit_user_message(format!("CALL hashline_edit {edit}"));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !core.is_idle() || fs::read_to_string(dir.join("notes.txt")).unwrap() != "formatted\n" {
+        assert!(
+            Instant::now() < deadline,
+            "the turn or the action never finished"
+        );
+        core.poll_events();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let info = rewind_to(&mut core, "CALL hashline_edit");
+    assert_eq!(info, "rewound · restored 1 file(s), removed 0");
+    assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "v0\n");
+}

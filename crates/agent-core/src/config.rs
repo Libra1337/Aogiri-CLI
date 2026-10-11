@@ -130,13 +130,14 @@ impl ApprovalMode {
         if is_shell_tool(tool_name) {
             return *self != Self::FullAccess;
         }
-        // generate_image writes files into the workspace like `write`, and
+        // generate_image writes files into the workspace like `write`,
         // merge_agent (apply) and pick_attempt bring a subagent's changes
-        // into it.
+        // into it, and checkpoint (restore) puts files back.
         if is_edit_tool(tool_name)
             || tool_name == crate::images::TOOL_NAME
             || tool_name == "merge_agent"
             || tool_name == "pick_attempt"
+            || tool_name == "checkpoint"
         {
             return self.is_strict();
         }
@@ -146,6 +147,13 @@ impl ApprovalMode {
             return self.is_strict();
         }
         false
+    }
+
+    /// `requires_approval` for a `checkpoint` restore with `force`: it may
+    /// overwrite a change the session cannot tell is its own (the user's,
+    /// say), so every mode but full access asks.
+    pub fn requires_approval_for_forced_restore(&self) -> bool {
+        *self != Self::FullAccess
     }
 
     /// `requires_approval` for a host tool gated as `gate`.
@@ -2572,6 +2580,7 @@ mod tests {
             "hashline_edit",
             "apply_patch",
             "generate_image",
+            "checkpoint",
         ];
         let network_tools = ["web_fetch", "web_search"];
         let free_tools = ["read", "ls", "ripgrep", "outline", "spawn_agent"];

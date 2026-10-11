@@ -1,6 +1,7 @@
 use crate::{
     board::{Board, NewTask, Task},
     config::AgentsConfig,
+    tools::ToolState,
 };
 use serde_json::{json, Value};
 use std::{
@@ -1439,12 +1440,14 @@ impl SubagentManager {
     /// `merge_agent`: brings the worktree of the requester's subagent
     /// `target` into the directory it was spawned from (`apply`), or deletes
     /// it (`discard`). A conflict writes nothing and keeps the worktree.
-    /// Always queues a `Merge` event.
+    /// Always queues a `Merge` event. `state` is the requester's: the
+    /// files written are checkpointed under its session.
     pub(crate) fn merge_agent(
         &self,
         requester_path: &str,
         target: &str,
         action: &str,
+        state: &ToolState,
     ) -> Result<Value, String> {
         let target = target.trim();
         let path = if target.starts_with('/') {
@@ -1452,7 +1455,7 @@ impl SubagentManager {
         } else {
             child_path(requester_path, target)
         };
-        let outcome = self.merge_path(requester_path, &path, action);
+        let outcome = self.merge_path(requester_path, &path, action, state);
         let mut state = self.inner.state.lock().unwrap();
         let (ok, files, conflicts, error) = match &outcome {
             Ok(merge) => (
@@ -1511,6 +1514,7 @@ impl SubagentManager {
         requester_path: &str,
         path: &str,
         action: &str,
+        state: &ToolState,
     ) -> Result<MergeOutcome, String> {
         if !matches!(action, "apply" | "discard") {
             return Err(format!(
@@ -1544,13 +1548,13 @@ impl SubagentManager {
                 workdir: workdir.clone(),
             })
         } else {
-            apply_workspace(&pending.workspace, &pending.parent_cwd).map(|(files, conflicts)| {
-                MergeOutcome {
+            apply_workspace(&pending.workspace, &pending.parent_cwd, state).map(
+                |(files, conflicts)| MergeOutcome {
                     files,
                     conflicts,
                     workdir: workdir.clone(),
-                }
-            })
+                },
+            )
         };
         let done = outcome
             .as_ref()
@@ -1572,6 +1576,7 @@ impl SubagentManager {
         requester_path: &str,
         group: &str,
         target: &str,
+        state: &ToolState,
     ) -> Result<Value, String> {
         let group = group
             .trim()
@@ -1630,12 +1635,15 @@ impl SubagentManager {
                 let _ = self.close_agent(requester_path, other);
             }
         }
-        let merged = self.merge_agent(requester_path, &picked, "apply")?;
+        let merged = self.merge_agent(requester_path, &picked, "apply", state)?;
         let mut result = json!({ "group": group, "picked": picked, "merge": merged });
         if merged["ok"] == true {
             let mut discarded = Vec::new();
             for other in &others {
-                if self.merge_agent(requester_path, other, "discard").is_ok() {
+                if self
+                    .merge_agent(requester_path, other, "discard", state)
+                    .is_ok()
+                {
                     discarded.push(other.clone());
                 }
             }
@@ -2288,10 +2296,13 @@ fn staged_diff(root: &Path, index: &Path, base: &str) -> Result<StagedDiff, Stri
 /// the patch fits, else a three-way merge of each file against the base.
 /// Either way all or nothing is written: with conflicts, `(files, conflicts)`
 /// comes back with nothing changed and the workspace kept; otherwise the
-/// workspace is removed.
+/// workspace is removed. The writes are checkpointed under `state`'s
+/// session, the parent's: a merge is that session's edit, so its rewind
+/// undoes it.
 fn apply_workspace(
     workspace: &SubagentWorkspace,
     parent_cwd: &Path,
+    state: &ToolState,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let changes = workspace_changes(workspace)?;
     let files: Vec<String> = changes.files.iter().map(|f| f.path.clone()).collect();
@@ -2300,11 +2311,15 @@ fn apply_workspace(
             Some(_) => PathBuf::from(git_text(parent_cwd, &["rev-parse", "--show-toplevel"])?),
             None => parent_cwd.to_path_buf(),
         };
-        let clean = workspace.base.is_some()
-            && git_apply(&target, &changes.patch, true).is_ok()
-            && git_apply(&target, &changes.patch, false).is_ok();
+        let clean =
+            workspace.base.is_some() && git_apply(&target, &changes.patch, true).is_ok() && {
+                let paths = parent_paths(&target, parent_cwd, files.iter().map(String::as_str));
+                with_checkpoint(parent_cwd, &paths, state, || {
+                    git_apply(&target, &changes.patch, false).is_ok()
+                })
+            };
         if !clean {
-            let conflicts = three_way_apply(workspace, &target, &changes.files)?;
+            let conflicts = three_way_apply(workspace, &target, &changes.files, parent_cwd, state)?;
             if !conflicts.is_empty() {
                 return Ok((files, conflicts));
             }
@@ -2356,6 +2371,8 @@ fn three_way_apply(
     workspace: &SubagentWorkspace,
     target: &Path,
     files: &[FileChange],
+    parent_cwd: &Path,
+    state: &ToolState,
 ) -> Result<Vec<String>, String> {
     let mut writes: Vec<(PathBuf, Option<Vec<u8>>, Option<PathBuf>)> = Vec::new();
     let mut conflicts = Vec::new();
@@ -2401,6 +2418,20 @@ fn three_way_apply(
     if !conflicts.is_empty() {
         return Ok(conflicts);
     }
+    let paths = parent_paths(
+        target,
+        parent_cwd,
+        writes
+            .iter()
+            .filter_map(|(path, _, _)| path.strip_prefix(target).ok()?.to_str()),
+    );
+    with_checkpoint(parent_cwd, &paths, state, || write_merged(writes))?;
+    Ok(Vec::new())
+}
+
+/// Writes (or deletes) each merged file, giving it the mode of the file
+/// named third.
+fn write_merged(writes: Vec<(PathBuf, Option<Vec<u8>>, Option<PathBuf>)>) -> Result<(), String> {
     for (path, content, mode_from) in writes {
         match content {
             Some(content) => {
@@ -2424,7 +2455,43 @@ fn three_way_apply(
             },
         }
     }
-    Ok(Vec::new())
+    Ok(())
+}
+
+/// Runs `write`, which changes `paths`, between the two halves of a
+/// checkpoint of them in `parent_cwd` (see `apply_workspace`).
+fn with_checkpoint<T>(
+    parent_cwd: &Path,
+    paths: &[PathBuf],
+    state: &ToolState,
+    write: impl FnOnce() -> T,
+) -> T {
+    let checkpoint = crate::tools::begin_checkpoint(parent_cwd, "auto-merge", paths, state);
+    let result = write();
+    let _ = checkpoint.and_then(crate::tools::PendingCheckpoint::finish);
+    result
+}
+
+/// Files of `target` (paths relative to it) as the parent session's file
+/// tools name them, under `parent_cwd`; files outside it are left out, as
+/// its rewind cannot reach them anyway.
+fn parent_paths<'a>(
+    target: &Path,
+    parent_cwd: &Path,
+    files: impl IntoIterator<Item = &'a str>,
+) -> Vec<PathBuf> {
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let Ok(inner) = canonical(parent_cwd)
+        .strip_prefix(canonical(target))
+        .map(Path::to_path_buf)
+    else {
+        return Vec::new();
+    };
+    files
+        .into_iter()
+        .filter_map(|file| Path::new(file).strip_prefix(&inner).ok())
+        .map(|rel| parent_cwd.join(rel))
+        .collect()
 }
 
 /// `path` as of commit `base`; None when it did not exist there.
@@ -3229,7 +3296,9 @@ mod tests {
         git(root, &["add", "src/new.rs"]);
         git(root, &["commit", "-qm", "child"]);
 
-        let refused = manager.merge_agent("/root", "worker", "apply").unwrap_err();
+        let refused = manager
+            .merge_agent("/root", "worker", "apply", &ToolState::default())
+            .unwrap_err();
         assert!(refused.contains("still running"), "{refused}");
         manager.finish_ok("/root/worker", run_result(1, 1));
         manager.drain_events();
@@ -3237,7 +3306,9 @@ mod tests {
         let summary = manager.merge_summary("/root", "worker");
         assert!(summary.contains("3 files"), "{summary}");
 
-        let result = manager.merge_agent("/root", "worker", "apply").unwrap();
+        let result = manager
+            .merge_agent("/root", "worker", "apply", &ToolState::default())
+            .unwrap();
         assert_eq!(result["ok"], true);
         assert_eq!(result["files"], json!(["a.txt", "b.txt", "src/new.rs"]));
         assert_eq!(
@@ -3268,7 +3339,9 @@ mod tests {
             }]
         );
         // Merged once: there is nothing left to merge.
-        assert!(manager.merge_agent("/root", "worker", "apply").is_err());
+        assert!(manager
+            .merge_agent("/root", "worker", "apply", &ToolState::default())
+            .is_err());
         let _ = std::fs::remove_dir_all(repo);
     }
 
@@ -3290,7 +3363,9 @@ mod tests {
         manager.finish_ok("/root/worker", run_result(1, 1));
         manager.drain_events();
 
-        let result = manager.merge_agent("/root", "worker", "apply").unwrap();
+        let result = manager
+            .merge_agent("/root", "worker", "apply", &ToolState::default())
+            .unwrap();
         assert_eq!(result["ok"], true, "{result}");
         assert_eq!(result["files"], json!(["test_a.py"]));
         assert!(repo.join("test_a.py").exists());
@@ -3305,7 +3380,9 @@ mod tests {
         // The parent changed a nearby line since: a plain apply no longer fits.
         std::fs::write(repo.join("a.txt"), LINES.replace("two", "TWO")).unwrap();
 
-        let result = manager.merge_agent("/root", "worker", "apply").unwrap();
+        let result = manager
+            .merge_agent("/root", "worker", "apply", &ToolState::default())
+            .unwrap();
         assert_eq!(result["ok"], true, "{result}");
         assert_eq!(
             std::fs::read_to_string(repo.join("a.txt")).unwrap(),
@@ -3313,6 +3390,61 @@ mod tests {
         );
         assert!(!workspace.root.exists());
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn a_rewind_undoes_a_merge_as_the_parent_sessions_own_edit() {
+        // Applied cleanly, and three-way after the session edited a.txt too.
+        for three_way in [false, true] {
+            let tag = if three_way {
+                "merge-rewind-3way"
+            } else {
+                "merge-rewind"
+            };
+            let (repo, manager, workspace) = merge_fixture(tag);
+            let state = ToolState::default();
+            state.set_session_id("parent-session");
+            let t = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            if three_way {
+                let call = |name: &str, args: Value| {
+                    crate::tools::run_tool_with_events(
+                        name,
+                        &args.to_string(),
+                        &repo,
+                        &[],
+                        &state,
+                        |_| Ok(()),
+                    )
+                };
+                call("read", json!({ "path": "a.txt" }));
+                let content = LINES.replace("two", "TWO");
+                call("write", json!({ "path": "a.txt", "content": content }));
+            }
+            let root = &workspace.root;
+            std::fs::write(root.join("a.txt"), LINES.replace("four", "FOUR")).unwrap();
+            std::fs::write(root.join("c.txt"), "sea\n").unwrap();
+            std::fs::remove_file(root.join("b.txt")).unwrap();
+            manager.finish_ok("/root/worker", run_result(1, 1));
+
+            let result = manager
+                .merge_agent("/root", "worker", "apply", &state)
+                .unwrap();
+            assert_eq!(result["ok"], true, "{result}");
+            let rewound = crate::tools::restore_to_timestamp(&repo, t, &state).unwrap();
+            assert_eq!(rewound["conflicts"], json!([]), "{three_way}: {rewound}");
+            assert_eq!(rewound["restored"], json!(["a.txt", "b.txt"]), "{rewound}");
+            assert_eq!(rewound["removed"], json!(["c.txt"]), "{rewound}");
+            assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), LINES);
+            assert_eq!(
+                std::fs::read_to_string(repo.join("b.txt")).unwrap(),
+                "bee\n"
+            );
+            assert!(!repo.join("c.txt").exists());
+            let _ = std::fs::remove_dir_all(repo);
+        }
     }
 
     #[test]
@@ -3329,7 +3461,9 @@ mod tests {
         std::fs::write(repo.join("a.txt"), &parent_edit).unwrap();
         manager.drain_events();
 
-        let result = manager.merge_agent("/root", "worker", "apply").unwrap();
+        let result = manager
+            .merge_agent("/root", "worker", "apply", &ToolState::default())
+            .unwrap();
         assert_eq!(result["ok"], false);
         assert_eq!(result["conflicts"], json!(["a.txt"]));
         assert!(result["note"]
@@ -3356,7 +3490,7 @@ mod tests {
         )));
 
         let result = manager
-            .merge_agent("/root", "/root/worker", "discard")
+            .merge_agent("/root", "/root/worker", "discard", &ToolState::default())
             .unwrap();
         assert_eq!(result["ok"], true);
         assert!(!workspace.root.exists());
@@ -3374,7 +3508,9 @@ mod tests {
         std::fs::write(workspace.root.join("c.txt"), "child\n").unwrap();
         manager.finish_ok("/root/worker", run_result(1, 1));
         std::fs::write(repo.join("c.txt"), "parent\n").unwrap();
-        let result = manager.merge_agent("/root", "worker", "apply").unwrap();
+        let result = manager
+            .merge_agent("/root", "worker", "apply", &ToolState::default())
+            .unwrap();
         assert_eq!(result["conflicts"], json!(["c.txt"]));
         assert_eq!(
             std::fs::read_to_string(repo.join("c.txt")).unwrap(),
@@ -3392,7 +3528,9 @@ mod tests {
         let next = SubagentManager::new(AgentsConfig::default(), manager.shared().clone());
         let error = next.reserve_spawn(spawn("worker")).unwrap_err();
         assert!(error.contains("worktree to merge"), "{error}");
-        let result = next.merge_agent("/root", "worker", "apply").unwrap();
+        let result = next
+            .merge_agent("/root", "worker", "apply", &ToolState::default())
+            .unwrap();
         assert_eq!(result["files"], json!(["c.txt"]));
         assert!(repo.join("c.txt").exists());
         assert!(next.drain_events().contains(&TeamEvent::Lifecycle {
@@ -3410,14 +3548,21 @@ mod tests {
         manager.reserve_spawn(spawn("inplace")).unwrap();
         manager.finish_ok("/root/inplace", run_result(1, 1));
         let error = manager
-            .merge_agent("/root", "inplace", "apply")
+            .merge_agent("/root", "inplace", "apply", &ToolState::default())
             .unwrap_err();
         assert!(error.contains("no worktree"), "{error}");
         let error = manager
-            .merge_agent("/root/other", "/root/inplace", "apply")
+            .merge_agent(
+                "/root/other",
+                "/root/inplace",
+                "apply",
+                &ToolState::default(),
+            )
             .unwrap_err();
         assert!(error.contains("not one of your subagents"), "{error}");
-        let error = manager.merge_agent("/root", "inplace", "keep").unwrap_err();
+        let error = manager
+            .merge_agent("/root", "inplace", "keep", &ToolState::default())
+            .unwrap_err();
         assert!(error.contains("apply"), "{error}");
         // Every attempt is reported to the front-ends.
         assert_eq!(merge_events(&manager).len(), 3);
@@ -3433,7 +3578,9 @@ mod tests {
         std::fs::create_dir_all(workspace.root.join("docs")).unwrap();
         std::fs::write(workspace.root.join("docs/report.md"), "findings").unwrap();
         manager.finish_ok("/root/writer", run_result(1, 1));
-        let result = manager.merge_agent("/root", "writer", "apply").unwrap();
+        let result = manager
+            .merge_agent("/root", "writer", "apply", &ToolState::default())
+            .unwrap();
         assert_eq!(result["files"], json!(["docs/report.md"]));
         assert_eq!(
             std::fs::read_to_string(parent.join("docs/report.md")).unwrap(),
@@ -3688,7 +3835,9 @@ mod tests {
             .unwrap();
         assert_eq!(waiting["timed_out"], true);
         assert!(waiting.get("attempts").is_none());
-        let refused = manager.pick_attempt("/root", "fix", "fix_a3").unwrap_err();
+        let refused = manager
+            .pick_attempt("/root", "fix", "fix_a3", &ToolState::default())
+            .unwrap_err();
         assert!(refused.contains("still running"), "{refused}");
 
         manager.finish_ok("/root/fix_a3", run_result(1, 1));
@@ -3707,10 +3856,14 @@ mod tests {
         );
         assert_eq!(attempts[0]["files"], json!(["a.txt"]));
 
-        let error = manager.pick_attempt("/root", "fix", "other").unwrap_err();
+        let error = manager
+            .pick_attempt("/root", "fix", "other", &ToolState::default())
+            .unwrap_err();
         assert!(error.contains("not an attempt of fix"), "{error}");
         manager.drain_events();
-        let picked = manager.pick_attempt("/root", "fix", "2").unwrap();
+        let picked = manager
+            .pick_attempt("/root", "fix", "2", &ToolState::default())
+            .unwrap();
         assert_eq!(picked["picked"], "/root/fix_a2");
         assert_eq!(picked["merge"]["ok"], true);
         assert_eq!(picked["discarded"], json!(["/root/fix_a1", "/root/fix_a3"]));
@@ -3847,7 +4000,9 @@ mod tests {
         assert_eq!(rows[0]["isolation"], "worktree");
         // It was running when the engine stopped.
         assert_eq!(rows[1]["state"], "interrupted");
-        let result = restored.merge_agent("/root", "worker", "apply").unwrap();
+        let result = restored
+            .merge_agent("/root", "worker", "apply", &ToolState::default())
+            .unwrap();
         assert_eq!(result["files"], json!(["c.txt"]));
         assert!(repo.join("c.txt").exists());
         // Once merged it is no longer saved.
