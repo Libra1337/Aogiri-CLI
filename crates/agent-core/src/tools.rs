@@ -7327,6 +7327,12 @@ new mode 100755
         assert!(!dir.join("new.txt").exists());
 
         // A renamed file changed since is left in place.
+        // Checkpoints have one-second resolution: start the second rewind
+        // point after the first part's checkpoints.
+        let first_part = now_secs();
+        while now_secs() == first_part {
+            thread::sleep(Duration::from_millis(20));
+        }
         let t = now_secs();
         call_as(&a, &dir, "read", json!({ "path": "old.txt" }));
         let renamed = call_as(
