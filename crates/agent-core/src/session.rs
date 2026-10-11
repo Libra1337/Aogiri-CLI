@@ -29,6 +29,8 @@ pub(crate) const COMPACTION_PREFIX: &str =
 /// Heads the list of changed files that ends the compaction input and is
 /// added to the summary (see `CompactionPlan::finish_summary`).
 const CHANGED_FILES_HEADING: &str = "Files changed in this session:";
+/// Heads the plan added to the summary (see `CompactionPlan::finish_summary`).
+const PLAN_HEADING: &str = "Your plan from update_plan, as it stands:";
 /// At most this many files are listed: the summary rides along with every
 /// later request.
 const MAX_LISTED_CHANGED_FILES: usize = 100;
@@ -102,16 +104,22 @@ pub struct CompactionPlan {
 }
 
 impl CompactionPlan {
-    /// The summary as stored: the model's text, then the changed files, so
-    /// the list survives whatever the model left out.
-    pub fn finish_summary(&self, summary: String) -> String {
-        if self.changed_files.is_empty() {
-            return summary;
+    /// The summary as stored: the model's text, then the current `plan`
+    /// (its update_plan calls were folded) and the changed files, so they
+    /// survive whatever the model left out. The plan is part of the summary,
+    /// which comes before the kept conversation: as a message of its own
+    /// after it, it would follow the user's latest request and be read as
+    /// that request (by the safety classifier, say).
+    pub fn finish_summary(&self, mut summary: String, plan: &[PlanItem]) -> String {
+        if !plan.is_empty() {
+            summary.push_str("\n\n");
+            summary.push_str(&plan_section(plan));
         }
-        format!(
-            "{summary}\n\n{}",
-            changed_files_section(&self.changed_files)
-        )
+        if !self.changed_files.is_empty() {
+            summary.push_str("\n\n");
+            summary.push_str(&changed_files_section(&self.changed_files));
+        }
+        summary
     }
 }
 
@@ -714,8 +722,9 @@ impl SessionStore {
         let mut folded_text = String::new();
         if let Some(summary) = &summary {
             folded_text.push_str("Earlier summary:\n");
-            // Its file list is written anew below, from the whole branch.
-            folded_text.push_str(without_changed_files(summary));
+            // Its plan and file list are written anew, from the current plan
+            // and the whole branch.
+            folded_text.push_str(without_added_sections(summary));
             folded_text.push_str("\n\n");
         }
         for entry in fold {
@@ -741,6 +750,39 @@ impl SessionStore {
             replaced_through,
             changed_files,
         })
+    }
+
+    /// The arguments of the last call to `name` on this branch that ran
+    /// without an error.
+    pub fn last_successful_call(&self, name: &str) -> Option<Value> {
+        let mut calls: HashMap<&str, &str> = HashMap::new();
+        let mut last = None;
+        for entry in self.branch() {
+            match &entry.kind {
+                EntryKind::ResponseItem { item }
+                    if item.get("type").and_then(Value::as_str) == Some("function_call")
+                        && item.get("name").and_then(Value::as_str) == Some(name) =>
+                {
+                    if let (Some(call_id), Some(arguments)) = (
+                        item.get("call_id").and_then(Value::as_str),
+                        item.get("arguments").and_then(Value::as_str),
+                    ) {
+                        calls.insert(call_id, arguments);
+                    }
+                }
+                EntryKind::ToolOutput {
+                    call_id, output, ..
+                } => {
+                    let failed = serde_json::from_str::<Value>(output)
+                        .map_or(true, |output| output.get("error").is_some());
+                    if let (false, Some(arguments)) = (failed, calls.get(call_id.as_str())) {
+                        last = serde_json::from_str::<Value>(arguments).ok();
+                    }
+                }
+                _ => {}
+            }
+        }
+        last
     }
 
     /// Files the edit tools changed on this branch, in the order they were
@@ -792,7 +834,9 @@ impl SessionStore {
                                 .get(call_id.as_str())
                                 .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
                                 .and_then(|args| {
-                                    args.get("patch").and_then(Value::as_str).map(patch_files)
+                                    args.get("patch")
+                                        .and_then(Value::as_str)
+                                        .map(tools::patch_file_names)
                                 })
                                 .unwrap_or_default()
                         }
@@ -1698,39 +1742,34 @@ fn changed_files_section(files: &[String]) -> String {
     section
 }
 
-/// A summary without the changed-files list `finish_summary` added.
-fn without_changed_files(summary: &str) -> &str {
-    summary
-        .rfind(&format!("\n\n{CHANGED_FILES_HEADING}\n"))
-        .map_or(summary, |at| &summary[..at])
-}
-
-/// The files a unified diff's `---`/`+++` headers name (`a/`, `b/` dropped,
-/// `/dev/null` skipped), each once.
-fn patch_files(patch: &str) -> Vec<String> {
-    let mut files: Vec<String> = Vec::new();
-    for line in patch.lines() {
-        let Some(rest) = line
-            .strip_prefix("--- ")
-            .or_else(|| line.strip_prefix("+++ "))
-        else {
-            continue;
-        };
-        // `diff -u` puts a tab and a timestamp after the name.
-        let rest = rest.split('\t').next().unwrap_or(rest).trim();
-        if rest == "/dev/null" {
-            continue;
+/// The plan as `finish_summary` adds it to the summary.
+fn plan_section(plan: &[PlanItem]) -> String {
+    let mut section = PLAN_HEADING.to_string();
+    for (index, item) in plan.iter().enumerate() {
+        section.push_str(&format!("\n{}. [{}] {}", index + 1, item.status, item.step));
+        let mut details = Vec::new();
+        if let Some(agent) = &item.agent {
+            details.push(format!("agent: {agent}"));
         }
-        let file = rest
-            .strip_prefix("a/")
-            .or_else(|| rest.strip_prefix("b/"))
-            .unwrap_or(rest)
-            .to_string();
-        if !files.contains(&file) {
-            files.push(file);
+        if !item.files.is_empty() {
+            details.push(format!("files: {}", item.files.join(", ")));
+        }
+        if !details.is_empty() {
+            section.push_str(&format!(" ({})", details.join("; ")));
         }
     }
-    files
+    section.push_str("\nKeep it current with update_plan.");
+    section
+}
+
+/// A summary without the plan and changed-files list `finish_summary`
+/// added.
+fn without_added_sections(summary: &str) -> &str {
+    [PLAN_HEADING, CHANGED_FILES_HEADING]
+        .iter()
+        .filter_map(|heading| summary.rfind(&format!("\n\n{heading}\n")))
+        .min()
+        .map_or(summary, |at| &summary[..at])
 }
 
 fn plan_to_json(plan: &[PlanItem]) -> Value {
@@ -3098,8 +3137,15 @@ mod tests {
             .expect("older turns should be foldable");
         let list = "Files changed in this session:\n- src/new.rs\n- src/lib.rs\n- docs/notes.md\n- /elsewhere/x.rs";
         assert!(plan.folded_text.contains(list), "{}", plan.folded_text);
-        let summary = plan.finish_summary("Wrote and patched files.".to_string());
-        assert_eq!(summary, format!("Wrote and patched files.\n\n{list}"));
+        let summary = plan.finish_summary(
+            "Wrote and patched files.".to_string(),
+            &[plan_item("Fix it", "in_progress")],
+        );
+        let current_plan = "Your plan from update_plan, as it stands:\n1. [in_progress] Fix it\nKeep it current with update_plan.";
+        assert_eq!(
+            summary,
+            format!("Wrote and patched files.\n\n{current_plan}\n\n{list}")
+        );
         session.apply_compaction(summary, plan.replaced_through);
 
         // The next compaction lists the files once, from the whole branch.
@@ -3125,6 +3171,12 @@ mod tests {
         assert!(next
             .folded_text
             .contains("Earlier summary:\nWrote and patched files.\n"));
+        // The plan then is not folded again: the summary gets the plan of then.
+        assert!(
+            !next.folded_text.contains(PLAN_HEADING),
+            "{}",
+            next.folded_text
+        );
         assert!(next.folded_text.contains("- /elsewhere/x.rs\n- README.md"));
         // Without changed files, the summary is the model's text.
         let quiet = CompactionPlan {
@@ -3133,7 +3185,7 @@ mod tests {
             replaced_through: 1,
             changed_files: SessionStore::new().changed_files(cwd),
         };
-        assert_eq!(quiet.finish_summary("Talked.".to_string()), "Talked.");
+        assert_eq!(quiet.finish_summary("Talked.".to_string(), &[]), "Talked.");
         // A long list is cut.
         let many = (0..MAX_LISTED_CHANGED_FILES + 3)
             .map(|index| format!("f{index}.rs"))
@@ -3141,6 +3193,25 @@ mod tests {
         let section = changed_files_section(&many);
         assert_eq!(section.lines().count(), MAX_LISTED_CHANGED_FILES + 2);
         assert!(section.ends_with("\n- f99.rs\n- and 3 more"), "{section}");
+    }
+
+    #[test]
+    fn changed_files_skip_patch_lines_that_only_look_like_headers() {
+        let mut session = SessionStore::new();
+        // A removed line `-- old` reads `--- old`, an added `++ new` reads
+        // `+++ new`: hunk lines, not headers.
+        let patch = "--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,2 @@\n keep\n--- old\n+++ new\ndiff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\ndiff --git a/a.rs b/b.rs\nsimilarity index 100%\nrename from a.rs\nrename to b.rs\n";
+        call(
+            &mut session,
+            "c1",
+            "apply_patch",
+            json!({ "patch": patch }),
+            json!({ "command": "git apply", "exit_code": 0, "applied": true }),
+        );
+        assert_eq!(
+            session.changed_files(Path::new("/work")),
+            ["notes.md", "run.sh", "a.rs", "b.rs"]
+        );
     }
 
     #[test]

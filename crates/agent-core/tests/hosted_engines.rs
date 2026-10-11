@@ -1691,6 +1691,17 @@ fn a_rewind_takes_a_post_tool_hooks_rewrite_for_the_sessions_own_edit() {
 /// `/rewind` to the first user turn that starts with `label`; the `info`
 /// line it answers with.
 fn rewind_to(core: &mut AgentCore, label: &str) -> String {
+    rewind_events(core, label)
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::Info(text) if text.starts_with("rewound") => Some(text.clone()),
+            _ => None,
+        })
+        .expect("rewound")
+}
+
+/// `/rewind` to the first user turn that starts with `label`; its events.
+fn rewind_events(core: &mut AgentCore, label: &str) -> Vec<AgentEvent> {
     let (_, events) = core.handle_command("/rewind");
     let turn = events
         .iter()
@@ -1702,14 +1713,7 @@ fn rewind_to(core: &mut AgentCore, label: &str) -> String {
             _ => None,
         })
         .unwrap_or_else(|| panic!("no turn {label}: {events:#?}"));
-    let (_, events) = core.handle_command(&format!("/rewind {turn}"));
-    events
-        .iter()
-        .find_map(|event| match event {
-            AgentEvent::Info(text) if text.starts_with("rewound") => Some(text.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("not rewound: {events:#?}"))
+    core.handle_command(&format!("/rewind {turn}")).1
 }
 
 fn write_hooks(dir: &Path, hooks: serde_json::Value) {
@@ -1917,6 +1921,34 @@ fn the_loop_guard_stops_a_turn_whose_calls_keep_failing() {
     )));
 }
 
+#[test]
+fn commands_that_run_and_exit_non_zero_do_not_stop_the_turn() {
+    let _guard = setup();
+    let dir = temp_dir("loop-guard-exit-codes");
+    fs::write(dir.join("note.txt"), "hello\n").unwrap();
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    // grep without a match, each time for something else: exit code 1.
+    let command = if cfg!(windows) {
+        "Select-String -Quiet -Pattern missing{n} note.txt; exit 1"
+    } else {
+        "grep -q missing{n} note.txt"
+    };
+    let arguments = serde_json::json!({ "command": command });
+    core.submit_user_message(format!("REPEAT 8 bash {arguments}"));
+    let events = pump(&mut core, is_ready);
+
+    let outputs = tool_outputs(&events);
+    assert_eq!(outputs.len(), 8, "{outputs:?}");
+    assert!(outputs
+        .iter()
+        .all(|(output, _)| output.contains("\"exit_code\":1")));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Error(message) if message.starts_with("loop guard:")
+    )));
+    assert!(assistant_text(&events).starts_with("tool said:"));
+}
+
 fn plan_steps(events: &[AgentEvent]) -> Option<Vec<(String, String)>> {
     events.iter().rev().find_map(|event| match event {
         AgentEvent::Plan(items) => Some(
@@ -2002,12 +2034,69 @@ fn after_a_compaction_the_model_gets_its_plan_and_the_summary_lists_changed_file
         "{summary}"
     );
 
+    // The plan is in the summary, so it comes before the kept conversation.
+    let plan = "Your plan from update_plan, as it stands:\n1. [completed] Read the code\n2. [in_progress] Fix the bug (files: src/lib.rs)\nKeep it current with update_plan.\n\nFiles changed";
+    assert!(summary.contains(plan), "{summary}");
     core.submit_user_message("HISTORY".to_string());
     let history = assistant_text(&pump(&mut core, is_ready));
-    assert_eq!(history.matches("<plan_context>").count(), 1, "{history}");
-    assert!(history.contains("1. [completed] Read the code\n"));
-    assert!(history.contains("2. [in_progress] Fix the bug (files: src/lib.rs)\n"));
-    // The plan follows the summary.
-    let summary_at = history.find("Files changed in this session").unwrap();
-    assert!(summary_at < history.find("<plan_context>").unwrap());
+    assert_eq!(
+        history.matches("Your plan from update_plan").count(),
+        1,
+        "{history}"
+    );
+}
+
+#[test]
+fn after_a_compaction_the_users_request_is_still_the_last_message_the_model_gets() {
+    let _guard = setup();
+    let dir = temp_dir("plan-compaction-order");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.submit_user_message(update_plan_call());
+    pump(&mut core, is_ready);
+    core.submit_user_message("lorem ipsum dolor sit amet ".repeat(6000));
+    pump(&mut core, is_ready);
+
+    // Refused as too long: the turn compacts and retries.
+    core.submit_user_message("OVERFLOW go on".to_string());
+    let events = pump(&mut core, is_ready);
+    let summary = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::CompactionEnd { summary } => Some(summary.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no compaction: {events:#?}"));
+    // What the safety classifier takes for the user's request.
+    assert_eq!(assistant_text(&events), "user said: OVERFLOW go on");
+    assert!(
+        summary.contains("2. [in_progress] Fix the bug"),
+        "{summary}"
+    );
+}
+
+/// `update_plan` with one pending step.
+fn one_step_plan(step: &str) -> String {
+    format!(r#"CALL update_plan {{"plan":[{{"step":"{step}"}}]}}"#)
+}
+
+#[test]
+fn a_rewind_brings_back_the_plan_of_that_point() {
+    let _guard = setup();
+    let dir = temp_dir("plan-rewind");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.submit_user_message(one_step_plan("First"));
+    pump(&mut core, is_ready);
+    core.submit_user_message(one_step_plan("Second"));
+    let events = pump(&mut core, is_ready);
+    let second = vec![("Second".to_string(), "pending".to_string())];
+    assert_eq!(plan_steps(&events), Some(second));
+
+    let events = rewind_events(&mut core, &one_step_plan("Second"));
+    let first = vec![("First".to_string(), "pending".to_string())];
+    assert_eq!(plan_steps(&events), Some(first.clone()));
+    assert_eq!(plan_steps(&core.state_events()), Some(first));
+
+    let events = rewind_events(&mut core, &one_step_plan("First"));
+    assert_eq!(plan_steps(&events), Some(Vec::new()));
+    assert_eq!(plan_steps(&core.state_events()), None);
 }

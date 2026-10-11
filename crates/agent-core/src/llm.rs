@@ -1137,10 +1137,8 @@ impl OpenAiClient {
                 let round = tool_results
                     .iter()
                     .map(|tool_result| {
-                        (
-                            tool_result.request.name.as_str(),
-                            tool_result.result.is_error,
-                        )
+                        let name = tool_result.request.name.as_str();
+                        (name, loop_guard::is_failure(name, &tool_result.result))
                     })
                     .collect::<Vec<_>>();
                 loop_guard.record_round(&round)

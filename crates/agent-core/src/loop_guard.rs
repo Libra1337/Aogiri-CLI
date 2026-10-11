@@ -11,7 +11,8 @@ pub(crate) const REPEAT_WARN: usize = 3;
 /// The same call this many times in a row: it does not run and the turn
 /// stops.
 pub(crate) const REPEAT_STOP: usize = 5;
-/// Tool rounds in a row whose calls all failed: the turn stops.
+/// Tool rounds in a row whose calls all failed (see `is_failure`): the
+/// turn stops.
 pub(crate) const FAILED_ROUNDS_STOP: usize = 6;
 
 /// How the error of a turn the guard stopped starts.
@@ -38,10 +39,13 @@ pub(crate) enum CallCheck {
 }
 
 impl LoopGuard {
-    /// Counts a call before it runs. Polling calls are not counted and do
-    /// not break a run of identical calls either.
+    /// Counts a call before it runs. A polling call is not counted, and
+    /// ends a run of identical calls: the same check between two waits (a
+    /// test run after each worker an orchestrator waited for) is progress.
     pub(crate) fn check_call(&mut self, name: &str, arguments: &str) -> CallCheck {
         if is_polling_call(name, arguments) {
+            self.last = None;
+            self.repeats = 0;
             return CallCheck::Run;
         }
         let key = (name.to_string(), normalized_arguments(arguments));
@@ -63,14 +67,15 @@ impl LoopGuard {
         }
     }
 
-    /// Counts the results of one round of calls (one model response). A
-    /// round counts as failed when every call in it failed; any success
-    /// starts the count again. Returns the error to stop the turn with.
+    /// Counts the results of one round of calls (one model response), each
+    /// a tool name and whether it failed (`is_failure`). A round counts as
+    /// failed when every call in it failed; any success starts the count
+    /// again. Returns the error to stop the turn with.
     pub(crate) fn record_round(&mut self, results: &[(&str, bool)]) -> Option<String> {
         if results.is_empty() {
             return None;
         }
-        if results.iter().any(|(_, is_error)| !is_error) {
+        if results.iter().any(|(_, failed)| !failed) {
             self.failed_rounds = 0;
             return None;
         }
@@ -83,6 +88,21 @@ impl LoopGuard {
             )
         })
     }
+}
+
+/// Whether a call's result counts as a failure: a tool error (bad
+/// arguments, a missing file, an unknown tool, a command that could not run,
+/// was killed or timed out). A shell command that ran and exited non-zero is
+/// an answer, not a failure: grep without a match, a failing test run.
+pub(crate) fn is_failure(name: &str, result: &crate::tools::ToolExecutionResult) -> bool {
+    if !result.is_error {
+        return false;
+    }
+    if !crate::config::is_shell_tool(name) {
+        return true;
+    }
+    let output = serde_json::from_str::<Value>(&result.output).unwrap_or(Value::Null);
+    output.get("error").is_some() || !output.get("exit_code").is_some_and(Value::is_i64)
 }
 
 /// What the model reads with the result of a call it made `repeats` times
@@ -210,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn polling_calls_are_not_counted_and_keep_a_run_going() {
+    fn polling_calls_are_not_counted_and_end_a_run_of_identical_calls() {
         let mut guard = LoopGuard::default();
         for (name, arguments) in [
             ("write_stdin", r#"{"session_id":1,"chars":""}"#),
@@ -225,13 +245,48 @@ mod tests {
                 .iter()
                 .all(|check| *check == CallCheck::Run));
         }
-        // A poll between two identical calls does not reset their count.
-        let call = r#"{"command":"cargo build"}"#;
-        guard.check_call("bash", call);
-        guard.check_call("write_stdin", r#"{"session_id":1}"#);
-        guard.check_call("bash", call);
-        guard.check_call("wait_agent", "{}");
-        assert!(matches!(guard.check_call("bash", call), CallCheck::Warn(_)));
+        // An orchestrator runs the tests after each worker it waited for.
+        let call = r#"{"command":"cargo test"}"#;
+        for _ in 0..REPEAT_STOP + 2 {
+            assert_eq!(
+                guard.check_call("wait_agent", r#"{"targets":["w"]}"#),
+                CallCheck::Run
+            );
+            assert_eq!(guard.check_call("bash", call), CallCheck::Run);
+            guard.check_call("write_stdin", r#"{"session_id":1}"#);
+            assert_eq!(guard.check_call("bash", call), CallCheck::Run);
+        }
+    }
+
+    #[test]
+    fn a_command_that_ran_and_exited_non_zero_is_no_failure() {
+        let result = |output: Value, is_error: bool| crate::tools::ToolExecutionResult {
+            output: output.to_string(),
+            model_output: String::new(),
+            is_error,
+        };
+        let no_match = result(json!({ "exit_code": 1, "stdout": "", "stderr": "" }), true);
+        assert!(!is_failure("bash", &no_match));
+        assert!(!is_failure("exec_command", &no_match));
+        let timed_out = result(json!({ "exit_code": null, "timed_out": true }), true);
+        assert!(is_failure("bash", &timed_out));
+        let killed = result(
+            json!({ "exit_code": null, "error": "terminated by signal 9" }),
+            true,
+        );
+        assert!(is_failure("bash", &killed));
+        let bad_arguments = result(json!({ "error": "missing command" }), true);
+        assert!(is_failure("bash", &bad_arguments));
+        // Another tool's non-zero exit (git apply refusing a patch) fails.
+        assert!(is_failure("apply_patch", &no_match));
+        assert!(is_failure(
+            "read",
+            &result(json!({ "error": "not found" }), true)
+        ));
+        assert!(!is_failure(
+            "read",
+            &result(json!({ "content": "x" }), false)
+        ));
     }
 
     #[test]

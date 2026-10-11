@@ -61,9 +61,11 @@ pub fn temp_dir(label: &str) -> PathBuf {
 /// call, `CALL <name> <arguments>` with that call, `CALLS [{name,
 /// arguments}, …]` with all of them in one reply; `LOOP <tool> <arguments>`
 /// makes that call again after every result (`{n}` in the arguments becomes
-/// the call's number); anything after a tool result or a deferred-action
+/// the call's number), `REPEAT <times> <tool> <arguments>` `times` calls in
+/// all; anything after a tool result or a deferred-action
 /// message answers with plain text naming what it saw; `HISTORY` answers
-/// with every user message of the request. In a subagent's task, `[sleep:N]`
+/// with every user message of the request; `OVERFLOW …` is refused as over
+/// the context window until the conversation was compacted. In a subagent's task, `[sleep:N]`
 /// waits N ms before answering and a line `RUN: <command>` runs it;
 /// `[history]` answers with every user message of the request. A message
 /// from another conversation (`<session_message …>`) is scripted by its body.
@@ -76,10 +78,20 @@ fn start_fake_model() -> String {
             thread::spawn(move || {
                 let body = read_request_body(&mut stream);
                 let reply = script(&body);
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{reply}"
-                );
+                let _ = match reply.strip_prefix("ERROR ") {
+                    Some(message) => {
+                        let error = json!({ "error": { "message": message } }).to_string();
+                        write!(
+                            stream,
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}",
+                            error.len()
+                        )
+                    }
+                    None => write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{reply}"
+                    ),
+                };
             });
         }
     });
@@ -148,6 +160,12 @@ fn script(request: &Value) -> String {
     }
     if let Some(reply) = loop_call(&messages) {
         return reply;
+    }
+    let compacted = messages.iter().any(|message| {
+        content_text(&message["content"]).starts_with("[Earlier conversation compacted")
+    });
+    if text.starts_with("OVERFLOW") && !compacted {
+        return "ERROR maximum context length exceeded".to_string();
     }
     let task_command = task
         .then(|| text.lines().find_map(|line| line.strip_prefix("RUN: ")))
@@ -251,19 +269,29 @@ fn script(request: &Value) -> String {
 }
 
 /// `LOOP <tool> <arguments>` as the latest user message: the same call
-/// again, whatever the tool said.
+/// again, whatever the tool said; `REPEAT <times> <tool> <arguments>`: the
+/// same, `times` calls in all.
 fn loop_call(messages: &[Value]) -> Option<String> {
     let at = messages
         .iter()
         .rposition(|message| message["role"] == "user")?;
     let text = content_text(&messages[at]["content"]);
-    let call = text.strip_prefix("LOOP ")?;
+    let (times, call) = match text.strip_prefix("REPEAT ") {
+        Some(rest) => {
+            let (times, call) = rest.split_once(' ')?;
+            (times.parse::<usize>().ok()?, call)
+        }
+        None => (usize::MAX, text.strip_prefix("LOOP ")?),
+    };
     let (name, arguments) = call.split_once(' ').unwrap_or((call, "{}"));
     let n = messages[at..]
         .iter()
         .filter(|message| message["role"] == "tool")
         .count()
         + 1;
+    if n > times {
+        return None;
+    }
     let arguments = arguments.replace("{n}", &n.to_string());
     Some(sse(&[
         json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{

@@ -103,9 +103,6 @@ enum WorkerEvent {
     CompactionDone {
         summary: String,
         replaced_through: u64,
-        /// The plan message the conversation continues with after the
-        /// summary (see `compacted`).
-        plan_item: Option<Value>,
     },
     CompactionFailed(String),
     ResumeSummaryDone {
@@ -919,9 +916,11 @@ impl AgentCore {
                     let fill = self.session.user_content(label);
                     match self.session.checkout(label) {
                         Ok(()) => {
+                            let plan_event = self.plan_from_branch();
                             let save_event = self.save_session_event();
                             let mut events =
                                 vec![AgentEvent::Transcript(self.session.transcript_items())];
+                            events.extend(plan_event);
                             if let Some(content) = fill {
                                 events.push(AgentEvent::FillInput(content));
                             }
@@ -936,13 +935,18 @@ impl AgentCore {
                 let label = args.trim();
                 match self.session.fork(label) {
                     Ok(id) => {
+                        let plan_event = self.plan_from_branch();
                         let save_event = self.save_session_event();
                         vec![
                             AgentEvent::Transcript(self.session.transcript_items()),
                             AgentEvent::TreeView(self.session.tree_view()),
-                            AgentEvent::Status(format!("forked {label}: {}", id.display())),
                         ]
                         .into_iter()
+                        .chain(plan_event)
+                        .chain([AgentEvent::Status(format!(
+                            "forked {label}: {}",
+                            id.display()
+                        ))])
                         .chain(save_event)
                         .collect()
                     }
@@ -1681,13 +1685,9 @@ impl AgentCore {
                     WorkerEvent::CompactionDone {
                         summary,
                         replaced_through,
-                        plan_item,
                     } => {
                         self.session
                             .apply_compaction(summary.clone(), replaced_through);
-                        if let Some(item) = plan_item {
-                            self.session.append(EntryKind::ResponseItem { item });
-                        }
                         events.extend(self.save_session_event());
                         events.push(AgentEvent::CompactionEnd { summary });
                         events.push(self.context_usage_event());
@@ -2534,7 +2534,7 @@ impl AgentCore {
             None
         };
         let cwd = self.cwd.clone();
-        let plan_item = plan_context_item(&self.plan);
+        let current_plan = self.plan.clone();
         let (tx, rx) = mpsc::channel();
         self.interrupt_flag = Arc::new(AtomicBool::new(false));
         let interrupt_flag = Arc::clone(&self.interrupt_flag);
@@ -2553,7 +2553,7 @@ impl AgentCore {
                                 .map_err(|error| error.to_string())
                         },
                     ) {
-                        Ok(summary) => compacted(plan, summary, plan_item, &tx),
+                        Ok(summary) => compacted(plan, summary, &current_plan, &tx),
                         Err(error) => {
                             let _ = tx.send(WorkerEvent::CompactionFailed(error));
                             request_items
@@ -2684,7 +2684,7 @@ impl AgentCore {
         self.turn_started_at = None;
         self.turn_goal_tokens = 0;
         self.goal_continuation_running = false;
-        let plan_item = plan_context_item(&self.plan);
+        let current_plan = self.plan.clone();
         let (tx, rx) = mpsc::channel();
         self.interrupt_flag = Arc::new(AtomicBool::new(false));
         self.receiver = Some(rx);
@@ -2697,7 +2697,7 @@ impl AgentCore {
                     .map_err(|error| error.to_string())
             }) {
                 Ok(summary) => {
-                    compacted(plan, summary, plan_item, &tx);
+                    compacted(plan, summary, &current_plan, &tx);
                     let _ = tx.send(WorkerEvent::Done);
                 }
                 Err(error) => {
@@ -3773,7 +3773,7 @@ impl AgentCore {
     }
 
     fn handle_update_plan(&mut self, args: &Value) -> (ToolGoalResponse, Option<AgentEvent>) {
-        let Some(items) = args.get("plan").and_then(Value::as_array) else {
+        let Some(plan) = parse_plan(args) else {
             let output = json!({ "error": "update_plan requires a plan array" }).to_string();
             return (
                 ToolGoalResponse {
@@ -3783,46 +3783,6 @@ impl AgentCore {
                 None,
             );
         };
-        let mut plan = Vec::new();
-        for item in items {
-            let step = item.get("step").and_then(Value::as_str).unwrap_or_default();
-            let status = item
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("pending");
-            if step.is_empty() {
-                continue;
-            }
-            let status = match status {
-                "in_progress" | "completed" => status,
-                _ => "pending",
-            };
-            let agent = item
-                .get("agent")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|agent| !agent.is_empty())
-                .map(str::to_string);
-            let files = item
-                .get("files")
-                .and_then(Value::as_array)
-                .map(|files| {
-                    files
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::trim)
-                        .filter(|file| !file.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
-            plan.push(PlanItem {
-                step: step.to_string(),
-                status: status.to_string(),
-                agent,
-                files,
-            });
-        }
         self.plan = plan;
         // Saved with the session (poll_goal_tool_requests saves after each
         // request), so a reopened session has its plan back.
@@ -3838,6 +3798,26 @@ impl AgentCore {
             },
             Some(AgentEvent::Plan(self.plan.clone())),
         )
+    }
+
+    /// The conversation moved to another point of the session tree (a
+    /// rewind, a checkout, a fork): the plan is the one its last update_plan
+    /// call set there, none without one. Its `plan` event when it changed.
+    fn plan_from_branch(&mut self) -> Option<AgentEvent> {
+        let plan = self
+            .session
+            .last_successful_call("update_plan")
+            .and_then(|args| parse_plan(&args))
+            .unwrap_or_default();
+        if plan == self.plan {
+            return None;
+        }
+        self.plan = plan;
+        self.session.set_plan(self.plan.clone());
+        self.subagent_manager
+            .shared()
+            .set_plan_steps(self.plan.iter().map(|item| item.step.clone()).collect());
+        Some(AgentEvent::Plan(self.plan.clone()))
     }
 
     /// The loop guard stopped the turn: an active goal is paused, so goal
@@ -4639,6 +4619,7 @@ impl AgentCore {
                 "failed to rewind conversation: {error}"
             ))];
         }
+        let plan_event = self.plan_from_branch();
         let (restored, removed, conflicts) =
             match crate::tools::restore_to_timestamp(&self.cwd, t, &self.tool_state) {
                 Ok(result) => (
@@ -4655,12 +4636,13 @@ impl AgentCore {
                     crate::tools::restore_conflicts_note(&result),
                 ),
                 Err(error) => {
-                    return vec![
-                        AgentEvent::Transcript(self.session.transcript_items()),
-                        AgentEvent::Error(format!(
+                    return [AgentEvent::Transcript(self.session.transcript_items())]
+                        .into_iter()
+                        .chain(plan_event)
+                        .chain([AgentEvent::Error(format!(
                             "conversation rewound, but file restore failed: {error}"
-                        )),
-                    ];
+                        ))])
+                        .collect();
                 }
             };
         let save_event = self.save_session_event();
@@ -4668,13 +4650,12 @@ impl AgentCore {
         if let Some(conflicts) = conflicts {
             message.push_str(&format!(" · {conflicts}"));
         }
-        vec![
-            AgentEvent::Transcript(self.session.transcript_items()),
-            AgentEvent::Info(message),
-        ]
-        .into_iter()
-        .chain(save_event)
-        .collect()
+        [AgentEvent::Transcript(self.session.transcript_items())]
+            .into_iter()
+            .chain(plan_event)
+            .chain([AgentEvent::Info(message)])
+            .chain(save_event)
+            .collect()
     }
 
     fn resume_list_events(&self) -> Vec<AgentEvent> {
@@ -5151,57 +5132,69 @@ impl AgentCore {
     }
 }
 
-/// A compaction's summary is in: tells the engine, which records the
-/// summary and then the plan message, and returns what the turn continues
-/// from, in the order the session will project it: the summary, the kept
-/// items, the plan.
+/// A compaction's summary is in: tells the engine, which records it with
+/// the current `plan` and the changed files (`finish_summary`), and returns
+/// what the turn continues from: the summary, then the kept items.
 fn compacted(
-    plan: crate::session::CompactionPlan,
+    compaction: crate::session::CompactionPlan,
     summary: String,
-    plan_item: Option<Value>,
+    plan: &[PlanItem],
     tx: &Sender<WorkerEvent>,
 ) -> Vec<Value> {
-    let summary = plan.finish_summary(summary);
+    let summary = compaction.finish_summary(summary, plan);
     let _ = tx.send(WorkerEvent::CompactionDone {
         summary: summary.clone(),
-        replaced_through: plan.replaced_through,
-        plan_item: plan_item.clone(),
+        replaced_through: compaction.replaced_through,
     });
     let mut items = vec![compaction_summary_item(&summary)];
-    items.extend(plan.kept_items);
-    items.extend(plan_item);
+    items.extend(compaction.kept_items);
     items
 }
 
-/// The plan, as a user message that follows a compaction: the update_plan
-/// calls that set it were folded into the summary. None without a plan. A
-/// message, not system prompt text, so the cached prompt prefix stays.
-fn plan_context_item(plan: &[PlanItem]) -> Option<Value> {
-    if plan.is_empty() {
-        return None;
+/// The steps of an `update_plan` call; None without a `plan` array.
+fn parse_plan(args: &Value) -> Option<Vec<PlanItem>> {
+    let items = args.get("plan").and_then(Value::as_array)?;
+    let mut plan = Vec::new();
+    for item in items {
+        let step = item.get("step").and_then(Value::as_str).unwrap_or_default();
+        let status = item
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending");
+        if step.is_empty() {
+            continue;
+        }
+        let status = match status {
+            "in_progress" | "completed" => status,
+            _ => "pending",
+        };
+        let agent = item
+            .get("agent")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|agent| !agent.is_empty())
+            .map(str::to_string);
+        let files = item
+            .get("files")
+            .and_then(Value::as_array)
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|file| !file.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        plan.push(PlanItem {
+            step: step.to_string(),
+            status: status.to_string(),
+            agent,
+            files,
+        });
     }
-    let mut text = String::from(
-        "<plan_context>\nThe conversation was compacted. Your plan from update_plan, as it stands:\n",
-    );
-    for (index, item) in plan.iter().enumerate() {
-        text.push_str(&format!("{}. [{}] {}", index + 1, item.status, item.step));
-        let mut details = Vec::new();
-        if let Some(agent) = &item.agent {
-            details.push(format!("agent: {agent}"));
-        }
-        if !item.files.is_empty() {
-            details.push(format!("files: {}", item.files.join(", ")));
-        }
-        if !details.is_empty() {
-            text.push_str(&format!(" ({})", details.join("; ")));
-        }
-        text.push('\n');
-    }
-    text.push_str("Keep it current with update_plan.\n</plan_context>");
-    Some(json!({
-        "role": "user",
-        "content": [{ "type": "input_text", "text": text }]
-    }))
+    Some(plan)
 }
 
 fn mask_key(value: Option<&str>) -> String {
@@ -6076,8 +6069,7 @@ mod compaction_tests {
     use super::*;
 
     #[test]
-    fn after_a_compaction_the_turn_continues_with_the_summary_kept_items_and_plan() {
-        assert_eq!(plan_context_item(&[]), None);
+    fn after_a_compaction_the_turn_continues_with_the_summary_then_the_kept_items() {
         let plan = [
             PlanItem {
                 step: "Read the code".to_string(),
@@ -6091,47 +6083,26 @@ mod compaction_tests {
                 files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
             },
         ];
-        let item = plan_context_item(&plan).expect("a plan message");
-        assert_eq!(item["role"], "user");
-        let text = item["content"][0]["text"].as_str().unwrap();
-        assert!(text.starts_with("<plan_context>\n"), "{text}");
-        assert!(text.contains("1. [completed] Read the code\n"), "{text}");
-        assert!(
-            text.contains(
-                "2. [in_progress] Fix the bug (agent: /root/fixer; files: src/a.rs, src/b.rs)\n"
-            ),
-            "{text}"
-        );
-
-        let kept =
+        // The user's request is the last kept item.
+        let request =
             json!({ "role": "user", "content": [{ "type": "input_text", "text": "go on" }] });
         let compaction = crate::session::CompactionPlan {
             folded_text: String::new(),
-            kept_items: vec![kept.clone()],
+            kept_items: vec![request.clone()],
             replaced_through: 7,
             changed_files: vec!["src/a.rs".to_string()],
         };
         let (tx, rx) = mpsc::channel();
-        let items = compacted(
-            compaction,
-            "Did things.".to_string(),
-            Some(item.clone()),
-            &tx,
-        );
-        let summary = "Did things.\n\nFiles changed in this session:\n- src/a.rs";
-        assert_eq!(
-            items,
-            [compaction_summary_item(summary), kept, item.clone()]
-        );
-        // The engine records the summary, then the plan message after it.
+        let items = compacted(compaction, "Did things.".to_string(), &plan, &tx);
+        let summary = "Did things.\n\nYour plan from update_plan, as it stands:\n1. [completed] Read the code\n2. [in_progress] Fix the bug (agent: /root/fixer; files: src/a.rs, src/b.rs)\nKeep it current with update_plan.\n\nFiles changed in this session:\n- src/a.rs";
+        assert_eq!(items, [compaction_summary_item(summary), request]);
         let events = rx.try_iter().collect::<Vec<_>>();
         assert!(matches!(
             &events[..],
             [WorkerEvent::CompactionDone {
                 summary: done,
                 replaced_through: 7,
-                plan_item: Some(recorded),
-            }] if done == summary && *recorded == item
+            }] if done == summary
         ));
     }
 }
