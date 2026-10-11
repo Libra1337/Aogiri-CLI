@@ -534,6 +534,14 @@ fn str_replace_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         }
     };
 
+    // A CRLF file is matched and edited with LF line breaks and written back
+    // with CRLF throughout, so an edit cannot leave mixed line endings.
+    let crlf = uses_crlf(&original);
+    let text = if crlf {
+        original.replace("\r\n", "\n")
+    } else {
+        original.clone()
+    };
     let mut replacements = Vec::new();
     for edit in edits {
         let Some(old_text) = edit.get("oldText").and_then(Value::as_str) else {
@@ -545,8 +553,16 @@ fn str_replace_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         if old_text.is_empty() {
             return json!({ "path": path.display().to_string(), "error": "oldText must not be empty" });
         }
+        let (find, new_text) = if crlf {
+            (
+                old_text.replace("\r\n", "\n"),
+                new_text.replace("\r\n", "\n"),
+            )
+        } else {
+            (old_text.to_string(), new_text.to_string())
+        };
 
-        let matches = original.match_indices(old_text).collect::<Vec<_>>();
+        let matches = text.match_indices(find.as_str()).collect::<Vec<_>>();
         if matches.len() != 1 {
             return json!({
                 "path": path.display().to_string(),
@@ -555,7 +571,7 @@ fn str_replace_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
             });
         }
         let start = matches[0].0;
-        replacements.push((start, start + old_text.len(), new_text.to_string()));
+        replacements.push((start, start + find.len(), new_text));
     }
 
     replacements.sort_by_key(|(start, _, _)| *start);
@@ -565,14 +581,17 @@ fn str_replace_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         }
     }
 
-    let mut output = String::with_capacity(original.len());
+    let mut output = String::with_capacity(text.len());
     let mut cursor = 0usize;
     for (start, end, new_text) in &replacements {
-        output.push_str(&original[cursor..*start]);
+        output.push_str(&text[cursor..*start]);
         output.push_str(new_text);
         cursor = *end;
     }
-    output.push_str(&original[cursor..]);
+    output.push_str(&text[cursor..]);
+    if crlf {
+        output = to_crlf(&output);
+    }
 
     let checkpoint = begin_checkpoint(cwd, "auto-edit", std::slice::from_ref(&path));
     let written = fs::write(&path, &output);
@@ -701,6 +720,13 @@ fn write_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
     } else {
         String::new()
     };
+    // Overwriting a CRLF file keeps its line endings.
+    let content = if uses_crlf(&original) {
+        to_crlf(content)
+    } else {
+        content.to_string()
+    };
+    let content = content.as_str();
     if let Some(parent) = path.parent() {
         if let Err(error) = fs::create_dir_all(parent) {
             return json!({ "path": path.display().to_string(), "error": error.to_string() });
@@ -724,6 +750,17 @@ fn write_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
     }
 }
 
+/// Whether a file's text uses CRLF line breaks: most of its line breaks
+/// are CRLF. Edits write such a file back with CRLF throughout.
+fn uses_crlf(text: &str) -> bool {
+    let crlf = text.matches("\r\n").count();
+    crlf > 0 && crlf * 2 > text.matches('\n').count()
+}
+
+fn to_crlf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
 /// Applies hashline edits to `original` without touching the filesystem.
 /// Shared by `hashline_edit` itself and hunk planning for selective approval
 /// (which previews each edit in isolation).
@@ -731,6 +768,16 @@ pub(crate) fn apply_hashline_edits_preview(
     original: &str,
     raw_edits: &[Value],
 ) -> Result<String, String> {
+    // Edits are made with LF line breaks; a CRLF file gets CRLF throughout
+    // again (line numbers and anchors are the same either way).
+    if uses_crlf(original) {
+        let output = apply_hashline_edits_lf(&original.replace("\r\n", "\n"), raw_edits)?;
+        return Ok(to_crlf(&output));
+    }
+    apply_hashline_edits_lf(original, raw_edits)
+}
+
+fn apply_hashline_edits_lf(original: &str, raw_edits: &[Value]) -> Result<String, String> {
     let edits = parse_hashline_edits(raw_edits)?;
     let line_index = LineIndex::new(original);
     validate_hashline_anchors(&edits, &line_index)?;
@@ -2242,6 +2289,19 @@ fn apply_patch(
             return json!({ "error": error });
         }
     }
+    // As for str_replace: every existing file the patch changes must have
+    // been read, and be unchanged since. Files it creates need no read.
+    for target in targets.iter().filter(|target| target.exists()) {
+        if let Some(error) = unread_or_stale_error(
+            state,
+            target,
+            "apply_patch requires reading each file it changes first so the patch matches bytes on disk",
+        ) {
+            return error;
+        }
+    }
+    let patch = patch_for_line_endings(patch, cwd);
+    let patch = patch.as_str();
 
     let check = run_command_events(
         "git",
@@ -2273,6 +2333,9 @@ fn apply_patch(
             let mut value = command_result_json("git apply", result);
             value["applied"] = json!(value.get("exit_code").and_then(Value::as_i64) == Some(0));
             if value["applied"].as_bool().unwrap_or(false) {
+                for target in &targets {
+                    state.mark_read(target);
+                }
                 // Diff only the files this patch touched, not the whole worktree.
                 let mut chunks = Vec::new();
                 for target in &targets {
@@ -2895,20 +2958,87 @@ fn patch_target_paths(patch: &str, cwd: &Path) -> Vec<PathBuf> {
         else {
             continue;
         };
-        let rest = rest.trim();
-        if rest == "/dev/null" {
+        let Some(abs) = patch_header_path(rest, cwd) else {
             continue;
-        }
-        let rel = rest
-            .strip_prefix("a/")
-            .or_else(|| rest.strip_prefix("b/"))
-            .unwrap_or(rest);
-        let abs = resolve_path(cwd, rel);
+        };
         if !paths.contains(&abs) {
             paths.push(abs);
         }
     }
     paths
+}
+
+/// The file a `---`/`+++` header names; None for `/dev/null`.
+fn patch_header_path(rest: &str, cwd: &Path) -> Option<PathBuf> {
+    let rest = rest.trim();
+    if rest == "/dev/null" {
+        return None;
+    }
+    let rel = rest
+        .strip_prefix("a/")
+        .or_else(|| rest.strip_prefix("b/"))
+        .unwrap_or(rest);
+    Some(resolve_path(cwd, rel))
+}
+
+/// `patch` with the hunk lines for each file that uses CRLF given CRLF
+/// endings, so git apply matches the file's lines and adds lines in its
+/// style. Hunks are delimited by their header's line counts, as git reads
+/// them; a line followed by a "\ No newline" marker keeps its ending.
+fn patch_for_line_endings(patch: &str, cwd: &Path) -> String {
+    let lines = patch.split_inclusive('\n').collect::<Vec<_>>();
+    let mut out = String::with_capacity(patch.len() + patch.len() / 16);
+    let mut crlf = false;
+    let (mut old_left, mut new_left) = (0usize, 0usize);
+    for (index, line) in lines.iter().enumerate() {
+        let text = line.strip_suffix('\n').unwrap_or(line);
+        let text = text.strip_suffix('\r').unwrap_or(text);
+        if old_left == 0 && new_left == 0 {
+            if let Some(rest) = text.strip_prefix("--- ") {
+                crlf = patch_header_path(rest, cwd)
+                    .and_then(|path| fs::read_to_string(path).ok())
+                    .is_some_and(|content| uses_crlf(&content));
+            } else if text.starts_with("@@") {
+                (old_left, new_left) = hunk_line_counts(text).unwrap_or((0, 0));
+            }
+            out.push_str(line);
+            continue;
+        }
+        match text.as_bytes().first() {
+            Some(b'+') => new_left = new_left.saturating_sub(1),
+            Some(b'-') => old_left = old_left.saturating_sub(1),
+            Some(b'\\') => {}
+            _ => {
+                old_left = old_left.saturating_sub(1);
+                new_left = new_left.saturating_sub(1);
+            }
+        }
+        let keeps_ending = text.starts_with('\\')
+            || !line.ends_with('\n')
+            || lines
+                .get(index + 1)
+                .is_some_and(|next| next.starts_with('\\'));
+        if crlf && !keeps_ending {
+            out.push_str(text);
+            out.push_str("\r\n");
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// The old and new line counts of a hunk header `@@ -a,b +c,d @@`; a range
+/// without a count has one line.
+fn hunk_line_counts(header: &str) -> Option<(usize, usize)> {
+    let mut ranges = header.split_whitespace().skip(1);
+    let count = |range: &str, sign: char| -> Option<usize> {
+        match range.strip_prefix(sign)?.split_once(',') {
+            Some((_, count)) => count.parse().ok(),
+            None => Some(1),
+        }
+    };
+    Some((count(ranges.next()?, '-')?, count(ranges.next()?, '+')?))
 }
 
 /// Files as they were before an edit. `save` writes the checkpoint once the
@@ -5140,6 +5270,7 @@ mod tests {
 -beta
 +gamma
 "#;
+        run_tool("read", &json!({ "path": path }).to_string(), &dir);
         let result = run_tool("apply_patch", &json!({ "patch": patch }).to_string(), &dir);
         let value = serde_json::from_str::<Value>(&result).unwrap();
 
@@ -6511,6 +6642,7 @@ mod tests {
 -beta
 +gamma
 "#;
+        run_tool("read", &json!({ "path": "sample.txt" }).to_string(), &dir);
         let result = run_tool("apply_patch", &json!({ "patch": patch }).to_string(), &dir);
         let value = serde_json::from_str::<Value>(&result).unwrap();
 
@@ -6518,6 +6650,109 @@ mod tests {
         let diff = value["diff"].as_str().unwrap();
         assert!(diff.contains("sample.txt"));
         assert!(!diff.contains("unrelated.txt"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn edits_keep_a_crlf_files_line_endings() {
+        let dir = test_dir("crlf-edits");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("win.txt");
+        let call = |name: &str, args: Value| -> Value {
+            serde_json::from_str(&run_tool(name, &args.to_string(), &dir)).unwrap()
+        };
+        let assert_crlf = |expected: &str| {
+            let content = fs::read_to_string(&path).unwrap();
+            assert_eq!(content, expected.replace('\n', "\r\n"));
+            assert!(!content.replace("\r\n", "").contains('\n'), "{content:?}");
+        };
+        fs::write(&path, "alpha\r\nbeta\r\n-- note\r\ngamma\r\n").unwrap();
+        call("read", json!({ "path": "win.txt" }));
+
+        // The model writes LF line breaks, as it usually does.
+        let edited = call(
+            "str_replace",
+            json!({ "path": "win.txt", "edits": [{ "oldText": "beta\n-- note", "newText": "beta\nBETA" }] }),
+        );
+        assert_eq!(edited["edits"], 1, "{edited}");
+        assert_crlf("alpha\nbeta\nBETA\ngamma\n");
+
+        let edited = call(
+            "hashline_edit",
+            json!({ "path": "win.txt", "edits": [
+                { "op": "replace", "pos": 1, "lines": ["one", "two"] },
+                { "op": "append", "lines": "tail\n" }
+            ] }),
+        );
+        assert!(edited.get("error").is_none(), "{edited}");
+        assert_crlf("one\ntwo\nbeta\nBETA\ngamma\ntail\n");
+
+        let patch =
+            "--- a/win.txt\n+++ b/win.txt\n@@ -3,3 +3,3 @@\n beta\n-BETA\n+-- back\n gamma\n";
+        let patched = call("apply_patch", json!({ "patch": patch }));
+        assert_eq!(patched["applied"], true, "{patched}");
+        assert_crlf("one\ntwo\nbeta\n-- back\ngamma\ntail\n");
+
+        // A removed line that starts like a header stays in its hunk.
+        let patch = "--- a/win.txt\n+++ b/win.txt\n@@ -3,3 +3,2 @@\n beta\n--- back\n gamma\n";
+        let patched = call("apply_patch", json!({ "patch": patch }));
+        assert_eq!(patched["applied"], true, "{patched}");
+        assert_crlf("one\ntwo\nbeta\ngamma\ntail\n");
+
+        let written = call("write", json!({ "path": "win.txt", "content": "x\ny\n" }));
+        assert!(written.get("error").is_none(), "{written}");
+        assert_crlf("x\ny\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lf_files_and_mostly_lf_files_count_as_lf() {
+        assert!(uses_crlf("a\r\nb\r\nc\n"));
+        assert!(!uses_crlf("a\nb\r\nc\n"));
+        assert!(!uses_crlf("a\nb\n"));
+        assert!(!uses_crlf("no line break"));
+    }
+
+    #[test]
+    fn apply_patch_requires_reading_files_it_changes_but_not_ones_it_creates() {
+        let dir = test_dir("apply-patch-read");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sample.txt");
+        fs::write(&path, "alpha\nbeta\n").unwrap();
+        let call = |name: &str, args: Value| -> Value {
+            serde_json::from_str(&run_tool(name, &args.to_string(), &dir)).unwrap()
+        };
+        let edit = |from: &str, to: &str| {
+            format!("--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,2 @@\n alpha\n-{from}\n+{to}\n")
+        };
+
+        let blind = call("apply_patch", json!({ "patch": edit("beta", "gamma") }));
+        assert!(blind["error"]
+            .as_str()
+            .unwrap()
+            .contains("apply_patch requires reading"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nbeta\n");
+
+        let created = call(
+            "apply_patch",
+            json!({ "patch": "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+fresh\n" }),
+        );
+        assert_eq!(created["applied"], true, "{created}");
+        assert_eq!(fs::read_to_string(dir.join("new.txt")).unwrap(), "fresh\n");
+
+        call("read", json!({ "path": "sample.txt" }));
+        let first = call("apply_patch", json!({ "patch": edit("beta", "gamma") }));
+        assert_eq!(first["applied"], true, "{first}");
+        // The patch marks the file read: the next edit needs no new read.
+        let second = call("apply_patch", json!({ "patch": edit("gamma", "delta") }));
+        assert_eq!(second["applied"], true, "{second}");
+
+        fs::write(&path, "alpha\nchanged by someone else\n").unwrap();
+        let stale = call("apply_patch", json!({ "patch": edit("delta", "epsilon") }));
+        assert!(stale["error"]
+            .as_str()
+            .unwrap()
+            .contains("changed on disk since you last read it"));
         let _ = fs::remove_dir_all(dir);
     }
 
