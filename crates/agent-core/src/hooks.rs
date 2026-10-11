@@ -31,8 +31,14 @@ struct HookSet {
 /// Most characters of a hook's output the main agent receives.
 const MAX_REPORT_CHARS: usize = 4000;
 
-/// How long a hook may run unless its entry sets `timeout`.
+/// How long a hook that runs around each tool call or prompt may run unless
+/// its entry sets `timeout`.
 const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The same for the events that run once per session, turn or task
+/// (`session_start`, `stop`, `task_completed`, `agent_idle`): such a hook
+/// often runs a whole build or test suite.
+const DEFAULT_LONG_HOOK_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How long output may keep arriving after a hook exited: a background
 /// process it started can hold its output open indefinitely.
@@ -336,6 +342,8 @@ fn run_command_with_env(
             }
         }
     };
+    // Ended with the tool commands when the engine process exits.
+    crate::tools::track_tool_group(child.id());
     // Written and read on threads: a hook that ignores its stdin or fills a
     // pipe must not stall the turn past the timeout.
     if let Some(mut stdin) = child.stdin.take() {
@@ -462,12 +470,16 @@ fn push_entries(target: &mut Vec<HookEntry>, value: &Value, key: &str) {
         });
         // Seconds, at most a day; anything but a positive number keeps the
         // default.
+        let default = match key {
+            "pre_tool_use" | "post_tool_use" | "user_prompt_submit" => DEFAULT_HOOK_TIMEOUT,
+            _ => DEFAULT_LONG_HOOK_TIMEOUT,
+        };
         let timeout = entry
             .get("timeout")
             .and_then(Value::as_f64)
             .filter(|seconds| *seconds > 0.0)
             .and_then(|seconds| Duration::try_from_secs_f64(seconds.min(86_400.0)).ok())
-            .unwrap_or(DEFAULT_HOOK_TIMEOUT);
+            .unwrap_or(default);
         target.push(HookEntry {
             command: command.to_string(),
             tools,
@@ -636,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn hook_timeout_is_a_minute_unless_the_entry_sets_one() {
+    fn hook_timeout_defaults_to_a_minute_per_call_and_ten_for_completion_events() {
         let hooks = Hooks::from_value(&json!({
             "stop": [
                 { "command": "a" },
@@ -644,15 +656,40 @@ mod tests {
                 { "command": "c", "timeout": 0 },
                 { "command": "d", "timeout": "soon" },
                 { "command": "e", "timeout": 1e300 }
-            ]
+            ],
+            "session_start": [{ "command": "f" }],
+            "task_completed": [{ "command": "g" }],
+            "agent_idle": [{ "command": "h" }],
+            "pre_tool_use": [{ "command": "i" }, { "command": "j", "timeout": 900 }],
+            "post_tool_use": [{ "command": "k" }],
+            "user_prompt_submit": [{ "command": "l" }]
         }));
-        let timeouts = hooks
-            .inner
-            .stop
-            .iter()
-            .map(|entry| entry.timeout.as_secs())
-            .collect::<Vec<_>>();
-        assert_eq!(timeouts, vec![60, 5, 60, 60, 86_400]);
+        let set = &hooks.inner;
+        let timeouts = |entries: &[HookEntry]| {
+            entries
+                .iter()
+                .map(|entry| entry.timeout.as_secs())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(timeouts(&set.stop), vec![600, 5, 600, 600, 86_400]);
+        assert_eq!(timeouts(&set.session_start), vec![600]);
+        assert_eq!(timeouts(&set.task_completed), vec![600]);
+        assert_eq!(timeouts(&set.agent_idle), vec![600]);
+        assert_eq!(timeouts(&set.pre_tool_use), vec![60, 900]);
+        assert_eq!(timeouts(&set.post_tool_use), vec![60]);
+        assert_eq!(timeouts(&set.user_prompt_submit), vec![60]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hooks_are_registered_to_be_stopped_when_the_engine_exits() {
+        let hooks = Hooks::from_value(&json!({ "stop": [{ "command": "echo $$" }] }));
+        let messages = hooks.stop(Path::new("."));
+        let pid = messages[0]
+            .strip_prefix("hook (stop): ")
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .unwrap_or_else(|| panic!("{messages:?}"));
+        assert!(crate::tools::is_tracked_tool_group(pid));
     }
 
     #[test]

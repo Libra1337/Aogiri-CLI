@@ -1652,3 +1652,56 @@ fn context_breakdown_counts_the_prompt_tools_and_conversation_by_kind() {
     assert_eq!(tokens("Memory files"), None);
     assert!(memory_files.is_empty());
 }
+
+#[test]
+fn a_rewind_takes_a_post_tool_hooks_rewrite_for_the_sessions_own_edit() {
+    let _guard = setup();
+    let dir = temp_dir("rewind-hook");
+    fs::write(dir.join("notes.txt"), "v0\n").unwrap();
+    fs::create_dir_all(dir.join(".lynshen")).unwrap();
+    // A formatter that rewrites what the edit wrote.
+    fs::write(
+        dir.join(".lynshen/hooks.json"),
+        serde_json::json!({
+            "post_tool_use": [{ "command": "echo formatted> notes.txt", "tools": ["hashline_edit"] }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.handle_command("/trust yes");
+
+    core.submit_user_message(r#"CALL read {"path":"notes.txt"}"#.to_string());
+    pump(&mut core, is_ready);
+    let edit = serde_json::json!({
+        "path": "notes.txt",
+        "edits": [{ "op": "replace", "pos": 1, "lines": ["v1"] }]
+    });
+    core.submit_user_message(format!("CALL hashline_edit {edit}"));
+    pump(&mut core, is_ready);
+    assert!(fs::read_to_string(dir.join("notes.txt"))
+        .unwrap()
+        .starts_with("formatted"));
+
+    let (_, events) = core.handle_command("/rewind");
+    let turn = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::CheckpointView(turns) => turns
+                .iter()
+                .find(|turn| turn.label.starts_with("CALL read"))
+                .map(|turn| turn.id.clone()),
+            _ => None,
+        })
+        .expect("the read turn");
+    let (_, events) = core.handle_command(&format!("/rewind {turn}"));
+    let info = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::Info(text) if text.starts_with("rewound") => Some(text.clone()),
+            _ => None,
+        })
+        .expect("rewound");
+    assert_eq!(info, "rewound · restored 1 file(s), removed 0");
+    assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "v0\n");
+}

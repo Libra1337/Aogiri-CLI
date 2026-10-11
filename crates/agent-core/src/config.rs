@@ -149,6 +149,13 @@ impl ApprovalMode {
         false
     }
 
+    /// `requires_approval` for a `checkpoint` restore with `force`: it may
+    /// overwrite a change the session cannot tell is its own (the user's,
+    /// say), so every mode but full access asks.
+    pub fn requires_approval_for_forced_restore(&self) -> bool {
+        *self != Self::FullAccess
+    }
+
     /// `requires_approval` for a host tool gated as `gate`.
     pub fn requires_approval_for_host(&self, gate: crate::host::HostGate) -> bool {
         use crate::host::HostGate;

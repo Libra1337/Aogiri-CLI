@@ -2149,7 +2149,9 @@ impl AgentCore {
         if target.trim().is_empty() {
             return vec![AgentEvent::Error("merge_agent requires target".to_string())];
         }
-        let _ = self.subagent_manager.merge_agent(ROOT_PATH, target, action);
+        let _ = self
+            .subagent_manager
+            .merge_agent(ROOT_PATH, target, action, &self.tool_state);
         self.team_op_events(None)
     }
 
@@ -2180,7 +2182,7 @@ impl AgentCore {
         }
         let error = self
             .subagent_manager
-            .pick_attempt(ROOT_PATH, group, target)
+            .pick_attempt(ROOT_PATH, group, target, &self.tool_state)
             .err();
         self.team_op_events(error)
     }
@@ -2851,9 +2853,19 @@ impl AgentCore {
                 .host
                 .as_ref()
                 .and_then(|host| host.gate_of(&request.name));
+            // "Always allow checkpoint" was given for a plain restore: a
+            // forced one is asked every time.
             let allowlisted = gate != Some(crate::host::HostGate::Ask)
-                && self.approved_tools.contains(&request.name);
-            if allowlisted || !requires_approval(self.approval_mode.get(), gate, &request.name) {
+                && self.approved_tools.contains(&request.name)
+                && !crate::tools::is_forced_restore(&request.name, &request.arguments);
+            if allowlisted
+                || !requires_approval(
+                    self.approval_mode.get(),
+                    gate,
+                    &request.name,
+                    &request.arguments,
+                )
+            {
                 let _ = request.response_tx.send(ApprovalDecision::allow_all());
                 continue;
             }
@@ -3095,14 +3107,22 @@ impl AgentCore {
             let text = |key: &str| args[key].as_str().unwrap_or_default().to_string();
             let result = if action.name == "pick_attempt" {
                 if self.subagent_manager.team_v2_now() {
-                    self.subagent_manager
-                        .pick_attempt(ROOT_PATH, &text("group"), &text("target"))
+                    self.subagent_manager.pick_attempt(
+                        ROOT_PATH,
+                        &text("group"),
+                        &text("target"),
+                        &self.tool_state,
+                    )
                 } else {
                     Err(crate::llm::team_v2_off("pick_attempt"))
                 }
             } else {
-                self.subagent_manager
-                    .merge_agent(ROOT_PATH, &text("target"), &text("action"))
+                self.subagent_manager.merge_agent(
+                    ROOT_PATH,
+                    &text("target"),
+                    &text("action"),
+                    &self.tool_state,
+                )
             };
             let (output, is_error) = match result {
                 Ok(value) => (value.to_string(), false),
@@ -3127,6 +3147,7 @@ impl AgentCore {
         let host = self.host.clone().filter(|host| host.has_tool(&action.name));
         self.actions_running += 1;
         thread::spawn(move || {
+            tool_state.collect_checkpoints();
             let result = if let Some(host) = host {
                 let (output, is_error) =
                     (host.run_tool)(&action.name, &action.arguments, &AtomicBool::new(false));
@@ -3172,6 +3193,7 @@ impl AgentCore {
                 )
             };
             hooks.post_tool(&action.name, &result.output, &action.cwd);
+            tool_state.settle_checkpoints();
             let _ = tx.send(ActionOutcome {
                 action,
                 output: result.model_output,
@@ -3217,7 +3239,7 @@ impl AgentCore {
             .iter()
             .filter(|(_, pending)| {
                 let gate = host.and_then(|host| host.gate_of(&pending.name));
-                !requires_approval(mode, gate, &pending.name)
+                !requires_approval(mode, gate, &pending.name, &pending.arguments)
             })
             .map(|(call, _)| call.clone())
             .collect();
@@ -5441,9 +5463,17 @@ fn parse_hunk_id_list(list: &str) -> Result<Vec<String>, String> {
 
 /// Whether a call to `name` needs a person under `mode`: a host tool by
 /// its `gate`, any other tool by its class.
-fn requires_approval(mode: ApprovalMode, gate: Option<crate::host::HostGate>, name: &str) -> bool {
+fn requires_approval(
+    mode: ApprovalMode,
+    gate: Option<crate::host::HostGate>,
+    name: &str,
+    arguments: &str,
+) -> bool {
     match gate {
         Some(gate) => mode.requires_approval_for_host(gate),
+        None if crate::tools::is_forced_restore(name, arguments) => {
+            mode.requires_approval_for_forced_restore()
+        }
         None => mode.requires_approval(name),
     }
 }
@@ -5737,6 +5767,36 @@ mod approval_decision_tests {
                 if title == "Snake" && append == "## Goal"
         ));
     }
+
+    #[test]
+    fn the_engine_lets_a_forced_restore_through_unasked_only_in_full_access() {
+        let forced = json!({ "action": "restore", "id": "cp-1", "force": true }).to_string();
+        let plain = json!({ "action": "restore", "id": "cp-1" }).to_string();
+        for mode in [
+            ApprovalMode::Manual,
+            ApprovalMode::Plan,
+            ApprovalMode::AutoEdit,
+            ApprovalMode::Auto,
+        ] {
+            assert!(
+                requires_approval(mode, None, "checkpoint", &forced),
+                "{mode:?}"
+            );
+        }
+        assert!(!requires_approval(
+            ApprovalMode::FullAccess,
+            None,
+            "checkpoint",
+            &forced
+        ));
+        assert!(!requires_approval(
+            ApprovalMode::AutoEdit,
+            None,
+            "checkpoint",
+            &plain
+        ));
+    }
+
     use std::sync::mpsc::TryRecvError;
 
     fn pending(

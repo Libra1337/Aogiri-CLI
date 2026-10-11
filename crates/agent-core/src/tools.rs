@@ -239,8 +239,13 @@ fn with_function_tool_defaults(mut definitions: Vec<Value>) -> Vec<Value> {
 
 #[cfg(test)]
 thread_local! {
-    /// One tracker per test thread, standing in for an engine's.
-    static TEST_STATE: ToolState = ToolState::default();
+    /// One tracker per test thread, standing in for an engine's (in a
+    /// session of its own).
+    static TEST_STATE: ToolState = {
+        let state = ToolState::default();
+        state.set_session_id("test-session");
+        state
+    };
 }
 
 #[cfg(test)]
@@ -534,14 +539,9 @@ fn str_replace_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         }
     };
 
-    // A CRLF file is matched and edited with LF line breaks and written back
-    // with CRLF throughout, so an edit cannot leave mixed line endings.
-    let crlf = uses_crlf(&original);
-    let text = if crlf {
-        original.replace("\r\n", "\n")
-    } else {
-        original.clone()
-    };
+    // Matched and edited with LF line breaks; see LfText for the line
+    // endings written back.
+    let text = LfText::new(&original);
     let mut replacements = Vec::new();
     for edit in edits {
         let Some(old_text) = edit.get("oldText").and_then(Value::as_str) else {
@@ -553,16 +553,13 @@ fn str_replace_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         if old_text.is_empty() {
             return json!({ "path": path.display().to_string(), "error": "oldText must not be empty" });
         }
-        let (find, new_text) = if crlf {
-            (
-                old_text.replace("\r\n", "\n"),
-                new_text.replace("\r\n", "\n"),
-            )
+        let find = if text.has_crlf() {
+            old_text.replace("\r\n", "\n")
         } else {
-            (old_text.to_string(), new_text.to_string())
+            old_text.to_string()
         };
 
-        let matches = text.match_indices(find.as_str()).collect::<Vec<_>>();
+        let matches = text.lf.match_indices(find.as_str()).collect::<Vec<_>>();
         if matches.len() != 1 {
             return json!({
                 "path": path.display().to_string(),
@@ -581,21 +578,16 @@ fn str_replace_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         }
     }
 
-    let mut output = String::with_capacity(text.len());
-    let mut cursor = 0usize;
-    for (start, end, new_text) in &replacements {
-        output.push_str(&text[cursor..*start]);
-        output.push_str(new_text);
-        cursor = *end;
-    }
-    output.push_str(&text[cursor..]);
-    if crlf {
-        output = to_crlf(&output);
-    }
+    let output = text.apply(
+        &original,
+        replacements
+            .iter()
+            .map(|(start, end, new_text)| (*start, *end, *new_text)),
+    );
 
-    let checkpoint = begin_checkpoint(cwd, "auto-edit", std::slice::from_ref(&path));
+    let checkpoint = begin_checkpoint(cwd, "auto-edit", std::slice::from_ref(&path), state);
     let written = fs::write(&path, &output);
-    let _ = checkpoint.save(cwd, state);
+    let _ = checkpoint.and_then(|checkpoint| checkpoint.finish(state));
     match written {
         Ok(()) => {
             state.mark_read(&path);
@@ -671,9 +663,14 @@ fn hashline_edit_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         }
     };
 
-    let checkpoint = begin_checkpoint(cwd, "auto-hashline-edit", std::slice::from_ref(&path));
+    let checkpoint = begin_checkpoint(
+        cwd,
+        "auto-hashline-edit",
+        std::slice::from_ref(&path),
+        state,
+    );
     let written = fs::write(&path, &output);
-    let _ = checkpoint.save(cwd, state);
+    let _ = checkpoint.and_then(|checkpoint| checkpoint.finish(state));
     match written {
         Ok(()) => {
             state.mark_read(&path);
@@ -733,9 +730,9 @@ fn write_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         }
     }
 
-    let checkpoint = begin_checkpoint(cwd, "auto-write", std::slice::from_ref(&path));
+    let checkpoint = begin_checkpoint(cwd, "auto-write", std::slice::from_ref(&path), state);
     let written = fs::write(&path, content);
-    let _ = checkpoint.save(cwd, state);
+    let _ = checkpoint.and_then(|checkpoint| checkpoint.finish(state));
     match written {
         Ok(()) => {
             state.mark_read(&path);
@@ -751,7 +748,7 @@ fn write_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
 }
 
 /// Whether a file's text uses CRLF line breaks: most of its line breaks
-/// are CRLF. Edits write such a file back with CRLF throughout.
+/// are CRLF. The lines an edit inserts into such a file get CRLF.
 fn uses_crlf(text: &str) -> bool {
     let crlf = text.matches("\r\n").count();
     crlf > 0 && crlf * 2 > text.matches('\n').count()
@@ -761,6 +758,67 @@ fn to_crlf(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
+/// A file's text with its CRLF line breaks read as LF, so an edit is
+/// matched and made with LF line breaks and then applied to the original:
+/// text outside the edit keeps its bytes, and the text it inserts gets the
+/// file's main line ending (`uses_crlf`). A file without CRLF is edited as
+/// it is.
+struct LfText {
+    lf: String,
+    /// Offsets in `lf` of the line feeds that were CRLF.
+    crlf_at: Vec<usize>,
+    crlf: bool,
+}
+
+impl LfText {
+    fn new(original: &str) -> Self {
+        let mut lf = String::with_capacity(original.len());
+        let mut crlf_at = Vec::new();
+        let mut rest = original;
+        while let Some(at) = rest.find("\r\n") {
+            lf.push_str(&rest[..at]);
+            crlf_at.push(lf.len());
+            lf.push('\n');
+            rest = &rest[at + 2..];
+        }
+        lf.push_str(rest);
+        Self {
+            lf,
+            crlf_at,
+            crlf: uses_crlf(original),
+        }
+    }
+
+    fn has_crlf(&self) -> bool {
+        !self.crlf_at.is_empty()
+    }
+
+    /// `original` with each `(start, end, replacement)` applied: offsets in
+    /// `lf`, in order and not overlapping.
+    fn apply<'a>(
+        &self,
+        original: &str,
+        edits: impl IntoIterator<Item = (usize, usize, &'a str)>,
+    ) -> String {
+        let to_original = |offset: usize| offset + self.crlf_at.partition_point(|&at| at < offset);
+        let mut output = String::with_capacity(original.len());
+        let mut cursor = 0;
+        for (start, end, replacement) in edits {
+            output.push_str(&original[cursor..to_original(start)]);
+            if !self.has_crlf() {
+                output.push_str(replacement);
+            } else if self.crlf {
+                output.push_str(&to_crlf(replacement));
+            } else {
+                output.push_str(&replacement.replace("\r\n", "\n"));
+            }
+            cursor = to_original(end);
+        }
+        output.push_str(&original[cursor..]);
+        output
+    }
+}
+
 /// Applies hashline edits to `original` without touching the filesystem.
 /// Shared by `hashline_edit` itself and hunk planning for selective approval
 /// (which previews each edit in isolation).
@@ -768,25 +826,19 @@ pub(crate) fn apply_hashline_edits_preview(
     original: &str,
     raw_edits: &[Value],
 ) -> Result<String, String> {
-    // Edits are made with LF line breaks; a CRLF file gets CRLF throughout
-    // again (line numbers and anchors are the same either way).
-    if uses_crlf(original) {
-        let output = apply_hashline_edits_lf(&original.replace("\r\n", "\n"), raw_edits)?;
-        return Ok(to_crlf(&output));
-    }
-    apply_hashline_edits_lf(original, raw_edits)
-}
-
-fn apply_hashline_edits_lf(original: &str, raw_edits: &[Value]) -> Result<String, String> {
+    // Made with LF line breaks (line numbers and anchors are the same
+    // either way); see LfText for the line endings written back.
+    let text = LfText::new(original);
     let edits = parse_hashline_edits(raw_edits)?;
-    let line_index = LineIndex::new(original);
+    let line_index = LineIndex::new(&text.lf);
     validate_hashline_anchors(&edits, &line_index)?;
-    let spans = resolve_hashline_spans(&edits, original, &line_index)?;
-    let mut output = original.to_string();
-    for span in spans.iter().rev() {
-        output.replace_range(span.start..span.end, &span.replacement);
-    }
-    Ok(output)
+    let spans = resolve_hashline_spans(&edits, &text.lf, &line_index)?;
+    Ok(text.apply(
+        original,
+        spans
+            .iter()
+            .map(|span| (span.start, span.end, span.replacement.as_str())),
+    ))
 }
 
 fn parse_hashline_edits(raw_edits: &[Value]) -> Result<Vec<HashlineEdit>, String> {
@@ -1770,16 +1822,25 @@ pub(crate) fn kill_child(child: &mut Child) {
     }
 }
 
-/// Process groups of the tool commands this process started (each child is
-/// a group leader). Entries are never removed; `terminate_tool_processes`
-/// signals only leaders that are still unreaped children of this process, so
-/// a stale entry whose pid was reused is skipped.
+/// Process groups of the tool commands and hooks this process started (each
+/// child is a group leader). Entries are never removed;
+/// `terminate_tool_processes` signals only leaders that are still unreaped
+/// children of this process, so a stale entry whose pid was reused is
+/// skipped.
 static TOOL_GROUPS: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
 
-fn track_tool_group(pid: u32) {
+pub(crate) fn track_tool_group(pid: u32) {
     if let Ok(mut groups) = TOOL_GROUPS.get_or_init(|| Mutex::new(Vec::new())).lock() {
         groups.push(pid);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn is_tracked_tool_group(pid: u32) -> bool {
+    TOOL_GROUPS
+        .get()
+        .and_then(|groups| groups.lock().ok().map(|groups| groups.contains(&pid)))
+        .unwrap_or(false)
 }
 
 /// Ends every tool command this process started that is still running —
@@ -2320,7 +2381,7 @@ fn apply_patch(
     match check {
         Ok(_) => {
             // Snapshot the patch's target files (pre-apply) so /rewind can undo it.
-            let checkpoint = begin_checkpoint(cwd, "auto-patch", &targets);
+            let checkpoint = begin_checkpoint(cwd, "auto-patch", &targets, state);
             let result = run_command_events(
                 "git",
                 &["apply", "--whitespace=nowarn", "-"],
@@ -2329,7 +2390,7 @@ fn apply_patch(
                 Duration::from_secs(30),
                 emit,
             );
-            let _ = checkpoint.save(cwd, state);
+            let _ = checkpoint.and_then(|checkpoint| checkpoint.finish(state));
             let mut value = command_result_json("git apply", result);
             value["applied"] = json!(value.get("exit_code").and_then(Value::as_i64) == Some(0));
             if value["applied"].as_bool().unwrap_or(false) {
@@ -2739,6 +2800,9 @@ pub struct ToolState {
     /// A worktree subagent's (worktree, project): its shell commands start
     /// inside the worktree and write nowhere else (see `wrap_confined`).
     confine: Option<Arc<(PathBuf, PathBuf)>>,
+    /// The checkpoints this agent's current batch of tool calls saved, for
+    /// `settle_checkpoints`; None outside a batch.
+    batch: Arc<Mutex<Option<Vec<SavedCheckpoint>>>>,
 }
 
 enum ReadCheck {
@@ -2881,6 +2945,7 @@ impl ToolState {
             inner: self.inner.clone(),
             reads: Arc::default(),
             confine: self.confine.clone(),
+            batch: Arc::default(),
         }
     }
 
@@ -2891,6 +2956,41 @@ impl ToolState {
             inner: self.inner.clone(),
             reads: Arc::default(),
             confine: Some(Arc::new((root, project))),
+            batch: Arc::default(),
+        }
+    }
+
+    /// Starts a batch of tool calls whose post-tool hooks run once they are
+    /// done: the checkpoints the calls save are kept for
+    /// `settle_checkpoints`.
+    pub(crate) fn collect_checkpoints(&self) {
+        if let Ok(mut batch) = self.batch.lock() {
+            *batch = Some(Vec::new());
+        }
+    }
+
+    /// Ends the batch once its post-tool hooks have run: each of its
+    /// checkpoints records what its files hold now as `after`, so a hook
+    /// that rewrote them (a formatter, say) counts as part of this session's
+    /// edit, not as a later change a rewind must leave alone.
+    pub(crate) fn settle_checkpoints(&self) {
+        let saved = self
+            .batch
+            .lock()
+            .ok()
+            .and_then(|mut batch| batch.take())
+            .unwrap_or_default();
+        for checkpoint in saved {
+            let _ = checkpoint.record_after_again();
+        }
+    }
+
+    /// Outside a batch nothing is kept: no hook runs after the edit.
+    fn collect_checkpoint(&self, saved: SavedCheckpoint) {
+        if let Ok(mut batch) = self.batch.lock() {
+            if let Some(batch) = batch.as_mut() {
+                batch.push(saved);
+            }
         }
     }
 
@@ -2946,23 +3046,45 @@ impl ToolState {
     }
 }
 
-/// Files referenced by a unified diff's `---`/`+++` headers, for pre-apply
-/// snapshotting. `/dev/null` (creations/deletions) is skipped on its own line
-/// but the counterpart path is kept, so created and deleted files are captured.
+/// Files a unified diff changes, creates or deletes, for the workspace and
+/// read checks and the pre-apply snapshot: the paths of its `---`/`+++`
+/// headers (`/dev/null` aside), of git's `rename from`, `rename to` and
+/// `copy to` lines, and of a `diff --git a/x b/x` header (a mode change or an
+/// empty file has nothing else). A copy's source does not change and is left
+/// out. Hunk lines are skipped by their header's line counts, as git reads
+/// them, so a removed line that starts like a header is not taken for one.
 fn patch_target_paths(patch: &str, cwd: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
+    let (mut old_left, mut new_left) = (0usize, 0usize);
     for line in patch.lines() {
-        let Some(rest) = line
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if old_left > 0 || new_left > 0 {
+            count_hunk_line(line, &mut old_left, &mut new_left);
+            continue;
+        }
+        let path = if line.starts_with("@@") {
+            (_, old_left, new_left) = hunk_header(line).unwrap_or_default();
+            None
+        } else if let Some(rest) = line
             .strip_prefix("--- ")
             .or_else(|| line.strip_prefix("+++ "))
-        else {
-            continue;
+        {
+            patch_header_path(rest, cwd)
+        } else if let Some(rest) = line
+            .strip_prefix("rename from ")
+            .or_else(|| line.strip_prefix("rename to "))
+            .or_else(|| line.strip_prefix("copy to "))
+        {
+            Some(resolve_path(cwd, rest))
+        } else if let Some(rest) = line.strip_prefix("diff --git ") {
+            git_header_path(rest).map(|rel| resolve_path(cwd, rel))
+        } else {
+            None
         };
-        let Some(abs) = patch_header_path(rest, cwd) else {
-            continue;
-        };
-        if !paths.contains(&abs) {
-            paths.push(abs);
+        if let Some(abs) = path {
+            if !paths.contains(&abs) {
+                paths.push(abs);
+            }
         }
     }
     paths
@@ -2981,82 +3103,136 @@ fn patch_header_path(rest: &str, cwd: &Path) -> Option<PathBuf> {
     Some(resolve_path(cwd, rel))
 }
 
-/// `patch` with the hunk lines for each file that uses CRLF given CRLF
-/// endings, so git apply matches the file's lines and adds lines in its
-/// style. Hunks are delimited by their header's line counts, as git reads
-/// them; a line followed by a "\ No newline" marker keeps its ending.
+/// The path of a `diff --git a/x b/x` header whose two sides are the same
+/// file; a rename or a copy names its paths on lines of their own.
+fn git_header_path(rest: &str) -> Option<&str> {
+    let rest = rest.strip_prefix("a/")?;
+    let half = rest.len().checked_sub(3)? / 2;
+    let (old, new) = (rest.get(..half)?, rest.get(half..)?);
+    (new.strip_prefix(" b/")? == old && !old.is_empty()).then_some(old)
+}
+
+/// Counts one line of a hunk against the old and new lines it has left.
+fn count_hunk_line(line: &str, old_left: &mut usize, new_left: &mut usize) {
+    match line.as_bytes().first() {
+        Some(b'+') => *new_left = new_left.saturating_sub(1),
+        Some(b'-') => *old_left = old_left.saturating_sub(1),
+        Some(b'\\') => {}
+        _ => {
+            *old_left = old_left.saturating_sub(1);
+            *new_left = new_left.saturating_sub(1);
+        }
+    }
+}
+
+/// `patch` with the hunk lines for each file that has CRLF line breaks
+/// given the endings git apply has to see: a context or removed line the
+/// ending of the file line it stands for, an added line the file's main
+/// ending (`uses_crlf`). A line followed by a "\ No newline" marker keeps its
+/// ending, and an empty context line gets the space git expects before a
+/// CR. A file without CRLF gets its hunks as they are.
 fn patch_for_line_endings(patch: &str, cwd: &Path) -> String {
     let lines = patch.split_inclusive('\n').collect::<Vec<_>>();
     let mut out = String::with_capacity(patch.len() + patch.len() / 16);
-    let mut crlf = false;
+    // Per line of the current file whether it ends with CRLF, and its main
+    // ending; None for a file without CRLF.
+    let mut endings: Option<(Vec<bool>, bool)> = None;
+    let mut old_line = 0usize;
     let (mut old_left, mut new_left) = (0usize, 0usize);
     for (index, line) in lines.iter().enumerate() {
         let text = line.strip_suffix('\n').unwrap_or(line);
         let text = text.strip_suffix('\r').unwrap_or(text);
         if old_left == 0 && new_left == 0 {
             if let Some(rest) = text.strip_prefix("--- ") {
-                crlf = patch_header_path(rest, cwd)
+                endings = patch_header_path(rest, cwd)
                     .and_then(|path| fs::read_to_string(path).ok())
-                    .is_some_and(|content| uses_crlf(&content));
+                    .filter(|content| content.contains("\r\n"))
+                    .map(|content| {
+                        let lines = content
+                            .split_inclusive('\n')
+                            .map(|line| line.ends_with("\r\n"))
+                            .collect();
+                        (lines, uses_crlf(&content))
+                    });
             } else if text.starts_with("@@") {
-                (old_left, new_left) = hunk_line_counts(text).unwrap_or((0, 0));
+                let (old_start, old_count, new_count) = hunk_header(text).unwrap_or_default();
+                (old_left, new_left) = (old_count, new_count);
+                old_line = old_start.saturating_sub(1);
             }
             out.push_str(line);
             continue;
         }
-        match text.as_bytes().first() {
-            Some(b'+') => new_left = new_left.saturating_sub(1),
-            Some(b'-') => old_left = old_left.saturating_sub(1),
-            Some(b'\\') => {}
+        let kind = text.as_bytes().first().copied();
+        count_hunk_line(text, &mut old_left, &mut new_left);
+        let Some((file_lines, main_crlf)) = &endings else {
+            out.push_str(line);
+            continue;
+        };
+        let crlf = match kind {
+            Some(b'+') => *main_crlf,
+            Some(b'\\') => false,
             _ => {
-                old_left = old_left.saturating_sub(1);
-                new_left = new_left.saturating_sub(1);
+                old_line += 1;
+                file_lines.get(old_line - 1).copied().unwrap_or(*main_crlf)
             }
-        }
-        let keeps_ending = text.starts_with('\\')
+        };
+        let keeps_ending = kind == Some(b'\\')
             || !line.ends_with('\n')
             || lines
                 .get(index + 1)
                 .is_some_and(|next| next.starts_with('\\'));
-        if crlf && !keeps_ending {
-            out.push_str(text);
-            out.push_str("\r\n");
-        } else {
+        if keeps_ending {
             out.push_str(line);
+            continue;
         }
+        out.push_str(if text.is_empty() { " " } else { text });
+        out.push_str(if crlf { "\r\n" } else { "\n" });
     }
     out
 }
 
-/// The old and new line counts of a hunk header `@@ -a,b +c,d @@`; a range
-/// without a count has one line.
-fn hunk_line_counts(header: &str) -> Option<(usize, usize)> {
+/// The old start line and the old and new line counts of a hunk header
+/// `@@ -a,b +c,d @@`; a range without a count has one line.
+fn hunk_header(header: &str) -> Option<(usize, usize, usize)> {
     let mut ranges = header.split_whitespace().skip(1);
-    let count = |range: &str, sign: char| -> Option<usize> {
-        match range.strip_prefix(sign)?.split_once(',') {
-            Some((_, count)) => count.parse().ok(),
-            None => Some(1),
+    let range = |range: &str, sign: char| -> Option<(usize, usize)> {
+        let range = range.strip_prefix(sign)?;
+        match range.split_once(',') {
+            Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+            None => Some((range.parse().ok()?, 1)),
         }
     };
-    Some((count(ranges.next()?, '-')?, count(ranges.next()?, '+')?))
+    let (old_start, old_count) = range(ranges.next()?, '-')?;
+    let (_, new_count) = range(ranges.next()?, '+')?;
+    Some((old_start, old_count, new_count))
 }
 
-/// Files as they were before an edit. `save` writes the checkpoint once the
-/// edit has run, with the session that took it and a hash of what the edit
-/// left in each file (`after`), so a rewind can tell whether anyone changed
-/// a file after this session did.
+/// A checkpoint whose snapshot is on disk: `begin_checkpoint` writes the
+/// files as they are before an edit, with the session that took it, so a
+/// crash during the edit loses nothing. `finish` adds, once the edit has
+/// run, a hash of what it left in each file (`after`), so a rewind can tell
+/// whether anyone changed a file after this session did.
 pub(crate) struct PendingCheckpoint {
-    id: String,
-    name: String,
-    created_at: u64,
-    /// (workspace-relative label, absolute path, content before the edit).
-    files: Vec<(String, PathBuf, Value)>,
-    bytes: usize,
+    saved: SavedCheckpoint,
+    checkpoint: Value,
 }
 
-pub(crate) fn begin_checkpoint(cwd: &Path, name: &str, paths: &[PathBuf]) -> PendingCheckpoint {
+/// A checkpoint file and the files it captured, with the `after` each one
+/// got (see `after_value`).
+struct SavedCheckpoint {
+    path: PathBuf,
+    files: Vec<(PathBuf, Option<Value>)>,
+}
+
+pub(crate) fn begin_checkpoint(
+    cwd: &Path,
+    name: &str,
+    paths: &[PathBuf],
+    state: &ToolState,
+) -> io::Result<PendingCheckpoint> {
     let id = format!("cp-{}", now_nanos());
     let mut files = Vec::new();
+    let mut captured = Vec::new();
     let mut bytes = 0usize;
     for path in paths {
         let abs = resolve_existing_or_future(cwd, path);
@@ -3074,65 +3250,110 @@ pub(crate) fn begin_checkpoint(cwd: &Path, name: &str, paths: &[PathBuf]) -> Pen
             Err(_) if abs.exists() => json!({ "unreadable": true }),
             Err(_) => Value::Null,
         };
-        files.push((rel, abs, content));
+        files.push(json!({ "path": rel, "content": content }));
+        captured.push((abs, None));
     }
-    PendingCheckpoint {
-        id,
-        name: name.to_string(),
-        created_at: now_secs(),
-        files,
-        bytes,
+    let mut checkpoint = json!({
+        "id": id,
+        "name": name,
+        "created_at": now_secs(),
+        "files": files,
+        "bytes": bytes,
+    });
+    if let Some(session) = state.session_id() {
+        checkpoint["session_id"] = json!(session);
     }
+    let dir = checkpoint_dir(cwd);
+    fs::create_dir_all(&dir)?;
+    // Keep .lynshen out of the user's git history.
+    let ignore = cwd.join(".lynshen").join(".gitignore");
+    if !ignore.exists() {
+        let _ = fs::write(&ignore, "*\n");
+    }
+    let path = dir.join(format!("{id}.json"));
+    write_checkpoint(&path, &checkpoint)?;
+    prune_checkpoints(&dir);
+    Ok(PendingCheckpoint {
+        saved: SavedCheckpoint {
+            path,
+            files: captured,
+        },
+        checkpoint,
+    })
 }
 
 impl PendingCheckpoint {
-    pub(crate) fn save(self, cwd: &Path, state: &ToolState) -> io::Result<Value> {
-        let files = self
+    /// Records `after` for each file; returns what the checkpoint tool
+    /// reports. Within a batch of tool calls the files are hashed again once
+    /// its post-tool hooks have run (`ToolState::settle_checkpoints`).
+    pub(crate) fn finish(mut self, state: &ToolState) -> io::Result<Value> {
+        let files = self.checkpoint["files"].as_array_mut();
+        for (file, (abs, after)) in files.into_iter().flatten().zip(&mut self.saved.files) {
+            *after = after_value(abs);
+            if let Some(after) = after {
+                file["after"] = after.clone();
+            }
+        }
+        write_checkpoint(&self.saved.path, &self.checkpoint)?;
+        let report = json!({
+            "id": self.checkpoint["id"],
+            "name": self.checkpoint["name"],
+            "files": self.saved.files.len(),
+            "bytes": self.checkpoint["bytes"],
+        });
+        state.collect_checkpoint(self.saved);
+        Ok(report)
+    }
+}
+
+impl SavedCheckpoint {
+    /// Stores what the files hold now as their `after`, when that changed.
+    /// A checkpoint pruned meanwhile is left gone.
+    fn record_after_again(self) -> io::Result<()> {
+        let now = self
             .files
             .iter()
-            .map(|(rel, abs, content)| {
-                let mut file = json!({ "path": rel, "content": content });
-                // No `after` when the file cannot be read now: a rewind then
-                // treats any content as a later change.
-                if let Ok(after) = content_hash(abs) {
-                    file["after"] = json!(after);
-                }
-                file
-            })
+            .map(|(abs, _)| after_value(abs))
             .collect::<Vec<_>>();
-        let count = files.len();
-        let mut checkpoint = json!({
-            "id": self.id,
-            "name": self.name,
-            "created_at": self.created_at,
-            "files": files,
-            "bytes": self.bytes,
-        });
-        if let Some(session) = state.session_id() {
-            checkpoint["session_id"] = json!(session);
+        if now.iter().eq(self.files.iter().map(|(_, after)| after)) {
+            return Ok(());
         }
-        let dir = checkpoint_dir(cwd);
-        fs::create_dir_all(&dir)?;
-        // Keep .lynshen out of the user's git history.
-        let ignore = cwd.join(".lynshen").join(".gitignore");
-        if !ignore.exists() {
-            let _ = fs::write(&ignore, "*\n");
+        let mut checkpoint = serde_json::from_str::<Value>(&fs::read_to_string(&self.path)?)
+            .map_err(io::Error::other)?;
+        let files = checkpoint["files"].as_array_mut();
+        for (file, after) in files.into_iter().flatten().zip(now) {
+            match after {
+                Some(after) => file["after"] = after,
+                None => {
+                    if let Some(file) = file.as_object_mut() {
+                        file.remove("after");
+                    }
+                }
+            }
         }
-        fs::write(
-            dir.join(format!("{}.json", self.id)),
-            format!(
-                "{}\n",
-                serde_json::to_string_pretty(&checkpoint).map_err(io::Error::other)?
-            ),
-        )?;
-        prune_checkpoints(&dir);
-        Ok(json!({
-            "id": self.id,
-            "name": self.name,
-            "files": count,
-            "bytes": self.bytes,
-        }))
+        write_checkpoint(&self.path, &checkpoint)
     }
+}
+
+/// A checkpoint file's `after` for `abs`: its content hash, null when it
+/// does not exist, None when it cannot be read (a rewind then treats any
+/// content as a later change).
+fn after_value(abs: &Path) -> Option<Value> {
+    content_hash(abs).ok().map(|hash| json!(hash))
+}
+
+/// Writes a checkpoint file whole or not at all: through a temporary file
+/// (not `.json`, so nothing reads it as a checkpoint) and a rename.
+fn write_checkpoint(path: &Path, checkpoint: &Value) -> io::Result<()> {
+    let temporary = path.with_extension("json.tmp");
+    fs::write(
+        &temporary,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(checkpoint).map_err(io::Error::other)?
+        ),
+    )?;
+    fs::rename(&temporary, path)
 }
 
 /// A checkpoint of `paths` as they are now, with nothing edited after it.
@@ -3142,7 +3363,7 @@ pub(crate) fn create_checkpoint(
     paths: &[PathBuf],
     state: &ToolState,
 ) -> io::Result<Value> {
-    begin_checkpoint(cwd, name, paths).save(cwd, state)
+    begin_checkpoint(cwd, name, paths, state)?.finish(state)
 }
 
 /// A stable hash of a file's bytes, stored in checkpoints; None when the
@@ -3285,27 +3506,33 @@ fn load_checkpoints(cwd: &Path) -> io::Result<Vec<StoredCheckpoint>> {
     Ok(checkpoints)
 }
 
-/// A checkpoint this session may restore: its own, or one of unknown
-/// origin (restored only when the file is unchanged since).
+/// A checkpoint this session took. One without a session (from an older
+/// version, or taken outside a session) never counts: it cannot be told
+/// apart from another session's.
 fn is_own_checkpoint(checkpoint: &StoredCheckpoint, session: Option<&str>) -> bool {
-    checkpoint.session.is_none() || checkpoint.session.as_deref() == session
+    checkpoint.session.is_some() && checkpoint.session.as_deref() == session
 }
 
 /// One file a restore would put back, from the checkpoints in its range.
 struct RestoreFile {
     rel: String,
     /// Its content in the earliest of this session's checkpoints: text,
-    /// null for "did not exist", or the unreadable marker.
-    content: Value,
+    /// null for "did not exist", or the unreadable marker. None when only
+    /// checkpoints without a session captured it: there is no content known
+    /// to be from before this session's edits.
+    content: Option<Value>,
     /// `after` of this session's latest checkpoint of it: what that edit
     /// left there. None when the checkpoint records none.
     after: Option<Value>,
-    /// Another session's checkpoint of it follows this session's first.
+    /// A checkpoint of it by another session, or without a session,
+    /// follows this session's first.
     edited_by_other: bool,
 }
 
 /// The files this session's checkpoints in `range` (oldest first) captured,
-/// limited to `only` when given.
+/// and those only checkpoints without a session captured (reported, never
+/// restored), limited to `only` when given. Edits other sessions made
+/// before this session's first checkpoint of a file are in its content.
 fn restore_files(
     range: &[StoredCheckpoint],
     session: Option<&str>,
@@ -3322,15 +3549,26 @@ fn restore_files(
             if only.is_some_and(|only| !only.contains(rel)) {
                 continue;
             }
-            match index.get(rel) {
-                Some(&at) if own => files[at].after = file.get("after").cloned(),
-                Some(&at) => files[at].edited_by_other = true,
-                None if own => {
+            let content = || file.get("content").cloned().unwrap_or(Value::Null);
+            match index.get(rel).map(|&at| &mut files[at]) {
+                Some(found) if found.content.is_none() => {
+                    if own {
+                        found.content = Some(content());
+                        found.after = file.get("after").cloned();
+                    }
+                }
+                Some(found) if own => found.after = file.get("after").cloned(),
+                Some(found) => found.edited_by_other = true,
+                None if own || checkpoint.session.is_none() => {
                     index.insert(rel.to_string(), files.len());
                     files.push(RestoreFile {
                         rel: rel.to_string(),
-                        content: file.get("content").cloned().unwrap_or(Value::Null),
-                        after: file.get("after").cloned(),
+                        content: own.then(content),
+                        after: if own {
+                            file.get("after").cloned()
+                        } else {
+                            None
+                        },
                         edited_by_other: false,
                     });
                 }
@@ -3341,19 +3579,20 @@ fn restore_files(
     files
 }
 
-/// Why restoring `file` would overwrite someone else's change, if it
-/// would. `force` accepts a change since this session's last edit (one of
-/// its own commands, say), never another session's checkpointed edit.
-fn restore_conflict(abs: &Path, file: &RestoreFile, force: bool) -> Option<&'static str> {
+/// Why restoring `file` to `content` would overwrite someone else's
+/// change, if it would. `force` accepts a change since this session's last
+/// edit (one of its own commands, say), never another session's
+/// checkpointed edit.
+fn restore_conflict(
+    abs: &Path,
+    content: &Value,
+    file: &RestoreFile,
+    force: bool,
+) -> Option<&'static str> {
     let Ok(current) = content_hash(abs) else {
         return Some("it cannot be read to check for later changes");
     };
-    if current
-        == file
-            .content
-            .as_str()
-            .map(|text| bytes_hash(text.as_bytes()))
-    {
+    if current == content.as_str().map(|text| bytes_hash(text.as_bytes())) {
         return None;
     }
     if file.edited_by_other {
@@ -3368,7 +3607,7 @@ fn restore_conflict(abs: &Path, file: &RestoreFile, force: bool) -> Option<&'sta
             "changed since this session last edited it (by another session, the user, or a command)",
         ),
         None => Some(
-            "its checkpoint does not record what the edit wrote (made by an older version), so a later change cannot be ruled out",
+            "its checkpoint does not record what the edit left (the edit did not finish, or the file could not be read), so a later change cannot be ruled out",
         ),
     }
 }
@@ -3389,13 +3628,20 @@ fn apply_restore(
         if !is_inside(cwd, &abs) {
             continue;
         }
-        if !file.content.is_string() && !file.content.is_null() {
+        let Some(content) = &file.content else {
+            conflicts.push(json!({
+                "path": file.rel,
+                "reason": "only a checkpoint without a session (made by an older version) captured it, so it cannot be told which edits were this session's",
+            }));
+            continue;
+        };
+        if !content.is_string() && !content.is_null() {
             // Unreadable at checkpoint time: never delete, just report it.
             skipped.push(file.rel);
-        } else if let Some(reason) = restore_conflict(&abs, &file, force) {
+        } else if let Some(reason) = restore_conflict(&abs, content, &file, force) {
             conflicts.push(json!({ "path": file.rel, "reason": reason }));
         } else {
-            changes.push((file.rel, abs, file.content));
+            changes.push((file.rel, abs, content.clone()));
         }
     }
     // The restore is this session's edit too: a later rewind compares with
@@ -3404,7 +3650,11 @@ fn apply_restore(
         .iter()
         .map(|(_, abs, _)| abs.clone())
         .collect::<Vec<_>>();
-    let checkpoint = (!paths.is_empty()).then(|| begin_checkpoint(cwd, "auto-restore", &paths));
+    let checkpoint = if paths.is_empty() {
+        None
+    } else {
+        begin_checkpoint(cwd, "auto-restore", &paths, state).ok()
+    };
     let mut restored = Vec::new();
     let mut removed = Vec::new();
     let mut outcome = Ok(());
@@ -3427,7 +3677,7 @@ fn apply_restore(
         }
     }
     if let Some(checkpoint) = checkpoint {
-        let _ = checkpoint.save(cwd, state);
+        let _ = checkpoint.finish(state);
     }
     outcome?;
     let mut warnings = Vec::new();
@@ -3436,7 +3686,7 @@ fn apply_restore(
             .push("some files could not be captured at checkpoint time and were left untouched");
     }
     if !conflicts.is_empty() {
-        warnings.push("some files changed after this session edited them and were left as they are; see conflicts");
+        warnings.push("some files were left as they are so as not to overwrite changes that may not be this session's; see conflicts");
     }
     let mut result = json!({ "restored": restored, "removed": removed, "conflicts": conflicts });
     if !skipped.is_empty() {
@@ -3446,6 +3696,17 @@ fn apply_restore(
         result["warning"] = json!(warnings.join("; "));
     }
     Ok(result)
+}
+
+/// Whether a call is a `checkpoint` restore with `force`, which asks for
+/// approval in more modes than a plain restore
+/// (`ApprovalMode::requires_approval_for_forced_restore`).
+pub(crate) fn is_forced_restore(name: &str, arguments: &str) -> bool {
+    name == "checkpoint"
+        && serde_json::from_str::<Value>(arguments).is_ok_and(|args| {
+            args.get("action").and_then(Value::as_str) == Some("restore")
+                && args.get("force").and_then(Value::as_bool) == Some(true)
+        })
 }
 
 /// Restore the files of checkpoint `id`, which must be this session's, to
@@ -3470,7 +3731,7 @@ pub(crate) fn restore_checkpoint(
     let session = state.session_id();
     if !is_own_checkpoint(&checkpoints[start], session.as_deref()) {
         return Err(io::Error::other(format!(
-            "checkpoint {id} was taken by another session; only this session's checkpoints can be restored"
+            "checkpoint {id} was taken by another session, or by an older version that did not record sessions; only this session's checkpoints can be restored"
         )));
     }
     let only = checkpoints[start]
@@ -4436,6 +4697,8 @@ fn patch_escapes_workdir(patch: &str) -> Option<String> {
         } else if let Some(rest) = line.strip_prefix("rename to ") {
             rest
         } else if let Some(rest) = line.strip_prefix("rename from ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("copy to ") {
             rest
         } else {
             continue;
@@ -5726,47 +5989,123 @@ mod tests {
     }
 
     #[test]
-    fn rewind_restores_unknown_session_checkpoints_only_when_unchanged() {
+    fn rewind_never_restores_from_a_checkpoint_without_a_session() {
         let dir = test_dir("rewind-legacy");
         let cp_dir = dir.join(".lynshen").join("checkpoints");
         fs::create_dir_all(&cp_dir).unwrap();
         let t = now_secs();
-        // An older version wrote neither a session nor `after`.
+        // An older version, in another session, edited x.txt and only.txt:
+        // its checkpoints record neither a session nor `after`.
         let legacy = json!({
             "id": format!("cp-{}", now_nanos()),
             "name": "auto-edit",
             "created_at": t,
-            "files": [{ "path": "legacy.txt", "content": "original" }],
-            "bytes": 8,
+            "files": [
+                { "path": "x.txt", "content": "before b" },
+                { "path": "only.txt", "content": "o0" }
+            ],
+            "bytes": 10,
         });
         fs::write(
             cp_dir.join(format!("{}.json", legacy["id"].as_str().unwrap())),
             legacy.to_string(),
         )
         .unwrap();
-        fs::write(dir.join("legacy.txt"), "edited").unwrap();
-        // Checkpoints taken without a session id but with `after`.
-        fs::write(dir.join("same.txt"), "s0").unwrap();
-        fs::write(dir.join("moved.txt"), "m0").unwrap();
-        let unknown = ToolState::default();
-        write_as(&unknown, &dir, "same.txt", "s1");
-        write_as(&unknown, &dir, "moved.txt", "m1");
-        fs::write(dir.join("moved.txt"), "changed later").unwrap();
+        fs::write(dir.join("x.txt"), "b's change").unwrap();
+        fs::write(dir.join("only.txt"), "o1").unwrap();
+        // Then this session edits x.txt, and later.txt, which a checkpoint
+        // without a session (taken outside any session) captures after it.
+        fs::write(dir.join("later.txt"), "l0").unwrap();
+        let a = session_state("session-a");
+        write_as(&a, &dir, "x.txt", "a's change");
+        write_as(&a, &dir, "later.txt", "l1");
+        write_as(&ToolState::default(), &dir, "later.txt", "l2");
 
-        let rewound = restore_to_timestamp(&dir, t, &session_state("session-a")).unwrap();
-        assert_eq!(rewound["restored"], json!(["same.txt"]), "{rewound}");
+        let rewound = restore_to_timestamp(&dir, t, &a).unwrap();
+        // x.txt goes back to before this session's edit, keeping B's.
+        assert_eq!(rewound["restored"], json!(["x.txt"]), "{rewound}");
+        assert_eq!(fs::read_to_string(dir.join("x.txt")).unwrap(), "b's change");
         let mut conflicts = conflict_paths(&rewound);
         conflicts.sort_unstable();
-        assert_eq!(conflicts, vec!["legacy.txt", "moved.txt"]);
-        assert_eq!(fs::read_to_string(dir.join("same.txt")).unwrap(), "s0");
-        assert_eq!(
-            fs::read_to_string(dir.join("legacy.txt")).unwrap(),
-            "edited"
+        assert_eq!(conflicts, vec!["later.txt", "only.txt"]);
+        assert_eq!(fs::read_to_string(dir.join("only.txt")).unwrap(), "o1");
+        assert_eq!(fs::read_to_string(dir.join("later.txt")).unwrap(), "l2");
+
+        // Nor can the model restore such a checkpoint by its id, forced or not.
+        let refused = call_as(
+            &a,
+            &dir,
+            "checkpoint",
+            json!({ "action": "restore", "id": legacy["id"], "force": true }),
         );
-        assert_eq!(
-            fs::read_to_string(dir.join("moved.txt")).unwrap(),
-            "changed later"
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("older version that did not record sessions"),
+            "{refused}"
         );
+        assert_eq!(fs::read_to_string(dir.join("x.txt")).unwrap(), "b's change");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_post_tool_hooks_rewrite_counts_as_the_edit_only_within_its_batch() {
+        let dir = test_dir("rewind-hook-batch");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("hooked.txt"), "h0").unwrap();
+        fs::write(dir.join("plain.txt"), "p0").unwrap();
+        let a = session_state("session-a");
+        let t = now_secs();
+        a.collect_checkpoints();
+        write_as(&a, &dir, "hooked.txt", "h1");
+        // A formatter hook rewrites the file before the batch settles.
+        fs::write(dir.join("hooked.txt"), "h1 formatted").unwrap();
+        a.settle_checkpoints();
+        // Outside a batch: the user's later change is not taken for a hook's.
+        write_as(&a, &dir, "plain.txt", "p1");
+        fs::write(dir.join("plain.txt"), "the user's change").unwrap();
+        a.collect_checkpoints();
+        a.settle_checkpoints();
+
+        let rewound = restore_to_timestamp(&dir, t, &a).unwrap();
+        assert_eq!(rewound["restored"], json!(["hooked.txt"]), "{rewound}");
+        assert_eq!(fs::read_to_string(dir.join("hooked.txt")).unwrap(), "h0");
+        assert_eq!(conflict_paths(&rewound), vec!["plain.txt"]);
+        assert_eq!(
+            fs::read_to_string(dir.join("plain.txt")).unwrap(),
+            "the user's change"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_snapshot_is_on_disk_before_the_edit_and_survives_an_edit_cut_off() {
+        let dir = test_dir("checkpoint-before-write");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notes.txt");
+        fs::write(&path, "before").unwrap();
+        let a = session_state("session-a");
+        let t = now_secs();
+        let pending = begin_checkpoint(&dir, "auto-edit", std::slice::from_ref(&path), &a).unwrap();
+        let listed = list_checkpoints(&dir).unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        let id = listed[0]["id"].as_str().unwrap().to_string();
+        // The engine dies after writing, before the checkpoint is finished.
+        fs::write(&path, "half-written").unwrap();
+        drop(pending);
+
+        // Not knowing what the edit left, a rewind leaves the file...
+        let rewound = restore_to_timestamp(&dir, t, &a).unwrap();
+        assert_eq!(conflict_paths(&rewound), vec!["notes.txt"], "{rewound}");
+        assert!(rewound["conflicts"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("did not finish"));
+        // ...and the content from before the edit is still there to restore.
+        let restored = restore_checkpoint(&dir, &id, true, &a).unwrap();
+        assert_eq!(restored["restored"], json!(["notes.txt"]), "{restored}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -5776,6 +6115,11 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("notes.txt"), "v0").unwrap();
         let a = session_state("session-a");
+        // Right after a second starts, so the first edit is taken within it.
+        let start = now_secs();
+        while now_secs() == start {
+            thread::sleep(Duration::from_millis(5));
+        }
         let first = now_secs();
         write_as(&a, &dir, "notes.txt", "v1");
         while now_secs() == first {
@@ -6753,6 +7097,188 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("changed on disk since you last read it"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn edits_to_a_file_with_mixed_line_endings_touch_only_the_lines_they_insert() {
+        let dir = test_dir("mixed-endings");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mixed.txt");
+        let call = |name: &str, args: Value| -> Value {
+            serde_json::from_str(&run_tool(name, &args.to_string(), &dir)).unwrap()
+        };
+        let reset = |content: &str| {
+            fs::write(&path, content).unwrap();
+            call("read", json!({ "path": "mixed.txt" }));
+        };
+        let content = || fs::read_to_string(&path).unwrap();
+
+        // Mostly CRLF: the untouched LF line stays LF, new lines get CRLF.
+        reset("l1\r\nl2\r\nl3\nl4\r\n");
+        let edited = call(
+            "str_replace",
+            json!({ "path": "mixed.txt", "edits": [{ "oldText": "l1\nl2", "newText": "one\nl2" }] }),
+        );
+        assert_eq!(edited["edits"], 1, "{edited}");
+        assert_eq!(content(), "one\r\nl2\r\nl3\nl4\r\n");
+
+        reset("l1\r\nl2\r\nl3\nl4\r\n");
+        let edited = call(
+            "hashline_edit",
+            json!({ "path": "mixed.txt", "edits": [{ "op": "replace", "pos": 1, "lines": ["one", "two"] }] }),
+        );
+        assert!(edited.get("error").is_none(), "{edited}");
+        assert_eq!(content(), "one\r\ntwo\r\nl2\r\nl3\nl4\r\n");
+
+        reset("l1\r\nl2\r\nl3\nl4\r\n");
+        let patch =
+            "--- a/mixed.txt\n+++ b/mixed.txt\n@@ -1,4 +1,5 @@\n-l1\n+one\n+two\n l2\n l3\n l4\n";
+        let patched = call("apply_patch", json!({ "patch": patch }));
+        assert_eq!(patched["applied"], true, "{patched}");
+        assert_eq!(content(), "one\r\ntwo\r\nl2\r\nl3\nl4\r\n");
+
+        // Mostly LF: the one CRLF line stays CRLF, new lines get LF.
+        reset("a\nb\r\nc\nd\n");
+        let edited = call(
+            "str_replace",
+            json!({ "path": "mixed.txt", "edits": [{ "oldText": "c", "newText": "C\r\nC2" }] }),
+        );
+        assert_eq!(edited["edits"], 1, "{edited}");
+        assert_eq!(content(), "a\nb\r\nC\nC2\nd\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_crlf_patch_keeps_an_empty_context_line_written_without_its_space() {
+        let dir = test_dir("crlf-empty-context");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("win.txt");
+        fs::write(&path, "a\r\n\r\nb\r\n").unwrap();
+        run_tool("read", &json!({ "path": "win.txt" }).to_string(), &dir);
+        // Models often drop the space of an empty context line.
+        let patch = "--- a/win.txt\n+++ b/win.txt\n@@ -1,3 +1,3 @@\n a\n\n-b\n+c\n";
+        let patched = serde_json::from_str::<Value>(&run_tool(
+            "apply_patch",
+            &json!({ "patch": patch }).to_string(),
+            &dir,
+        ))
+        .unwrap();
+        assert_eq!(patched["applied"], true, "{patched}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a\r\n\r\nc\r\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn patch_targets_include_renames_copies_and_bare_git_headers_but_not_hunk_lines() {
+        let dir = Path::new("/work");
+        let patch = "\
+diff --git a/old.rs b/new.rs
+similarity index 100%
+rename from old.rs
+rename to new.rs
+diff --git a/src.rs b/copy.rs
+similarity index 100%
+copy from src.rs
+copy to copy.rs
+diff --git a/empty.txt b/empty.txt
+new file mode 100644
+diff --git a/run.sh b/run.sh
+old mode 100644
+new mode 100755
+--- a/notes.md
++++ b/notes.md
+@@ -1,2 +1,1 @@
+ keep
+--- not-a-header.md
+";
+        let targets = patch_target_paths(patch, dir);
+        let names = targets
+            .iter()
+            .map(|path| {
+                path.strip_prefix(dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "old.rs",
+                "new.rs",
+                "copy.rs",
+                "empty.txt",
+                "run.sh",
+                "notes.md"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rename_patch_needs_a_read_and_rewind_undoes_it() {
+        let dir = test_dir("rename-patch");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("old.txt"), "content\n").unwrap();
+        let a = session_state("session-a");
+        let rename = |from: &str, to: &str| {
+            format!(
+                "diff --git a/{from} b/{to}\nsimilarity index 100%\nrename from {from}\nrename to {to}\n"
+            )
+        };
+        let t = now_secs();
+        let blind = call_as(
+            &a,
+            &dir,
+            "apply_patch",
+            json!({ "patch": rename("old.txt", "new.txt") }),
+        );
+        assert!(
+            blind["error"]
+                .as_str()
+                .unwrap()
+                .contains("apply_patch requires reading"),
+            "{blind}"
+        );
+        assert!(dir.join("old.txt").exists());
+
+        call_as(&a, &dir, "read", json!({ "path": "old.txt" }));
+        let renamed = call_as(
+            &a,
+            &dir,
+            "apply_patch",
+            json!({ "patch": rename("old.txt", "new.txt") }),
+        );
+        assert_eq!(renamed["applied"], true, "{renamed}");
+        assert!(!dir.join("old.txt").exists());
+
+        let rewound = restore_to_timestamp(&dir, t, &a).unwrap();
+        assert_eq!(rewound["restored"], json!(["old.txt"]), "{rewound}");
+        assert_eq!(rewound["removed"], json!(["new.txt"]));
+        assert_eq!(
+            fs::read_to_string(dir.join("old.txt")).unwrap(),
+            "content\n"
+        );
+        assert!(!dir.join("new.txt").exists());
+
+        // A renamed file changed since is left in place.
+        let t = now_secs();
+        call_as(&a, &dir, "read", json!({ "path": "old.txt" }));
+        let renamed = call_as(
+            &a,
+            &dir,
+            "apply_patch",
+            json!({ "patch": rename("old.txt", "moved.txt") }),
+        );
+        assert_eq!(renamed["applied"], true, "{renamed}");
+        fs::write(dir.join("moved.txt"), "the user's change\n").unwrap();
+        let rewound = restore_to_timestamp(&dir, t, &a).unwrap();
+        assert_eq!(rewound["restored"], json!(["old.txt"]), "{rewound}");
+        assert_eq!(conflict_paths(&rewound), vec!["moved.txt"]);
+        assert_eq!(
+            fs::read_to_string(dir.join("moved.txt")).unwrap(),
+            "the user's change\n"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -331,12 +331,12 @@ fn save(
         crate::tools::write_target(cwd, &path.to_string_lossy(), state)?;
     }
     // Every target is new: rewinding the turn deletes them again.
-    let checkpoint = crate::tools::begin_checkpoint(cwd, "auto-generate-image", &paths);
+    let checkpoint = crate::tools::begin_checkpoint(cwd, "auto-generate-image", &paths, state);
     let written = paths
         .iter()
         .zip(&generated.images)
         .try_for_each(|(path, bytes)| write_new(path, bytes));
-    let _ = checkpoint.save(cwd, state);
+    let _ = checkpoint.and_then(|checkpoint| checkpoint.finish(state));
     written.map(|()| paths)
 }
 
