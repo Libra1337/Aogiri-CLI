@@ -754,10 +754,12 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         // Confirmed by the `session_closed` broadcast once the engine has
         // stopped and released the session.
         ("session_close", Some(session)) => hub.close_session(&session).map(|()| Value::Null),
-        ("watch", Some(session)) => {
+        // A session closed meanwhile (idle, or before a restart) opens again
+        // as with `session_open`, so a watcher always gets its snapshot.
+        ("watch", Some(session)) => hub.open_session(&session, None).map(|()| {
             hub.set_watch(client, &session, true);
-            Ok(json!({ "type": "watching", "session": session, "watching": true }))
-        }
+            json!({ "type": "watching", "session": session, "watching": true })
+        }),
         ("unwatch", Some(session)) => {
             hub.set_watch(client, &session, false);
             Ok(json!({ "type": "watching", "session": session, "watching": false }))

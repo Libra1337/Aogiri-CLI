@@ -560,6 +560,9 @@ struct SubagentRecord {
     context: Option<Vec<Value>>,
     /// What it is doing, for the front-ends' agent trace.
     trace: crate::subagent_trace::SubagentTrace,
+    /// Brought back from the saved team (`restore`): its row is all there
+    /// is of it.
+    restored: bool,
 }
 
 /// Finished agents kept for agent_runs, transcripts and resume_agent.
@@ -743,6 +746,7 @@ impl SubagentManager {
                     attempt: spawn.attempt,
                     spec: None,
                     context: None,
+                    restored: false,
                 },
             );
             state.push_event(&path, "pending", "reserved");
@@ -1057,6 +1061,14 @@ impl SubagentManager {
         let paths = foreground_live(&state, ROOT_PATH);
         close_paths(&mut state, paths, message);
         self.inner.changed.notify_all();
+    }
+
+    /// A subagent works or worked in this engine (a background one outlives
+    /// its turn): its run, transcript and conversation live only here. A
+    /// saved team brings back only its worktree agents' rows (`restore`).
+    pub(crate) fn has_unsaved_runs(&self) -> bool {
+        let state = self.inner.state.lock().unwrap();
+        state.agents.values().any(|agent| !agent.restored)
     }
 
     /// Every live agent stops, background ones too (the session ends).
@@ -1894,6 +1906,7 @@ impl SubagentManager {
                     spec: None,
                     context: None,
                     trace,
+                    restored: true,
                 },
             );
         }
@@ -3823,6 +3836,10 @@ mod tests {
 
         let restored = SubagentManager::restore(AgentsConfig::default(), &saved);
         assert_eq!(restored.board_json(), manager.board_json());
+        // The runs of this engine live only in it; restored rows are all
+        // the saved team has.
+        assert!(manager.has_unsaved_runs());
+        assert!(!restored.has_unsaved_runs());
         let rows = restored.runs_json();
         let ids: Vec<&str> = rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["/root/worker", "/root/busy"]);

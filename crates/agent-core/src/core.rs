@@ -49,6 +49,8 @@ use std::{
 /// turns are folded into the summary.
 const COMPACTION_KEEP_RECENT_TOKENS: usize = 20_000;
 const RESUME_SUMMARY_IDLE_SECONDS: u64 = 5 * 60;
+/// How long a resume summary that could not start waits before another try.
+const RESUME_SUMMARY_RETRY: Duration = Duration::from_secs(10 * 60);
 const RESUME_SUMMARY_MODEL: &str = "gpt-5.4-mini";
 
 /// A gated tool call parked until the client answers `/approve` (or the serve
@@ -62,6 +64,21 @@ struct PendingApproval {
     arguments: String,
     cwd: PathBuf,
     subagent_id: Option<String>,
+}
+
+/// What an engine holds of its session only in memory (see
+/// `AgentCore::kept_state`): the approval and sandbox modes switched for the
+/// session, its "always allow" tools and action decisions, its token and
+/// cost totals and its plan.
+#[derive(Debug, Clone, Default)]
+pub struct KeptState {
+    approval_mode: Option<ApprovalMode>,
+    sandbox_mode: Option<crate::sandbox::SandboxMode>,
+    approved_tools: HashSet<String>,
+    action_decisions: HashMap<String, bool>,
+    /// Input, cached input and output tokens, and cost.
+    totals: (u64, u64, u64, f64),
+    plan: Vec<PlanItem>,
 }
 
 /// Outcome of a deferred action approved and run on a background thread.
@@ -167,7 +184,8 @@ pub struct AgentCore {
     /// loosen the approval mode, never tighten it.
     approved_tools: HashSet<String>,
     /// Session approval mode; starts from config and is switched by /permissions
-    /// or the serve `set_approval_mode` op (session-only, not persisted). The
+    /// or the serve `set_approval_mode` op (session-only, not persisted; a
+    /// host hands it to the session's next engine, see `kept_state`). The
     /// running turn and its subagents share it, so a switch applies at once.
     approval_mode: LiveApprovalMode,
     /// False when no client is watching: gated calls become deferred actions
@@ -177,6 +195,9 @@ pub struct AgentCore {
     deferred_actions: HashMap<String, DeferredAction>,
     /// Decisions by action digest, reused for identical calls in this session.
     action_decisions: HashMap<String, bool>,
+    /// Approved actions still running on their threads: each outcome comes
+    /// back on `action_rx`, and this engine must still be there to read it.
+    actions_running: usize,
     action_tx: Sender<ActionOutcome>,
     action_rx: Receiver<ActionOutcome>,
     update_receiver: Option<Receiver<UpdateNotice>>,
@@ -202,6 +223,9 @@ pub struct AgentCore {
     /// far and how much of the plan text clients were sent.
     plan_draft: Option<PlanDraft>,
     resume_summary_running: bool,
+    /// A resume summary that could not start (no credentials, no client)
+    /// is not tried again before this: the engine polls every 30 ms.
+    resume_summary_retry_at: Option<Instant>,
     interrupt_flag: Arc<AtomicBool>,
     /// The session's agent team: its subagents (background ones outlive a
     /// turn), mail, task board and worktrees to merge.
@@ -337,6 +361,7 @@ impl AgentCore {
             overflow_retried: false,
             plan_draft: None,
             resume_summary_running: false,
+            resume_summary_retry_at: None,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             subagent_manager,
             team_saved: 0,
@@ -360,6 +385,7 @@ impl AgentCore {
             attended: true,
             deferred_actions: HashMap::new(),
             action_decisions: HashMap::new(),
+            actions_running: 0,
             action_tx,
             action_rx,
             mcp,
@@ -2916,6 +2942,77 @@ impl AgentCore {
         self.attended
     }
 
+    /// Nothing runs or waits in this engine: no turn, queued message or
+    /// staged image, no prompt, deferred action or approved action still
+    /// running, no sign-in, plan, goal or resume work, no subagent run here
+    /// (its run lives only in this engine), waiting background result or
+    /// shell. A host may then close it: reopening the session brings back
+    /// its conversation, team board, worktree agents and deferred actions,
+    /// and `kept_state` carries what the engine holds only in memory. MCP
+    /// servers start again with the next engine, without what a server
+    /// kept in its own process.
+    pub fn is_idle(&self) -> bool {
+        !self.running
+            && self.queued.is_empty()
+            && self.pending_images.is_empty()
+            && self.pending_approvals.is_empty()
+            && self.deferred_actions.is_empty()
+            && self.actions_running == 0
+            && self.steered_pending.is_empty()
+            && self.plan_draft.is_none()
+            && self.login_receiver.is_none()
+            && self.omp_login_receiver.is_none()
+            && !self.goal_continuation_running
+            && !self.overflow_retry_pending
+            && !self.resume_summary_running
+            && self.subagent_manager.pending_wake().is_none()
+            && !self.subagent_manager.has_unsaved_runs()
+            && !self.tool_state.has_live_shells()
+    }
+
+    /// What this engine holds of its session only in memory, for the
+    /// session's next engine (`restore_kept_state`) when a host closes this
+    /// one while the session stays in use.
+    pub fn kept_state(&self) -> KeptState {
+        KeptState {
+            approval_mode: Some(self.approval_mode.get()),
+            sandbox_mode: self.tool_state.sandbox().map(|sandbox| sandbox.mode),
+            approved_tools: self.approved_tools.clone(),
+            action_decisions: self.action_decisions.clone(),
+            totals: (
+                self.total_input_tokens,
+                self.total_cached_input_tokens,
+                self.total_output_tokens,
+                self.total_cost,
+            ),
+            plan: self.plan.clone(),
+        }
+    }
+
+    /// Takes back what the session's previous engine kept (`kept_state`).
+    pub fn restore_kept_state(&mut self, kept: KeptState) {
+        if let Some(mode) = kept.approval_mode {
+            self.set_approval_mode(mode);
+        }
+        if let Some(mode) = kept.sandbox_mode {
+            let mut sandbox = self
+                .tool_state
+                .sandbox()
+                .unwrap_or_else(|| self.config.sandbox.clone());
+            sandbox.mode = mode;
+            self.tool_state.set_sandbox(Some(sandbox));
+        }
+        self.approved_tools.extend(kept.approved_tools);
+        self.action_decisions.extend(kept.action_decisions);
+        (
+            self.total_input_tokens,
+            self.total_cached_input_tokens,
+            self.total_output_tokens,
+            self.total_cost,
+        ) = kept.totals;
+        self.plan = kept.plan;
+    }
+
     /// Marks whether a client is watching. Going unattended also converts
     /// calls already waiting on a prompt into deferred actions, so a client
     /// that disconnects mid-prompt never leaves the turn blocked.
@@ -3009,6 +3106,7 @@ impl AgentCore {
         let hooks = self.hooks.clone();
         let tool_state = self.tool_state.clone();
         let host = self.host.clone().filter(|host| host.has_tool(&action.name));
+        self.actions_running += 1;
         thread::spawn(move || {
             let result = if let Some(host) = host {
                 let (output, is_error) =
@@ -3067,6 +3165,7 @@ impl AgentCore {
     fn poll_action_outcomes(&mut self) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         while let Ok(outcome) = self.action_rx.try_recv() {
+            self.actions_running = self.actions_running.saturating_sub(1);
             let action = outcome.action;
             events.push(AgentEvent::ActionDecided {
                 id: action.id.clone(),
@@ -3694,6 +3793,12 @@ impl AgentCore {
         if self.running || self.resume_summary_running || !self.queued.is_empty() {
             return false;
         }
+        if self
+            .resume_summary_retry_at
+            .is_some_and(|at| Instant::now() < at)
+        {
+            return false;
+        }
         let idle_for = now_secs().saturating_sub(self.session.updated_at());
         if idle_for < RESUME_SUMMARY_IDLE_SECONDS {
             return false;
@@ -3720,12 +3825,17 @@ impl AgentCore {
             .goal()
             .map(|goal| normalize_resume_status(goal.status))
             .unwrap_or(ThreadGoalStatus::Active);
-        if self.ensure_provider_credentials().is_err() {
-            return;
-        }
-        let client = match self.resume_summary_client() {
+        let client = match self
+            .ensure_provider_credentials()
+            .and_then(|()| self.resume_summary_client())
+        {
             Ok(client) => client,
-            Err(_) => return,
+            Err(_) => {
+                // Building the input walked the whole conversation and the
+                // client read config.json: not on every poll.
+                self.resume_summary_retry_at = Some(Instant::now() + RESUME_SUMMARY_RETRY);
+                return;
+            }
         };
         let (tx, rx) = mpsc::channel();
         self.resume_summary_receiver = Some(rx);
@@ -3786,6 +3896,7 @@ impl AgentCore {
         // Any in-flight resume summary belongs to the old session; drop it.
         self.resume_summary_receiver = None;
         self.resume_summary_running = false;
+        self.resume_summary_retry_at = None;
         self.session = SessionStore::new();
         self.reset_team();
         // Release the old session's lock and hold the new one.
@@ -4056,7 +4167,7 @@ impl AgentCore {
             .unwrap_or_else(|| provider_id.clone());
         self.auth.set_oauth_credential(&store_id, *credential);
         self.adopt_provider(&provider_id);
-        match self.auth.save().and_then(|_| self.config.save()) {
+        match self.save_login() {
             Ok(()) => vec![
                 AgentEvent::Info(format!(
                     "{name} connected; provider switched to {provider_id}"
@@ -4095,7 +4206,7 @@ impl AgentCore {
         let name = auth_provider.name.clone();
         self.auth.set_key(provider, key.to_string());
         self.adopt_provider(provider);
-        match self.auth.save().and_then(|_| self.config.save()) {
+        match self.save_login() {
             Ok(()) => vec![
                 AgentEvent::Info(format!(
                     "{name} api key saved; provider switched to {provider}"
@@ -4104,6 +4215,14 @@ impl AgentCore {
             ],
             Err(error) => vec![AgentEvent::Error(format!("failed to save login: {error}"))],
         }
+    }
+
+    /// Saves a sign-in. A resume summary that could not start for want of
+    /// credentials may try again at once.
+    fn save_login(&mut self) -> io::Result<()> {
+        self.auth.save().and_then(|_| self.config.save())?;
+        self.resume_summary_retry_at = None;
+        Ok(())
     }
 
     /// Point the session config at `provider_id` after a successful login:
@@ -4196,7 +4315,7 @@ impl AgentCore {
             refresh_expires_at: result.tokens.refresh_expires_at,
             machine: crate::machine::machine_id().map(str::to_string),
         });
-        match self.auth.save().and_then(|_| self.config.save()) {
+        match self.save_login() {
             Ok(()) => {
                 let mut events = vec![
                     AgentEvent::Info(
@@ -4360,6 +4479,7 @@ impl AgentCore {
                 // Any in-flight resume summary belongs to the old session; drop it.
                 self.resume_summary_receiver = None;
                 self.resume_summary_running = false;
+                self.resume_summary_retry_at = None;
                 self.goal_tool_receiver = None;
                 self.goal_continuation_running = false;
                 self.turn_started_at = None;

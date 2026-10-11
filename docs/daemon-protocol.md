@@ -140,7 +140,7 @@ every connected client.
 | `session_create` | `cwd`, optional `engine` (`lynshen`, default, `claude`, `codex` or `acp`) and `options` | `session_created` with `session`; the session's startup events follow. See "Other engines" |
 | `session_open` | `session`, optional `cwd`, `engine`, `options` | `session_opened`; with `cwd`, also opens a session saved there that the daemon never hosted. Reopens a closed session (or one from before a restart), resuming its transcript and its undecided deferred actions |
 | `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped |
-| `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `approval_mode_pending`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
+| `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` opens a closed session first, as `session_open` does (an error when it cannot), and also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `approval_mode_pending`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
 | `actions_list` | — | `actions`: undecided deferred actions across all sessions, and in `closed` the ones closed lately (as in `questions`) |
 | `pair_start` | — | `pairing` with `code` and `expires_at` (local clients only) |
 | `device_list` | — | `devices`: paired, unrevoked devices (local clients only) |
@@ -855,3 +855,18 @@ Differences from `lynshen serve`:
   `approval_request` into a deferred action.
 - `decide_action` is recorded in `actions.jsonl` before the engine acts on
   it, so an approved action is never offered again after a restart.
+- An idle LynShen session closes by itself. It closes when nobody has
+  watched it and nothing has happened in it for 10 minutes, and its engine
+  is idle: no turn, queued message, prompt, deferred action or approved
+  action still running, sign-in, plan or goal work, background result or
+  shell. It does not close while a delivered message, a title or handoff
+  being written, or a reply another session waits for holds it. A session
+  that ran subagents stays open: their runs and transcripts live only in
+  its engine. Clients receive `session_closed`. `session_open`, `watch`,
+  `decide_action` and a message from another session open it again. The
+  conversation, task board, worktree agents and undecided deferred actions
+  come back from disk. The approval and sandbox modes, "always allow"
+  tools, action decisions, token totals and plan come back from the
+  daemon's memory, until the daemon restarts. Its MCP servers stop with
+  the engine and start again with the next one, without the state a server
+  kept in its own process.

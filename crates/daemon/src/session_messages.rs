@@ -453,10 +453,10 @@ fn check_target(hub: &Hub, me: &str, target: &str) -> Result<(), String> {
     }
 }
 
+/// Opens the session, or marks an open one as just opened: either way it
+/// is not closed as idle before the message or read reaches it (see
+/// `Hub::retire_idle`).
 fn ensure_open(hub: &Hub, session: &str) -> Result<(), String> {
-    if hub.is_open(session) {
-        return Ok(());
-    }
     let hub = hub.handle().ok_or("the daemon is stopping")?;
     hub.open_session(session, None)
 }
@@ -631,6 +631,18 @@ pub fn observe(hub: &Hub, session: &str, event: &Value) {
             },
         );
     }
+}
+
+/// Another session waits on this one's reply, or it has messages it has
+/// not finished handling.
+pub(crate) fn awaited(hub: &Hub, session: &str) -> bool {
+    let state = lock(&hub.messages.state);
+    state
+        .pending
+        .get(session)
+        .is_some_and(|list| !list.is_empty())
+        || state.waiting.contains_key(session)
+        || state.waiting.values().any(|target| target == session)
 }
 
 /// A session's engine stopped: waits for its replies end, and what it
