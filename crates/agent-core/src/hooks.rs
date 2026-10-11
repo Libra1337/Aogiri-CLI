@@ -1,10 +1,12 @@
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::Path,
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{mpsc, Arc},
+    thread,
+    time::{Duration, Instant},
 };
 
 /// User-configured shell hooks that run at lifecycle points. Loaded from
@@ -29,6 +31,13 @@ struct HookSet {
 /// Most characters of a hook's output the main agent receives.
 const MAX_REPORT_CHARS: usize = 4000;
 
+/// How long a hook may run unless its entry sets `timeout`.
+const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long output may keep arriving after a hook exited: a background
+/// process it started can hold its output open indefinitely.
+const OUTPUT_GRACE: Duration = Duration::from_millis(500);
+
 /// What a `task_completed` or `agent_idle` hook said, for the main agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookReport {
@@ -45,6 +54,8 @@ struct HookEntry {
     command: String,
     /// Tool names this hook applies to. `None` means every tool.
     tools: Option<Vec<String>>,
+    /// Past this the hook and its process group are killed and it fails.
+    timeout: Duration,
 }
 
 impl HookEntry {
@@ -60,6 +71,8 @@ struct Outcome {
     code: i32,
     stdout: String,
     stderr: String,
+    /// The hook ran past its timeout and was killed; `stderr` says so.
+    timed_out: bool,
 }
 
 impl Hooks {
@@ -140,7 +153,7 @@ impl Hooks {
                 "workdir": workdir_text,
                 "cwd": workdir_text,
             });
-            let outcome = run_command_with_env(&entry.command, &payload, workdir, &env);
+            let outcome = run_command_with_env(entry, &payload, workdir, &env);
             let ok = outcome.code == 0;
             let text = if ok {
                 outcome.stdout.trim().to_string()
@@ -178,7 +191,7 @@ impl Hooks {
             "cwd": cwd.display().to_string(),
         });
         for entry in &self.inner.user_prompt_submit {
-            let outcome = run_command(&entry.command, &payload, cwd);
+            let outcome = run_command(entry, &payload, cwd);
             if outcome.code != 0 {
                 return Err(block_reason(&outcome, "user_prompt_submit"));
             }
@@ -202,7 +215,7 @@ impl Hooks {
             if !entry.matches(tool) {
                 continue;
             }
-            let outcome = run_command(&entry.command, &payload, cwd);
+            let outcome = run_command(entry, &payload, cwd);
             if outcome.code != 0 {
                 return Some(block_reason(&outcome, "pre_tool_use"));
             }
@@ -223,7 +236,7 @@ impl Hooks {
         });
         for entry in &self.inner.post_tool_use {
             if entry.matches(tool) {
-                let _ = run_command(&entry.command, &payload, cwd);
+                let _ = run_command(entry, &payload, cwd);
             }
         }
     }
@@ -237,8 +250,12 @@ impl Hooks {
                     map.insert(key.clone(), value.clone());
                 }
             }
-            let outcome = run_command(&entry.command, &payload, cwd);
-            let text = outcome.stdout.trim();
+            let outcome = run_command(entry, &payload, cwd);
+            let text = if outcome.timed_out {
+                outcome.stderr.trim()
+            } else {
+                outcome.stdout.trim()
+            };
             if !text.is_empty() {
                 messages.push(format!("hook ({event}): {text}"));
             }
@@ -272,12 +289,12 @@ fn parse_arguments(arguments: &str) -> Value {
         .unwrap_or_else(|_| Value::String(arguments.to_string()))
 }
 
-fn run_command(command: &str, payload: &Value, cwd: &Path) -> Outcome {
-    run_command_with_env(command, payload, cwd, &[])
+fn run_command(entry: &HookEntry, payload: &Value, cwd: &Path) -> Outcome {
+    run_command_with_env(entry, payload, cwd, &[])
 }
 
 fn run_command_with_env(
-    command: &str,
+    entry: &HookEntry,
     payload: &Value,
     cwd: &Path,
     env: &[(&str, String)],
@@ -292,41 +309,115 @@ fn run_command_with_env(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let spawn = Command::new(shell)
+    let mut command = Command::new(shell);
+    command
         .arg(flag)
-        .arg(command)
+        .arg(&entry.command)
         .current_dir(cwd)
-        .env("LYNSHEN_HOOK_EVENT", event)
+        .env("LYNSHEN_HOOK_EVENT", &event)
         .envs(env.iter().map(|(key, value)| (*key, value.as_str())))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    let mut child = match spawn {
+        .stderr(Stdio::piped());
+    // Its own process group, so a timeout kills what the hook started too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             return Outcome {
                 code: -1,
                 stdout: String::new(),
                 stderr: error.to_string(),
+                timed_out: false,
             }
         }
     };
+    // Written and read on threads: a hook that ignores its stdin or fills a
+    // pipe must not stall the turn past the timeout.
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(payload.to_string().as_bytes());
+        let payload = payload.to_string();
+        thread::spawn(move || {
+            let _ = stdin.write_all(payload.as_bytes());
+        });
     }
-    match child.wait_with_output() {
-        Ok(output) => Outcome {
-            code: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        },
-        Err(error) => Outcome {
-            code: -1,
-            stdout: String::new(),
-            stderr: error.to_string(),
-        },
+    let (tx, rx) = mpsc::channel();
+    if let Some(stdout) = child.stdout.take() {
+        read_pipe(stdout, true, tx.clone());
     }
+    if let Some(stderr) = child.stderr.take() {
+        read_pipe(stderr, false, tx);
+    }
+
+    let deadline = Instant::now() + entry.timeout;
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let mut open_pipes = 2;
+    let mut exited: Option<(i32, Instant)> = None;
+    loop {
+        let now = Instant::now();
+        if exited.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => exited = Some((status.code().unwrap_or(-1), now)),
+                Ok(None) => {}
+                Err(_) => exited = Some((-1, now)),
+            }
+        }
+        if let Some((code, at)) = exited {
+            if open_pipes == 0 || now >= at + OUTPUT_GRACE {
+                return Outcome {
+                    code,
+                    stdout: String::from_utf8_lossy(&stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&stderr).to_string(),
+                    timed_out: false,
+                };
+            }
+        } else if now >= deadline {
+            crate::tools::kill_child(&mut child);
+            return Outcome {
+                code: -1,
+                stdout: String::from_utf8_lossy(&stdout).to_string(),
+                stderr: format!(
+                    "{event} hook timed out after {}s and was stopped: {}",
+                    entry.timeout.as_secs_f64(),
+                    entry.command
+                ),
+                timed_out: true,
+            };
+        }
+        match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok((true, Some(chunk))) => stdout.extend_from_slice(&chunk),
+            Ok((false, Some(chunk))) => stderr.extend_from_slice(&chunk),
+            Ok((_, None)) => open_pipes -= 1,
+            Err(_) => {}
+        }
+    }
+}
+
+/// Sends what `pipe` yields, chunk by chunk, on a thread; None at its end.
+fn read_pipe(
+    mut pipe: impl Read + Send + 'static,
+    is_stdout: bool,
+    tx: mpsc::Sender<(bool, Option<Vec<u8>>)>,
+) {
+    thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match pipe.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if tx.send((is_stdout, Some(buffer[..read].to_vec()))).is_err() {
+                        return;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send((is_stdout, None));
+    });
 }
 
 fn merge_file(set: &mut HookSet, path: &Path) {
@@ -369,9 +460,18 @@ fn push_entries(target: &mut Vec<HookEntry>, value: &Value, key: &str) {
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         });
+        // Seconds, at most a day; anything but a positive number keeps the
+        // default.
+        let timeout = entry
+            .get("timeout")
+            .and_then(Value::as_f64)
+            .filter(|seconds| *seconds > 0.0)
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds.min(86_400.0)).ok())
+            .unwrap_or(DEFAULT_HOOK_TIMEOUT);
         target.push(HookEntry {
             command: command.to_string(),
             tools,
+            timeout,
         });
     }
 }
@@ -472,6 +572,87 @@ mod tests {
         assert!(reports[0].text.starts_with("xxxx"));
         assert!(reports[0].text.ends_with("[hook output cut]"));
         assert!(reports[0].text.len() < 4100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_past_its_timeout_is_killed_with_its_children_and_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "lynshen-hook-timeout-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let hooks = Hooks::from_value(&json!({
+            "pre_tool_use": [{ "command": "sleep 30 & echo $! > child.pid; sleep 30", "timeout": 1 }],
+            "stop": [{ "command": "sleep 30", "timeout": 0.5 }]
+        }));
+
+        let started = Instant::now();
+        let reason = hooks
+            .pre_tool("bash", "{}", &dir)
+            .expect("a timed-out hook blocks");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the hook was not stopped"
+        );
+        assert_eq!(
+            reason,
+            "pre_tool_use hook timed out after 1s and was stopped: sleep 30 & echo $! > child.pid; sleep 30"
+        );
+        let child: i32 = fs::read_to_string(dir.join("child.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 only probes the pid.
+        let alive = || unsafe { libc::kill(child, 0) } == 0;
+        let gone_by = Instant::now() + Duration::from_secs(5);
+        while alive() && Instant::now() < gone_by {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(), "the hook's own child outlived the timeout");
+
+        assert_eq!(
+            hooks.stop(&dir),
+            vec!["hook (stop): stop hook timed out after 0.5s and was stopped: sleep 30"]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_hook_that_leaves_a_process_holding_its_output_still_returns() {
+        if cfg!(windows) {
+            return;
+        }
+        let hooks = Hooks::from_value(&json!({
+            "stop": [{ "command": "sleep 5 & echo done" }]
+        }));
+        let started = Instant::now();
+        assert_eq!(hooks.stop(Path::new(".")), vec!["hook (stop): done"]);
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn hook_timeout_is_a_minute_unless_the_entry_sets_one() {
+        let hooks = Hooks::from_value(&json!({
+            "stop": [
+                { "command": "a" },
+                { "command": "b", "timeout": 5 },
+                { "command": "c", "timeout": 0 },
+                { "command": "d", "timeout": "soon" },
+                { "command": "e", "timeout": 1e300 }
+            ]
+        }));
+        let timeouts = hooks
+            .inner
+            .stop
+            .iter()
+            .map(|entry| entry.timeout.as_secs())
+            .collect::<Vec<_>>();
+        assert_eq!(timeouts, vec![60, 5, 60, 60, 86_400]);
     }
 
     #[test]

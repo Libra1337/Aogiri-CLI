@@ -1746,7 +1746,7 @@ fn status_signal(status: &std::process::ExitStatus) -> Option<i32> {
     }
 }
 
-fn kill_child(child: &mut Child) {
+pub(crate) fn kill_child(child: &mut Child) {
     #[cfg(windows)]
     {
         let id = child.id().to_string();

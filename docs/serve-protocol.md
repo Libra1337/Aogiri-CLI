@@ -602,7 +602,7 @@ them. The `pick_attempt` tool (`group`, `target`) or op keeps one.
 project), with the same entry shape:
 
 ```json
-{"task_completed": [{"command": "cargo test 2>&1 | tail -20"}],
+{"task_completed": [{"command": "cargo test 2>&1 | tail -20", "timeout": 600}],
  "agent_idle": [{"command": "./scripts/check.sh"}]}
 ```
 
@@ -624,6 +624,16 @@ as `<hook_result hook="task_completed" ok="true">…</hook_result>` and an
 nothing. A non-zero exit sends `ok="false"` with its stderr (else stdout, else
 the exit code). Hook output wakes an idle main agent like a background
 result.
+
+Every hook entry, of any event, may set `timeout` in seconds (default 60, at
+most a day). A hook still running then is killed with its process group (its
+process tree on Windows), so it cannot hold up the turn, and counts as failed
+with the message `<event> hook timed out after <n>s and was stopped:
+<command>`: a `pre_tool_use` hook blocks the tool, a `user_prompt_submit`
+hook blocks the prompt, `task_completed` and `agent_idle` report it with
+`ok="false"`, `session_start` and `stop` show it as `hook (<event>): …`, and
+`post_tool_use` ignores it. Once a hook has exited, output that a process it
+left running keeps open is read for at most another half second.
 
 ### Worktree confinement
 
