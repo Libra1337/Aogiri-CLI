@@ -3824,6 +3824,7 @@ impl AgentCore {
         // Any in-flight resume summary belongs to the old session; drop it.
         self.resume_summary_receiver = None;
         self.resume_summary_running = false;
+        self.resume_summary_retry_at = None;
         self.session = SessionStore::new();
         self.reset_team();
         // Release the old session's lock and hold the new one.
@@ -4094,7 +4095,7 @@ impl AgentCore {
             .unwrap_or_else(|| provider_id.clone());
         self.auth.set_oauth_credential(&store_id, *credential);
         self.adopt_provider(&provider_id);
-        match self.auth.save().and_then(|_| self.config.save()) {
+        match self.save_login() {
             Ok(()) => vec![
                 AgentEvent::Info(format!(
                     "{name} connected; provider switched to {provider_id}"
@@ -4133,7 +4134,7 @@ impl AgentCore {
         let name = auth_provider.name.clone();
         self.auth.set_key(provider, key.to_string());
         self.adopt_provider(provider);
-        match self.auth.save().and_then(|_| self.config.save()) {
+        match self.save_login() {
             Ok(()) => vec![
                 AgentEvent::Info(format!(
                     "{name} api key saved; provider switched to {provider}"
@@ -4142,6 +4143,14 @@ impl AgentCore {
             ],
             Err(error) => vec![AgentEvent::Error(format!("failed to save login: {error}"))],
         }
+    }
+
+    /// Saves a sign-in. A resume summary that could not start for want of
+    /// credentials may try again at once.
+    fn save_login(&mut self) -> io::Result<()> {
+        self.auth.save().and_then(|_| self.config.save())?;
+        self.resume_summary_retry_at = None;
+        Ok(())
     }
 
     /// Point the session config at `provider_id` after a successful login:
@@ -4234,7 +4243,7 @@ impl AgentCore {
             refresh_expires_at: result.tokens.refresh_expires_at,
             machine: crate::machine::machine_id().map(str::to_string),
         });
-        match self.auth.save().and_then(|_| self.config.save()) {
+        match self.save_login() {
             Ok(()) => {
                 let mut events = vec![
                     AgentEvent::Info(
@@ -4398,6 +4407,7 @@ impl AgentCore {
                 // Any in-flight resume summary belongs to the old session; drop it.
                 self.resume_summary_receiver = None;
                 self.resume_summary_running = false;
+                self.resume_summary_retry_at = None;
                 self.goal_tool_receiver = None;
                 self.goal_continuation_running = false;
                 self.turn_started_at = None;
