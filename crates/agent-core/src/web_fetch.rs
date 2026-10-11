@@ -497,7 +497,11 @@ pub fn decode_entities(text: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        let end = rest[..rest.len().min(12)].find(';');
+        // `;` is ASCII, so a byte position is a char boundary; slicing the
+        // str itself could split a multi-byte character.
+        let end = rest.as_bytes()[..rest.len().min(12)]
+            .iter()
+            .position(|&b| b == b';');
         let Some(end) = end else {
             out.push('&');
             rest = &rest[1..];
@@ -632,6 +636,13 @@ mod tests {
         let html = "<p>a &amp; b &lt;c&gt; &quot;d&quot; &#39;e&#39; &#x41;&nbsp;f</p>";
         assert_eq!(extract_html_text(html), "a & b <c> \"d\" 'e' A f");
         assert_eq!(decode_entities("1 &unknown; 2 & 3"), "1 &unknown; 2 & 3");
+    }
+
+    #[test]
+    fn an_ampersand_before_multibyte_text_does_not_panic() {
+        // The 12-byte lookahead for `;` ends inside a character here.
+        assert_eq!(decode_entities("Q&A：動態為何"), "Q&A：動態為何");
+        assert_eq!(decode_entities("&a為什麼好&amp;"), "&a為什麼好&");
     }
 
     #[test]
