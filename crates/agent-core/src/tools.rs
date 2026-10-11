@@ -3009,14 +3009,27 @@ impl ToolState {
 }
 
 /// Files a unified diff changes, creates or deletes, for the workspace and
-/// read checks and the pre-apply snapshot: the paths of its `---`/`+++`
-/// headers (`/dev/null` aside), of git's `rename from`, `rename to` and
-/// `copy to` lines, and of a `diff --git a/x b/x` header (a mode change or an
-/// empty file has nothing else). A copy's source does not change and is left
-/// out. Hunk lines are skipped by their header's line counts, as git reads
-/// them, so a removed line that starts like a header is not taken for one.
+/// read checks and the pre-apply snapshot (see `patch_file_names`).
 fn patch_target_paths(patch: &str, cwd: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
+    for name in patch_file_names(patch) {
+        let abs = resolve_path(cwd, &name);
+        if !paths.contains(&abs) {
+            paths.push(abs);
+        }
+    }
+    paths
+}
+
+/// The files a unified diff changes, creates or deletes, as it names them
+/// (`a/`/`b/` dropped), each once: the paths of its `---`/`+++` headers
+/// (`/dev/null` aside), of git's `rename from`, `rename to` and `copy to`
+/// lines, and of a `diff --git a/x b/x` header (a mode change or an empty
+/// file has nothing else). A copy's source does not change and is left out.
+/// Hunk lines are skipped by their header's line counts, as git reads them,
+/// so a removed line that starts like a header is not taken for one.
+pub(crate) fn patch_file_names(patch: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
     let (mut old_left, mut new_left) = (0usize, 0usize);
     for line in patch.lines() {
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -3024,45 +3037,49 @@ fn patch_target_paths(patch: &str, cwd: &Path) -> Vec<PathBuf> {
             count_hunk_line(line, &mut old_left, &mut new_left);
             continue;
         }
-        let path = if line.starts_with("@@") {
+        let name = if line.starts_with("@@") {
             (_, old_left, new_left) = hunk_header(line).unwrap_or_default();
             None
         } else if let Some(rest) = line
             .strip_prefix("--- ")
             .or_else(|| line.strip_prefix("+++ "))
         {
-            patch_header_path(rest, cwd)
+            patch_header_name(rest)
         } else if let Some(rest) = line
             .strip_prefix("rename from ")
             .or_else(|| line.strip_prefix("rename to "))
             .or_else(|| line.strip_prefix("copy to "))
         {
-            Some(resolve_path(cwd, rest))
+            Some(rest.trim())
         } else if let Some(rest) = line.strip_prefix("diff --git ") {
-            git_header_path(rest).map(|rel| resolve_path(cwd, rel))
+            git_header_path(rest)
         } else {
             None
         };
-        if let Some(abs) = path {
-            if !paths.contains(&abs) {
-                paths.push(abs);
-            }
+        if let Some(name) = name.filter(|name| !names.iter().any(|known| known == name)) {
+            names.push(name.to_string());
         }
     }
-    paths
+    names
 }
 
 /// The file a `---`/`+++` header names; None for `/dev/null`.
 fn patch_header_path(rest: &str, cwd: &Path) -> Option<PathBuf> {
-    let rest = rest.trim();
+    patch_header_name(rest).map(|name| resolve_path(cwd, name))
+}
+
+/// The name in a `---`/`+++` header, `a/`/`b/` dropped; None for
+/// `/dev/null`. `diff -u` puts a tab and a timestamp after it.
+fn patch_header_name(rest: &str) -> Option<&str> {
+    let rest = rest.split('\t').next().unwrap_or(rest).trim();
     if rest == "/dev/null" {
         return None;
     }
-    let rel = rest
-        .strip_prefix("a/")
-        .or_else(|| rest.strip_prefix("b/"))
-        .unwrap_or(rest);
-    Some(resolve_path(cwd, rel))
+    Some(
+        rest.strip_prefix("a/")
+            .or_else(|| rest.strip_prefix("b/"))
+            .unwrap_or(rest),
+    )
 }
 
 /// The path of a `diff --git a/x b/x` header whose two sides are the same

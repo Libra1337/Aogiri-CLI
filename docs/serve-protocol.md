@@ -416,7 +416,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `usage` | `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_tokens` | Real API usage for the completed turn. |
 | `context_usage` | `tokens`, `tokenizer`, `cost` | Tokenizer-counted context size; `cost` is cumulative USD (0 when unpriced). |
 | `compaction_start` | — | Context compaction began. |
-| `compaction_end` | `summary` | Context compaction finished; the older conversation now reads as `summary`. Other engines send no `summary`. |
+| `compaction_end` | `summary` | Context compaction finished; the older conversation now reads as `summary`. When the session has a plan, `summary` then has a blank line, `Your plan from update_plan, as it stands:`, one `N. [<status>] <step>` line per step and `Keep it current with update_plan.`, so the model keeps its plan; it is part of the summary, which comes before the kept conversation, so the user's latest request stays the last message. When the session's edit tools changed files, `summary` ends with a blank line, `Files changed in this session:` and one `- <path>` line per file (relative to the session's directory when under it; past 100 files, a last line `- and N more`). Other engines send no `summary`. |
 | `compaction_progress` | `output_tokens` | Compaction summary tokens produced so far. |
 | `compaction_failed` | `error` | Compaction failed; the session continues uncompacted. |
 | `model_view` | `models: [{model, active, context_window, max_output_tokens, reasoning_efforts}]`, `active_effort` | Model picker data (`/model`). |
@@ -424,10 +424,10 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `resume_view` | `items: [{id, label, active}]` | Session picker data (`/resume`). |
 | `checkpoint_view` | `items: [{id, label, detail}]` | Checkpoint picker data. |
 | `goal` | `goal: {objective, status, token_budget, tokens_used, time_used_seconds, created_at, updated_at} \| null` | Goal state; `null` clears it. |
-| `plan` | `plan: [{step, status, agent, files}]` | Goal/plan step list. `agent` (string or `null`) is the subagent doing the step, as the model named it (path or task name); `files` the files it is expected to write. |
+| `plan` | `plan: [{step, status, agent, files}]` | Goal/plan step list. `agent` (string or `null`) is the subagent doing the step, as the model named it (path or task name); `files` the files it is expected to write. Saved with the session: part of the startup batch and of a resumed session's events when the session has a plan; `/new` or `/resume` sends an empty `plan` to clear the previous session's plan when it had one and the next session has none. `/rewind`, `/checkout` and `/fork` set the plan the last successful `update_plan` call before that point set (none without one), and send `plan` when it changed. |
 | `transcript` | `items: [{role, ...}]` | Rendered conversation (`/transcript`); roles: `user`, `assistant`, `tool` (`name`, `output`), `branch` (`label`), `compaction` (`summary`: where the older conversation was folded). |
-| `info` | `message` | Informational line (hook output, notices, update available). |
-| `error` | `message` | Error line. Also used for malformed commands and unknown ops. |
+| `info` | `message` | Informational line (hook output, notices, update available, loop guard warnings; see "Loop guard"). |
+| `error` | `message` | Error line. Also used for malformed commands and unknown ops, and for a turn the loop guard stopped (message starts with `loop guard:`). |
 | `status` | `message` | Turn status string: `ready`, `streaming`, `queued: N`, `steering`, `interrupted`, `compacting`, `approval mode: ...`, `trusted ...`, etc. `ready` marks the end of a turn. |
 
 ## Agent team
@@ -672,6 +672,41 @@ command rule matches.
 and `files` (the files the step writes). The `plan` event passes them
 through. `subagent_lifecycle` carries `plan_step`: the step given to
 `spawn_agent`, else the step whose `agent` names the subagent.
+
+## Loop guard
+
+The engine stops a turn that goes in circles, so an unattended session
+(daemon dispatch, a schedule, goal continuation) does not spend tokens until
+someone notices. It counts within one turn, for the main agent and each
+subagent alike:
+
+- **The same call again.** The same tool with the same arguments (as JSON,
+  spacing and key order ignored) several times in a row. The 3rd and 4th
+  calls run, and their results carry a `loop_guard` note that tells the
+  model to change its approach; the engine emits an `info` event
+  `loop guard: <tool> was called N times in a row ...` (a subagent's path
+  follows `loop guard:` in parentheses). The 5th call does not run, nor
+  does any other call of the same model response: each one's `tool_output`
+  is an error starting `not run: loop guard:`, and the turn ends.
+- **Calls that keep failing.** 6 tool rounds (model responses) in a row
+  whose calls all failed end the turn after the 6th. A round with any
+  successful call starts the count again. A failure is a tool error: bad
+  arguments, a missing file, an unknown tool, a command that could not run,
+  was killed or timed out. A shell command that ran and exited non-zero
+  (grep without a match, a failing test run) is no failure.
+
+Calls whose repetition is normal are not counted, and end a run of
+identical calls (running the tests after each worker an orchestrator waited
+for is progress): `write_stdin`, `wait_agent`, `list_agents`, `task_list`,
+`list_sessions`, `read_session`, and a shell command whose first word is
+`sleep` (`Start-Sleep` on Windows).
+
+A turn the guard ends emits `error` with a message that starts with
+`loop guard:`, then `status` `ready`, as any failed turn does. An active
+goal is paused (`goal` with `status: "paused"`, then `info`), so goal
+continuation does not start the loop again; `/goal resume` continues it.
+A stopped subagent ends `errored` with that message as its error. The
+limits are fixed (`crates/agent-core/src/loop_guard.rs`).
 
 ## Turn sequence
 

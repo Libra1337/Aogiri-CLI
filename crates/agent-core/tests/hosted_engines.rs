@@ -1691,6 +1691,17 @@ fn a_rewind_takes_a_post_tool_hooks_rewrite_for_the_sessions_own_edit() {
 /// `/rewind` to the first user turn that starts with `label`; the `info`
 /// line it answers with.
 fn rewind_to(core: &mut AgentCore, label: &str) -> String {
+    rewind_events(core, label)
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::Info(text) if text.starts_with("rewound") => Some(text.clone()),
+            _ => None,
+        })
+        .expect("rewound")
+}
+
+/// `/rewind` to the first user turn that starts with `label`; its events.
+fn rewind_events(core: &mut AgentCore, label: &str) -> Vec<AgentEvent> {
     let (_, events) = core.handle_command("/rewind");
     let turn = events
         .iter()
@@ -1702,14 +1713,7 @@ fn rewind_to(core: &mut AgentCore, label: &str) -> String {
             _ => None,
         })
         .unwrap_or_else(|| panic!("no turn {label}: {events:#?}"));
-    let (_, events) = core.handle_command(&format!("/rewind {turn}"));
-    events
-        .iter()
-        .find_map(|event| match event {
-            AgentEvent::Info(text) if text.starts_with("rewound") => Some(text.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("not rewound: {events:#?}"))
+    core.handle_command(&format!("/rewind {turn}")).1
 }
 
 fn write_hooks(dir: &Path, hooks: serde_json::Value) {
@@ -1825,4 +1829,274 @@ fn a_deferred_action_running_beside_a_turn_leaves_the_turns_hook_rewrite_to_it()
     let info = rewind_to(&mut core, "CALL hashline_edit");
     assert_eq!(info, "rewound · restored 1 file(s), removed 0");
     assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "v0\n");
+}
+
+fn tool_outputs(events: &[AgentEvent]) -> Vec<(String, bool)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolOutput {
+                output, is_error, ..
+            } => Some((output.clone(), *is_error)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_loop_guard_warns_a_repeating_model_then_stops_the_turn_and_pauses_the_goal() {
+    let _guard = setup();
+    let dir = temp_dir("loop-guard");
+    fs::write(dir.join("note.txt"), "hello\n").unwrap();
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.handle_command("/goal keep reading the note");
+    core.submit_user_message(r#"LOOP read {"path":"note.txt"}"#.to_string());
+    let events = pump(&mut core, is_ready);
+
+    // Four calls ran; the fifth did not.
+    let outputs = tool_outputs(&events);
+    assert_eq!(outputs.len(), 5, "{outputs:?}");
+    assert!(outputs[..4].iter().all(|(_, is_error)| !is_error));
+    assert!(outputs[4].1);
+    assert!(
+        outputs[4].0.contains("not run: loop guard:"),
+        "{}",
+        outputs[4].0
+    );
+    let infos = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Info(message) => Some(message.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        infos
+            .iter()
+            .any(|info| info.contains("read was called 3 times in a row")),
+        "{infos:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Error(message) if message.starts_with("loop guard:")
+            && message.contains("read was called 5 times")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Goal(Some(goal)) if goal.status == "paused"
+    )));
+    // The model read the note with its third and fourth results.
+    let AgentEvent::Transcript(items) = core.transcript_event() else {
+        panic!("not a transcript");
+    };
+    let noted = items
+        .iter()
+        .filter(|item| {
+            matches!(item, lynshen_agent_core::TranscriptItem::Tool { output, .. }
+                if output.contains("\"loop_guard\""))
+        })
+        .count();
+    assert_eq!(noted, 2);
+    // Nothing continues the paused goal.
+    pump_for(&mut core, &mut Vec::new(), 300);
+    assert!(core.is_idle());
+}
+
+#[test]
+fn the_loop_guard_stops_a_turn_whose_calls_keep_failing() {
+    let _guard = setup();
+    let dir = temp_dir("loop-guard-errors");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    // A different missing file each time: never a repeat, always an error.
+    core.submit_user_message(r#"LOOP read {"path":"missing-{n}.txt"}"#.to_string());
+    let events = pump(&mut core, is_ready);
+
+    let outputs = tool_outputs(&events);
+    assert_eq!(outputs.len(), 6, "{outputs:?}");
+    assert!(outputs.iter().all(|(_, is_error)| *is_error));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Error(message) if message.starts_with("loop guard:")
+            && message.contains("failed 6 times in a row")
+    )));
+}
+
+#[test]
+fn commands_that_run_and_exit_non_zero_do_not_stop_the_turn() {
+    let _guard = setup();
+    let dir = temp_dir("loop-guard-exit-codes");
+    fs::write(dir.join("note.txt"), "hello\n").unwrap();
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    // grep without a match, each time for something else: exit code 1.
+    let command = if cfg!(windows) {
+        "Select-String -Quiet -Pattern missing{n} note.txt; exit 1"
+    } else {
+        "grep -q missing{n} note.txt"
+    };
+    let arguments = serde_json::json!({ "command": command });
+    core.submit_user_message(format!("REPEAT 8 bash {arguments}"));
+    let events = pump(&mut core, is_ready);
+
+    let outputs = tool_outputs(&events);
+    assert_eq!(outputs.len(), 8, "{outputs:?}");
+    assert!(outputs
+        .iter()
+        .all(|(output, _)| output.contains("\"exit_code\":1")));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Error(message) if message.starts_with("loop guard:")
+    )));
+    assert!(assistant_text(&events).starts_with("tool said:"));
+}
+
+fn plan_steps(events: &[AgentEvent]) -> Option<Vec<(String, String)>> {
+    events.iter().rev().find_map(|event| match event {
+        AgentEvent::Plan(items) => Some(
+            items
+                .iter()
+                .map(|item| (item.step.clone(), item.status.clone()))
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
+fn update_plan_call() -> String {
+    let plan = serde_json::json!({ "plan": [
+        { "step": "Read the code", "status": "completed" },
+        { "step": "Fix the bug", "status": "in_progress", "files": ["src/lib.rs"] },
+    ]});
+    format!("CALL update_plan {plan}")
+}
+
+#[test]
+fn the_plan_comes_back_when_the_session_is_reopened() {
+    let _guard = setup();
+    let dir = temp_dir("plan-reopen");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.submit_user_message(update_plan_call());
+    let events = pump(&mut core, is_ready);
+    let steps = vec![
+        ("Read the code".to_string(), "completed".to_string()),
+        ("Fix the bug".to_string(), "in_progress".to_string()),
+    ];
+    assert_eq!(plan_steps(&events), Some(steps.clone()));
+    let session = core.session_id().to_string();
+    drop(core);
+
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    assert_eq!(plan_steps(&core.state_events()), None);
+    let (_, resumed) = core.handle_command(&format!("/resume {session}"));
+    assert_eq!(plan_steps(&resumed), Some(steps.clone()));
+    // A client that attaches later gets it too.
+    assert_eq!(plan_steps(&core.state_events()), Some(steps));
+    // A new session starts without it.
+    let (_, fresh) = core.handle_command("/new");
+    assert_eq!(plan_steps(&fresh), Some(Vec::new()));
+    assert_eq!(plan_steps(&core.state_events()), None);
+}
+
+#[test]
+fn after_a_compaction_the_model_gets_its_plan_and_the_summary_lists_changed_files() {
+    let _guard = setup();
+    let dir = temp_dir("plan-compaction");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.submit_user_message(update_plan_call());
+    pump(&mut core, is_ready);
+    fs::write(dir.join("notes.txt"), "hello\n").unwrap();
+    core.submit_user_message(r#"CALL read {"path":"notes.txt"}"#.to_string());
+    pump(&mut core, is_ready);
+    let edit = serde_json::json!({
+        "path": "notes.txt",
+        "edits": [{ "op": "append", "lines": ["hi"] }],
+    });
+    core.submit_user_message(format!("CALL hashline_edit {edit}"));
+    pump(&mut core, is_ready);
+    assert_eq!(
+        fs::read_to_string(dir.join("notes.txt")).unwrap(),
+        "hello\nhi\n"
+    );
+    // Recent text big enough that the turns above are folded.
+    core.submit_user_message("lorem ipsum dolor sit amet ".repeat(6000));
+    pump(&mut core, is_ready);
+
+    let (_, mut events) = core.handle_command("/compact");
+    events.extend(pump(&mut core, is_ready));
+    let summary = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::CompactionEnd { summary } => Some(summary.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no compaction: {events:#?}"));
+    assert!(
+        summary.ends_with("\n\nFiles changed in this session:\n- notes.txt"),
+        "{summary}"
+    );
+
+    // The plan is in the summary, so it comes before the kept conversation.
+    let plan = "Your plan from update_plan, as it stands:\n1. [completed] Read the code\n2. [in_progress] Fix the bug (files: src/lib.rs)\nKeep it current with update_plan.\n\nFiles changed";
+    assert!(summary.contains(plan), "{summary}");
+    core.submit_user_message("HISTORY".to_string());
+    let history = assistant_text(&pump(&mut core, is_ready));
+    assert_eq!(
+        history.matches("Your plan from update_plan").count(),
+        1,
+        "{history}"
+    );
+}
+
+#[test]
+fn after_a_compaction_the_users_request_is_still_the_last_message_the_model_gets() {
+    let _guard = setup();
+    let dir = temp_dir("plan-compaction-order");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.submit_user_message(update_plan_call());
+    pump(&mut core, is_ready);
+    core.submit_user_message("lorem ipsum dolor sit amet ".repeat(6000));
+    pump(&mut core, is_ready);
+
+    // Refused as too long: the turn compacts and retries.
+    core.submit_user_message("OVERFLOW go on".to_string());
+    let events = pump(&mut core, is_ready);
+    let summary = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::CompactionEnd { summary } => Some(summary.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no compaction: {events:#?}"));
+    // What the safety classifier takes for the user's request.
+    assert_eq!(assistant_text(&events), "user said: OVERFLOW go on");
+    assert!(
+        summary.contains("2. [in_progress] Fix the bug"),
+        "{summary}"
+    );
+}
+
+/// `update_plan` with one pending step.
+fn one_step_plan(step: &str) -> String {
+    format!(r#"CALL update_plan {{"plan":[{{"step":"{step}"}}]}}"#)
+}
+
+#[test]
+fn a_rewind_brings_back_the_plan_of_that_point() {
+    let _guard = setup();
+    let dir = temp_dir("plan-rewind");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.submit_user_message(one_step_plan("First"));
+    pump(&mut core, is_ready);
+    core.submit_user_message(one_step_plan("Second"));
+    let events = pump(&mut core, is_ready);
+    let second = vec![("Second".to_string(), "pending".to_string())];
+    assert_eq!(plan_steps(&events), Some(second));
+
+    let events = rewind_events(&mut core, &one_step_plan("Second"));
+    let first = vec![("First".to_string(), "pending".to_string())];
+    assert_eq!(plan_steps(&events), Some(first.clone()));
+    assert_eq!(plan_steps(&core.state_events()), Some(first));
+
+    let events = rewind_events(&mut core, &one_step_plan("First"));
+    assert_eq!(plan_steps(&events), Some(Vec::new()));
+    assert_eq!(plan_steps(&core.state_events()), None);
 }
