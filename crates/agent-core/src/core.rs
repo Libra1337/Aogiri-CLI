@@ -326,6 +326,7 @@ impl AgentCore {
         let subagent_manager = SubagentManager::new(config.agents.clone(), TeamShared::default());
         subagent_manager.set_config_path(config.path().to_path_buf());
         let session = SessionStore::new();
+        tool_state.set_session_id(session.session_id());
         // A fresh session id is unique, so this only fails on IO problems.
         let session_lock = SessionLock::acquire(&profile_dir()?, &cwd, session.session_id()).ok();
         let (action_tx, action_rx) = mpsc::channel();
@@ -4085,6 +4086,7 @@ impl AgentCore {
         self.resume_summary_running = false;
         self.resume_summary_retry_at = None;
         self.session = SessionStore::new();
+        self.tool_state.set_session_id(self.session.session_id());
         self.reset_team();
         // Release the old session's lock and hold the new one.
         self.session_lock = None;
@@ -4570,7 +4572,7 @@ impl AgentCore {
                 "failed to rewind conversation: {error}"
             ))];
         }
-        let (restored, removed) =
+        let (restored, removed, conflicts) =
             match crate::tools::restore_to_timestamp(&self.cwd, t, &self.tool_state) {
                 Ok(result) => (
                     result
@@ -4583,6 +4585,7 @@ impl AgentCore {
                         .and_then(Value::as_array)
                         .map(Vec::len)
                         .unwrap_or(0),
+                    crate::tools::restore_conflicts_note(&result),
                 ),
                 Err(error) => {
                     return vec![
@@ -4594,11 +4597,13 @@ impl AgentCore {
                 }
             };
         let save_event = self.save_session_event();
+        let mut message = format!("rewound · restored {restored} file(s), removed {removed}");
+        if let Some(conflicts) = conflicts {
+            message.push_str(&format!(" · {conflicts}"));
+        }
         vec![
             AgentEvent::Transcript(self.session.transcript_items()),
-            AgentEvent::Info(format!(
-                "rewound · restored {restored} file(s), removed {removed}"
-            )),
+            AgentEvent::Info(message),
         ]
         .into_iter()
         .chain(save_event)
@@ -4672,6 +4677,7 @@ impl AgentCore {
                 self.turn_started_at = None;
                 self.turn_goal_tokens = 0;
                 self.session = session;
+                self.tool_state.set_session_id(self.session.session_id());
                 // Release the previous session's lock only after the switch.
                 self.session_lock = Some(lock);
                 self.reset_team();

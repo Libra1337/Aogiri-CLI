@@ -130,13 +130,14 @@ impl ApprovalMode {
         if is_shell_tool(tool_name) {
             return *self != Self::FullAccess;
         }
-        // generate_image writes files into the workspace like `write`, and
+        // generate_image writes files into the workspace like `write`,
         // merge_agent (apply) and pick_attempt bring a subagent's changes
-        // into it.
+        // into it, and checkpoint (restore) puts files back.
         if is_edit_tool(tool_name)
             || tool_name == crate::images::TOOL_NAME
             || tool_name == "merge_agent"
             || tool_name == "pick_attempt"
+            || tool_name == "checkpoint"
         {
             return self.is_strict();
         }
@@ -2572,6 +2573,7 @@ mod tests {
             "hashline_edit",
             "apply_patch",
             "generate_image",
+            "checkpoint",
         ];
         let network_tools = ["web_fetch", "web_search"];
         let free_tools = ["read", "ls", "ripgrep", "outline", "spawn_agent"];

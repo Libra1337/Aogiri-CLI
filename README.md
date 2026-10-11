@@ -85,7 +85,7 @@ lynshen
 | `/permissions [模式]` | 查看或切换审批模式。`Shift+Tab` 循环切换 |
 | `/sandbox [模式]` | 查看或切换 shell 命令的沙箱 |
 | `/resume [会话 ID]` | 列出或恢复以前的会话。也可以用 `lynshen --resume <id>` 启动 |
-| `/rewind [回合 ID]` | 把对话和文件退回到之前的某一回合 |
+| `/rewind [回合 ID]` | 把对话和文件退回到之前的某一回合。只退回本会话改过的文件；之后被别的会话、你或命令改过的文件保持不动，并在结果里列出 |
 | `/tree` | 查看对话分支树 |
 | `/context`、`/compact` | 查看上下文用量；立即压缩上下文 |
 | `/skills`、`/mcp` | 管理技能和 MCP 服务器 |

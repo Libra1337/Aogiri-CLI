@@ -331,7 +331,7 @@ fn run_tool_inner(
             value
         }
         "write_stdin" => write_stdin(&args, state),
-        "apply_patch" => apply_patch(&args, cwd, sandbox.as_ref(), &mut emit),
+        "apply_patch" => apply_patch(&args, cwd, sandbox.as_ref(), state, &mut emit),
         "ls" => list_dir(&args, cwd, extra_read_roots),
         "ripgrep" => ripgrep(&args, cwd, extra_read_roots),
         "outline" => outline_file(&args, cwd, extra_read_roots),
@@ -574,8 +574,10 @@ fn str_replace_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
     }
     output.push_str(&original[cursor..]);
 
-    let _ = create_checkpoint(cwd, "auto-edit", std::slice::from_ref(&path));
-    match fs::write(&path, &output) {
+    let checkpoint = begin_checkpoint(cwd, "auto-edit", std::slice::from_ref(&path));
+    let written = fs::write(&path, &output);
+    let _ = checkpoint.save(cwd, state);
+    match written {
         Ok(()) => {
             state.mark_read(&path);
             let diff = unified_diff_for_file(cwd, &path, &original, &output);
@@ -650,8 +652,10 @@ fn hashline_edit_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         }
     };
 
-    let _ = create_checkpoint(cwd, "auto-hashline-edit", std::slice::from_ref(&path));
-    match fs::write(&path, &output) {
+    let checkpoint = begin_checkpoint(cwd, "auto-hashline-edit", std::slice::from_ref(&path));
+    let written = fs::write(&path, &output);
+    let _ = checkpoint.save(cwd, state);
+    match written {
         Ok(()) => {
             state.mark_read(&path);
             let diff = unified_diff_for_file(cwd, &path, &original, &output);
@@ -703,8 +707,10 @@ fn write_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         }
     }
 
-    let _ = create_checkpoint(cwd, "auto-write", std::slice::from_ref(&path));
-    match fs::write(&path, content) {
+    let checkpoint = begin_checkpoint(cwd, "auto-write", std::slice::from_ref(&path));
+    let written = fs::write(&path, content);
+    let _ = checkpoint.save(cwd, state);
+    match written {
         Ok(()) => {
             state.mark_read(&path);
             let diff = unified_diff_for_file(cwd, &path, &original, content);
@@ -2217,6 +2223,7 @@ fn apply_patch(
     args: &Value,
     cwd: &Path,
     sandbox: Option<&crate::sandbox::SandboxPolicy>,
+    state: &ToolState,
     emit: &mut impl FnMut(ToolExecutionEvent) -> Result<(), String>,
 ) -> Value {
     let Some(patch) = args.get("patch").and_then(Value::as_str) else {
@@ -2253,7 +2260,7 @@ fn apply_patch(
     match check {
         Ok(_) => {
             // Snapshot the patch's target files (pre-apply) so /rewind can undo it.
-            let _ = create_checkpoint(cwd, "auto-patch", &targets);
+            let checkpoint = begin_checkpoint(cwd, "auto-patch", &targets);
             let result = run_command_events(
                 "git",
                 &["apply", "--whitespace=nowarn", "-"],
@@ -2262,6 +2269,7 @@ fn apply_patch(
                 Duration::from_secs(30),
                 emit,
             );
+            let _ = checkpoint.save(cwd, state);
             let mut value = command_result_json("git apply", result);
             value["applied"] = json!(value.get("exit_code").and_then(Value::as_i64) == Some(0));
             if value["applied"].as_bool().unwrap_or(false) {
@@ -2525,7 +2533,7 @@ fn checkpoint_tool(args: &Value, cwd: &Path, state: &ToolState) -> Value {
                 return json!({ "error": "checkpoint create requires paths" });
             }
             let name = args.get("name").and_then(Value::as_str).unwrap_or("manual");
-            match create_checkpoint(cwd, name, &paths) {
+            match create_checkpoint(cwd, name, &paths, state) {
                 Ok(meta) => meta,
                 Err(error) => json!({ "error": error.to_string() }),
             }
@@ -2538,7 +2546,8 @@ fn checkpoint_tool(args: &Value, cwd: &Path, state: &ToolState) -> Value {
             let Some(id) = args.get("id").and_then(Value::as_str) else {
                 return json!({ "error": "checkpoint restore requires id" });
             };
-            match restore_checkpoint(cwd, id, state) {
+            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            match restore_checkpoint(cwd, id, force, state) {
                 Ok(value) => value,
                 Err(error) => json!({ "error": error.to_string() }),
             }
@@ -2690,6 +2699,9 @@ struct ToolStateInner {
     /// Messages for the session from work that outlived its tool call (an
     /// interrupted generate_image saving its result), drained into Info events.
     notices: Vec<String>,
+    /// The session the engine is in, recorded in each checkpoint so a rewind
+    /// restores only this session's edits.
+    session_id: Option<String>,
 }
 
 impl Drop for ToolStateInner {
@@ -2750,6 +2762,19 @@ impl ToolState {
 
     pub fn web(&self) -> Option<crate::web::WebTools> {
         self.inner.lock().ok().and_then(|inner| inner.web.clone())
+    }
+
+    pub fn set_session_id(&self, session_id: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.session_id = Some(session_id.to_string());
+        }
+    }
+
+    pub(crate) fn session_id(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.session_id.clone())
     }
 
     /// web_search is offered whenever the web tools are configured: the
@@ -2886,7 +2911,20 @@ fn patch_target_paths(patch: &str, cwd: &Path) -> Vec<PathBuf> {
     paths
 }
 
-pub(crate) fn create_checkpoint(cwd: &Path, name: &str, paths: &[PathBuf]) -> io::Result<Value> {
+/// Files as they were before an edit. `save` writes the checkpoint once the
+/// edit has run, with the session that took it and a hash of what the edit
+/// left in each file (`after`), so a rewind can tell whether anyone changed
+/// a file after this session did.
+pub(crate) struct PendingCheckpoint {
+    id: String,
+    name: String,
+    created_at: u64,
+    /// (workspace-relative label, absolute path, content before the edit).
+    files: Vec<(String, PathBuf, Value)>,
+    bytes: usize,
+}
+
+pub(crate) fn begin_checkpoint(cwd: &Path, name: &str, paths: &[PathBuf]) -> PendingCheckpoint {
     let id = format!("cp-{}", now_nanos());
     let mut files = Vec::new();
     let mut bytes = 0usize;
@@ -2906,36 +2944,93 @@ pub(crate) fn create_checkpoint(cwd: &Path, name: &str, paths: &[PathBuf]) -> io
             Err(_) if abs.exists() => json!({ "unreadable": true }),
             Err(_) => Value::Null,
         };
-        files.push(json!({ "path": rel, "content": content }));
+        files.push((rel, abs, content));
     }
-    let checkpoint = json!({
-        "id": id,
-        "name": name,
-        "created_at": now_secs(),
-        "files": files,
-        "bytes": bytes,
-    });
-    let dir = checkpoint_dir(cwd);
-    fs::create_dir_all(&dir)?;
-    // Keep .lynshen out of the user's git history.
-    let ignore = cwd.join(".lynshen").join(".gitignore");
-    if !ignore.exists() {
-        let _ = fs::write(&ignore, "*\n");
+    PendingCheckpoint {
+        id,
+        name: name.to_string(),
+        created_at: now_secs(),
+        files,
+        bytes,
     }
-    fs::write(
-        dir.join(format!("{id}.json")),
-        format!(
-            "{}\n",
-            serde_json::to_string_pretty(&checkpoint).map_err(io::Error::other)?
-        ),
-    )?;
-    prune_checkpoints(&dir);
-    Ok(json!({
-        "id": id,
-        "name": name,
-        "files": checkpoint["files"].as_array().map(Vec::len).unwrap_or(0),
-        "bytes": bytes,
-    }))
+}
+
+impl PendingCheckpoint {
+    pub(crate) fn save(self, cwd: &Path, state: &ToolState) -> io::Result<Value> {
+        let files = self
+            .files
+            .iter()
+            .map(|(rel, abs, content)| {
+                let mut file = json!({ "path": rel, "content": content });
+                // No `after` when the file cannot be read now: a rewind then
+                // treats any content as a later change.
+                if let Ok(after) = content_hash(abs) {
+                    file["after"] = json!(after);
+                }
+                file
+            })
+            .collect::<Vec<_>>();
+        let count = files.len();
+        let mut checkpoint = json!({
+            "id": self.id,
+            "name": self.name,
+            "created_at": self.created_at,
+            "files": files,
+            "bytes": self.bytes,
+        });
+        if let Some(session) = state.session_id() {
+            checkpoint["session_id"] = json!(session);
+        }
+        let dir = checkpoint_dir(cwd);
+        fs::create_dir_all(&dir)?;
+        // Keep .lynshen out of the user's git history.
+        let ignore = cwd.join(".lynshen").join(".gitignore");
+        if !ignore.exists() {
+            let _ = fs::write(&ignore, "*\n");
+        }
+        fs::write(
+            dir.join(format!("{}.json", self.id)),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&checkpoint).map_err(io::Error::other)?
+            ),
+        )?;
+        prune_checkpoints(&dir);
+        Ok(json!({
+            "id": self.id,
+            "name": self.name,
+            "files": count,
+            "bytes": self.bytes,
+        }))
+    }
+}
+
+/// A checkpoint of `paths` as they are now, with nothing edited after it.
+pub(crate) fn create_checkpoint(
+    cwd: &Path,
+    name: &str,
+    paths: &[PathBuf],
+    state: &ToolState,
+) -> io::Result<Value> {
+    begin_checkpoint(cwd, name, paths).save(cwd, state)
+}
+
+/// A stable hash of a file's bytes, stored in checkpoints; None when the
+/// file does not exist.
+fn content_hash(path: &Path) -> io::Result<Option<String>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes_hash(&bytes))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn bytes_hash(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Bound checkpoint disk use: keep the newest checkpoints within both a count
@@ -3004,63 +3099,24 @@ pub(crate) fn list_checkpoints(cwd: &Path) -> io::Result<Vec<Value>> {
     Ok(items)
 }
 
-pub(crate) fn restore_checkpoint(cwd: &Path, id: &str, state: &ToolState) -> io::Result<Value> {
-    let path = checkpoint_dir(cwd).join(format!("{id}.json"));
-    let value =
-        serde_json::from_str::<Value>(&fs::read_to_string(path)?).map_err(io::Error::other)?;
-    let mut restored = Vec::new();
-    let mut removed = Vec::new();
-    let mut skipped = Vec::new();
-    for file in value
-        .get("files")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let Some(rel) = file.get("path").and_then(Value::as_str) else {
-            continue;
-        };
-        let abs = resolve_path(cwd, rel);
-        if !is_inside(cwd, &abs) {
-            continue;
-        }
-        let content = file.get("content").unwrap_or(&Value::Null);
-        if let Some(content) = content.as_str() {
-            if let Some(parent) = abs.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&abs, content)?;
-            state.mark_read(&abs);
-            restored.push(rel.to_string());
-        } else if content.is_null() {
-            if abs.exists() {
-                fs::remove_file(&abs)?;
-                removed.push(rel.to_string());
-            }
-        } else {
-            // Unreadable at checkpoint time: never delete, just report it.
-            skipped.push(rel.to_string());
-        }
-    }
-    let mut result = json!({ "id": id, "restored": restored, "removed": removed });
-    if !skipped.is_empty() {
-        result["skipped"] = json!(skipped);
-        result["warning"] =
-            json!("some files could not be captured at checkpoint time and were left untouched");
-    }
-    Ok(result)
+/// A stored checkpoint, as a restore reads it.
+struct StoredCheckpoint {
+    id: String,
+    nanos: u128,
+    created_at: u64,
+    /// The session that took it; None for one taken outside a session or
+    /// by a version that did not record sessions.
+    session: Option<String>,
+    files: Vec<Value>,
 }
 
-/// Reconstruct the working tree as of `t` (a turn's creation time): for every
-/// file touched at or after `t`, restore the content captured by the earliest
-/// such checkpoint (its pre-edit state), and delete files that did not yet
-/// exist then. Checkpoints are ordered by their nanosecond id for precision.
-pub(crate) fn restore_to_timestamp(cwd: &Path, t: u64, state: &ToolState) -> io::Result<Value> {
+/// Every checkpoint of the workspace, oldest first (by nanosecond id).
+fn load_checkpoints(cwd: &Path) -> io::Result<Vec<StoredCheckpoint>> {
     let dir = checkpoint_dir(cwd);
     if !dir.exists() {
-        return Ok(json!({ "restored": [], "removed": [] }));
+        return Ok(Vec::new());
     }
-    let mut snaps: Vec<(u128, Value)> = Vec::new();
+    let mut checkpoints = Vec::new();
     for entry in fs::read_dir(&dir)? {
         let entry = entry?;
         if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
@@ -3072,66 +3128,281 @@ pub(crate) fn restore_to_timestamp(cwd: &Path, t: u64, state: &ToolState) -> io:
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
-        let created = value.get("created_at").and_then(Value::as_u64).unwrap_or(0);
-        if created < t {
-            continue;
-        }
-        let nanos = value
+        let id = value
             .get("id")
             .and_then(Value::as_str)
-            .and_then(|id| id.strip_prefix("cp-"))
-            .and_then(|n| n.parse::<u128>().ok())
-            .unwrap_or(0);
-        if let Some(files) = value.get("files").cloned() {
-            snaps.push((nanos, files));
-        }
+            .unwrap_or_default()
+            .to_string();
+        checkpoints.push(StoredCheckpoint {
+            nanos: id
+                .strip_prefix("cp-")
+                .and_then(|n| n.parse::<u128>().ok())
+                .unwrap_or(0),
+            created_at: value.get("created_at").and_then(Value::as_u64).unwrap_or(0),
+            session: value
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            files: value
+                .get("files")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            id,
+        });
     }
-    snaps.sort_by_key(|(nanos, _)| *nanos);
+    checkpoints.sort_by_key(|checkpoint| checkpoint.nanos);
+    Ok(checkpoints)
+}
 
-    let mut earliest: HashMap<String, Value> = HashMap::new();
-    for (_, files) in &snaps {
-        for file in files.as_array().into_iter().flatten() {
+/// A checkpoint this session may restore: its own, or one of unknown
+/// origin (restored only when the file is unchanged since).
+fn is_own_checkpoint(checkpoint: &StoredCheckpoint, session: Option<&str>) -> bool {
+    checkpoint.session.is_none() || checkpoint.session.as_deref() == session
+}
+
+/// One file a restore would put back, from the checkpoints in its range.
+struct RestoreFile {
+    rel: String,
+    /// Its content in the earliest of this session's checkpoints: text,
+    /// null for "did not exist", or the unreadable marker.
+    content: Value,
+    /// `after` of this session's latest checkpoint of it: what that edit
+    /// left there. None when the checkpoint records none.
+    after: Option<Value>,
+    /// Another session's checkpoint of it follows this session's first.
+    edited_by_other: bool,
+}
+
+/// The files this session's checkpoints in `range` (oldest first) captured,
+/// limited to `only` when given.
+fn restore_files(
+    range: &[StoredCheckpoint],
+    session: Option<&str>,
+    only: Option<&HashSet<String>>,
+) -> Vec<RestoreFile> {
+    let mut files: Vec<RestoreFile> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for checkpoint in range {
+        let own = is_own_checkpoint(checkpoint, session);
+        for file in &checkpoint.files {
             let Some(rel) = file.get("path").and_then(Value::as_str) else {
                 continue;
             };
-            earliest
-                .entry(rel.to_string())
-                .or_insert_with(|| file.get("content").cloned().unwrap_or(Value::Null));
+            if only.is_some_and(|only| !only.contains(rel)) {
+                continue;
+            }
+            match index.get(rel) {
+                Some(&at) if own => files[at].after = file.get("after").cloned(),
+                Some(&at) => files[at].edited_by_other = true,
+                None if own => {
+                    index.insert(rel.to_string(), files.len());
+                    files.push(RestoreFile {
+                        rel: rel.to_string(),
+                        content: file.get("content").cloned().unwrap_or(Value::Null),
+                        after: file.get("after").cloned(),
+                        edited_by_other: false,
+                    });
+                }
+                None => {}
+            }
         }
     }
+    files
+}
 
-    let mut restored = Vec::new();
-    let mut removed = Vec::new();
+/// Why restoring `file` would overwrite someone else's change, if it
+/// would. `force` accepts a change since this session's last edit (one of
+/// its own commands, say), never another session's checkpointed edit.
+fn restore_conflict(abs: &Path, file: &RestoreFile, force: bool) -> Option<&'static str> {
+    let Ok(current) = content_hash(abs) else {
+        return Some("it cannot be read to check for later changes");
+    };
+    if current
+        == file
+            .content
+            .as_str()
+            .map(|text| bytes_hash(text.as_bytes()))
+    {
+        return None;
+    }
+    if file.edited_by_other {
+        return Some("another session edited it after this session did");
+    }
+    if force {
+        return None;
+    }
+    match &file.after {
+        Some(after) if after.as_str() == current.as_deref() => None,
+        Some(_) => Some(
+            "changed since this session last edited it (by another session, the user, or a command)",
+        ),
+        None => Some(
+            "its checkpoint does not record what the edit wrote (made by an older version), so a later change cannot be ruled out",
+        ),
+    }
+}
+
+/// Puts `files` back, leaving alone (as `conflicts`) any whose restore
+/// would overwrite a later change by someone else.
+fn apply_restore(
+    cwd: &Path,
+    files: Vec<RestoreFile>,
+    force: bool,
+    state: &ToolState,
+) -> io::Result<Value> {
     let mut skipped = Vec::new();
-    for (rel, content) in earliest {
-        let abs = resolve_path(cwd, &rel);
+    let mut conflicts = Vec::new();
+    let mut changes = Vec::new();
+    for file in files {
+        let abs = resolve_path(cwd, &file.rel);
         if !is_inside(cwd, &abs) {
             continue;
         }
-        if let Some(text) = content.as_str() {
-            if let Some(parent) = abs.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&abs, text)?;
-            state.mark_read(&abs);
-            restored.push(rel);
-        } else if content.is_null() {
-            if abs.exists() {
-                fs::remove_file(&abs)?;
-                removed.push(rel);
-            }
-        } else {
+        if !file.content.is_string() && !file.content.is_null() {
             // Unreadable at checkpoint time: never delete, just report it.
-            skipped.push(rel);
+            skipped.push(file.rel);
+        } else if let Some(reason) = restore_conflict(&abs, &file, force) {
+            conflicts.push(json!({ "path": file.rel, "reason": reason }));
+        } else {
+            changes.push((file.rel, abs, file.content));
         }
     }
-    let mut result = json!({ "restored": restored, "removed": removed });
+    // The restore is this session's edit too: a later rewind compares with
+    // what it wrote.
+    let paths = changes
+        .iter()
+        .map(|(_, abs, _)| abs.clone())
+        .collect::<Vec<_>>();
+    let checkpoint = (!paths.is_empty()).then(|| begin_checkpoint(cwd, "auto-restore", &paths));
+    let mut restored = Vec::new();
+    let mut removed = Vec::new();
+    let mut outcome = Ok(());
+    for (rel, abs, content) in changes {
+        let step = match content.as_str() {
+            Some(text) => abs
+                .parent()
+                .map_or(Ok(()), fs::create_dir_all)
+                .and_then(|()| fs::write(&abs, text))
+                .map(|()| {
+                    state.mark_read(&abs);
+                    restored.push(rel);
+                }),
+            None if abs.exists() => fs::remove_file(&abs).map(|()| removed.push(rel)),
+            None => Ok(()),
+        };
+        if step.is_err() {
+            outcome = step;
+            break;
+        }
+    }
+    if let Some(checkpoint) = checkpoint {
+        let _ = checkpoint.save(cwd, state);
+    }
+    outcome?;
+    let mut warnings = Vec::new();
+    if !skipped.is_empty() {
+        warnings
+            .push("some files could not be captured at checkpoint time and were left untouched");
+    }
+    if !conflicts.is_empty() {
+        warnings.push("some files changed after this session edited them and were left as they are; see conflicts");
+    }
+    let mut result = json!({ "restored": restored, "removed": removed, "conflicts": conflicts });
     if !skipped.is_empty() {
         result["skipped"] = json!(skipped);
-        result["warning"] =
-            json!("some files could not be captured at checkpoint time and were left untouched");
+    }
+    if !warnings.is_empty() {
+        result["warning"] = json!(warnings.join("; "));
     }
     Ok(result)
+}
+
+/// Restore the files of checkpoint `id`, which must be this session's, to
+/// their content then. `force` also overwrites files changed since this
+/// session last edited them (see `restore_conflict`).
+pub(crate) fn restore_checkpoint(
+    cwd: &Path,
+    id: &str,
+    force: bool,
+    state: &ToolState,
+) -> io::Result<Value> {
+    let checkpoints = load_checkpoints(cwd)?;
+    let Some(start) = checkpoints
+        .iter()
+        .position(|checkpoint| checkpoint.id == id)
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no checkpoint {id}"),
+        ));
+    };
+    let session = state.session_id();
+    if !is_own_checkpoint(&checkpoints[start], session.as_deref()) {
+        return Err(io::Error::other(format!(
+            "checkpoint {id} was taken by another session; only this session's checkpoints can be restored"
+        )));
+    }
+    let only = checkpoints[start]
+        .files
+        .iter()
+        .filter_map(|file| file.get("path").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    let files = restore_files(&checkpoints[start..], session.as_deref(), Some(&only));
+    let mut result = apply_restore(cwd, files, force, state)?;
+    result["id"] = json!(id);
+    // `force` is offered here rather than in the tool definition: only a
+    // conflict makes it relevant.
+    if !force
+        && result["conflicts"]
+            .as_array()
+            .is_some_and(|c| !c.is_empty())
+    {
+        result["suggestion"] = json!(
+            "If a listed change is your own (a command you ran after your last edit), restore again with \"force\": true to overwrite it. Another session's edits are never overwritten."
+        );
+    }
+    Ok(result)
+}
+
+/// Reconstruct the working tree as of `t` (a turn's creation time) for this
+/// session's edits: every file one of its checkpoints at or after `t`
+/// captured gets the content of the earliest such checkpoint (its pre-edit
+/// state), or is deleted when it did not exist yet. Files only other
+/// sessions touched are left alone, and so is a file changed since this
+/// session last edited it (listed under `conflicts`).
+pub(crate) fn restore_to_timestamp(cwd: &Path, t: u64, state: &ToolState) -> io::Result<Value> {
+    let range = load_checkpoints(cwd)?
+        .into_iter()
+        .filter(|checkpoint| checkpoint.created_at >= t)
+        .collect::<Vec<_>>();
+    let files = restore_files(&range, state.session_id().as_deref(), None);
+    apply_restore(cwd, files, false, state)
+}
+
+/// The files a restore left alone and why, for the session's message; None
+/// when there were none.
+pub(crate) fn restore_conflicts_note(result: &Value) -> Option<String> {
+    let conflicts = result
+        .get("conflicts")
+        .and_then(Value::as_array)
+        .filter(|conflicts| !conflicts.is_empty())?;
+    let items = conflicts
+        .iter()
+        .map(|conflict| {
+            format!(
+                "{} ({})",
+                conflict["path"].as_str().unwrap_or_default(),
+                conflict["reason"].as_str().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>();
+    Some(format!(
+        "left {} file(s) as they are: {}",
+        conflicts.len(),
+        items.join("; ")
+    ))
 }
 
 fn checkpoint_dir(cwd: &Path) -> PathBuf {
@@ -3146,9 +3417,12 @@ fn resolve_existing_or_future(cwd: &Path, path: &Path) -> PathBuf {
     }
 }
 
+/// Whether `path` lies in `root`. A file that does not exist (yet, or any
+/// more) is judged by its deepest existing directory, so a workspace reached
+/// through a symlink still holds its new and deleted files.
 fn is_inside(root: &Path, path: &Path) -> bool {
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let root = normalize_for_policy(root);
+    let path = normalize_for_policy(path);
     path == root || path.starts_with(root)
 }
 
@@ -5173,7 +5447,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_can_restore_file_content() {
+    fn checkpoint_restore_leaves_a_later_change_unless_forced() {
         let dir = test_dir("checkpoint");
         let path = dir.join("sample.txt");
         fs::create_dir_all(&dir).unwrap();
@@ -5186,18 +5460,239 @@ mod tests {
         );
         let created = serde_json::from_str::<Value>(&created).unwrap();
         fs::write(dir.join("sample.txt"), "after\n").unwrap();
-        let restored = run_tool(
-            "checkpoint",
-            &json!({ "action": "restore", "id": created["id"] }).to_string(),
-            &dir,
-        );
-        let restored = serde_json::from_str::<Value>(&restored).unwrap();
+        let restore = |force: bool| {
+            let restored = run_tool(
+                "checkpoint",
+                &json!({ "action": "restore", "id": created["id"], "force": force }).to_string(),
+                &dir,
+            );
+            serde_json::from_str::<Value>(&restored).unwrap()
+        };
 
-        assert_eq!(restored["restored"][0], "sample.txt");
-        assert_eq!(
-            fs::read_to_string(dir.join("sample.txt")).unwrap(),
-            "before\n"
+        let refused = restore(false);
+        assert_eq!(refused["restored"], json!([]), "{refused}");
+        assert_eq!(refused["conflicts"][0]["path"], "sample.txt");
+        assert!(refused["conflicts"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("changed since this session last edited it"));
+        assert!(refused["suggestion"].as_str().unwrap().contains("force"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after\n");
+
+        let forced = restore(true);
+        assert_eq!(forced["restored"][0], "sample.txt", "{forced}");
+        assert_eq!(forced["conflicts"], json!([]));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn session_state(id: &str) -> ToolState {
+        let state = ToolState::default();
+        state.set_session_id(id);
+        state
+    }
+
+    fn call_as(state: &ToolState, dir: &Path, name: &str, args: Value) -> Value {
+        let output =
+            run_tool_with_events(name, &args.to_string(), dir, &[], state, |_| Ok(())).output;
+        serde_json::from_str(&output).unwrap()
+    }
+
+    /// `state` writes `content` to `path` with the write tool, reading an
+    /// existing file first as an agent must.
+    fn write_as(state: &ToolState, dir: &Path, path: &str, content: &str) {
+        if dir.join(path).exists() {
+            call_as(state, dir, "read", json!({ "path": path }));
+        }
+        let value = call_as(
+            state,
+            dir,
+            "write",
+            json!({ "path": path, "content": content }),
         );
+        assert!(value.get("error").is_none(), "{value}");
+    }
+
+    fn conflict_paths(result: &Value) -> Vec<&str> {
+        result["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|conflict| conflict["path"].as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn rewind_restores_only_this_sessions_edits() {
+        let dir = test_dir("rewind-two-sessions");
+        fs::create_dir_all(&dir).unwrap();
+        for (name, content) in [("a.txt", "a0"), ("b.txt", "b0"), ("shared.txt", "s0")] {
+            fs::write(dir.join(name), content).unwrap();
+        }
+        let (a, b) = (session_state("session-a"), session_state("session-b"));
+        let t = now_secs();
+        write_as(&a, &dir, "a.txt", "a1");
+        write_as(&a, &dir, "new.txt", "created by a");
+        write_as(&a, &dir, "shared.txt", "s1");
+        // Later, another session works in the same project.
+        write_as(&b, &dir, "b.txt", "b1");
+        write_as(&b, &dir, "shared.txt", "s2");
+
+        let rewound = restore_to_timestamp(&dir, t, &a).unwrap();
+        assert_eq!(rewound["restored"], json!(["a.txt"]), "{rewound}");
+        assert_eq!(rewound["removed"], json!(["new.txt"]));
+        assert_eq!(conflict_paths(&rewound), vec!["shared.txt"]);
+        assert!(rewound["conflicts"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("another session edited it"));
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "a0");
+        assert!(!dir.join("new.txt").exists());
+        assert_eq!(fs::read_to_string(dir.join("b.txt")).unwrap(), "b1");
+        assert_eq!(fs::read_to_string(dir.join("shared.txt")).unwrap(), "s2");
+
+        // B's own rewind undoes only B's edits, back to what A had left.
+        let rewound = restore_to_timestamp(&dir, t, &b).unwrap();
+        assert_eq!(rewound["conflicts"], json!([]), "{rewound}");
+        assert_eq!(fs::read_to_string(dir.join("b.txt")).unwrap(), "b0");
+        assert_eq!(fs::read_to_string(dir.join("shared.txt")).unwrap(), "s1");
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "a0");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rewind_leaves_a_file_changed_after_this_session_as_is() {
+        let dir = test_dir("rewind-user-change");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("edited.txt"), "v0").unwrap();
+        fs::write(dir.join("kept.txt"), "k0").unwrap();
+        let a = session_state("session-a");
+        let t = now_secs();
+        write_as(&a, &dir, "edited.txt", "v1");
+        write_as(&a, &dir, "kept.txt", "k1");
+        // The user changes the file afterwards, outside any session.
+        fs::write(dir.join("edited.txt"), "user's change").unwrap();
+
+        let rewound = restore_to_timestamp(&dir, t, &a).unwrap();
+        assert_eq!(rewound["restored"], json!(["kept.txt"]), "{rewound}");
+        assert_eq!(conflict_paths(&rewound), vec!["edited.txt"]);
+        assert!(rewound["conflicts"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("changed since this session last edited it"));
+        assert!(rewound["warning"].as_str().unwrap().contains("conflicts"));
+        assert_eq!(
+            fs::read_to_string(dir.join("edited.txt")).unwrap(),
+            "user's change"
+        );
+        assert_eq!(fs::read_to_string(dir.join("kept.txt")).unwrap(), "k0");
+        let note = restore_conflicts_note(&rewound).unwrap();
+        assert!(
+            note.starts_with("left 1 file(s) as they are: edited.txt ("),
+            "{note}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rewind_restores_unknown_session_checkpoints_only_when_unchanged() {
+        let dir = test_dir("rewind-legacy");
+        let cp_dir = dir.join(".lynshen").join("checkpoints");
+        fs::create_dir_all(&cp_dir).unwrap();
+        let t = now_secs();
+        // An older version wrote neither a session nor `after`.
+        let legacy = json!({
+            "id": format!("cp-{}", now_nanos()),
+            "name": "auto-edit",
+            "created_at": t,
+            "files": [{ "path": "legacy.txt", "content": "original" }],
+            "bytes": 8,
+        });
+        fs::write(
+            cp_dir.join(format!("{}.json", legacy["id"].as_str().unwrap())),
+            legacy.to_string(),
+        )
+        .unwrap();
+        fs::write(dir.join("legacy.txt"), "edited").unwrap();
+        // Checkpoints taken without a session id but with `after`.
+        fs::write(dir.join("same.txt"), "s0").unwrap();
+        fs::write(dir.join("moved.txt"), "m0").unwrap();
+        let unknown = ToolState::default();
+        write_as(&unknown, &dir, "same.txt", "s1");
+        write_as(&unknown, &dir, "moved.txt", "m1");
+        fs::write(dir.join("moved.txt"), "changed later").unwrap();
+
+        let rewound = restore_to_timestamp(&dir, t, &session_state("session-a")).unwrap();
+        assert_eq!(rewound["restored"], json!(["same.txt"]), "{rewound}");
+        let mut conflicts = conflict_paths(&rewound);
+        conflicts.sort_unstable();
+        assert_eq!(conflicts, vec!["legacy.txt", "moved.txt"]);
+        assert_eq!(fs::read_to_string(dir.join("same.txt")).unwrap(), "s0");
+        assert_eq!(
+            fs::read_to_string(dir.join("legacy.txt")).unwrap(),
+            "edited"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("moved.txt")).unwrap(),
+            "changed later"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rewinding_again_goes_back_further() {
+        let dir = test_dir("rewind-twice");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("notes.txt"), "v0").unwrap();
+        let a = session_state("session-a");
+        let first = now_secs();
+        write_as(&a, &dir, "notes.txt", "v1");
+        while now_secs() == first {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let second = now_secs();
+        write_as(&a, &dir, "notes.txt", "v2");
+
+        let rewound = restore_to_timestamp(&dir, second, &a).unwrap();
+        assert_eq!(rewound["restored"], json!(["notes.txt"]), "{rewound}");
+        assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "v1");
+        // The first rewind counts as this session's edit, so the second one
+        // does not see "v1" as someone else's change.
+        let rewound = restore_to_timestamp(&dir, first, &a).unwrap();
+        assert_eq!(rewound["conflicts"], json!([]), "{rewound}");
+        assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "v0");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn checkpoint_restore_refuses_another_sessions_checkpoint() {
+        let dir = test_dir("checkpoint-other-session");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("notes.txt"), "v0").unwrap();
+        let b = session_state("session-b");
+        let created = call_as(
+            &b,
+            &dir,
+            "checkpoint",
+            json!({ "action": "create", "paths": ["notes.txt"] }),
+        );
+        let restored = call_as(
+            &session_state("session-a"),
+            &dir,
+            "checkpoint",
+            json!({ "action": "restore", "id": created["id"], "force": true }),
+        );
+        assert!(restored["error"]
+            .as_str()
+            .unwrap()
+            .contains("another session"));
+        let missing = call_as(
+            &b,
+            &dir,
+            "checkpoint",
+            json!({ "action": "restore", "id": "../../outside" }),
+        );
+        assert!(missing["error"].as_str().unwrap().contains("no checkpoint"));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -5505,9 +6000,10 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(&path, [0xff, 0x00, 0x9f]).unwrap();
 
-        let created = create_checkpoint(&dir, "manual", std::slice::from_ref(&path)).unwrap();
+        let created =
+            create_checkpoint(&dir, "manual", std::slice::from_ref(&path), &test_state()).unwrap();
         let id = created["id"].as_str().unwrap();
-        let restored = restore_checkpoint(&dir, id, &test_state()).unwrap();
+        let restored = restore_checkpoint(&dir, id, false, &test_state()).unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), vec![0xff, 0x00, 0x9f]);
         assert_eq!(restored["skipped"][0], "binary.bin");
@@ -5523,7 +6019,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(&path, [0xff, 0x00]).unwrap();
 
-        create_checkpoint(&dir, "manual", std::slice::from_ref(&path)).unwrap();
+        create_checkpoint(&dir, "manual", std::slice::from_ref(&path), &test_state()).unwrap();
         let restored = restore_to_timestamp(&dir, 0, &test_state()).unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), vec![0xff, 0x00]);

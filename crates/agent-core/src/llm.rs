@@ -2471,6 +2471,10 @@ impl OpenAiClient {
         if request.name == "merge_agent" && merge_action(&request.arguments) != "apply" {
             return false;
         }
+        // Listing or taking a snapshot changes no workspace file.
+        if request.name == "checkpoint" && merge_action(&request.arguments) != "restore" {
+            return false;
+        }
         // A refused call changes nothing: nobody is asked.
         if self.team_v2_refusal(&request.name).is_some() {
             return false;
@@ -4449,6 +4453,30 @@ mod tests {
                 "{mode:?}"
             );
             assert!(!client.call_needs_approval(&call("discard")), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn checkpoint_restore_asks_in_manual_mode_and_list_never_asks() {
+        let (tx, _rx) = mpsc::channel();
+        let call = |action: &str| ToolCallRequest {
+            call_id: "c".to_string(),
+            name: "checkpoint".to_string(),
+            arguments: json!({ "action": action, "id": "cp-1" }).to_string(),
+        };
+        for (mode, restore) in [
+            (ApprovalMode::Manual, true),
+            (ApprovalMode::AutoEdit, false),
+            (ApprovalMode::FullAccess, false),
+        ] {
+            let client = approval_test_client(mode, Some(tx.clone()));
+            assert_eq!(
+                client.call_needs_approval(&call("restore")),
+                restore,
+                "{mode:?}"
+            );
+            assert!(!client.call_needs_approval(&call("list")), "{mode:?}");
+            assert!(!client.call_needs_approval(&call("create")), "{mode:?}");
         }
     }
 

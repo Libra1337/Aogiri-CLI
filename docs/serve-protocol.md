@@ -93,6 +93,48 @@ Runs any slash command exactly as the TUI would (`/model`, `/resume`,
 Structured views come back as events (`model_view`, `resume_view`,
 `tree_view`, ...). `/quit` and `/exit` terminate the process.
 
+### Rewind
+
+`/rewind` answers with `checkpoint_view` (the user turns of the active
+branch). `/rewind <id>` cuts the conversation back to before that turn,
+restores files from `.lynshen/checkpoints`, and answers with `transcript` and
+an `info` line:
+
+```text
+rewound · restored 2 file(s), removed 1 · left 1 file(s) as they are: src/lib.rs (changed since this session last edited it (by another session, the user, or a command))
+```
+
+The part after the second `·` is there only when files were left alone.
+Several sessions often share one project, so a rewind undoes only this
+session's edits:
+
+- Every checkpoint records the session that took it (`session_id`) and, per
+  file, a hash of what the edit left there (`after`).
+- Only files that this session's checkpoints at or after the turn captured
+  are restored, each to its content before the session's first edit in that
+  range (or deleted when it did not exist then). Files that only other
+  sessions edited are not touched.
+- A file is left as it is, and reported as a conflict, when another
+  session's checkpoint of it follows this session's first one, or when its
+  content is no longer what this session's last edit left there (the user,
+  another session or a command changed it). A change made by one of this
+  session's own commands after its last edit counts too: bash changes are not
+  recorded.
+- A checkpoint without a session (from an older version, or taken outside a
+  session) restores a file only when the file is provably unchanged since;
+  older versions recorded no `after`, so their files are reported as
+  conflicts.
+- The restore is recorded as a checkpoint of this session, so a second rewind
+  further back compares with what the first one wrote.
+
+The model's `checkpoint` tool follows the same rules for `restore` (its
+result carries `restored`, `removed`, `conflicts: [{path, reason}]`, and
+`skipped`/`warning` as before); it refuses another session's checkpoint.
+`force: true` (not in the tool definition, to keep it short; a result with
+conflicts suggests it) also overwrites a change made since this session's
+last edit, never another session's checkpointed edit. In `manual` approval mode a
+`restore` asks first, like an edit; `list` and `create` never ask.
+
 ### `steer`
 
 ```json
