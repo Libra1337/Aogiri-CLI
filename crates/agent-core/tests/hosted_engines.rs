@@ -1605,3 +1605,50 @@ fn a_reopened_session_takes_back_what_its_engine_kept_in_memory() {
     assert!(assistant_text(&events).contains("denied by user"));
     assert!(!dir.join("marker.txt").exists());
 }
+
+#[test]
+fn context_breakdown_counts_the_prompt_tools_and_conversation_by_kind() {
+    let _guard = setup();
+    let dir = temp_dir("breakdown");
+    // This HOME's config leaves project instruction files out.
+    fs::write(dir.join("AGENTS.md"), "Always answer in haiku.").unwrap();
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.submit_user_message("RUN: printf hi > note.txt".to_string());
+    pump(&mut core, is_ready);
+
+    let AgentEvent::ContextBreakdown {
+        total,
+        max,
+        categories,
+        memory_files,
+        error,
+    } = core.context_breakdown_event()
+    else {
+        panic!("not a breakdown");
+    };
+    assert_eq!(error, None);
+    let tokens = |name: &str| categories.iter().find(|c| c.name == name).map(|c| c.tokens);
+    for name in [
+        "System prompt",
+        "System tools",
+        "User messages",
+        "Tool calls",
+        "Tool results",
+    ] {
+        assert!(tokens(name).unwrap_or(0) > 0, "{name}: {categories:?}");
+    }
+    let used: u64 = categories
+        .iter()
+        .filter(|c| c.kind == "used")
+        .map(|c| c.tokens)
+        .sum();
+    assert_eq!(used, total);
+    let room: u64 = categories
+        .iter()
+        .filter(|c| c.kind != "used")
+        .map(|c| c.tokens)
+        .sum();
+    assert!(max == 0 || total + room == max, "{total} + {room} != {max}");
+    assert_eq!(tokens("Memory files"), None);
+    assert!(memory_files.is_empty());
+}

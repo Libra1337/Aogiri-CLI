@@ -565,7 +565,7 @@ impl TuiState {
                 AgentEvent::PlanDraft { .. } => false,
                 // Structured MCP state is for GUI front-ends; the TUI relies on
                 // the accompanying Info lines (and /mcp) instead.
-                AgentEvent::McpServers { .. } => false,
+                AgentEvent::McpServers { .. } | AgentEvent::ContextBreakdown { .. } => false,
                 // The agent trace is for GUI front-ends (the TUI has /subagents).
                 AgentEvent::AgentRuns(_)
                 | AgentEvent::TaskBoard(_)
