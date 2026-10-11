@@ -12,6 +12,7 @@ mod fake_model;
 use fake_model::{requests, setup, temp_dir};
 use lynshen_agent_core::{
     host::{HostExtensions, HostGate},
+    sandbox::{SandboxMode, SandboxPolicy},
     AgentCore, AgentEvent, ApprovalMode,
 };
 use serde_json::Value;
@@ -67,6 +68,13 @@ impl Request {
             text.push_str(&message.to_string());
         }
         text
+    }
+
+    /// The system prompt's text.
+    fn system_text(&self) -> String {
+        serde_json::from_str::<Value>(&self.system)
+            .map(|system| text(&system))
+            .unwrap_or_default()
     }
 
     /// The engine's notes among the messages, in order.
@@ -267,4 +275,261 @@ fn the_host_state_reaches_the_model_as_a_note_when_it_changes() {
             "<system-reminder>\n<state>two</state>\n</system-reminder>"
         ]
     );
+}
+
+fn sandbox(mode: SandboxMode) -> Option<SandboxPolicy> {
+    Some(SandboxPolicy {
+        mode,
+        ..SandboxPolicy::default_for_platform()
+    })
+}
+
+#[test]
+fn a_sandbox_change_reaches_the_model_as_a_note() {
+    let _guard = setup();
+    let dir = temp_dir("sandbox-note");
+    let mut core = AgentCore::open(dir.clone()).unwrap();
+    core.set_approval_mode(ApprovalMode::FullAccess);
+    core.set_sandbox(sandbox(SandboxMode::WorkspaceWrite));
+    let turn = |core: &mut AgentCore, message: &str| {
+        core.submit_user_message(message.to_string());
+        pump(core);
+        last_request()
+    };
+    let first = turn(&mut core, "first");
+    assert!(first
+        .system_text()
+        .contains("<sandbox mode=\"workspace-write\">"));
+    assert!(first.notes().is_empty());
+
+    // `/sandbox read-only` mid-session.
+    core.set_sandbox(sandbox(SandboxMode::ReadOnly));
+    let read_only = turn(&mut core, "read-only now");
+    assert_eq!(read_only.system, first.system);
+    assert_eq!(read_only.tools, first.tools);
+    let note = &read_only.notes()[0];
+    assert!(note.contains("<sandbox mode=\"read-only\">"), "{note}");
+    assert!(note.contains("Nothing is writable."), "{note}");
+
+    // The mode a closed engine kept, taken back by the session's next one.
+    let mut other = AgentCore::open(temp_dir("sandbox-kept")).unwrap();
+    other.set_sandbox(sandbox(SandboxMode::WorkspaceWrite));
+    core.restore_kept_state(other.kept_state());
+    let restored = turn(&mut core, "workspace again");
+    assert_eq!(restored.notes().len(), 2);
+    assert!(restored.notes()[1].contains("<sandbox mode=\"workspace-write\">"));
+
+    // A directory added to the workspace.
+    let extra = temp_dir("sandbox-extra");
+    core.add_writable_dirs(std::slice::from_ref(&extra));
+    let widened = turn(&mut core, "with another directory");
+    let notes = widened.notes();
+    assert_eq!(notes.len(), 3);
+    assert!(
+        notes[2].contains(&extra.display().to_string()),
+        "{}",
+        notes[2]
+    );
+
+    // Nothing changed: no note.
+    assert_eq!(turn(&mut core, "same again").notes(), notes);
+    assert_eq!(last_request().system, first.system);
+}
+
+#[test]
+fn propose_plan_outside_plan_mode_shows_no_draft() {
+    let _guard = setup();
+    let mut core = AgentCore::open(temp_dir("draft-outside-plan")).unwrap();
+    core.set_approval_mode(ApprovalMode::FullAccess);
+    core.submit_user_message(
+        r###"CALL propose_plan {"title":"Snake","plan":"## Goal\nShip it"}"###.to_string(),
+    );
+    let events = pump(&mut core);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::PlanDraft { .. })),
+        "{events:#?}"
+    );
+    // The call itself fails.
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolOutput { output, is_error: true, .. } if output.contains("only available in plan mode")
+    )));
+
+    // In plan mode the plan is shown as it is written.
+    core.set_approval_mode(ApprovalMode::Plan);
+    core.submit_user_message(
+        r###"CALL propose_plan {"title":"Snake","plan":"## Goal\nShip it"}"###.to_string(),
+    );
+    let events = pump(&mut core);
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::PlanDraft { title, .. } if title == "Snake")));
+}
+
+/// The summary of the first compaction in `events`; panics without one.
+fn compaction_summary(events: &[AgentEvent]) -> String {
+    events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::CompactionEnd { summary } => Some(summary.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no compaction: {events:#?}"))
+}
+
+fn assistant_text(events: &[AgentEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::AssistantDelta(delta) => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_summary_answered_with_a_tool_call_is_asked_again_without_tools() {
+    let _guard = setup();
+    let mut core = AgentCore::open(temp_dir("summary-tool-call")).unwrap();
+    core.set_approval_mode(ApprovalMode::FullAccess);
+    core.submit_user_message("SUMMARY_CALLS_TOOL first".to_string());
+    pump(&mut core);
+    core.submit_user_message("lorem ipsum dolor sit amet ".repeat(6000));
+    pump(&mut core);
+    let start = requests().len();
+
+    // Refused as too long: the turn compacts and retries.
+    core.submit_user_message("OVERFLOW go on".to_string());
+    let events = pump(&mut core);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error(_) | AgentEvent::CompactionFailed(_)
+        )),
+        "{events:#?}"
+    );
+    assert!(compaction_summary(&events).starts_with("summary without tools"));
+    assert_eq!(assistant_text(&events), "user said: OVERFLOW go on");
+
+    // The retry is the same request without tools.
+    let sent = requests()[start..].to_vec();
+    let asks: Vec<&Value> = sent
+        .iter()
+        .filter(|body| {
+            let last = body["messages"].as_array().and_then(|m| m.last()).cloned();
+            last.is_some_and(|last| text(&last).starts_with("<compaction_request>"))
+        })
+        .collect();
+    assert_eq!(asks.len(), 2, "{sent:#?}");
+    // Both with less reasoning than the turns (the model offers "low").
+    assert_eq!(sent.last().unwrap()["reasoning_effort"], "medium");
+    assert!(asks.iter().all(|ask| ask["reasoning_effort"] == "low"));
+    assert!(asks[0]["tools"].is_array());
+    assert!(asks[1].get("tools").is_none());
+    assert_eq!(asks[0]["messages"], asks[1]["messages"]);
+}
+
+#[test]
+fn a_summary_the_model_only_answers_with_tool_calls_falls_back_to_plain_text() {
+    let _guard = setup();
+    let mut core = AgentCore::open(temp_dir("summary-only-tool-calls")).unwrap();
+    core.set_approval_mode(ApprovalMode::FullAccess);
+    core.submit_user_message("SUMMARY_ONLY_CALLS_TOOL first".to_string());
+    pump(&mut core);
+    core.submit_user_message("lorem ipsum dolor sit amet ".repeat(6000));
+    pump(&mut core);
+    core.submit_user_message("short again".to_string());
+    pump(&mut core);
+
+    let (_, mut events) = core.handle_command("/compact");
+    events.extend(pump(&mut core));
+    let summary = compaction_summary(&events);
+    // The summarizer got the conversation as text.
+    assert!(
+        summary.starts_with("user said: Summarize this earlier conversation:\n\nUser: SUMMARY_ONLY_CALLS_TOOL first\nAssistant: user said: SUMMARY_ONLY_CALLS_TOOL first"),
+        "{summary}"
+    );
+    let last = requests().last().cloned().unwrap();
+    assert!(last.get("tools").is_none());
+}
+
+#[test]
+fn a_trust_decision_reaches_the_kept_system_prompt() {
+    let _guard = setup();
+    let dir = temp_dir("trust-rebuild");
+    let skill = dir.join(".lynshen").join("skills").join("checklist");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: checklist\ndescription: Run the release checklist\n---\nSteps.\n",
+    )
+    .unwrap();
+    let mut core = AgentCore::open(dir.clone()).unwrap();
+    core.set_approval_mode(ApprovalMode::FullAccess);
+    let turn = |core: &mut AgentCore, message: &str| {
+        core.submit_user_message(message.to_string());
+        pump(core);
+        last_request()
+    };
+    let untrusted = turn(&mut core, "first");
+    assert!(!untrusted
+        .system_text()
+        .contains("Run the release checklist"));
+
+    core.handle_command("/trust yes");
+    let trusted = turn(&mut core, "trusted now");
+    assert!(trusted.system_text().contains("Run the release checklist"));
+    // Built again once: the next turn keeps it.
+    assert_eq!(turn(&mut core, "again").system, trusted.system);
+
+    // So does a reopened session.
+    let session = core.session_id().to_string();
+    drop(core);
+    let mut core = AgentCore::open(dir.clone()).unwrap();
+    core.set_approval_mode(ApprovalMode::FullAccess);
+    core.handle_command(&format!("/resume {session}"));
+    core.handle_command("/trust no");
+    let reopened = turn(&mut core, "after reopening");
+    assert!(!reopened.system_text().contains("Run the release checklist"));
+    assert_eq!(reopened.system, untrusted.system);
+}
+
+#[test]
+fn a_chat_session_is_not_offered_propose_plan() {
+    let _guard = setup();
+    let chats = lynshen_agent_core::chat::ensure_chats_dir().unwrap();
+    let mut core = AgentCore::open(chats).unwrap();
+    assert!(core.is_chat());
+    core.set_approval_mode(ApprovalMode::FullAccess);
+    core.submit_user_message("hello".to_string());
+    pump(&mut core);
+    let tools = last_request().tools;
+    assert!(tools.contains("\"update_plan\""));
+    assert!(!tools.contains("\"propose_plan\""));
+}
+
+#[test]
+fn each_user_turn_in_plan_mode_ends_with_a_short_reminder() {
+    let _guard = setup();
+    let mut core = AgentCore::open(temp_dir("plan-reminder")).unwrap();
+    core.set_approval_mode(ApprovalMode::Plan);
+    let turn = |core: &mut AgentCore, message: &str| {
+        core.submit_user_message(message.to_string());
+        pump(core);
+        last_request()
+    };
+    let first = turn(&mut core, "plan something");
+    assert_eq!(first.notes().len(), 1);
+    assert!(first.notes()[0].contains("<plan_mode>"));
+    let second = turn(&mut core, "and more");
+    let notes = second.notes();
+    assert_eq!(notes.len(), 2);
+    assert!(notes[1].contains("Plan mode is still on"), "{}", notes[1]);
+    assert!(!notes[1].contains("<plan_mode>"));
+    // Just before the user's message, which stays last.
+    let messages = &second.messages;
+    assert_eq!(text(&messages[messages.len() - 2]), notes[1]);
+    assert_eq!(text(messages.last().unwrap()), "and more");
 }

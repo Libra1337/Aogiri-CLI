@@ -101,6 +101,7 @@ fn client_with(system_prompt: String, agents: AgentsConfig) -> OpenAiClient {
         connect_timeout: Duration::from_secs(1),
         read_timeout: Duration::from_secs(1),
         goal_tool_tx: Some(goal_tx),
+        propose_plan: true,
         approval_tx: None,
         approval_mode: LiveApprovalMode::default(),
         safety_model: None,

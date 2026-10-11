@@ -200,21 +200,17 @@ fn ensure_agent(hub: &Hub) -> Result<(), String> {
 const ROLE: &str = "Route the user's requests to the coding sessions on this computer.";
 
 /// Where this dispatch stands, told to the dispatcher before a turn when it
-/// changed (its system prompt is `GUIDE` and stays as the session began);
-/// empty before the dispatch exists.
+/// changed (its system prompt is `GUIDE` and stays as the session began,
+/// and says what these lines mean); empty before the dispatch exists. Each
+/// change is told anew, so it is kept to the state.
 pub fn context(hub: &Hub, session: &str) -> String {
     let Some(d) = hub.dispatch.get(session) else {
         return String::new();
     };
-    let plan = if d["plan"] == true {
-        "Plan mode is ON: after `plan`, end your turn. The user's decision arrives as a message; start no task before they confirm."
-    } else {
-        "Plan mode is OFF: after `plan`, start the tasks right away."
-    };
     let mut tasks = String::new();
     for task in d["tasks"].as_array().into_iter().flatten() {
         tasks.push_str(&format!(
-            "- task {} [{}] {} · project {} · session {}\n",
+            "\n- task {} [{}] {} · project {} · session {}",
             task["id"],
             text(&task["status"]),
             text(&task["title"]),
@@ -223,11 +219,12 @@ pub fn context(hub: &Hub, session: &str) -> String {
         ));
     }
     if tasks.is_empty() {
-        tasks.push_str("(no plan yet)\n");
+        tasks.push_str(" none yet");
     }
     format!(
-        "<dispatch>\nStatus: {}\n{plan}\nEvery task runs in permission mode `{}`, chosen by the user and applied by the system.\nTasks:\n{tasks}</dispatch>",
+        "<dispatch>\nStatus: {} · plan mode: {} · tasks run in permission mode `{}`\nTasks:{tasks}\n</dispatch>",
         text(&d["status"]),
+        if d["plan"] == true { "on" } else { "off" },
         text(&d["mode"]),
     )
 }
@@ -245,6 +242,7 @@ How to work:
 7. If the request is unclear about where or what (two projects fit, say), call `question` with your best guess as the assumption and the default, and carry on with it.
 8. Results arrive as messages starting with [task ...]. A task that failed or stopped short may get one corrective `start_task`; one waiting for the user's approval is theirs to decide.
 9. When every task has finished or failed, call `finish` with the report for the user, in their language: the overall outcome in one line, then one short line per task (done, failed, or waiting for them), then anything they must do. No more than that.
+Before a message you may get a <dispatch> note: where this dispatch stands now (its status, plan mode, the permission mode its tasks run in, and its tasks); the latest one holds. With plan mode on, end your turn after `plan`: the user's decision arrives as a message; start no task before they confirm. With plan mode off, start the tasks right after `plan`. The permission mode is the user's choice and the system applies it to every task.
 Keep your own replies short; the user reads them on a phone.";
 
 /// The dispatcher's tools (with `question` from the agent tools).
@@ -791,6 +789,28 @@ mod tests {
             "status": "planning", "tasks": [], "summary": "",
         }));
         rx
+    }
+
+    #[test]
+    fn the_dispatch_note_carries_only_its_state() {
+        let (hub, project) = hub("note");
+        let _dispatcher = dispatch(&hub, true, "auto");
+        assert_eq!(
+            context(&hub, "d1"),
+            "<dispatch>\nStatus: planning · plan mode: on · tasks run in permission mode `auto`\nTasks: none yet\n</dispatch>"
+        );
+        let tasks =
+            json!({ "tasks": [{ "title": "fix", "project": project.display().to_string() }] });
+        plan(&hub, "d1", &tasks).unwrap();
+        let note = context(&hub, "d1");
+        assert_eq!(note.lines().count(), 5, "{note}");
+        assert!(
+            note.contains("\n- task 1 [planned] fix · project "),
+            "{note}"
+        );
+        // What the lines mean is the system prompt's.
+        assert!(GUIDE.contains("With plan mode on, end your turn after `plan`"));
+        assert_eq!(context(&hub, "none"), "");
     }
 
     #[test]

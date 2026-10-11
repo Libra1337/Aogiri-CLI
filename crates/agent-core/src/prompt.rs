@@ -86,7 +86,7 @@ pub(crate) fn stable_prefix_len(system_prompt: &str) -> Option<usize> {
 /// skills (fixed per project), the sandbox note, the working directory and
 /// the date, then the host's lasting text. A session keeps the prompt its
 /// first turn built (`SessionPrompt`); what changes later (plan mode, the
-/// date, the host's state) reaches the model as a note (`Note`).
+/// date, the sandbox, the host's state) reaches the model as a note (`Note`).
 #[cfg(test)]
 pub fn build_system_prompt(base: &str, context: &PromptContext) -> String {
     let mut prompt = runtime_prompt(base, context);
@@ -167,9 +167,11 @@ pub fn tail_section(context: &PromptContext) -> String {
 }
 
 /// A session's system prompt in its parts, built when its first turn starts
-/// and kept for the whole session, across reopening: a provider reuses its
-/// prompt cache only for a byte-identical prefix. What changes later reaches
-/// the model as a note instead (see `notes_due`).
+/// and kept while what it is built from stays the same, across reopening: a
+/// provider reuses its prompt cache only for a byte-identical prefix. The
+/// date and the sandbox change it by a note instead (see `notes_due`); a
+/// change to the base prompt, the edit tools, the project's instructions or
+/// the skills makes the session take the prompt built now (`outdated_by`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionPrompt {
     /// The base prompt with its tool guidance (`runtime_prompt`).
@@ -179,11 +181,24 @@ pub struct SessionPrompt {
     pub tail: String,
     /// The date `tail` gives.
     pub date: String,
+    /// The sandbox note `tail` gives; empty without a sandbox.
+    pub sandbox: String,
 }
 
 impl SessionPrompt {
     pub fn text(&self) -> String {
         format!("{}{}{}{}", self.head, self.project, self.skills, self.tail)
+    }
+
+    /// Whether `now`, the prompt a turn would build now, was built from
+    /// other inputs than this one: another base prompt (prompt.txt, a new
+    /// version), edit tools, project instructions or skills (a trust
+    /// decision). The tail is left out: its date and sandbox note reach the
+    /// model as notes, the working directory is the session's and the host's
+    /// lasting text is fixed when the prompt is built (the host's state is a
+    /// note too).
+    pub fn outdated_by(&self, now: &SessionPrompt) -> bool {
+        self.head != now.head || self.project != now.project || self.skills != now.skills
     }
 
     pub fn to_json(&self) -> Value {
@@ -193,6 +208,7 @@ impl SessionPrompt {
             "skills": self.skills,
             "tail": self.tail,
             "date": self.date,
+            "sandbox": self.sandbox,
         })
     }
 
@@ -204,6 +220,7 @@ impl SessionPrompt {
             skills: field("skills")?,
             tail: field("tail")?,
             date: field("date")?,
+            sandbox: field("sandbox")?,
         })
     }
 }
@@ -214,24 +231,44 @@ impl SessionPrompt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Note {
     PlanMode,
+    /// The short reminder each user turn in plan mode starts with, after the
+    /// one that turned it on (see `plan_mode::REMINDER`).
+    PlanReminder,
     Date,
+    /// The shell sandbox (`SandboxPolicy::prompt`).
+    Sandbox,
     /// The host's current state (`HostExtensions::context`).
     Host,
 }
 
 impl Note {
+    const ALL: [Note; 5] = [
+        Note::PlanMode,
+        Note::PlanReminder,
+        Note::Date,
+        Note::Sandbox,
+        Note::Host,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Note::PlanMode => "plan_mode",
+            Note::PlanReminder => "plan_reminder",
             Note::Date => "date",
+            Note::Sandbox => "sandbox",
             Note::Host => "host",
         }
     }
 
     pub fn parse(name: &str) -> Option<Self> {
-        [Note::PlanMode, Note::Date, Note::Host]
-            .into_iter()
-            .find(|note| note.as_str() == name)
+        Note::ALL.into_iter().find(|note| note.as_str() == name)
+    }
+
+    /// Whether the note states what holds until a later note of its kind,
+    /// so a compaction keeps the latest one in view. A plan reminder only
+    /// repeats the plan-mode note.
+    pub fn lasting(self) -> bool {
+        self != Note::PlanReminder
     }
 }
 
@@ -243,24 +280,40 @@ fn note(body: &str) -> String {
     format!("{NOTE_OPEN}{}{NOTE_CLOSE}", body.trim())
 }
 
-/// What the notes describe now: the approval mode's plan mode, today's date
-/// and the host's state.
+/// The note when the host's state, told earlier, is empty now (a dispatch
+/// that ended, say).
+const HOST_EMPTY_NOTE: &str =
+    "No active tasks or host state now; what earlier notes listed no longer applies.";
+
+/// The note when the shell runs without a sandbox now.
+const SANDBOX_OFF_NOTE: &str =
+    "The shell sandbox is off now: commands run without one (full access), as the approval mode allows.";
+
+/// What the notes describe now: the approval mode's plan mode, today's date,
+/// the shell sandbox and the host's state.
 pub struct NoteState {
     pub plan_mode: bool,
+    /// The turn starts with a user's message: in plan mode it gets a short
+    /// reminder, unless plan mode is told in full just then.
+    pub user_turn: bool,
     pub date: String,
+    /// The sandbox note (`SandboxPolicy::prompt`); empty without a sandbox.
+    pub sandbox: String,
     pub host: String,
 }
 
 /// The notes to add before the next request: each kind whose latest note
 /// (`last`) says something else than the state now. Without one, the model
-/// knows what the system prompt says: plan mode off, the prompt's date, no
-/// host state.
+/// knows what the system prompt (`prompt`) says: plan mode off, its date and
+/// sandbox, no host state. Before the first turn (no `prompt`) the prompt
+/// still to be built will say what holds now.
 pub fn notes_due<'a>(
     now: &NoteState,
-    prompt_date: &str,
+    prompt: Option<&SessionPrompt>,
     last: impl Fn(Note) -> Option<&'a str>,
 ) -> Vec<(Note, String)> {
     let mut due = Vec::new();
+    let prompt_date = prompt.map_or(now.date.as_str(), |prompt| prompt.date.as_str());
     let date = note(&format!("The date is now {}.", now.date));
     if last(Note::Date).map_or(now.date != prompt_date, |told| told != date) {
         due.push((Note::Date, date));
@@ -270,14 +323,35 @@ pub fn notes_due<'a>(
     } else {
         crate::plan_mode::ENDED_NOTE
     });
-    if last(Note::PlanMode).map_or(now.plan_mode, |told| told != plan) {
+    let plan_told = last(Note::PlanMode).map_or(!now.plan_mode, |told| told == plan);
+    if !plan_told {
         due.push((Note::PlanMode, plan));
     }
-    if !now.host.trim().is_empty() {
-        let host = note(&now.host);
-        if last(Note::Host) != Some(host.as_str()) {
-            due.push((Note::Host, host));
-        }
+    let prompt_sandbox = prompt.map_or(now.sandbox.as_str(), |prompt| prompt.sandbox.as_str());
+    let sandbox = if now.sandbox.trim().is_empty() {
+        note(SANDBOX_OFF_NOTE)
+    } else {
+        note(&format!(
+            "The shell sandbox changed:\n{}",
+            now.sandbox.trim()
+        ))
+    };
+    if last(Note::Sandbox).map_or(now.sandbox.trim() != prompt_sandbox.trim(), |told| {
+        told != sandbox
+    }) {
+        due.push((Note::Sandbox, sandbox));
+    }
+    let host = note(if now.host.trim().is_empty() {
+        HOST_EMPTY_NOTE
+    } else {
+        &now.host
+    });
+    if last(Note::Host).map_or(!now.host.trim().is_empty(), |told| told != host) {
+        due.push((Note::Host, host));
+    }
+    // Last, so it is next to the user's message.
+    if now.plan_mode && now.user_turn && plan_told {
+        due.push((Note::PlanReminder, note(crate::plan_mode::REMINDER)));
     }
     due
 }
@@ -1071,6 +1145,7 @@ mod tests {
             skills: String::new(),
             tail: "\n\n<env>\nDate: 2026-10-12\n</env>".to_string(),
             date: "2026-10-12".to_string(),
+            sandbox: String::new(),
         };
         assert_eq!(
             SessionPrompt::from_json(&prompt.to_json()),
@@ -1083,20 +1158,115 @@ mod tests {
         assert_eq!(SessionPrompt::from_json(&json!({ "head": "x" })), None);
     }
 
+    /// The prompt a session keeps, as `core` builds it from `context`.
+    fn session_prompt(base: &str, context: &PromptContext) -> SessionPrompt {
+        SessionPrompt {
+            head: runtime_prompt(base, context),
+            project: project_section(&context.project_instructions),
+            skills: skills_section(&context.skills),
+            tail: tail_section(context),
+            date: context.date.clone(),
+            sandbox: context.sandbox.clone(),
+        }
+    }
+
+    #[test]
+    fn a_kept_prompt_is_outdated_by_new_instructions_tools_or_skills_only() {
+        let context = PromptContext {
+            date: "2026-10-12".to_string(),
+            cwd: PathBuf::from("/work"),
+            edit_tools: crate::config::default_edit_tools(),
+            project_instructions: vec![ProjectInstruction {
+                path: PathBuf::from("/work/AGENTS.md"),
+                content: "Run the tests.".to_string(),
+            }],
+            sandbox: "<sandbox mode=\"workspace-write\">\nnote\n</sandbox>".to_string(),
+            host: "Peers: ops (busy)".to_string(),
+            ..PromptContext::default()
+        };
+        let kept = session_prompt("Base.", &context);
+        // What reaches the model as a note, or is the session's own, keeps it.
+        let later = PromptContext {
+            date: "2026-10-13".to_string(),
+            sandbox: "<sandbox mode=\"read-only\">\nnote\n</sandbox>".to_string(),
+            host: "Peers: ops (idle)".to_string(),
+            ..context.clone()
+        };
+        assert!(!kept.outdated_by(&session_prompt("Base.", &later)));
+        // prompt.txt or a new version's prompt, AGENTS.md, the edit tools,
+        // the skills (a trust decision) each take the prompt built now.
+        let edited = PromptContext {
+            project_instructions: vec![ProjectInstruction {
+                path: PathBuf::from("/work/AGENTS.md"),
+                content: "Run the tests and the linter.".to_string(),
+            }],
+            ..later.clone()
+        };
+        let no_write = PromptContext {
+            edit_tools: vec!["edit".to_string()],
+            ..later.clone()
+        };
+        let trusted = PromptContext {
+            skills: vec![SkillPromptItem {
+                name: "review".to_string(),
+                description: "Review a change".to_string(),
+                path: PathBuf::from("/work/.lynshen/skills/review/SKILL.md"),
+            }],
+            ..later.clone()
+        };
+        for (base, context) in [
+            ("New base.", &later),
+            ("Base.", &edited),
+            ("Base.", &no_write),
+            ("Base.", &trusted),
+        ] {
+            assert!(kept.outdated_by(&session_prompt(base, context)), "{base}");
+        }
+    }
+
+    fn state(plan_mode: bool, date: &str, host: &str) -> NoteState {
+        NoteState {
+            plan_mode,
+            user_turn: false,
+            date: date.to_string(),
+            sandbox: String::new(),
+            host: host.to_string(),
+        }
+    }
+
+    fn kinds(due: &[(Note, String)]) -> Vec<Note> {
+        due.iter().map(|(note, _)| *note).collect()
+    }
+
+    /// `last` for notes told as `told` says (the latest of each kind last).
+    fn told<'a>(told: &'a [(Note, String)]) -> impl Fn(Note) -> Option<&'a str> {
+        move |note| {
+            told.iter()
+                .rev()
+                .find(|(kind, _)| *kind == note)
+                .map(|(_, text)| text.as_str())
+        }
+    }
+
+    fn prompt_of(date: &str, sandbox: &str) -> SessionPrompt {
+        SessionPrompt {
+            date: date.to_string(),
+            sandbox: sandbox.to_string(),
+            ..SessionPrompt::default()
+        }
+    }
+
     #[test]
     fn notes_tell_what_changed_since_the_prompt_or_the_last_note() {
-        let state = |plan_mode: bool, date: &str, host: &str| NoteState {
-            plan_mode,
-            date: date.to_string(),
-            host: host.to_string(),
-        };
-        let kinds = |due: &[(Note, String)]| due.iter().map(|(note, _)| *note).collect::<Vec<_>>();
+        let prompt = prompt_of("2026-10-12", "");
         // As the prompt says: nothing to tell.
-        assert!(notes_due(&state(false, "2026-10-12", ""), "2026-10-12", |_| None).is_empty());
+        assert!(notes_due(&state(false, "2026-10-12", ""), Some(&prompt), |_| None).is_empty());
+        // Before the first turn the prompt to come says what holds now.
+        assert!(notes_due(&state(false, "2026-10-13", ""), None, |_| None).is_empty());
 
         let due = notes_due(
             &state(true, "2026-10-13", "Status: running"),
-            "2026-10-12",
+            Some(&prompt),
             |_| None,
         );
         assert_eq!(kinds(&due), [Note::Date, Note::PlanMode, Note::Host]);
@@ -1108,21 +1278,16 @@ mod tests {
         assert!(due.iter().all(|(_, text)| text.starts_with(NOTE_OPEN)));
 
         // Once told, the same state needs no note; a change does.
-        let told = |note: Note| {
-            due.iter()
-                .find(|(kind, _)| *kind == note)
-                .map(|(_, text)| text.as_str())
-        };
         assert!(notes_due(
             &state(true, "2026-10-13", "Status: running"),
-            "2026-10-12",
-            told
+            Some(&prompt),
+            told(&due)
         )
         .is_empty());
         let off = notes_due(
             &state(false, "2026-10-13", "Status: done"),
-            "2026-10-12",
-            told,
+            Some(&prompt),
+            told(&due),
         );
         assert_eq!(kinds(&off), [Note::PlanMode, Note::Host]);
         assert!(off[0].1.contains(crate::plan_mode::ENDED_NOTE));
@@ -1131,5 +1296,76 @@ mod tests {
             "<system-reminder>\nStatus: done\n</system-reminder>"
         );
         assert_eq!(Note::parse(Note::Host.as_str()), Some(Note::Host));
+        assert_eq!(Note::parse(Note::Sandbox.as_str()), Some(Note::Sandbox));
+    }
+
+    #[test]
+    fn a_sandbox_change_is_a_note() {
+        let workspace =
+            "<sandbox mode=\"workspace-write\">\nWritable: the working directory.\n</sandbox>";
+        let read_only = "<sandbox mode=\"read-only\">\nNothing is writable.\n</sandbox>";
+        let prompt = prompt_of("2026-10-12", workspace);
+        let now = |sandbox: &str| NoteState {
+            sandbox: sandbox.to_string(),
+            ..state(false, "2026-10-12", "")
+        };
+        assert!(notes_due(&now(workspace), Some(&prompt), |_| None).is_empty());
+
+        let mut notes = notes_due(&now(read_only), Some(&prompt), |_| None);
+        assert_eq!(kinds(&notes), [Note::Sandbox]);
+        assert_eq!(
+            notes[0].1,
+            format!(
+                "<system-reminder>\nThe shell sandbox changed:\n{read_only}\n</system-reminder>"
+            )
+        );
+        assert!(notes_due(&now(read_only), Some(&prompt), told(&notes)).is_empty());
+        // Back to what the prompt says: the model was told otherwise since.
+        notes.extend(notes_due(&now(workspace), Some(&prompt), told(&notes)));
+        assert_eq!(kinds(&notes), [Note::Sandbox, Note::Sandbox]);
+        assert!(notes[1].1.contains(workspace));
+        // No sandbox at all.
+        let off = notes_due(&now(""), Some(&prompt), told(&notes));
+        assert_eq!(kinds(&off), [Note::Sandbox]);
+        assert!(off[0].1.contains(SANDBOX_OFF_NOTE));
+    }
+
+    #[test]
+    fn plan_mode_reminds_each_user_turn_after_the_one_that_told_it() {
+        let prompt = prompt_of("2026-10-12", "");
+        let user_turn = |plan_mode: bool| NoteState {
+            user_turn: true,
+            ..state(plan_mode, "2026-10-12", "")
+        };
+        let mut notes = notes_due(&user_turn(true), Some(&prompt), |_| None);
+        // The rules in full, no reminder on top.
+        assert_eq!(kinds(&notes), [Note::PlanMode]);
+        notes.extend(notes_due(&user_turn(true), Some(&prompt), told(&notes)));
+        assert_eq!(kinds(&notes), [Note::PlanMode, Note::PlanReminder]);
+        assert!(notes[1].1.contains(crate::plan_mode::REMINDER));
+        // Only a user's message gets one, and only in plan mode.
+        let in_plan_mode = state(true, "2026-10-12", "");
+        assert!(notes_due(&in_plan_mode, Some(&prompt), told(&notes)).is_empty());
+        let off = notes_due(&user_turn(false), Some(&prompt), told(&notes));
+        assert_eq!(kinds(&off), [Note::PlanMode]);
+        assert!(!Note::PlanReminder.lasting());
+    }
+
+    #[test]
+    fn a_host_state_that_empties_is_told_in_a_short_note() {
+        let prompt = prompt_of("2026-10-12", "");
+        let tasks = notes_due(
+            &state(false, "2026-10-12", "<dispatch>…</dispatch>"),
+            Some(&prompt),
+            |_| None,
+        );
+        assert_eq!(kinds(&tasks), [Note::Host]);
+        let empty = notes_due(&state(false, "2026-10-12", ""), Some(&prompt), told(&tasks));
+        assert_eq!(kinds(&empty), [Note::Host]);
+        assert_eq!(
+            empty[0].1,
+            format!("<system-reminder>\n{HOST_EMPTY_NOTE}\n</system-reminder>")
+        );
+        assert!(notes_due(&state(false, "2026-10-12", ""), Some(&prompt), told(&empty)).is_empty());
     }
 }

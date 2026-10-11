@@ -705,7 +705,7 @@ impl AgentCore {
             return vec![AgentEvent::Error("nothing to continue".to_string())];
         }
         self.overflow_retried = false;
-        self.append_due_notes();
+        self.append_due_notes(false);
         self.start_turn_from_existing_context()
     }
 
@@ -1673,12 +1673,15 @@ impl AgentCore {
         if let Some(rx) = self.receiver.take() {
             while let Ok(event) = rx.try_recv() {
                 match event {
-                    WorkerEvent::PlanDraft { call_id, delta } => {
+                    // propose_plan runs only in plan mode: outside it the
+                    // call fails, and a draft shown would never finish.
+                    WorkerEvent::PlanDraft { call_id, delta } if self.in_plan_mode() => {
                         let draft = self.plan_draft.get_or_insert_with(PlanDraft::default);
                         if let Some(event) = draft.push(&call_id, &delta) {
                             events.push(event);
                         }
                     }
+                    WorkerEvent::PlanDraft { .. } => {}
                     WorkerEvent::CompactionStart => events.push(AgentEvent::CompactionStart),
                     WorkerEvent::CompactionProgress { output_tokens } => {
                         events.push(AgentEvent::CompactionProgress { output_tokens });
@@ -1966,7 +1969,7 @@ impl AgentCore {
 
         if !self.running {
             if std::mem::take(&mut self.overflow_retry_pending) {
-                self.append_due_notes();
+                self.append_due_notes(false);
                 let save_event = self.save_session_event();
                 events.extend(self.spawn_current_context_turn(save_event));
             } else if let Some((next, images)) = self.queued.pop_front() {
@@ -2036,7 +2039,7 @@ impl AgentCore {
             .join("\n\n");
         self.overflow_retried = false;
         self.goal_continuation_running = false;
-        self.append_due_notes();
+        self.append_due_notes(false);
         self.session.append(EntryKind::ResponseItem {
             item: json!({
                 "role": "user",
@@ -2304,7 +2307,7 @@ impl AgentCore {
     fn start_turn(&mut self, message: String, images: Vec<String>) -> Vec<AgentEvent> {
         self.overflow_retried = false;
         // Notes come first: the user's message stays the last one.
-        self.append_due_notes();
+        self.append_due_notes(true);
         self.session.append(EntryKind::User { content: message });
         if !images.is_empty() {
             self.session.append(EntryKind::UserImage { paths: images });
@@ -2403,6 +2406,7 @@ impl AgentCore {
                 skills: crate::prompt::skills_section(&context.skills),
                 tail: crate::prompt::tail_section(&context),
                 date: context.date,
+                sandbox: context.sandbox,
             },
             project_files,
             extra_read_roots,
@@ -2410,35 +2414,51 @@ impl AgentCore {
         })
     }
 
-    /// The system prompt the session keeps: the one its first turn built
-    /// (`built` on that turn), fixed from then on (see `SessionPrompt`).
+    /// The system prompt the session keeps: the one its first turn built,
+    /// until what it is built from changes (`SessionPrompt::outdated_by`):
+    /// then `built`, the prompt this turn built, replaces it. One cache miss
+    /// per change; the date and the sandbox are notes instead.
     fn session_prompt(&mut self, built: SessionPrompt) -> SessionPrompt {
-        if let Some(prompt) = self.session.prompt() {
+        if let Some(prompt) = self
+            .session
+            .prompt()
+            .filter(|kept| !kept.outdated_by(&built))
+        {
             return prompt.clone();
         }
         self.session.set_prompt(built.clone());
         built
     }
 
+    /// Plan mode applies: the approval mode is plan, in a coding session.
+    fn in_plan_mode(&self) -> bool {
+        !self.chat && self.approval_mode.get() == ApprovalMode::Plan
+    }
+
     /// Adds a note for each thing the model was last told that is no longer
-    /// so (plan mode, the date, the host's state), before the input a turn
-    /// starts with: the system prompt stays as the session began.
-    fn append_due_notes(&mut self) {
+    /// so (plan mode, the date, the sandbox, the host's state), and a plan
+    /// mode reminder when a user's message starts the turn (`user_turn`),
+    /// before the input the turn starts with: the system prompt stays as the
+    /// session began.
+    fn append_due_notes(&mut self, user_turn: bool) {
         let now = crate::prompt::NoteState {
-            plan_mode: !self.chat && self.approval_mode.get() == ApprovalMode::Plan,
+            plan_mode: self.in_plan_mode(),
+            user_turn,
             date: current_utc_date(),
+            sandbox: self
+                .tool_state
+                .sandbox()
+                .map(|sandbox| sandbox.prompt())
+                .unwrap_or_default(),
             host: self
                 .host
                 .as_ref()
                 .map(|host| (host.context)())
                 .unwrap_or_default(),
         };
-        // Before the first turn the prompt is still to be built, today.
-        let prompt_date = self
-            .session
-            .prompt()
-            .map_or_else(|| now.date.clone(), |prompt| prompt.date.clone());
-        let due = crate::prompt::notes_due(&now, &prompt_date, |note| self.session.last_note(note));
+        let due = crate::prompt::notes_due(&now, self.session.prompt(), |note| {
+            self.session.last_note(note)
+        });
         for (note, content) in due {
             self.session.append_note(note, content);
         }
@@ -2548,7 +2568,7 @@ impl AgentCore {
         thread::spawn(move || {
             let input = if let Some(plan) = compaction {
                 let _ = tx.send(WorkerEvent::CompactionStart);
-                match client.summarize_conversation(plan.summary_request(), |output_tokens| {
+                match client.summarize_conversation(&plan, |output_tokens| {
                     tx.send(WorkerEvent::CompactionProgress { output_tokens })
                         .map_err(|error| error.to_string())
                 }) {
@@ -2704,7 +2724,7 @@ impl AgentCore {
 
         thread::spawn(move || {
             let _ = tx.send(WorkerEvent::CompactionStart);
-            match client.summarize_conversation(plan.summary_request(), |output_tokens| {
+            match client.summarize_conversation(&plan, |output_tokens| {
                 tx.send(WorkerEvent::CompactionProgress { output_tokens })
                     .map_err(|error| error.to_string())
             }) {
@@ -2756,6 +2776,8 @@ impl AgentCore {
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: Some(goal_tool_tx),
+            // Plan mode does not apply to a chat session.
+            propose_plan: !self.chat,
             approval_tx,
             approval_mode: self.approval_mode.clone(),
             safety_model: Some(self.config.safety().0).filter(|model| !model.trim().is_empty()),
@@ -2810,6 +2832,7 @@ impl AgentCore {
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: None,
+            propose_plan: false,
             approval_tx: None,
             approval_mode: self.approval_mode.clone(),
             safety_model: None,
@@ -2834,7 +2857,7 @@ impl AgentCore {
             "<goal_context>\nContinue working toward the active session goal.\n\nObjective: {}\n\nBefore doing more work, decide whether the objective is already satisfied. If all required work is done, call update_goal with status \"complete\" and stop. If the objective lacks a verifiable stopping condition, ask the user to clarify instead of continuing indefinitely. If progress cannot continue without user input or an external change, call update_goal with status \"blocked\".\n</goal_context>",
             goal.objective
         );
-        self.append_due_notes();
+        self.append_due_notes(false);
         self.session.append_goal_context(message);
         self.goal_continuation_running = true;
         let mut events = vec![AgentEvent::Info(format!(
@@ -3615,7 +3638,7 @@ impl AgentCore {
                 .to_string()
         };
         let (title, markdown) = (field("title"), field("plan"));
-        if self.approval_mode.get() != ApprovalMode::Plan {
+        if !self.in_plan_mode() {
             let output =
                 json!({ "error": "propose_plan is only available in plan mode" }).to_string();
             return (
@@ -4009,10 +4032,15 @@ impl AgentCore {
                 roles: roles.as_slice(),
             }),
             goals: true,
+            propose_plan: !self.chat,
         });
-        // What the session sends: the prompt it keeps, else the one its first
-        // turn would build now.
-        let prompt = self.session.prompt().unwrap_or(&turn.prompt);
+        // What the next turn sends: the prompt the session keeps, unless it
+        // is outdated or there is none yet (see `session_prompt`).
+        let prompt = self
+            .session
+            .prompt()
+            .filter(|kept| !kept.outdated_by(&turn.prompt))
+            .unwrap_or(&turn.prompt);
         let mcp_names: HashSet<String> = self
             .mcp
             .definitions()
@@ -5777,6 +5805,7 @@ fn title_request(
         connect_timeout: Duration::from_secs(config.connect_timeout_seconds),
         read_timeout: Duration::from_secs(config.read_timeout_seconds),
         goal_tool_tx: None,
+        propose_plan: false,
         approval_tx: None,
         approval_mode: LiveApprovalMode::new(config.approval_mode),
         safety_model: None,

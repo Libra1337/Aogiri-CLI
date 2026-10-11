@@ -24,6 +24,10 @@ Write the plan for scanning, with short sections and tables:
 Keep it decision-complete and concise: whoever executes it must not have to make new decisions. A revised plan replaces the earlier one completely.
 </plan_mode>"#;
 
+/// The note each later user turn in plan mode starts with: the rules above
+/// are told once, when plan mode turns on.
+pub const REMINDER: &str = "Plan mode is still on: only read-only tools run. Finish investigating, then deliver the plan with propose_plan; nothing changes until the user approves it.";
+
 /// The note when plan mode turns off again.
 pub const ENDED_NOTE: &str = "Plan mode is off now. Tools that change files and run commands work again, as the approval mode allows; propose_plan works only in plan mode.";
 

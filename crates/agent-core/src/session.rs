@@ -132,6 +132,42 @@ impl CompactionPlan {
         items
     }
 
+    /// The folded items as plain text, then the changed files: the
+    /// summarizer's input for a model that answers the summary request with
+    /// tool calls only (see `OpenAiClient::summarize_conversation`).
+    pub fn folded_text(&self) -> String {
+        let mut text = String::new();
+        for item in &self.folded_items {
+            let line = match item.get("type").and_then(Value::as_str) {
+                Some("function_call") => format!(
+                    "Assistant tool call {}: {}",
+                    item.get("name").and_then(Value::as_str).unwrap_or("tool"),
+                    item.get("arguments").and_then(Value::as_str).unwrap_or("")
+                ),
+                Some("function_call_output") => match item.get("output") {
+                    Some(Value::String(output)) => format!("Tool output: {output}"),
+                    Some(output) => format!("Tool output: {output}"),
+                    None => continue,
+                },
+                _ => {
+                    let said = extract_response_text(item);
+                    if said.trim().is_empty() {
+                        continue;
+                    }
+                    format!("{}: {said}", response_item_speaker(item))
+                }
+            };
+            text.push_str(&line);
+            text.push('\n');
+        }
+        if !self.changed_files.is_empty() {
+            text.push('\n');
+            text.push_str(&changed_files_section(&self.changed_files));
+            text.push('\n');
+        }
+        text
+    }
+
     /// The summary as stored: the model's text, then the current `plan`
     /// (its update_plan calls were folded) and the changed files, so they
     /// survive whatever the model left out. The plan is part of the summary,
@@ -1972,12 +2008,16 @@ fn note_in(entry: &SessionEntry) -> Option<(Note, &str)> {
 }
 
 /// The notes a compaction folded that are still the latest of their kind:
-/// they follow the summary, so the model keeps knowing the plan mode, date
-/// and host state it was told (`folded` is the branch up to the fold point,
-/// `kept` the rest).
+/// they follow the summary, so the model keeps knowing the plan mode, date,
+/// sandbox and host state it was told (`folded` is the branch up to the fold
+/// point, `kept` the rest). Plan reminders are not carried (`Note::lasting`).
 fn carried_notes(folded: &[&SessionEntry], kept: &[&SessionEntry]) -> Vec<Value> {
     let mut carried: Vec<(Note, &str)> = Vec::new();
-    for (note, content) in folded.iter().filter_map(|entry| note_in(entry)) {
+    for (note, content) in folded
+        .iter()
+        .filter_map(|entry| note_in(entry))
+        .filter(|(note, _)| note.lasting())
+    {
         carried.retain(|(kind, _)| *kind != note);
         carried.push((note, content));
     }
@@ -2966,6 +3006,7 @@ mod tests {
         let mut session = SessionStore::new();
         session.append_note(Note::PlanMode, "plan on".to_string());
         session.append_note(Note::Date, "date 1".to_string());
+        session.append_note(Note::PlanReminder, "plan still on".to_string());
         session.append_note(Note::PlanMode, "plan off".to_string());
         for index in 0..6 {
             session.append(EntryKind::User {
@@ -2975,9 +3016,13 @@ mod tests {
         let plan = session
             .plan_compaction(80, "gpt-5", Path::new("/work"))
             .expect("older turns should be foldable");
-        assert!(item_text(&plan.folded_items).starts_with("plan on\ndate 1\nplan off"));
+        assert!(
+            item_text(&plan.folded_items).starts_with("plan on\ndate 1\nplan still on\nplan off")
+        );
         // Each kind's latest note follows the summary: the model still knows.
+        // A plan reminder only repeated the plan-mode note: it is not carried.
         assert_eq!(item_text(&plan.kept_items[..2]), "date 1\nplan off");
+        assert!(!item_text(&plan.kept_items).contains("plan still on"));
 
         session.apply_compaction("SUMMARY".to_string(), plan.replaced_through);
         let items = session.request_context_items();
@@ -3639,6 +3684,26 @@ mod tests {
             .kept_items
             .iter()
             .any(|item| item.to_string().contains("CURRENT QUESTION")));
+    }
+
+    #[test]
+    fn the_folded_conversation_as_plain_text_names_who_said_what() {
+        let plan = CompactionPlan {
+            folded_items: vec![
+                json!({ "role": "user", "content": [{ "type": "input_text", "text": "fix it" }] }),
+                json!({ "type": "reasoning", "summary": [] }),
+                json!({ "type": "function_call", "call_id": "c1", "name": "read", "arguments": "{\"path\":\"a.rs\"}" }),
+                json!({ "type": "function_call_output", "call_id": "c1", "output": "fn a() {}" }),
+                json!({ "role": "assistant", "content": [{ "type": "output_text", "text": "done" }] }),
+            ],
+            kept_items: Vec::new(),
+            replaced_through: 1,
+            changed_files: vec!["a.rs".to_string()],
+        };
+        assert_eq!(
+            plan.folded_text(),
+            "User: fix it\nAssistant tool call read: {\"path\":\"a.rs\"}\nTool output: fn a() {}\nAssistant: done\n\nFiles changed in this session:\n- a.rs\n"
+        );
     }
 
     /// The text of request items: messages' text, tool calls' arguments and
