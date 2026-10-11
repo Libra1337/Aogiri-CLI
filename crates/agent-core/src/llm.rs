@@ -4,6 +4,7 @@ use crate::{
     hooks::Hooks,
     host::HostGate,
     hunks::{self, HunkView},
+    loop_guard::{self, CallCheck, LoopGuard},
     mcp::McpManager,
     roles::Role,
     sandbox::RuleAction,
@@ -799,6 +800,7 @@ impl OpenAiClient {
         };
         let mut tool_calls_executed = 0u64;
         let mut empty_response_continuations = 0usize;
+        let mut loop_guard = LoopGuard::default();
         loop {
             if self
                 .deadline
@@ -906,6 +908,46 @@ impl OpenAiClient {
             }
             tool_calls_executed = tool_calls_executed
                 .saturating_add(u64::try_from(tool_requests.len()).unwrap_or(u64::MAX));
+
+            // The loop guard counts each call before anything runs. A call
+            // repeated too often stops the turn with none of this round run.
+            let mut loop_notes: HashMap<String, String> = HashMap::new();
+            let mut loop_stop = None;
+            for request in &tool_requests {
+                match loop_guard.check_call(&request.name, &request.arguments) {
+                    CallCheck::Run => {}
+                    CallCheck::Warn(repeats) => {
+                        let agent = (self.agent_depth > 0).then_some(self.agent_path.as_str());
+                        self.tool_state.push_notice(loop_guard::repeat_notice(
+                            agent,
+                            &request.name,
+                            repeats,
+                        ));
+                        loop_notes.insert(
+                            request.call_id.clone(),
+                            loop_guard::repeat_note(&request.name, repeats),
+                        );
+                    }
+                    CallCheck::Stop(error) => {
+                        loop_stop = Some(error);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = loop_stop {
+                let mut stopped = Vec::new();
+                for request in tool_requests {
+                    emit(StreamEvent::ToolStart {
+                        call_id: request.call_id.clone(),
+                        name: request.name.clone(),
+                    })?;
+                    let result = json_tool_result(loop_guard::stopped_result(&error), true);
+                    emit_tool_output(&request, &result, &mut emit)?;
+                    stopped.push(ToolCallResult { request, result });
+                }
+                push_tool_result_items(input, stopped);
+                return Err(error);
+            }
 
             // Fire pre_tool_use hooks up front: a hook may block a tool, in which
             // case it is never executed and the model receives the block reason.
@@ -1038,6 +1080,7 @@ impl OpenAiClient {
                     cwd,
                     &self.extra_read_roots,
                     &self.tool_state,
+                    &mut loop_notes,
                     &mut emit,
                 )?
             } else {
@@ -1063,6 +1106,9 @@ impl OpenAiClient {
                             &rejected,
                         );
                     }
+                    if let Some(note) = loop_notes.remove(&request.call_id) {
+                        result.model_output = loop_guard::with_note(&result.model_output, &note);
+                    }
                     emit_tool_output(&request, &result, &mut emit)?;
                     results.push(ToolCallResult { request, result });
                 }
@@ -1087,9 +1133,24 @@ impl OpenAiClient {
                 tool_result.request.name == crate::plan_mode::TOOL_NAME
                     && !tool_result.result.is_error
             });
+            let failing = {
+                let round = tool_results
+                    .iter()
+                    .map(|tool_result| {
+                        (
+                            tool_result.request.name.as_str(),
+                            tool_result.result.is_error,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                loop_guard.record_round(&round)
+            };
             push_tool_result_items(input, tool_results);
             if plan_delivered {
                 return Ok(());
+            }
+            if let Some(error) = failing {
+                return Err(error);
             }
         }
     }
@@ -3246,11 +3307,14 @@ fn should_run_parallel_tools(requests: &[ToolCallRequest]) -> bool {
             .all(|request| is_parallel_safe_tool(&request.name))
 }
 
+/// Runs read-only built-in calls at once and emits their results in call
+/// order; a result named in `loop_notes` carries the loop guard's note.
 fn run_parallel_builtin_tools(
     requests: &[ToolCallRequest],
     cwd: &Path,
     extra_read_roots: &[PathBuf],
     tool_state: &tools::ToolState,
+    loop_notes: &mut HashMap<String, String>,
     emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
 ) -> Result<Vec<ToolCallResult>, String> {
     let (tx, rx) = mpsc::channel();
@@ -3327,7 +3391,13 @@ fn run_parallel_builtin_tools(
     completed.sort_by_key(|(index, _)| *index);
     let results = completed
         .into_iter()
-        .map(|(_, result)| result)
+        .map(|(_, mut result)| {
+            if let Some(note) = loop_notes.remove(&result.request.call_id) {
+                result.result.model_output =
+                    loop_guard::with_note(&result.result.model_output, &note);
+            }
+            result
+        })
         .collect::<Vec<_>>();
     for result in &results {
         emit_tool_output(&result.request, &result.result, emit)?;
@@ -3865,10 +3935,17 @@ mod tests {
         let mut events = Vec::new();
 
         let tool_state = tools::ToolState::default();
-        let results = run_parallel_builtin_tools(&requests, &dir, &[], &tool_state, &mut |event| {
-            events.push(event);
-            Ok(())
-        })
+        let results = run_parallel_builtin_tools(
+            &requests,
+            &dir,
+            &[],
+            &tool_state,
+            &mut HashMap::new(),
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
         .unwrap();
 
         assert_eq!(results[0].request.call_id, "first");

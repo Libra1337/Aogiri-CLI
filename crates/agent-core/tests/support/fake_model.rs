@@ -59,9 +59,11 @@ pub fn temp_dir(label: &str) -> PathBuf {
 
 /// A scripted model: a user message `RUN: <command>` answers with one bash
 /// call, `CALL <name> <arguments>` with that call, `CALLS [{name,
-/// arguments}, …]` with all of them in one reply; anything after a tool
-/// result or a deferred-action message answers
-/// with plain text naming what it saw. In a subagent's task, `[sleep:N]`
+/// arguments}, …]` with all of them in one reply; `LOOP <tool> <arguments>`
+/// makes that call again after every result (`{n}` in the arguments becomes
+/// the call's number); anything after a tool result or a deferred-action
+/// message answers with plain text naming what it saw. In a subagent's
+/// task, `[sleep:N]`
 /// waits N ms before answering and a line `RUN: <command>` runs it;
 /// `[history]` answers with every user message of the request. A message
 /// from another conversation (`<session_message …>`) is scripted by its body.
@@ -143,6 +145,9 @@ fn script(request: &Value) -> String {
             json!({ "choices": [{ "index": 0, "delta": { "content": format!("history: {history}") }, "finish_reason": null }] }),
             json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
         ]);
+    }
+    if let Some(reply) = loop_call(&messages) {
+        return reply;
     }
     let task_command = task
         .then(|| text.lines().find_map(|line| line.strip_prefix("RUN: ")))
@@ -231,6 +236,30 @@ fn script(request: &Value) -> String {
         json!({ "choices": [{ "index": 0, "delta": { "content": reply }, "finish_reason": null }] }),
         json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
     ])
+}
+
+/// `LOOP <tool> <arguments>` as the latest user message: the same call
+/// again, whatever the tool said.
+fn loop_call(messages: &[Value]) -> Option<String> {
+    let at = messages
+        .iter()
+        .rposition(|message| message["role"] == "user")?;
+    let text = content_text(&messages[at]["content"]);
+    let call = text.strip_prefix("LOOP ")?;
+    let (name, arguments) = call.split_once(' ').unwrap_or((call, "{}"));
+    let n = messages[at..]
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .count()
+        + 1;
+    let arguments = arguments.replace("{n}", &n.to_string());
+    Some(sse(&[
+        json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{
+            "index": 0, "id": format!("call_{n}"), "type": "function",
+            "function": { "name": name, "arguments": arguments }
+        }] }, "finish_reason": null }] }),
+        json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] }),
+    ]))
 }
 
 fn sse(chunks: &[Value]) -> String {

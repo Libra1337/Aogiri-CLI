@@ -12,6 +12,7 @@ mod hunks;
 mod images;
 mod llm;
 pub mod logging;
+mod loop_guard;
 pub mod machine;
 mod mcp;
 mod nicknames;

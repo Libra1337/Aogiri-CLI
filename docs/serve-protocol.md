@@ -426,8 +426,8 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `goal` | `goal: {objective, status, token_budget, tokens_used, time_used_seconds, created_at, updated_at} \| null` | Goal state; `null` clears it. |
 | `plan` | `plan: [{step, status, agent, files}]` | Goal/plan step list. `agent` (string or `null`) is the subagent doing the step, as the model named it (path or task name); `files` the files it is expected to write. |
 | `transcript` | `items: [{role, ...}]` | Rendered conversation (`/transcript`); roles: `user`, `assistant`, `tool` (`name`, `output`), `branch` (`label`), `compaction` (`summary`: where the older conversation was folded). |
-| `info` | `message` | Informational line (hook output, notices, update available). |
-| `error` | `message` | Error line. Also used for malformed commands and unknown ops. |
+| `info` | `message` | Informational line (hook output, notices, update available, loop guard warnings; see "Loop guard"). |
+| `error` | `message` | Error line. Also used for malformed commands and unknown ops, and for a turn the loop guard stopped (message starts with `loop guard:`). |
 | `status` | `message` | Turn status string: `ready`, `streaming`, `queued: N`, `steering`, `interrupted`, `compacting`, `approval mode: ...`, `trusted ...`, etc. `ready` marks the end of a turn. |
 
 ## Agent team
@@ -672,6 +672,37 @@ command rule matches.
 and `files` (the files the step writes). The `plan` event passes them
 through. `subagent_lifecycle` carries `plan_step`: the step given to
 `spawn_agent`, else the step whose `agent` names the subagent.
+
+## Loop guard
+
+The engine stops a turn that goes in circles, so an unattended session
+(daemon dispatch, a schedule, goal continuation) does not spend tokens until
+someone notices. It counts within one turn, for the main agent and each
+subagent alike:
+
+- **The same call again.** The same tool with the same arguments (as JSON,
+  spacing and key order ignored) several times in a row. The 3rd and 4th
+  calls run, and their results carry a `loop_guard` note that tells the
+  model to change its approach; the engine emits an `info` event
+  `loop guard: <tool> was called N times in a row ...` (a subagent's path
+  follows `loop guard:` in parentheses). The 5th call does not run, nor
+  does any other call of the same model response: each one's `tool_output`
+  is an error starting `not run: loop guard:`, and the turn ends.
+- **Calls that keep failing.** 6 tool rounds (model responses) in a row
+  whose calls all failed (`is_error`) end the turn after the 6th. A round
+  with any successful call starts the count again.
+
+Calls whose repetition is normal are not counted and do not break a run of
+identical calls: `write_stdin`, `wait_agent`, `list_agents`, `task_list`,
+`list_sessions`, `read_session`, and a shell command whose first word is
+`sleep` (`Start-Sleep` on Windows).
+
+A turn the guard ends emits `error` with a message that starts with
+`loop guard:`, then `status` `ready`, as any failed turn does. An active
+goal is paused (`goal` with `status: "paused"`, then `info`), so goal
+continuation does not start the loop again; `/goal resume` continues it.
+A stopped subagent ends `errored` with that message as its error. The
+limits are fixed (`crates/agent-core/src/loop_guard.rs`).
 
 ## Turn sequence
 

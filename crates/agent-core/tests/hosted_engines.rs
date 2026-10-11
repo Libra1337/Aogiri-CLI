@@ -1826,3 +1826,93 @@ fn a_deferred_action_running_beside_a_turn_leaves_the_turns_hook_rewrite_to_it()
     assert_eq!(info, "rewound · restored 1 file(s), removed 0");
     assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "v0\n");
 }
+
+fn tool_outputs(events: &[AgentEvent]) -> Vec<(String, bool)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolOutput {
+                output, is_error, ..
+            } => Some((output.clone(), *is_error)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_loop_guard_warns_a_repeating_model_then_stops_the_turn_and_pauses_the_goal() {
+    let _guard = setup();
+    let dir = temp_dir("loop-guard");
+    fs::write(dir.join("note.txt"), "hello\n").unwrap();
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.handle_command("/goal keep reading the note");
+    core.submit_user_message(r#"LOOP read {"path":"note.txt"}"#.to_string());
+    let events = pump(&mut core, is_ready);
+
+    // Four calls ran; the fifth did not.
+    let outputs = tool_outputs(&events);
+    assert_eq!(outputs.len(), 5, "{outputs:?}");
+    assert!(outputs[..4].iter().all(|(_, is_error)| !is_error));
+    assert!(outputs[4].1);
+    assert!(
+        outputs[4].0.contains("not run: loop guard:"),
+        "{}",
+        outputs[4].0
+    );
+    let infos = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Info(message) => Some(message.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        infos
+            .iter()
+            .any(|info| info.contains("read was called 3 times in a row")),
+        "{infos:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Error(message) if message.starts_with("loop guard:")
+            && message.contains("read was called 5 times")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Goal(Some(goal)) if goal.status == "paused"
+    )));
+    // The model read the note with its third and fourth results.
+    let AgentEvent::Transcript(items) = core.transcript_event() else {
+        panic!("not a transcript");
+    };
+    let noted = items
+        .iter()
+        .filter(|item| {
+            matches!(item, lynshen_agent_core::TranscriptItem::Tool { output, .. }
+                if output.contains("\"loop_guard\""))
+        })
+        .count();
+    assert_eq!(noted, 2);
+    // Nothing continues the paused goal.
+    pump_for(&mut core, &mut Vec::new(), 300);
+    assert!(core.is_idle());
+}
+
+#[test]
+fn the_loop_guard_stops_a_turn_whose_calls_keep_failing() {
+    let _guard = setup();
+    let dir = temp_dir("loop-guard-errors");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    // A different missing file each time: never a repeat, always an error.
+    core.submit_user_message(r#"LOOP read {"path":"missing-{n}.txt"}"#.to_string());
+    let events = pump(&mut core, is_ready);
+
+    let outputs = tool_outputs(&events);
+    assert_eq!(outputs.len(), 6, "{outputs:?}");
+    assert!(outputs.iter().all(|(_, is_error)| *is_error));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Error(message) if message.starts_with("loop guard:")
+            && message.contains("failed 6 times in a row")
+    )));
+}

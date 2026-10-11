@@ -1856,6 +1856,9 @@ impl AgentCore {
                         self.subagent_manager
                             .close_all_with_message("parent turn failed");
                         events.extend(self.finish_goal_turn());
+                        if error.starts_with(crate::loop_guard::STOP_PREFIX) {
+                            events.extend(self.pause_goal_for_loop_guard());
+                        }
                         self.running = false;
                         disconnected = true;
                         self.goal_tool_receiver = None;
@@ -3826,6 +3829,30 @@ impl AgentCore {
             },
             Some(AgentEvent::Plan(self.plan.clone())),
         )
+    }
+
+    /// The loop guard stopped the turn: an active goal is paused, so goal
+    /// continuation does not start the same loop again unattended.
+    fn pause_goal_for_loop_guard(&mut self) -> Vec<AgentEvent> {
+        if !self
+            .session
+            .goal()
+            .is_some_and(|goal| goal.status == ThreadGoalStatus::Active)
+        {
+            return Vec::new();
+        }
+        let Ok(goal) = self.session.set_goal_status(ThreadGoalStatus::Paused) else {
+            return Vec::new();
+        };
+        let mut events = vec![
+            AgentEvent::Goal(Some(goal_view(&goal))),
+            AgentEvent::Info(
+                "goal paused after the loop guard stopped the turn; /goal resume continues it"
+                    .to_string(),
+            ),
+        ];
+        events.extend(self.save_session_event());
+        events
     }
 
     fn should_continue_goal(&self) -> bool {
