@@ -842,4 +842,101 @@ mod tests {
         assert_eq!(project_section(&[]), "");
         assert_eq!(skills_section(&[]), "");
     }
+
+    /// The prompt as `build_system_prompt` wrote it in one piece before it was
+    /// split into sections (LynShen 0.4.29), kept to prove the split sends the
+    /// same bytes.
+    fn prompt_before_the_split(base: &str, context: &PromptContext) -> String {
+        let mut prompt = base.trim_end().to_string();
+        if !context.chat {
+            prompt.push_str("\n\n");
+            prompt.push_str(&tool_guidance(&context.edit_tools));
+        }
+        if !context.project_instructions.is_empty() {
+            prompt.push_str("\n\n<project_context>\n");
+            prompt.push_str("Project-specific instructions and guidelines:\n\n");
+            for instruction in &context.project_instructions {
+                prompt.push_str(&format!(
+                    "<project_instructions path=\"{}\">\n{}\n</project_instructions>\n\n",
+                    escape_xml(&instruction.path.display().to_string()),
+                    instruction.content.trim_end()
+                ));
+            }
+            prompt.push_str("</project_context>");
+        }
+        if !context.skills.is_empty() {
+            prompt.push_str("\n\nSkills: when a task matches a skill's description, read its file first. Resolve relative paths in a skill against its directory.\n<available_skills>\n");
+            for skill in &context.skills {
+                prompt.push_str(&format!(
+                    "<skill name=\"{}\" location=\"{}\">{}</skill>\n",
+                    escape_xml(&skill.name),
+                    escape_xml(&skill.path.display().to_string()),
+                    escape_xml(&skill.description)
+                ));
+            }
+            prompt.push_str("</available_skills>");
+        }
+        if !context.sandbox.trim().is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(context.sandbox.trim_end());
+        }
+        prompt.push_str(&format!(
+            "{ENV_START}Working directory: {}\nDate: {}\n</env>",
+            context.cwd.display(),
+            context.date
+        ));
+        if context.plan_mode && !context.chat {
+            prompt.push_str("\n\n");
+            prompt.push_str(crate::plan_mode::PROMPT_ADDENDUM);
+        }
+        if !context.host.trim().is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(context.host.trim_end());
+        }
+        prompt
+    }
+
+    #[test]
+    fn the_split_prompt_sends_the_same_bytes_as_before() {
+        let full = PromptContext {
+            date: "2026-10-11".to_string(),
+            cwd: PathBuf::from("/work/p"),
+            edit_tools: vec!["hashline_edit".to_string()],
+            project_instructions: vec![
+                ProjectInstruction {
+                    path: PathBuf::from("/work/AGENTS.md"),
+                    content: "Use tabs.\n".to_string(),
+                },
+                ProjectInstruction {
+                    path: PathBuf::from("/work/p/CLAUDE.md"),
+                    content: "<b>&</b>".to_string(),
+                },
+            ],
+            skills: vec![SkillPromptItem {
+                name: "pdf & co".to_string(),
+                description: "Read <PDFs>".to_string(),
+                path: PathBuf::from("/s/pdf/SKILL.md"),
+            }],
+            sandbox: "Sandboxed.\n".to_string(),
+            plan_mode: true,
+            host: "Host.\n".to_string(),
+            ..PromptContext::default()
+        };
+        let bare = PromptContext {
+            date: "2026-10-11".to_string(),
+            cwd: PathBuf::from("/w"),
+            ..PromptContext::default()
+        };
+        let chat = PromptContext {
+            chat: true,
+            plan_mode: true,
+            ..full.clone()
+        };
+        for context in [&full, &bare, &chat] {
+            assert_eq!(
+                build_system_prompt("Base.\n", context),
+                prompt_before_the_split("Base.\n", context)
+            );
+        }
+    }
 }
