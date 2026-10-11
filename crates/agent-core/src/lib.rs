@@ -48,6 +48,7 @@ pub use event::{
     AgentEvent, CommandView, ContextBreakdown, GoalView, LoginProviderView, McpServerView,
     McpToolView, ModelOptionView, PlanItem, SessionListItemView, TranscriptItem, TreeNodeView,
 };
+pub use hooks::HookStopper;
 pub use hunks::HunkView;
 pub use session::{release_session_locks, SessionSummary};
 pub use tokens::release_idle_tokenizers;

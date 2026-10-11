@@ -1023,7 +1023,9 @@ impl OpenAiClient {
             }
             let allowed_requests = approved_requests;
 
-            self.tool_state.collect_checkpoints();
+            // The checkpoints each call's edits saved, for its post-tool
+            // hooks (the parallel calls only read).
+            let mut edits = HashMap::new();
             let mut tool_results = if should_run_parallel_tools(&allowed_requests) {
                 for request in &allowed_requests {
                     emit(StreamEvent::ToolStart {
@@ -1045,8 +1047,10 @@ impl OpenAiClient {
                         call_id: request.call_id.clone(),
                         name: request.name.clone(),
                     })?;
+                    let collector = tools::collect_checkpoints();
                     let mut result =
                         self.run_tool_call(&request, cwd, input, &pending_call_ids, &mut emit);
+                    edits.insert(request.call_id.clone(), collector.take());
                     // Edit tools are never parallel-safe, so a partially
                     // approved call always lands here; tell the model exactly
                     // which hunks were applied and which the user rejected.
@@ -1066,10 +1070,15 @@ impl OpenAiClient {
             };
 
             for tool_result in &tool_results {
-                self.hooks
-                    .post_tool(&tool_result.request.name, &tool_result.result.output, cwd);
+                self.hooks.post_tool(
+                    &tool_result.request.name,
+                    &tool_result.result.output,
+                    cwd,
+                    edits
+                        .remove(&tool_result.request.call_id)
+                        .unwrap_or_default(),
+                );
             }
-            self.tool_state.settle_checkpoints();
             tool_results.append(&mut blocked_results);
 
             // Plan mode: a delivered plan ends the turn; the user approves it

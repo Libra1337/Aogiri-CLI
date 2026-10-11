@@ -111,9 +111,12 @@ session's edits:
 - Every checkpoint records the session that took it (`session_id`) and, per
   file, a hash of what the edit left there (`after`). The checkpoint is
   written before the edit, with the content before it, so a crash during the
-  edit loses nothing; `after` is added once the edit has run, and again once
-  the `post_tool_use` hooks of that batch of tool calls have run, so a
-  formatter hook's rewrite counts as part of the edit.
+  edit loses nothing; `after` is added once the edit has run. When
+  `post_tool_use` hooks run for that tool call, what they leave counts as
+  part of the edit (a formatter's rewrite), but only in a file that still
+  held what the edit left when they started: a file the user saved
+  meanwhile, during a later command of the same reply say, stays a later
+  change.
 - A merge of a subagent's worktree (`merge_agent` apply, `pick_attempt`) is
   checkpointed as an edit of the session that merges.
 - Only files that this session's checkpoints at or after the turn captured
@@ -649,7 +652,11 @@ hook blocks the prompt, `task_completed` and `agent_idle` report it with
 `ok="false"`, `session_start` and `stop` show it as `hook (<event>): …`, and
 `post_tool_use` ignores it. Once a hook has exited, output that a process it
 left running keeps open is read for at most another half second. A hook still
-running when the engine process exits is stopped with the tool commands.
+running when the engine process exits is stopped with the tool commands. An
+`interrupt` op (ACP: `session/cancel`) also stops a running `session_start`,
+`user_prompt_submit` or `stop` hook, which holds the session until it ends; it
+reports `<event> hook was stopped by an interrupt: <command>`. The TUI cannot
+stop one yet: it reads keys on the thread the hook holds.
 
 ### Worktree confinement
 

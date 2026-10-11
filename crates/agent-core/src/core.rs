@@ -655,7 +655,8 @@ impl AgentCore {
             ))];
         }
         self.project_trusted = self.trust.decision_for(&self.cwd).unwrap_or(trusted);
-        self.hooks = Hooks::load(self.config.profile_dir(), &self.cwd, self.project_trusted);
+        self.hooks = Hooks::load(self.config.profile_dir(), &self.cwd, self.project_trusted)
+            .with_stopper(self.hooks.stopper());
         vec![
             AgentEvent::Status(format!(
                 "{} {}",
@@ -842,6 +843,13 @@ impl AgentCore {
             ];
         }
         self.start_turn(message, images)
+    }
+
+    /// Stops the session's `session_start`, `user_prompt_submit` and `stop`
+    /// hooks while they run (see `HookStopper`): a front end that reads
+    /// input on another thread calls it with an interrupt.
+    pub fn hook_stopper(&self) -> crate::hooks::HookStopper {
+        self.hooks.stopper()
     }
 
     pub fn interrupt(&mut self) -> Vec<AgentEvent> {
@@ -3147,7 +3155,7 @@ impl AgentCore {
         let host = self.host.clone().filter(|host| host.has_tool(&action.name));
         self.actions_running += 1;
         thread::spawn(move || {
-            tool_state.collect_checkpoints();
+            let collector = crate::tools::collect_checkpoints();
             let result = if let Some(host) = host {
                 let (output, is_error) =
                     (host.run_tool)(&action.name, &action.arguments, &AtomicBool::new(false));
@@ -3192,8 +3200,7 @@ impl AgentCore {
                     |_| Ok(()),
                 )
             };
-            hooks.post_tool(&action.name, &result.output, &action.cwd);
-            tool_state.settle_checkpoints();
+            hooks.post_tool(&action.name, &result.output, &action.cwd, collector.take());
             let _ = tx.send(ActionOutcome {
                 action,
                 output: result.model_output,

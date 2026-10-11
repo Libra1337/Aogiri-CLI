@@ -336,7 +336,7 @@ fn save(
         .iter()
         .zip(&generated.images)
         .try_for_each(|(path, bytes)| write_new(path, bytes));
-    let _ = checkpoint.and_then(|checkpoint| checkpoint.finish(state));
+    let _ = checkpoint.and_then(crate::tools::PendingCheckpoint::finish);
     written.map(|()| paths)
 }
 

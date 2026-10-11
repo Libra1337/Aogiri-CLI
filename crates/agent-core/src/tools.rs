@@ -2,6 +2,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     env, fs,
     fs::File,
@@ -587,7 +588,7 @@ fn str_replace_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
 
     let checkpoint = begin_checkpoint(cwd, "auto-edit", std::slice::from_ref(&path), state);
     let written = fs::write(&path, &output);
-    let _ = checkpoint.and_then(|checkpoint| checkpoint.finish(state));
+    let _ = checkpoint.and_then(PendingCheckpoint::finish);
     match written {
         Ok(()) => {
             state.mark_read(&path);
@@ -670,7 +671,7 @@ fn hashline_edit_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         state,
     );
     let written = fs::write(&path, &output);
-    let _ = checkpoint.and_then(|checkpoint| checkpoint.finish(state));
+    let _ = checkpoint.and_then(PendingCheckpoint::finish);
     match written {
         Ok(()) => {
             state.mark_read(&path);
@@ -732,7 +733,7 @@ fn write_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
 
     let checkpoint = begin_checkpoint(cwd, "auto-write", std::slice::from_ref(&path), state);
     let written = fs::write(&path, content);
-    let _ = checkpoint.and_then(|checkpoint| checkpoint.finish(state));
+    let _ = checkpoint.and_then(PendingCheckpoint::finish);
     match written {
         Ok(()) => {
             state.mark_read(&path);
@@ -2390,7 +2391,7 @@ fn apply_patch(
                 Duration::from_secs(30),
                 emit,
             );
-            let _ = checkpoint.and_then(|checkpoint| checkpoint.finish(state));
+            let _ = checkpoint.and_then(PendingCheckpoint::finish);
             let mut value = command_result_json("git apply", result);
             value["applied"] = json!(value.get("exit_code").and_then(Value::as_i64) == Some(0));
             if value["applied"].as_bool().unwrap_or(false) {
@@ -2800,9 +2801,6 @@ pub struct ToolState {
     /// A worktree subagent's (worktree, project): its shell commands start
     /// inside the worktree and write nowhere else (see `wrap_confined`).
     confine: Option<Arc<(PathBuf, PathBuf)>>,
-    /// The checkpoints this agent's current batch of tool calls saved, for
-    /// `settle_checkpoints`; None outside a batch.
-    batch: Arc<Mutex<Option<Vec<SavedCheckpoint>>>>,
 }
 
 enum ReadCheck {
@@ -2945,7 +2943,6 @@ impl ToolState {
             inner: self.inner.clone(),
             reads: Arc::default(),
             confine: self.confine.clone(),
-            batch: Arc::default(),
         }
     }
 
@@ -2956,41 +2953,6 @@ impl ToolState {
             inner: self.inner.clone(),
             reads: Arc::default(),
             confine: Some(Arc::new((root, project))),
-            batch: Arc::default(),
-        }
-    }
-
-    /// Starts a batch of tool calls whose post-tool hooks run once they are
-    /// done: the checkpoints the calls save are kept for
-    /// `settle_checkpoints`.
-    pub(crate) fn collect_checkpoints(&self) {
-        if let Ok(mut batch) = self.batch.lock() {
-            *batch = Some(Vec::new());
-        }
-    }
-
-    /// Ends the batch once its post-tool hooks have run: each of its
-    /// checkpoints records what its files hold now as `after`, so a hook
-    /// that rewrote them (a formatter, say) counts as part of this session's
-    /// edit, not as a later change a rewind must leave alone.
-    pub(crate) fn settle_checkpoints(&self) {
-        let saved = self
-            .batch
-            .lock()
-            .ok()
-            .and_then(|mut batch| batch.take())
-            .unwrap_or_default();
-        for checkpoint in saved {
-            let _ = checkpoint.record_after_again();
-        }
-    }
-
-    /// Outside a batch nothing is kept: no hook runs after the edit.
-    fn collect_checkpoint(&self, saved: SavedCheckpoint) {
-        if let Ok(mut batch) = self.batch.lock() {
-            if let Some(batch) = batch.as_mut() {
-                batch.push(saved);
-            }
         }
     }
 
@@ -3284,9 +3246,10 @@ pub(crate) fn begin_checkpoint(
 
 impl PendingCheckpoint {
     /// Records `after` for each file; returns what the checkpoint tool
-    /// reports. Within a batch of tool calls the files are hashed again once
-    /// its post-tool hooks have run (`ToolState::settle_checkpoints`).
-    pub(crate) fn finish(mut self, state: &ToolState) -> io::Result<Value> {
+    /// reports. The checkpoint goes to the thread's collector, if any, so
+    /// the tool call's post_tool_use hooks can update `after`
+    /// (`EditCheckpoints::around_hooks`).
+    pub(crate) fn finish(mut self) -> io::Result<Value> {
         let files = self.checkpoint["files"].as_array_mut();
         for (file, (abs, after)) in files.into_iter().flatten().zip(&mut self.saved.files) {
             *after = after_value(abs);
@@ -3301,28 +3264,44 @@ impl PendingCheckpoint {
             "files": self.saved.files.len(),
             "bytes": self.checkpoint["bytes"],
         });
-        state.collect_checkpoint(self.saved);
+        COLLECTED.with(|collected| {
+            if let Some(collected) = collected.borrow_mut().as_mut() {
+                collected.push(self.saved);
+            }
+        });
         Ok(report)
     }
 }
 
 impl SavedCheckpoint {
-    /// Stores what the files hold now as their `after`, when that changed.
-    /// A checkpoint pruned meanwhile is left gone.
-    fn record_after_again(self) -> io::Result<()> {
-        let now = self
-            .files
+    /// The files that still hold what the edit left (`after`).
+    fn unchanged_files(&self) -> Vec<usize> {
+        self.files
             .iter()
-            .map(|(abs, _)| after_value(abs))
+            .enumerate()
+            .filter(|(_, (abs, after))| after.is_some() && after_value(abs) == *after)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Stores what `files` hold now as their `after`, where that changed.
+    /// A checkpoint pruned meanwhile is left gone.
+    fn record_after(self, files: &[usize]) -> io::Result<()> {
+        let changed = files
+            .iter()
+            .map(|&index| (index, after_value(&self.files[index].0)))
+            .filter(|(index, now)| *now != self.files[*index].1)
             .collect::<Vec<_>>();
-        if now.iter().eq(self.files.iter().map(|(_, after)| after)) {
+        if changed.is_empty() {
             return Ok(());
         }
         let mut checkpoint = serde_json::from_str::<Value>(&fs::read_to_string(&self.path)?)
             .map_err(io::Error::other)?;
-        let files = checkpoint["files"].as_array_mut();
-        for (file, after) in files.into_iter().flatten().zip(now) {
-            match after {
+        for (index, now) in changed {
+            let Some(file) = checkpoint["files"].get_mut(index) else {
+                continue;
+            };
+            match now {
                 Some(after) => file["after"] = after,
                 None => {
                     if let Some(file) = file.as_object_mut() {
@@ -3332,6 +3311,73 @@ impl SavedCheckpoint {
             }
         }
         write_checkpoint(&self.path, &checkpoint)
+    }
+}
+
+thread_local! {
+    /// The checkpoints finished on this thread while a `CheckpointCollector`
+    /// collects; None when none does.
+    static COLLECTED: RefCell<Option<Vec<SavedCheckpoint>>> = const { RefCell::new(None) };
+}
+
+/// Collects the checkpoints the edits on this thread finish until `take`:
+/// those of one tool call, whose post_tool_use hooks run after it. Each
+/// thread collects its own, so a deferred action running next to a turn
+/// never takes the turn's.
+pub(crate) struct CheckpointCollector {
+    /// What an enclosing collector on this thread had, put back at the
+    /// end; None once ended.
+    outer: Option<Option<Vec<SavedCheckpoint>>>,
+}
+
+pub(crate) fn collect_checkpoints() -> CheckpointCollector {
+    CheckpointCollector {
+        outer: Some(COLLECTED.with(|collected| collected.replace(Some(Vec::new())))),
+    }
+}
+
+impl CheckpointCollector {
+    pub(crate) fn take(mut self) -> EditCheckpoints {
+        EditCheckpoints(self.end())
+    }
+
+    fn end(&mut self) -> Vec<SavedCheckpoint> {
+        match self.outer.take() {
+            Some(outer) => COLLECTED
+                .with(|collected| collected.replace(outer))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+}
+
+impl Drop for CheckpointCollector {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// The checkpoints one tool call's edits finished (see
+/// `collect_checkpoints`).
+#[derive(Default)]
+pub(crate) struct EditCheckpoints(Vec<SavedCheckpoint>);
+
+impl EditCheckpoints {
+    /// Runs `hooks`, post_tool_use hooks of the call that may rewrite what
+    /// its edits wrote (a formatter), and records what they leave as each
+    /// file's `after`: only for a file that still holds what its edit left
+    /// when they start, so a change someone else made meanwhile (the user
+    /// saving during a long command) is never taken for this session's.
+    pub(crate) fn around_hooks(self, hooks: impl FnOnce()) {
+        let unchanged = self
+            .0
+            .iter()
+            .map(SavedCheckpoint::unchanged_files)
+            .collect::<Vec<_>>();
+        hooks();
+        for (checkpoint, files) in self.0.into_iter().zip(unchanged) {
+            let _ = checkpoint.record_after(&files);
+        }
     }
 }
 
@@ -3363,7 +3409,7 @@ pub(crate) fn create_checkpoint(
     paths: &[PathBuf],
     state: &ToolState,
 ) -> io::Result<Value> {
-    begin_checkpoint(cwd, name, paths, state)?.finish(state)
+    begin_checkpoint(cwd, name, paths, state)?.finish()
 }
 
 /// A stable hash of a file's bytes, stored in checkpoints; None when the
@@ -3677,7 +3723,7 @@ fn apply_restore(
         }
     }
     if let Some(checkpoint) = checkpoint {
-        let _ = checkpoint.finish(state);
+        let _ = checkpoint.finish();
     }
     outcome?;
     let mut warnings = Vec::new();
@@ -6050,32 +6096,51 @@ mod tests {
     }
 
     #[test]
-    fn a_post_tool_hooks_rewrite_counts_as_the_edit_only_within_its_batch() {
-        let dir = test_dir("rewind-hook-batch");
+    fn a_post_tool_hook_counts_as_the_edit_only_where_it_found_what_the_edit_left() {
+        let dir = test_dir("rewind-hook-call");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("hooked.txt"), "h0").unwrap();
-        fs::write(dir.join("plain.txt"), "p0").unwrap();
+        fs::write(dir.join("raced.txt"), "r0").unwrap();
         let a = session_state("session-a");
         let t = now_secs();
-        a.collect_checkpoints();
+        let collector = collect_checkpoints();
         write_as(&a, &dir, "hooked.txt", "h1");
-        // A formatter hook rewrites the file before the batch settles.
-        fs::write(dir.join("hooked.txt"), "h1 formatted").unwrap();
-        a.settle_checkpoints();
-        // Outside a batch: the user's later change is not taken for a hook's.
-        write_as(&a, &dir, "plain.txt", "p1");
-        fs::write(dir.join("plain.txt"), "the user's change").unwrap();
-        a.collect_checkpoints();
-        a.settle_checkpoints();
+        write_as(&a, &dir, "raced.txt", "r1");
+        let edits = collector.take();
+        // The user saves raced.txt before the call's hooks start.
+        fs::write(dir.join("raced.txt"), "the user's change").unwrap();
+        edits.around_hooks(|| fs::write(dir.join("hooked.txt"), "h1 formatted").unwrap());
 
         let rewound = restore_to_timestamp(&dir, t, &a).unwrap();
         assert_eq!(rewound["restored"], json!(["hooked.txt"]), "{rewound}");
         assert_eq!(fs::read_to_string(dir.join("hooked.txt")).unwrap(), "h0");
-        assert_eq!(conflict_paths(&rewound), vec!["plain.txt"]);
+        assert_eq!(conflict_paths(&rewound), vec!["raced.txt"]);
         assert_eq!(
-            fs::read_to_string(dir.join("plain.txt")).unwrap(),
+            fs::read_to_string(dir.join("raced.txt")).unwrap(),
             "the user's change"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_collector_takes_only_the_checkpoints_of_its_own_thread() {
+        let dir = test_dir("collector-threads");
+        fs::create_dir_all(&dir).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (edited_tx, edited_rx) = std::sync::mpsc::channel::<()>();
+        // A deferred action collecting on its thread while a turn edits.
+        let action = thread::spawn(move || {
+            let collector = collect_checkpoints();
+            started_tx.send(()).unwrap();
+            edited_rx.recv().unwrap();
+            collector.take().0.len()
+        });
+        started_rx.recv().unwrap();
+        let collector = collect_checkpoints();
+        write_as(&session_state("session-a"), &dir, "turn.txt", "edited");
+        edited_tx.send(()).unwrap();
+        assert_eq!(action.join().unwrap(), 0);
+        assert_eq!(collector.take().0.len(), 1);
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -609,10 +609,16 @@ fn run_serve(approval_mode: Option<ApprovalMode>, chat: bool) -> io::Result<i32>
     ));
 
     let (tx, rx) = mpsc::channel::<String>();
+    let hook_stopper = core.hook_stopper();
     thread::spawn(move || {
         for line in io::stdin().lock().lines() {
             match line {
                 Ok(line) => {
+                    // A hook (a long stop hook) may hold the loop below.
+                    if serde_json::from_str::<Value>(&line).is_ok_and(|op| op["op"] == "interrupt")
+                    {
+                        hook_stopper.stop();
+                    }
                     if tx.send(line).is_err() {
                         break;
                     }

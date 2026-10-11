@@ -4,7 +4,7 @@
 use crate::hub::Hub;
 use lynshen_agent_core::{
     protocol::{self, session_event_json},
-    AgentCore, AgentEvent, ApprovalMode,
+    AgentCore, AgentEvent, ApprovalMode, HookStopper,
 };
 use serde_json::{json, Value};
 use std::{
@@ -29,13 +29,14 @@ const CLOSE_RETRY: Duration = Duration::from_secs(5);
 /// Opens an engine in `cwd` (resuming `resume` when given) on a new thread,
 /// set up for `agent` when the session belongs to one. Returns the session
 /// id once the engine is ready, with the thread's generation (see
-/// `Hub::session_ended`), or the open error.
+/// `Hub::session_ended`) and its engine's hook stopper (see
+/// `Hub::set_hook_stopper`), or the open error.
 pub fn spawn(
     hub: Arc<Hub>,
     cwd: PathBuf,
     resume: Option<String>,
     agent: Option<String>,
-) -> Result<(String, Sender<Value>, u64), String> {
+) -> Result<(String, Sender<Value>, u64, HookStopper), String> {
     let (ops_tx, ops_rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let generation = hub.next_generation();
@@ -48,14 +49,14 @@ pub fn spawn(
             }
         };
         let id = core.session_id().to_string();
-        let _ = ready_tx.send(Ok(id.clone()));
+        let _ = ready_tx.send(Ok((id.clone(), core.hook_stopper())));
         run(&hub, core, &id, ops_rx, generation);
         hub.session_ended(&id, generation);
     });
-    let id = ready_rx
+    let (id, stopper) = ready_rx
         .recv()
         .map_err(|_| "session thread stopped while opening".to_string())??;
-    Ok((id, ops_tx, generation))
+    Ok((id, ops_tx, generation, stopper))
 }
 
 fn open(

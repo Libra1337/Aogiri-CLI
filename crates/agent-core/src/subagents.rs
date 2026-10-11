@@ -2468,7 +2468,7 @@ fn with_checkpoint<T>(
 ) -> T {
     let checkpoint = crate::tools::begin_checkpoint(parent_cwd, "auto-merge", paths, state);
     let result = write();
-    let _ = checkpoint.and_then(|checkpoint| checkpoint.finish(state));
+    let _ = checkpoint.and_then(crate::tools::PendingCheckpoint::finish);
     result
 }
 

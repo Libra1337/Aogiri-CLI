@@ -1,10 +1,14 @@
+use crate::tools::EditCheckpoints;
 use serde_json::{json, Value};
 use std::{
     fs,
     io::{Read, Write},
     path::Path,
     process::{Command, Stdio},
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -15,6 +19,24 @@ use std::{
 #[derive(Debug, Clone, Default)]
 pub struct Hooks {
     inner: Arc<HookSet>,
+    stopper: HookStopper,
+}
+
+/// Stops the `session_start`, `user_prompt_submit` and `stop` hooks running
+/// at the time, with their process groups. Those run on the thread that
+/// drives the session, which cannot take an interrupt meanwhile, so the
+/// front end calls this from the thread that reads the interrupt.
+#[derive(Debug, Clone, Default)]
+pub struct HookStopper(Arc<AtomicU64>);
+
+impl HookStopper {
+    pub fn stop(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn generation(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -77,8 +99,9 @@ struct Outcome {
     code: i32,
     stdout: String,
     stderr: String,
-    /// The hook ran past its timeout and was killed; `stderr` says so.
-    timed_out: bool,
+    /// The hook ran past its timeout, or was stopped, and was killed;
+    /// `stderr` says so.
+    killed: bool,
 }
 
 impl Hooks {
@@ -90,7 +113,18 @@ impl Hooks {
         }
         Self {
             inner: Arc::new(set),
+            stopper: HookStopper::default(),
         }
+    }
+
+    /// These hooks, stopped by `stopper` (that of the hooks they replace).
+    pub fn with_stopper(mut self, stopper: HookStopper) -> Self {
+        self.stopper = stopper;
+        self
+    }
+
+    pub fn stopper(&self) -> HookStopper {
+        self.stopper.clone()
     }
 
     /// Hooks from one `hooks.json` value (tests).
@@ -100,6 +134,7 @@ impl Hooks {
         merge_value(&mut set, value);
         Self {
             inner: Arc::new(set),
+            stopper: HookStopper::default(),
         }
     }
 
@@ -159,7 +194,7 @@ impl Hooks {
                 "workdir": workdir_text,
                 "cwd": workdir_text,
             });
-            let outcome = run_command_with_env(entry, &payload, workdir, &env);
+            let outcome = run_command_with_env(entry, &payload, workdir, &env, None);
             let ok = outcome.code == 0;
             let text = if ok {
                 outcome.stdout.trim().to_string()
@@ -197,7 +232,7 @@ impl Hooks {
             "cwd": cwd.display().to_string(),
         });
         for entry in &self.inner.user_prompt_submit {
-            let outcome = run_command(entry, &payload, cwd);
+            let outcome = run_command(entry, &payload, cwd, Some(&self.stopper));
             if outcome.code != 0 {
                 return Err(block_reason(&outcome, "user_prompt_submit"));
             }
@@ -221,7 +256,7 @@ impl Hooks {
             if !entry.matches(tool) {
                 continue;
             }
-            let outcome = run_command(entry, &payload, cwd);
+            let outcome = run_command(entry, &payload, cwd, None);
             if outcome.code != 0 {
                 return Some(block_reason(&outcome, "pre_tool_use"));
             }
@@ -229,9 +264,17 @@ impl Hooks {
         None
     }
 
-    /// Runs `post_tool_use` hooks for `tool`. Best-effort; failures are ignored.
-    pub fn post_tool(&self, tool: &str, output: &str, cwd: &Path) {
-        if self.inner.post_tool_use.is_empty() {
+    /// Runs `post_tool_use` hooks for `tool`. Best-effort; failures are
+    /// ignored. When one runs, what it leaves in the files the call edited
+    /// (`edits`) counts as part of the edit for a rewind.
+    pub(crate) fn post_tool(&self, tool: &str, output: &str, cwd: &Path, edits: EditCheckpoints) {
+        let entries = self
+            .inner
+            .post_tool_use
+            .iter()
+            .filter(|entry| entry.matches(tool))
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
             return;
         }
         let payload = json!({
@@ -240,11 +283,11 @@ impl Hooks {
             "output": output,
             "cwd": cwd.display().to_string(),
         });
-        for entry in &self.inner.post_tool_use {
-            if entry.matches(tool) {
-                let _ = run_command(entry, &payload, cwd);
+        edits.around_hooks(|| {
+            for entry in entries {
+                let _ = run_command(entry, &payload, cwd, None);
             }
-        }
+        });
     }
 
     fn notify(&self, entries: &[HookEntry], event: &str, extra: Value, cwd: &Path) -> Vec<String> {
@@ -256,8 +299,8 @@ impl Hooks {
                     map.insert(key.clone(), value.clone());
                 }
             }
-            let outcome = run_command(entry, &payload, cwd);
-            let text = if outcome.timed_out {
+            let outcome = run_command(entry, &payload, cwd, Some(&self.stopper));
+            let text = if outcome.killed {
                 outcome.stderr.trim()
             } else {
                 outcome.stdout.trim()
@@ -295,16 +338,24 @@ fn parse_arguments(arguments: &str) -> Value {
         .unwrap_or_else(|_| Value::String(arguments.to_string()))
 }
 
-fn run_command(entry: &HookEntry, payload: &Value, cwd: &Path) -> Outcome {
-    run_command_with_env(entry, payload, cwd, &[])
+fn run_command(
+    entry: &HookEntry,
+    payload: &Value,
+    cwd: &Path,
+    stopper: Option<&HookStopper>,
+) -> Outcome {
+    run_command_with_env(entry, payload, cwd, &[], stopper)
 }
 
+/// Runs one hook; `stopper`, when given, can stop it (see `HookStopper`).
 fn run_command_with_env(
     entry: &HookEntry,
     payload: &Value,
     cwd: &Path,
     env: &[(&str, String)],
+    stopper: Option<&HookStopper>,
 ) -> Outcome {
+    let generation = stopper.map(HookStopper::generation);
     #[cfg(windows)]
     let (shell, flag) = ("cmd", "/C");
     #[cfg(not(windows))]
@@ -338,7 +389,7 @@ fn run_command_with_env(
                 code: -1,
                 stdout: String::new(),
                 stderr: error.to_string(),
-                timed_out: false,
+                killed: false,
             }
         }
     };
@@ -379,20 +430,24 @@ fn run_command_with_env(
                     code,
                     stdout: String::from_utf8_lossy(&stdout).to_string(),
                     stderr: String::from_utf8_lossy(&stderr).to_string(),
-                    timed_out: false,
+                    killed: false,
                 };
             }
-        } else if now >= deadline {
+        } else if now >= deadline || stopper.map(HookStopper::generation) != generation {
             crate::tools::kill_child(&mut child);
+            let why = if now >= deadline {
+                format!(
+                    "timed out after {}s and was stopped",
+                    entry.timeout.as_secs_f64()
+                )
+            } else {
+                "was stopped by an interrupt".to_string()
+            };
             return Outcome {
                 code: -1,
                 stdout: String::from_utf8_lossy(&stdout).to_string(),
-                stderr: format!(
-                    "{event} hook timed out after {}s and was stopped: {}",
-                    entry.timeout.as_secs_f64(),
-                    entry.command
-                ),
-                timed_out: true,
+                stderr: format!("{event} hook {why}: {}", entry.command),
+                killed: true,
             };
         }
         match rx.recv_timeout(Duration::from_millis(20)) {
@@ -497,6 +552,7 @@ mod tests {
         push_entries(&mut set.pre_tool_use, &value, "pre_tool_use");
         Hooks {
             inner: Arc::new(set),
+            stopper: HookStopper::default(),
         }
     }
 
@@ -678,6 +734,60 @@ mod tests {
         assert_eq!(timeouts(&set.pre_tool_use), vec![60, 900]);
         assert_eq!(timeouts(&set.post_tool_use), vec![60]);
         assert_eq!(timeouts(&set.user_prompt_submit), vec![60]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_stopper_stops_a_running_stop_hook_with_its_children_and_no_later_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "lynshen-hook-stopper-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let command = "sleep 30 & echo $! > child.pid; sleep 30";
+        let hooks = Hooks::from_value(&json!({ "stop": [{ "command": command }] }));
+        let stopper = hooks.stopper();
+        let pid_file = dir.join("child.pid");
+        let interrupt = {
+            let (stopper, pid_file) = (stopper.clone(), pid_file.clone());
+            thread::spawn(move || {
+                while !pid_file.exists() {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                stopper.stop();
+            })
+        };
+        let started = Instant::now();
+        assert_eq!(
+            hooks.stop(&dir),
+            vec![format!(
+                "hook (stop): stop hook was stopped by an interrupt: {command}"
+            )]
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        interrupt.join().unwrap();
+        let child: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 only probes the pid.
+        let alive = || unsafe { libc::kill(child, 0) } == 0;
+        let gone_by = Instant::now() + Duration::from_secs(5);
+        while alive() && Instant::now() < gone_by {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(), "the hook's child outlived the interrupt");
+
+        // A stop before a hook starts leaves it alone.
+        let quick = Hooks::from_value(&json!({ "stop": [{ "command": "echo done" }] }))
+            .with_stopper(stopper);
+        quick.stopper().stop();
+        assert_eq!(quick.stop(&dir), vec!["hook (stop): done"]);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]

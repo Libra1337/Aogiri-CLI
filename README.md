@@ -184,7 +184,7 @@ lynshen daemon pair              # 打印一次性配对链接，5 分钟内在�
 
 MCP 服务器写在 `config.json` 的 `mcp_servers` 里，支持 stdio 和 HTTP。详见 [docs/mcp.md](docs/mcp.md)。
 
-钩子（hooks）写在 `~/.lynshen/hooks.json` 和已信任项目的 `.lynshen/hooks.json` 里。每个钩子可以用 `timeout` 设超时秒数。不设时，每次工具调用或提问前后跑的钩子（`pre_tool_use`、`post_tool_use`、`user_prompt_submit`）最多跑 60 秒，`session_start`、`stop`、`task_completed`、`agent_idle` 最多跑 600 秒。超时的钩子连同它启动的进程一起被停掉，按失败处理。详见 [docs/serve-protocol.md](docs/serve-protocol.md) 的 "Hooks"。
+钩子（hooks）写在 `~/.lynshen/hooks.json` 和已信任项目的 `.lynshen/hooks.json` 里。每个钩子可以用 `timeout` 设超时秒数。不设时，每次工具调用或提问前后跑的钩子（`pre_tool_use`、`post_tool_use`、`user_prompt_submit`）最多跑 60 秒，`session_start`、`stop`、`task_completed`、`agent_idle` 最多跑 600 秒。超时的钩子连同它启动的进程一起被停掉，按失败处理。在桌面端、`serve` 或 ACP 里中断，也会停掉正在跑的 `session_start`、`user_prompt_submit`、`stop` 钩子；TUI 里暂时不能。详见 [docs/serve-protocol.md](docs/serve-protocol.md) 的 "Hooks"。
 
 子智能体可以按角色启动。内置三个角色：`explorer` 只读调研，`worker` 在自己的 git worktree 里写代码、用 `merge_agent` 合并回来，`reviewer` 只读审查 diff。`~/.lynshen/roles/<名字>.md` 和已信任项目的 `.lynshen/roles/<名字>.md` 可以覆盖或新增角色。同时运行的数量、嵌套层数、每轮 token 预算和分派策略写在 `config.json` 的 `agents` 里，见 [docs/serve-protocol.md](docs/serve-protocol.md) 的 "Agent team"。
 
