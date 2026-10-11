@@ -18,7 +18,7 @@ use crate::{
     oauth::{self, OAuthLoginResult, OAuthModel},
     prompt::{
         discover_project_instructions, discover_skills, skill_commands, skill_message,
-        skill_pin_message, PromptContext,
+        skill_pin_message, PromptContext, SessionPrompt,
     },
     session::{
         compaction_summary_item, ContextStatistics, EntryKind, SessionLock, SessionStore,
@@ -705,6 +705,7 @@ impl AgentCore {
             return vec![AgentEvent::Error("nothing to continue".to_string())];
         }
         self.overflow_retried = false;
+        self.append_due_notes();
         self.start_turn_from_existing_context()
     }
 
@@ -1965,6 +1966,7 @@ impl AgentCore {
 
         if !self.running {
             if std::mem::take(&mut self.overflow_retry_pending) {
+                self.append_due_notes();
                 let save_event = self.save_session_event();
                 events.extend(self.spawn_current_context_turn(save_event));
             } else if let Some((next, images)) = self.queued.pop_front() {
@@ -2034,6 +2036,7 @@ impl AgentCore {
             .join("\n\n");
         self.overflow_retried = false;
         self.goal_continuation_running = false;
+        self.append_due_notes();
         self.session.append(EntryKind::ResponseItem {
             item: json!({
                 "role": "user",
@@ -2300,6 +2303,8 @@ impl AgentCore {
 
     fn start_turn(&mut self, message: String, images: Vec<String>) -> Vec<AgentEvent> {
         self.overflow_retried = false;
+        // Notes come first: the user's message stays the last one.
+        self.append_due_notes();
         self.session.append(EntryKind::User { content: message });
         if !images.is_empty() {
             self.session.append(EntryKind::UserImage { paths: images });
@@ -2380,7 +2385,6 @@ impl AgentCore {
                 .sandbox()
                 .map(|sandbox| sandbox.prompt())
                 .unwrap_or_default(),
-            plan_mode: self.approval_mode.get() == ApprovalMode::Plan,
             host: self
                 .host
                 .as_ref()
@@ -2393,14 +2397,51 @@ impl AgentCore {
             .map(|file| (file.path.display().to_string(), file.content.clone()))
             .collect();
         Ok(TurnPrompt {
-            head: crate::prompt::runtime_prompt(&base_prompt, &context),
-            project: crate::prompt::project_section(&context.project_instructions),
+            prompt: SessionPrompt {
+                head: crate::prompt::runtime_prompt(&base_prompt, &context),
+                project: crate::prompt::project_section(&context.project_instructions),
+                skills: crate::prompt::skills_section(&context.skills),
+                tail: crate::prompt::tail_section(&context),
+                date: context.date,
+            },
             project_files,
-            skills: crate::prompt::skills_section(&context.skills),
-            tail: crate::prompt::tail_section(&context),
             extra_read_roots,
             model_headers,
         })
+    }
+
+    /// The system prompt the session keeps: the one its first turn built
+    /// (`built` on that turn), fixed from then on (see `SessionPrompt`).
+    fn session_prompt(&mut self, built: SessionPrompt) -> SessionPrompt {
+        if let Some(prompt) = self.session.prompt() {
+            return prompt.clone();
+        }
+        self.session.set_prompt(built.clone());
+        built
+    }
+
+    /// Adds a note for each thing the model was last told that is no longer
+    /// so (plan mode, the date, the host's state), before the input a turn
+    /// starts with: the system prompt stays as the session began.
+    fn append_due_notes(&mut self) {
+        let now = crate::prompt::NoteState {
+            plan_mode: !self.chat && self.approval_mode.get() == ApprovalMode::Plan,
+            date: current_utc_date(),
+            host: self
+                .host
+                .as_ref()
+                .map(|host| (host.context)())
+                .unwrap_or_default(),
+        };
+        // Before the first turn the prompt is still to be built, today.
+        let prompt_date = self
+            .session
+            .prompt()
+            .map_or_else(|| now.date.clone(), |prompt| prompt.date.clone());
+        let due = crate::prompt::notes_due(&now, &prompt_date, |note| self.session.last_note(note));
+        for (note, content) in due {
+            self.session.append_note(note, content);
+        }
     }
 
     fn spawn_current_context_turn(&mut self, save_event: Vec<AgentEvent>) -> Vec<AgentEvent> {
@@ -2411,10 +2452,7 @@ impl AgentCore {
         }
         self.requeue_unread_steers();
         let TurnPrompt {
-            head,
-            project,
-            skills,
-            tail,
+            prompt,
             extra_read_roots,
             model_headers,
             ..
@@ -2426,8 +2464,10 @@ impl AgentCore {
                 return events;
             }
         };
-        let skills_tokens = crate::tokens::count_text(&self.config.model, &skills).tokens as u64;
-        let system_prompt = format!("{head}{project}{skills}{tail}");
+        let prompt = self.session_prompt(prompt);
+        let skills_tokens =
+            crate::tokens::count_text(&self.config.model, &prompt.skills).tokens as u64;
+        let system_prompt = prompt.text();
         let new_window = !std::mem::take(&mut self.wake_turn);
         self.subagent_manager
             .begin_turn(self.config.agents.clone(), new_window);
@@ -2435,8 +2475,6 @@ impl AgentCore {
             self.latest_plan_approved(),
             self.plan.iter().map(|item| item.step.clone()).collect(),
         );
-        let project_skills = self.project_trusted && !self.chat;
-        let roles = crate::roles::discover(self.config.profile_dir(), &self.cwd, project_skills);
 
         let prompt_tokens =
             crate::tokens::count_text(&self.config.model, &system_prompt).tokens as u64;
@@ -2444,43 +2482,19 @@ impl AgentCore {
         self.goal_tool_receiver = Some(goal_tool_rx);
         let approval_tx = self.approval_sender();
         self.drop_foreground_approvals();
-        let Ok(mut client) = OpenAiClient::from_config(OpenAiClientConfig {
-            model: self.config.model.clone(),
-            provider: self.config.provider.clone(),
-            protocol: self.config.protocol.clone(),
-            reasoning_effort: self.effective_reasoning_effort(),
-            models: self.config.models.clone(),
-            subagent_models: self.config.subagent_models.clone(),
+        let mut client = match self.main_client(
             system_prompt,
-            prompt_cache_key: self.session.session_id().to_string(),
-            mcp: self.mcp.clone(),
-            base_url: self.config.base_url.clone(),
-            max_output_tokens: self.config.current_model_config().max_output_tokens,
-            api_key: self.provider_api_key().as_deref(),
-            api_key_env: &self.config.api_key_env,
-            retry_attempts: self.config.retry_attempts,
-            connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
-            read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
-            goal_tool_tx: Some(goal_tool_tx),
-            has_goal: self.session.goal().is_some(),
-            approval_tx: Some(approval_tx),
-            approval_mode: self.approval_mode.clone(),
-            safety_model: Some(self.config.safety().0).filter(|model| !model.trim().is_empty()),
-            safety_reasoning_effort: self.config.safety().1,
-            model_headers,
-            edit_tools: self.config.edit_tools.clone(),
             extra_read_roots,
-            tool_state: self.tool_state.clone(),
-            host: self.host.clone(),
-            subagent_manager: Some(self.subagent_manager.clone()),
-            roles,
-            hooks: self.hooks.clone(),
-        }) else {
-            let mut events = save_event;
-            events.push(AgentEvent::Error(
-                "missing API key in auth.json or env".to_string(),
-            ));
-            return events;
+            model_headers,
+            goal_tool_tx,
+            Some(approval_tx),
+        ) {
+            Ok(client) => client,
+            Err(error) => {
+                let mut events = save_event;
+                events.push(AgentEvent::Error(error));
+                return events;
+            }
         };
 
         let (system_tools, mcp_tools) = client.tool_definition_tokens();
@@ -2522,17 +2536,6 @@ impl AgentCore {
                 ..overhead
             }),
         });
-        let compaction_client = if compaction.is_some() {
-            match self.compaction_client() {
-                Ok(client) => Some(client),
-                Err(error) => {
-                    events.push(AgentEvent::CompactionFailed(error));
-                    None
-                }
-            }
-        } else {
-            None
-        };
         let cwd = self.cwd.clone();
         let current_plan = self.plan.clone();
         let (tx, rx) = mpsc::channel();
@@ -2543,25 +2546,21 @@ impl AgentCore {
         self.running = true;
 
         thread::spawn(move || {
-            let input =
-                if let (Some(plan), Some(compaction_client)) = (compaction, compaction_client) {
-                    let _ = tx.send(WorkerEvent::CompactionStart);
-                    match compaction_client.summarize_with_progress(
-                        &plan.folded_text,
-                        |output_tokens| {
-                            tx.send(WorkerEvent::CompactionProgress { output_tokens })
-                                .map_err(|error| error.to_string())
-                        },
-                    ) {
-                        Ok(summary) => compacted(plan, summary, &current_plan, &tx),
-                        Err(error) => {
-                            let _ = tx.send(WorkerEvent::CompactionFailed(error));
-                            request_items
-                        }
+            let input = if let Some(plan) = compaction {
+                let _ = tx.send(WorkerEvent::CompactionStart);
+                match client.summarize_conversation(plan.summary_request(), |output_tokens| {
+                    tx.send(WorkerEvent::CompactionProgress { output_tokens })
+                        .map_err(|error| error.to_string())
+                }) {
+                    Ok(summary) => compacted(plan, summary, &current_plan, &tx),
+                    Err(error) => {
+                        let _ = tx.send(WorkerEvent::CompactionFailed(error));
+                        request_items
                     }
-                } else {
-                    request_items
-                };
+                }
+            } else {
+                request_items
+            };
             let result = client.run_turn_events(input, &cwd, |event| {
                 if interrupt_flag.load(Ordering::SeqCst) {
                     return Err("interrupted".to_string());
@@ -2676,7 +2675,20 @@ impl AgentCore {
         if let Err(error) = self.ensure_provider_credentials() {
             return vec![AgentEvent::Error(error)];
         }
-        let client = match self.compaction_client() {
+        // The summary request goes out as a turn's would (see
+        // `summarize_conversation`); this client runs no tools.
+        let client = self.turn_prompt().and_then(|turn| {
+            let system_prompt = self.session_prompt(turn.prompt).text();
+            let (goal_tool_tx, _) = mpsc::channel();
+            self.main_client(
+                system_prompt,
+                turn.extra_read_roots,
+                turn.model_headers,
+                goal_tool_tx,
+                None,
+            )
+        });
+        let client = match client {
             Ok(client) => client,
             Err(error) => return vec![AgentEvent::Error(error)],
         };
@@ -2692,7 +2704,7 @@ impl AgentCore {
 
         thread::spawn(move || {
             let _ = tx.send(WorkerEvent::CompactionStart);
-            match client.summarize_with_progress(&plan.folded_text, |output_tokens| {
+            match client.summarize_conversation(plan.summary_request(), |output_tokens| {
                 tx.send(WorkerEvent::CompactionProgress { output_tokens })
                     .map_err(|error| error.to_string())
             }) {
@@ -2713,41 +2725,51 @@ impl AgentCore {
         ]
     }
 
-    fn compaction_client(&self) -> Result<OpenAiClient, String> {
-        let (model, reasoning_effort) = self.config.compact();
+    /// The client a turn sends its requests with: the main model, the
+    /// session's `system_prompt` and the tools a turn offers. Compaction uses
+    /// it too, so its request starts as the turn's do.
+    fn main_client(
+        &self,
+        system_prompt: String,
+        extra_read_roots: Vec<PathBuf>,
+        model_headers: HashMap<String, Vec<(String, String)>>,
+        goal_tool_tx: Sender<GoalToolRequest>,
+        approval_tx: Option<Sender<ApprovalRequest>>,
+    ) -> Result<OpenAiClient, String> {
+        let project_skills = self.project_trusted && !self.chat;
+        let roles = crate::roles::discover(self.config.profile_dir(), &self.cwd, project_skills);
         OpenAiClient::from_config(OpenAiClientConfig {
-            model,
+            model: self.config.model.clone(),
             provider: self.config.provider.clone(),
             protocol: self.config.protocol.clone(),
-            reasoning_effort,
-            models: Vec::new(),
-            subagent_models: Vec::new(),
-            system_prompt: String::new(),
+            reasoning_effort: self.effective_reasoning_effort(),
+            models: self.config.models.clone(),
+            subagent_models: self.config.subagent_models.clone(),
+            system_prompt,
             prompt_cache_key: self.session.session_id().to_string(),
-            mcp: McpManager::default(),
+            mcp: self.mcp.clone(),
             base_url: self.config.base_url.clone(),
-            max_output_tokens: self.config.compact_model_config().max_output_tokens,
+            max_output_tokens: self.config.current_model_config().max_output_tokens,
             api_key: self.provider_api_key().as_deref(),
             api_key_env: &self.config.api_key_env,
             retry_attempts: self.config.retry_attempts,
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
-            goal_tool_tx: None,
-            has_goal: false,
-            approval_tx: None,
+            goal_tool_tx: Some(goal_tool_tx),
+            approval_tx,
             approval_mode: self.approval_mode.clone(),
-            safety_model: None,
-            safety_reasoning_effort: String::new(),
-            model_headers: self.model_headers(),
-            // Summarization clients never expose or execute tools.
-            edit_tools: Vec::new(),
-            extra_read_roots: Vec::new(),
-            tool_state: crate::tools::ToolState::default(),
-            host: None,
-            subagent_manager: None,
-            roles: Vec::new(),
-            hooks: Hooks::default(),
+            safety_model: Some(self.config.safety().0).filter(|model| !model.trim().is_empty()),
+            safety_reasoning_effort: self.config.safety().1,
+            model_headers,
+            edit_tools: self.config.edit_tools.clone(),
+            extra_read_roots,
+            tool_state: self.tool_state.clone(),
+            host: self.host.clone(),
+            subagent_manager: Some(self.subagent_manager.clone()),
+            roles,
+            hooks: self.hooks.clone(),
         })
+        .map_err(|_| "missing API key in auth.json or env".to_string())
     }
 
     fn resume_summary_client(&self) -> Result<OpenAiClient, String> {
@@ -2788,7 +2810,6 @@ impl AgentCore {
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: None,
-            has_goal: false,
             approval_tx: None,
             approval_mode: self.approval_mode.clone(),
             safety_model: None,
@@ -2813,6 +2834,7 @@ impl AgentCore {
             "<goal_context>\nContinue working toward the active session goal.\n\nObjective: {}\n\nBefore doing more work, decide whether the objective is already satisfied. If all required work is done, call update_goal with status \"complete\" and stop. If the objective lacks a verifiable stopping condition, ask the user to clarify instead of continuing indefinitely. If progress cannot continue without user input or an external change, call update_goal with status \"blocked\".\n</goal_context>",
             goal.objective
         );
+        self.append_due_notes();
         self.session.append_goal_context(message);
         self.goal_continuation_running = true;
         let mut events = vec![AgentEvent::Info(format!(
@@ -3540,6 +3562,10 @@ impl AgentCore {
                 let token_budget = args.get("token_budget").and_then(Value::as_u64);
                 self.session.create_goal(objective, token_budget).map(Some)
             }
+            "update_goal" if self.session.goal().is_none() => Err(
+                "update_goal: this session has no goal; create one with create_goal, only when the user asks for one"
+                    .to_string(),
+            ),
             "update_goal" => {
                 let status = match args.get("status").and_then(Value::as_str) {
                     Some("complete") => Ok(ThreadGoalStatus::Complete),
@@ -3946,8 +3972,8 @@ impl AgentCore {
         let model = self.config.model.clone();
         let text = |t: &str| crate::tokens::count_text(&model, t).tokens as u64;
         let values = |v: &[Value]| crate::tokens::count_values(&model, v.iter()).tokens as u64;
-        let prompt = match self.turn_prompt() {
-            Ok(prompt) => prompt,
+        let turn = match self.turn_prompt() {
+            Ok(turn) => turn,
             Err(error) => {
                 return AgentEvent::ContextBreakdown {
                     total: 0,
@@ -3982,9 +4008,11 @@ impl AgentCore {
                 models: specs.as_slice(),
                 roles: roles.as_slice(),
             }),
-            goals: Some(self.session.goal().is_some()),
-            plan_mode: self.approval_mode.get() == ApprovalMode::Plan,
+            goals: true,
         });
+        // What the session sends: the prompt it keeps, else the one its first
+        // turn would build now.
+        let prompt = self.session.prompt().unwrap_or(&turn.prompt);
         let mcp_names: HashSet<String> = self
             .mcp
             .definitions()
@@ -4096,7 +4124,7 @@ impl AgentCore {
             total,
             max: window,
             categories,
-            memory_files: prompt
+            memory_files: turn
                 .project_files
                 .iter()
                 .map(|(path, content)| (path.clone(), text(content)))
@@ -5344,17 +5372,13 @@ fn overhead_tokens(overhead: &ContextBreakdown) -> u64 {
     overhead.system_prompt + overhead.skills + overhead.system_tools + overhead.mcp_tools
 }
 
-/// A turn's system prompt in its parts: the base prompt with its tool
-/// guidance (`head`), the project's instruction files, the skills list, and
-/// what follows them (sandbox note, working directory and date, plan-mode
-/// addendum, host prompt).
+/// The system prompt as a turn would build it now (a session keeps the one
+/// its first turn built; see `session_prompt`), with what the turn needs
+/// alongside it.
 struct TurnPrompt {
-    head: String,
-    project: String,
-    /// The instruction files `project` carries: path and content.
+    prompt: SessionPrompt,
+    /// The instruction files `prompt.project` carries now: path and content.
     project_files: Vec<(String, String)>,
-    skills: String,
-    tail: String,
     extra_read_roots: Vec<std::path::PathBuf>,
     model_headers: std::collections::HashMap<String, Vec<(String, String)>>,
 }
@@ -5753,7 +5777,6 @@ fn title_request(
         connect_timeout: Duration::from_secs(config.connect_timeout_seconds),
         read_timeout: Duration::from_secs(config.read_timeout_seconds),
         goal_tool_tx: None,
-        has_goal: false,
         approval_tx: None,
         approval_mode: LiveApprovalMode::new(config.approval_mode),
         safety_model: None,
@@ -6087,7 +6110,7 @@ mod compaction_tests {
         let request =
             json!({ "role": "user", "content": [{ "type": "input_text", "text": "go on" }] });
         let compaction = crate::session::CompactionPlan {
-            folded_text: String::new(),
+            folded_items: Vec::new(),
             kept_items: vec![request.clone()],
             replaced_through: 7,
             changed_files: vec!["src/a.rs".to_string()],

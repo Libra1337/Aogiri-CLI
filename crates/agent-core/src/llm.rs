@@ -103,10 +103,6 @@ pub struct OpenAiClient {
     context_budget: u64,
     provider_kind: Protocol,
     goal_tool_tx: Option<Sender<GoalToolRequest>>,
-    /// The session has a goal: which goal tools are offered (see
-    /// `goal_tool_definitions`). Set when create_goal succeeds, so the
-    /// turn's next request already offers get_goal and update_goal.
-    has_goal: std::cell::Cell<bool>,
     approval_tx: Option<Sender<ApprovalRequest>>,
     /// Which tool classes this client gates on the approval channel: the
     /// session's live mode, so a switch applies to the next call mid-turn.
@@ -184,8 +180,6 @@ pub struct OpenAiClientConfig<'a> {
     pub connect_timeout: Duration,
     pub read_timeout: Duration,
     pub goal_tool_tx: Option<Sender<GoalToolRequest>>,
-    /// The session has a goal when the turn starts.
-    pub has_goal: bool,
     pub approval_tx: Option<Sender<ApprovalRequest>>,
     pub approval_mode: LiveApprovalMode,
     /// Model the `auto` mode safety classifier runs on (same provider/base_url
@@ -482,6 +476,9 @@ enum ParallelToolMessage {
 
 /// What decides the tools a request offers: the host's, MCP servers', the
 /// built-ins this engine has (edit tools, web, images), subagents, goals.
+/// Nothing that changes while a session runs (plan mode, whether it has a
+/// goal): the provider caches the tools with the system prompt, so the list
+/// stays the same, and a call that does not fit the moment fails instead.
 pub(crate) struct ToolOffer<'a> {
     pub host: Option<&'a crate::host::HostExtensions>,
     pub mcp: &'a McpManager,
@@ -489,9 +486,8 @@ pub(crate) struct ToolOffer<'a> {
     pub enabled_edit_tools: &'a [String],
     /// The subagent team this engine works in; None without one.
     pub subagents: Option<SubagentOffer<'a>>,
-    /// The goal tools, with whether a goal is set; None without them.
-    pub goals: Option<bool>,
-    pub plan_mode: bool,
+    /// The goal and plan tools (the main agent's).
+    pub goals: bool,
 }
 
 /// What `spawn_agent` and the team tools offer: the team's config, whether
@@ -582,12 +578,10 @@ pub(crate) fn request_tool_definitions(offer: &ToolOffer<'_>) -> Vec<Value> {
             }
         }
     }
-    if let Some(has_goal) = offer.goals {
-        definitions.extend(goal_tool_definitions(has_goal));
+    if offer.goals {
+        definitions.extend(goal_tool_definitions());
         definitions.push(plan_tool_definition());
-        if offer.plan_mode {
-            definitions.push(crate::plan_mode::propose_plan_definition());
-        }
+        definitions.push(crate::plan_mode::propose_plan_definition());
     }
     definitions
 }
@@ -743,7 +737,6 @@ impl OpenAiClient {
             context_budget: 0,
             provider_kind,
             goal_tool_tx: config.goal_tool_tx,
-            has_goal: std::cell::Cell::new(config.has_goal),
             approval_tx: config.approval_tx,
             approval_mode: config.approval_mode,
             enabled_edit_tools: config.edit_tools,
@@ -1172,19 +1165,50 @@ impl OpenAiClient {
         }
     }
 
-    /// One-shot summarization used for context compaction. No tools, no thinking;
-    /// returns the summary text. Errors (including empty output) let the caller fall
+    /// Context compaction: the model's answer to `request`, the conversation
+    /// as the session's requests carry it followed by the request for a
+    /// summary (`CompactionPlan::summary_request`). It is sent as a turn's
+    /// request is, with this client's model, system prompt and tools, so the
+    /// provider serves the conversation from its prompt cache. Tool calls in
+    /// the answer are ignored. Errors (including no text) let the caller fall
     /// back to sending the full context.
-    pub fn summarize_with_progress(
+    pub fn summarize_conversation(
         &self,
-        conversation: &str,
+        request: Vec<Value>,
         mut emit_output_tokens: impl FnMut(u64) -> Result<(), String>,
     ) -> Result<String, String> {
-        self.summarize_text(
-            "You compress earlier conversation history so it can replace the raw turns while letting the work continue. Write a dense summary that preserves: the user's goals and explicit requests, decisions made, important facts and constraints discovered, files and tools touched with their outcomes, and any unfinished threads. When the input ends with a list of the files changed in this session, that list is added to your summary as it is: do not copy it, but say what changed in those files where it matters. Prefer tight prose or bullet points. Output only the summary.",
-            &format!("Summarize this earlier conversation:\n\n{conversation}"),
-            &mut emit_output_tokens,
-        )
+        let mut output_tokens = 0u64;
+        let mut emit = |event: StreamEvent| {
+            if let StreamEvent::Delta(delta) = event {
+                output_tokens = output_tokens.saturating_add(estimate_text_tokens(&delta));
+                emit_output_tokens(output_tokens)?;
+            }
+            Ok(())
+        };
+        let items = match self.provider_kind {
+            Protocol::OpenAiResponses
+            | Protocol::OpenAiCodexResponses
+            | Protocol::AzureOpenAiResponses => {
+                self.create_response_streaming(request, &mut emit)?
+            }
+            Protocol::AnthropicMessages => {
+                self.create_anthropic_message_streaming(request, &mut emit)?
+            }
+            Protocol::OpenAiChatCompletions => {
+                self.create_chat_completion_streaming(request, &mut emit)?
+            }
+        };
+        let summary = items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) != Some("function_call"))
+            .map(extract_response_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let summary = summary.trim().to_string();
+        if summary.is_empty() {
+            return Err("summarization produced no output".to_string());
+        }
+        Ok(summary)
     }
 
     pub fn summarize_text(
@@ -1407,8 +1431,7 @@ impl OpenAiClient {
                 models: self.subagent_models.as_slice(),
                 roles: self.roles.as_slice(),
             }),
-            goals: self.goal_tool_tx.is_some().then(|| self.has_goal.get()),
-            plan_mode: self.approval_mode.get() == ApprovalMode::Plan,
+            goals: self.goal_tool_tx.is_some(),
         })
     }
 
@@ -1979,7 +2002,6 @@ impl OpenAiClient {
             // Claude uses Anthropic Messages, the rest Responses).
             provider_kind: spec.protocol,
             goal_tool_tx: None,
-            has_goal: false.into(),
             // The child shares the parent's approval channel and live mode.
             approval_tx: self.approval_tx.clone(),
             approval_mode: self.approval_mode.clone(),
@@ -2463,9 +2485,6 @@ impl OpenAiClient {
             output: json!({ "error": error.to_string() }).to_string(),
             is_error: true,
         });
-        if name == "create_goal" && !response.is_error {
-            self.has_goal.set(true);
-        }
         Some(tools::ToolExecutionResult {
             model_output: response.output.clone(),
             output: response.output,
@@ -2730,24 +2749,23 @@ impl OpenAiClient {
 
 /// The most recent user message's text, passed to the safety classifier as
 /// authorization evidence. Content may be a plain string or a parts array.
+/// The engine's notes (`prompt::NOTE_OPEN`) are not the user's words.
 fn last_user_text(input: &[Value]) -> Option<String> {
     for item in input.iter().rev() {
         if item.get("role").and_then(Value::as_str) != Some("user") {
             continue;
         }
-        match item.get("content") {
-            Some(Value::String(text)) => return Some(text.clone()),
-            Some(Value::Array(parts)) => {
-                let text = parts
-                    .iter()
-                    .filter_map(|part| part.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if !text.is_empty() {
-                    return Some(text);
-                }
-            }
-            _ => {}
+        let text = match item.get("content") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => continue,
+        };
+        if !text.is_empty() && !text.starts_with(crate::prompt::NOTE_OPEN) {
+            return Some(text);
         }
     }
     None
@@ -3635,11 +3653,10 @@ fn filter_pending_subagent_items(
         .collect()
 }
 
-/// The goal tools for a session with or without a goal: create_goal only
-/// without one (it fails once a goal exists), get_goal and update_goal only
-/// with one. A goal created mid-turn switches them from the next request.
-fn goal_tool_definitions(has_goal: bool) -> Vec<Value> {
-    let [get, create, update] = [
+/// The goal tools, offered whether or not the session has a goal (see
+/// `ToolOffer`): create_goal fails once one exists, update_goal without one.
+fn goal_tool_definitions() -> Vec<Value> {
+    vec![
         json!({
             "type": "function",
             "name": "get_goal",
@@ -3652,7 +3669,7 @@ fn goal_tool_definitions(has_goal: bool) -> Vec<Value> {
         json!({
             "type": "function",
             "name": "create_goal",
-            "description": "Set the session goal, only when the user asks for one.",
+            "description": "Set the session goal, only when the user asks for one and the session has none.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3665,7 +3682,7 @@ fn goal_tool_definitions(has_goal: bool) -> Vec<Value> {
         json!({
             "type": "function",
             "name": "update_goal",
-            "description": "Mark the goal complete (all required work done) or blocked (progress cannot continue).",
+            "description": "Mark the session goal complete (all required work done) or blocked (progress cannot continue).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3674,12 +3691,7 @@ fn goal_tool_definitions(has_goal: bool) -> Vec<Value> {
                 "required": ["status"]
             }
         }),
-    ];
-    if has_goal {
-        vec![get, update]
-    } else {
-        vec![create]
-    }
+    ]
 }
 
 fn plan_tool_definition() -> Value {
@@ -4024,7 +4036,6 @@ mod tests {
             connect_timeout: Duration::from_secs(1),
             read_timeout: Duration::from_secs(1),
             goal_tool_tx: None,
-            has_goal: false,
             approval_tx: None,
             approval_mode: LiveApprovalMode::default(),
             safety_model: None,
@@ -4093,7 +4104,7 @@ mod tests {
     }
 
     #[test]
-    fn a_goal_created_mid_turn_gets_its_tools_on_the_next_request() {
+    fn the_tools_stay_the_same_through_goal_and_plan_mode_changes() {
         let mut config = test_client_config();
         let (goal_tx, goal_rx) = mpsc::channel::<GoalToolRequest>();
         config.goal_tool_tx = Some(goal_tx);
@@ -4105,40 +4116,29 @@ mod tests {
             });
         });
         let client = OpenAiClient::from_config(config).unwrap();
-        let goal_names = || {
-            client
-                .tool_definitions()
-                .into_iter()
-                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
-                .filter(|name| name.contains("goal"))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(goal_names(), ["create_goal"]);
+        let tools = client.tool_definitions();
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .filter(|name| name.contains("goal") || name.contains("plan"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "get_goal",
+                "create_goal",
+                "update_goal",
+                "update_plan",
+                "propose_plan"
+            ]
+        );
         let result = client
             .run_goal_tool("create_goal", r#"{"objective":"ship it"}"#)
             .unwrap();
         assert!(!result.is_error);
         handler.join().unwrap();
-        assert_eq!(goal_names(), ["get_goal", "update_goal"]);
-    }
-
-    #[test]
-    fn goal_tools_follow_whether_the_session_has_a_goal() {
-        let names = |has_goal: bool| {
-            let mut config = test_client_config();
-            let (goal_tx, _goal_rx) = mpsc::channel();
-            config.goal_tool_tx = Some(goal_tx);
-            config.has_goal = has_goal;
-            OpenAiClient::from_config(config)
-                .unwrap()
-                .tool_definitions()
-                .into_iter()
-                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
-                .filter(|name| name.contains("goal") || name == "update_plan")
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(names(false), ["create_goal", "update_plan"]);
-        assert_eq!(names(true), ["get_goal", "update_goal", "update_plan"]);
+        client.approval_mode.set(ApprovalMode::Plan);
+        assert_eq!(client.tool_definitions(), tools);
         // A client without the goal channel (a subagent) offers none.
         assert!(!test_client()
             .tool_definitions()
@@ -5385,6 +5385,7 @@ mod tests {
             json!({ "role": "user", "content": [{ "type": "input_text", "text": "first" }] }),
             json!({ "role": "assistant", "content": [{ "type": "output_text", "text": "ok" }] }),
             json!({ "role": "user", "content": "latest" }),
+            json!({ "role": "user", "content": [{ "type": "input_text", "text": "<system-reminder>\nThe date is now 2026-10-13.\n</system-reminder>" }] }),
         ];
         assert_eq!(last_user_text(&input).as_deref(), Some("latest"));
         assert_eq!(last_user_text(&[]), None);

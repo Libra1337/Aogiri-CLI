@@ -1,5 +1,6 @@
 use crate::{
     event::{PlanItem, TranscriptItem, TreeNodeView},
+    prompt::{Note, SessionPrompt},
     tokens, tools,
 };
 use serde_json::{json, Value};
@@ -34,6 +35,10 @@ const PLAN_HEADING: &str = "Your plan from update_plan, as it stands:";
 /// At most this many files are listed: the summary rides along with every
 /// later request.
 const MAX_LISTED_CHANGED_FILES: usize = 100;
+/// What the summary request asks for (`CompactionPlan::summary_request`).
+/// It goes with the session's own system prompt and tools, so it also says
+/// that no tool may be called.
+const COMPACTION_REQUEST: &str = "The conversation above is about to be replaced by a summary so the work can continue in a fresh context. Do not continue the task and do not call any tool: answer with the summary only.\n\nWrite a dense summary that preserves: the user's goals and explicit requests, decisions made, important facts and constraints discovered, files and tools touched with their outcomes, and any unfinished threads. The current plan from update_plan and the list of files changed in this session (when this request ends with one) are added to your summary as they are: do not copy them, but say what changed in those files where it matters. Prefer tight prose or bullet points. Output only the summary.";
 
 impl EntryId {
     pub fn display(self) -> String {
@@ -70,8 +75,12 @@ pub enum EntryKind {
         name: String,
         content: String,
     },
-    GoalContext {
+    /// A message the engine adds to the conversation: the goal
+    /// continuation prompt, or a note on what changed since the system
+    /// prompt was built (`note` says about what; see `prompt::notes_due`).
+    Context {
         content: String,
+        note: Option<Note>,
     },
     /// A plan proposed in plan mode (`propose_plan`) and its latest status;
     /// a status change appends the entry again with the same id.
@@ -92,10 +101,12 @@ pub enum EntryKind {
 
 #[derive(Debug, Clone)]
 pub struct CompactionPlan {
-    /// Rendered text of the prior summary plus the turns being folded, then
-    /// the files this session changed.
-    pub folded_text: String,
-    /// Recent context items kept verbatim after the fold point.
+    /// The items being folded as the session's requests carry them (the
+    /// prior summary first, if any): the start of the last request, so the
+    /// summary request reads them from the provider's prompt cache.
+    pub folded_items: Vec<Value>,
+    /// Recent context items kept verbatim after the fold point, behind the
+    /// notes that are still current (see `carried_notes`).
     pub kept_items: Vec<Value>,
     /// Id of the last entry folded into the new summary.
     pub replaced_through: u64,
@@ -104,6 +115,23 @@ pub struct CompactionPlan {
 }
 
 impl CompactionPlan {
+    /// The summary request: the folded items, then the request to summarize
+    /// them, which ends with the changed-files list.
+    pub fn summary_request(&self) -> Vec<Value> {
+        let mut text = format!("<compaction_request>\n{COMPACTION_REQUEST}");
+        if !self.changed_files.is_empty() {
+            text.push_str("\n\n");
+            text.push_str(&changed_files_section(&self.changed_files));
+        }
+        text.push_str("\n</compaction_request>");
+        let mut items = self.folded_items.clone();
+        items.push(json!({
+            "role": "user",
+            "content": [{ "type": "input_text", "text": text }]
+        }));
+        items
+    }
+
     /// The summary as stored: the model's text, then the current `plan`
     /// (its update_plan calls were folded) and the changed files, so they
     /// survive whatever the model left out. The plan is part of the summary,
@@ -152,6 +180,10 @@ pub struct SessionStore {
     team: Option<Value>,
     /// The latest `update_plan` steps.
     plan: Vec<PlanItem>,
+    /// The system prompt, fixed when the first turn starts.
+    prompt: Option<SessionPrompt>,
+    /// `prompt` is not in the journal yet.
+    prompt_unsaved: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,10 +377,11 @@ impl SessionStore {
         objective: &str,
         token_budget: Option<u64>,
     ) -> Result<ThreadGoal, String> {
-        if self.goal.is_some() {
-            return Err(
-                "cannot create a new goal because this session already has a goal".to_string(),
-            );
+        if let Some(goal) = &self.goal {
+            return Err(format!(
+                "create_goal: this session already has a goal ({}); use get_goal to read it and update_goal to mark it complete or blocked",
+                goal.status.as_str()
+            ));
         }
         self.set_goal_objective(objective, token_budget)
     }
@@ -400,7 +433,40 @@ impl SessionStore {
     }
 
     pub fn append_goal_context(&mut self, content: String) {
-        self.append(EntryKind::GoalContext { content });
+        self.append(EntryKind::Context {
+            content,
+            note: None,
+        });
+    }
+
+    /// The system prompt the session keeps (see `SessionPrompt`); None
+    /// before its first turn.
+    pub fn prompt(&self) -> Option<&SessionPrompt> {
+        self.prompt.as_ref()
+    }
+
+    /// Fixes the system prompt; written with the next save. Not a
+    /// conversation change, so `updated_at` stays.
+    pub fn set_prompt(&mut self, prompt: SessionPrompt) {
+        self.prompt = Some(prompt);
+        self.prompt_unsaved = true;
+    }
+
+    pub fn append_note(&mut self, note: Note, content: String) {
+        self.append(EntryKind::Context {
+            content,
+            note: Some(note),
+        });
+    }
+
+    /// The latest note about `note` on the active branch. The model sees it
+    /// even when a compaction folded it (see `carried_notes`).
+    pub fn last_note(&self, note: Note) -> Option<&str> {
+        self.branch()
+            .into_iter()
+            .rev()
+            .filter_map(note_in)
+            .find_map(|(kind, content)| (kind == note).then_some(content))
     }
 
     pub fn set_resume_summary(
@@ -613,6 +679,7 @@ impl SessionStore {
         let mut items = Vec::new();
         if let Some(summary) = &summary {
             items.push(compaction_summary_item(summary));
+            items.extend(carried_notes(&branch[..keep_after], &branch[keep_after..]));
         }
         let entries = branch
             .iter()
@@ -719,36 +786,29 @@ impl SessionStore {
         let fold = &kept[..fold_end];
         let replaced_through = fold.last()?.id.0;
 
-        let mut folded_text = String::new();
+        // The folded part as the last request began: the prior summary and
+        // the notes it carried, then the folded entries.
+        let mut folded = Vec::new();
         if let Some(summary) = &summary {
-            folded_text.push_str("Earlier summary:\n");
-            // Its plan and file list are written anew, from the current plan
-            // and the whole branch.
-            folded_text.push_str(without_added_sections(summary));
-            folded_text.push_str("\n\n");
+            folded.push(compaction_summary_item(summary));
+            folded.extend(carried_notes(&branch[..keep_after], &branch[keep_after..]));
         }
-        for entry in fold {
-            if let Some(rendered) = render_entry_for_summary(entry) {
-                folded_text.push_str(&rendered);
-                folded_text.push('\n');
-            }
-        }
-        let changed_files = self.changed_files(cwd);
-        if !changed_files.is_empty() {
-            folded_text.push('\n');
-            folded_text.push_str(&changed_files_section(&changed_files));
-            folded_text.push('\n');
-        }
+        append_projected_entries(&mut folded, fold.iter().copied());
+        let folded_items = sanitize_tool_pairs(folded);
 
-        let mut kept_projected = Vec::new();
+        let fold_point = branch
+            .iter()
+            .position(|entry| entry.id.0 == replaced_through)
+            .map_or(0, |index| index + 1);
+        let mut kept_projected = carried_notes(&branch[..fold_point], &branch[fold_point..]);
         append_projected_entries(&mut kept_projected, kept[fold_end..].iter().copied());
         let kept_items = sanitize_tool_pairs(kept_projected);
 
         Some(CompactionPlan {
-            folded_text,
+            folded_items,
             kept_items,
             replaced_through,
-            changed_files,
+            changed_files: self.changed_files(cwd),
         })
     }
 
@@ -1018,7 +1078,7 @@ impl SessionStore {
                 (!paths.is_empty()).then(|| TranscriptItem::User(image_attachment_label(paths)))
             }
             EntryKind::PinnedSkill { .. } => None,
-            EntryKind::GoalContext { .. } => None,
+            EntryKind::Context { .. } => None,
             EntryKind::ProposedPlan { .. } => None,
             EntryKind::Compaction { summary, .. } => Some(TranscriptItem::Compaction {
                 summary: summary.clone(),
@@ -1051,6 +1111,13 @@ impl SessionStore {
                 &json!({ "type": "snapshot", "session": self.to_json() }),
             )?;
         } else {
+            // Once, not with every state record: the prompt can be long.
+            if let Some(prompt) = self.prompt.as_ref().filter(|_| self.prompt_unsaved) {
+                write_json_line(
+                    &mut journal,
+                    &json!({ "type": "prompt", "prompt": prompt.to_json() }),
+                )?;
+            }
             for entry in &self.entries[self.persisted_entries..] {
                 write_json_line(
                     &mut journal,
@@ -1065,6 +1132,7 @@ impl SessionStore {
         journal.sync_all()?;
         self.persisted_entries = self.entries.len();
         self.needs_snapshot = false;
+        self.prompt_unsaved = false;
 
         let summary_path = dir.join(format!("{}.json", self.session_id));
         write_atomically(
@@ -1193,6 +1261,9 @@ impl SessionStore {
     fn to_json(&self) -> Value {
         let mut value = self.state_json();
         value["entries"] = json!(self.entries.iter().map(entry_to_json).collect::<Vec<_>>());
+        if let Some(prompt) = &self.prompt {
+            value["prompt"] = prompt.to_json();
+        }
         value
     }
 
@@ -1310,6 +1381,8 @@ impl SessionStore {
                 .and_then(Value::as_u64),
             team: value.get("team").filter(|team| !team.is_null()).cloned(),
             plan: value.get("plan").map(plan_from_json).unwrap_or_default(),
+            prompt: value.get("prompt").and_then(SessionPrompt::from_json),
+            prompt_unsaved: false,
         };
         if store.branch_heads.is_empty() {
             store.rebuild_branch_heads();
@@ -1347,6 +1420,9 @@ impl SessionStore {
                     if let Some(state) = record.get("state") {
                         store.apply_state_json(state);
                     }
+                }
+                Some("prompt") => {
+                    store.prompt = record.get("prompt").and_then(SessionPrompt::from_json);
                 }
                 _ => {}
             }
@@ -1762,16 +1838,6 @@ fn plan_section(plan: &[PlanItem]) -> String {
     section
 }
 
-/// A summary without the plan and changed-files list `finish_summary`
-/// added.
-fn without_added_sections(summary: &str) -> &str {
-    [PLAN_HEADING, CHANGED_FILES_HEADING]
-        .iter()
-        .filter_map(|heading| summary.rfind(&format!("\n\n{heading}\n")))
-        .min()
-        .map_or(summary, |at| &summary[..at])
-}
-
 fn plan_to_json(plan: &[PlanItem]) -> Value {
     json!(plan
         .iter()
@@ -1837,37 +1903,6 @@ fn image_attachment_label(paths: &[String]) -> String {
     }
 }
 
-fn render_entry_for_summary(entry: &SessionEntry) -> Option<String> {
-    match &entry.kind {
-        EntryKind::User { content } => Some(format!("User: {content}")),
-        EntryKind::UserImage { paths } => Some(format!("User attached {} image(s)", paths.len())),
-        EntryKind::ResponseItem { item } => {
-            if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
-                let args = item.get("arguments").and_then(Value::as_str).unwrap_or("");
-                Some(format!("Assistant tool call {name}: {args}"))
-            } else {
-                let text = extract_response_text(item);
-                if text.trim().is_empty() {
-                    None
-                } else {
-                    Some(format!("{}: {text}", response_item_speaker(item)))
-                }
-            }
-        }
-        EntryKind::ToolOutput { name, output, .. } => Some(format!("Tool {name} output: {output}")),
-        EntryKind::PinnedSkill { name, .. } => Some(format!("(pinned skill: {name})")),
-        EntryKind::GoalContext { content } => Some(format!("Goal context: {content}")),
-        EntryKind::ProposedPlan {
-            title,
-            markdown,
-            status,
-            ..
-        } => Some(format!("Proposed plan ({status}): {title}\n{markdown}")),
-        EntryKind::Branch { .. } | EntryKind::Compaction { .. } => None,
-    }
-}
-
 fn render_entry_for_resume_summary(entry: &SessionEntry) -> Option<String> {
     match &entry.kind {
         EntryKind::User { content } => Some(format!(
@@ -1901,10 +1936,14 @@ fn render_entry_for_resume_summary(entry: &SessionEntry) -> Option<String> {
             "Tool {name} output: {}",
             single_line_with_limit(output, RESUME_SUMMARY_TOOL_TEXT_MAX_CHARS)
         )),
-        EntryKind::GoalContext { content } => Some(format!(
+        EntryKind::Context {
+            content,
+            note: None,
+        } => Some(format!(
             "Goal context: {}",
             single_line_with_limit(content, SESSION_LABEL_MAX_CHARS)
         )),
+        EntryKind::Context { note: Some(_), .. } => None,
         EntryKind::ProposedPlan { title, status, .. } => {
             Some(format!("Proposed plan ({status}): {title}"))
         }
@@ -1912,6 +1951,45 @@ fn render_entry_for_resume_summary(entry: &SessionEntry) -> Option<String> {
             None
         }
     }
+}
+
+fn context_item(content: &str) -> Value {
+    json!({
+        "role": "user",
+        "content": [{ "type": "input_text", "text": content }]
+    })
+}
+
+/// The note an entry is: its kind and text.
+fn note_in(entry: &SessionEntry) -> Option<(Note, &str)> {
+    match &entry.kind {
+        EntryKind::Context {
+            content,
+            note: Some(note),
+        } => Some((*note, content.as_str())),
+        _ => None,
+    }
+}
+
+/// The notes a compaction folded that are still the latest of their kind:
+/// they follow the summary, so the model keeps knowing the plan mode, date
+/// and host state it was told (`folded` is the branch up to the fold point,
+/// `kept` the rest).
+fn carried_notes(folded: &[&SessionEntry], kept: &[&SessionEntry]) -> Vec<Value> {
+    let mut carried: Vec<(Note, &str)> = Vec::new();
+    for (note, content) in folded.iter().filter_map(|entry| note_in(entry)) {
+        carried.retain(|(kind, _)| *kind != note);
+        carried.push((note, content));
+    }
+    carried.retain(|(note, _)| {
+        !kept
+            .iter()
+            .any(|entry| note_in(entry).is_some_and(|(kind, _)| kind == *note))
+    });
+    carried
+        .into_iter()
+        .map(|(_, content)| context_item(content))
+        .collect()
 }
 
 /// Projects entries into request items. Images extracted from tool outputs
@@ -1980,10 +2058,7 @@ fn context_item_for_entry(entry: &SessionEntry) -> Option<Value> {
                 "text": format!("Pinned skill for future turns: {name}\n\n{content}")
             }]
         })),
-        EntryKind::GoalContext { content } => Some(json!({
-            "role": "user",
-            "content": [{ "type": "input_text", "text": content }]
-        })),
+        EntryKind::Context { content, .. } => Some(context_item(content)),
         // The plan itself reaches the model as the propose_plan call; the
         // status record is for the transcript only.
         EntryKind::ProposedPlan { .. } => None,
@@ -2005,7 +2080,7 @@ fn count_context_entry(kind: &EntryKind, counts: &mut ContextEntryCounts) {
         }
         EntryKind::ToolOutput { .. } => counts.tool_outputs += 1,
         EntryKind::PinnedSkill { .. } => counts.pinned_skills += 1,
-        EntryKind::GoalContext { .. } => counts.users += 1,
+        EntryKind::Context { .. } => counts.users += 1,
         EntryKind::ProposedPlan { .. } => {}
         EntryKind::UserImage { .. } => {}
         EntryKind::Compaction { .. } => {}
@@ -2031,7 +2106,10 @@ fn context_entry_label(entry: &SessionEntry) -> String {
         },
         EntryKind::ToolOutput { name, .. } => format!("tool output:{name}"),
         EntryKind::PinnedSkill { name, .. } => format!("pinned skill:{name}"),
-        EntryKind::GoalContext { .. } => "goal context".to_string(),
+        EntryKind::Context { note: None, .. } => "goal context".to_string(),
+        EntryKind::Context {
+            note: Some(note), ..
+        } => format!("note:{}", note.as_str()),
         EntryKind::ProposedPlan { .. } => "proposed plan".to_string(),
         EntryKind::Compaction { .. } => "compaction".to_string(),
     }
@@ -2093,7 +2171,13 @@ fn entry_to_json(entry: &SessionEntry) -> Value {
         EntryKind::PinnedSkill { name, content } => {
             json!({ "type": "pinned_skill", "name": name, "content": content })
         }
-        EntryKind::GoalContext { content } => json!({ "type": "goal_context", "content": content }),
+        // "goal_context", the type's name before notes: older versions keep
+        // reading these entries (and the conversation after them).
+        EntryKind::Context { content, note } => json!({
+            "type": "goal_context",
+            "content": content,
+            "note": note.map(Note::as_str),
+        }),
         EntryKind::ProposedPlan {
             id,
             title,
@@ -2160,8 +2244,12 @@ fn entry_from_json(value: &Value) -> Option<SessionEntry> {
             name: kind_value.get("name")?.as_str()?.to_string(),
             content: kind_value.get("content")?.as_str()?.to_string(),
         },
-        "goal_context" => EntryKind::GoalContext {
+        "goal_context" => EntryKind::Context {
             content: kind_value.get("content")?.as_str()?.to_string(),
+            note: kind_value
+                .get("note")
+                .and_then(Value::as_str)
+                .and_then(Note::parse),
         },
         "proposed_plan" => EntryKind::ProposedPlan {
             id: kind_value.get("id")?.as_str()?.to_string(),
@@ -2567,7 +2655,7 @@ mod tests {
         let plan = session
             .plan_compaction(80, "gpt-5", Path::new("/work"))
             .expect("older turns should be foldable");
-        assert!(plan.folded_text.contains("User: turn 0"));
+        assert!(item_text(&plan.folded_items).contains("turn 0"));
         session.apply_compaction("ROLLED UP SUMMARY".to_string(), plan.replaced_through);
 
         let items = session.request_context_items();
@@ -2874,6 +2962,79 @@ mod tests {
     }
 
     #[test]
+    fn the_latest_notes_stay_in_view_after_a_compaction() {
+        let mut session = SessionStore::new();
+        session.append_note(Note::PlanMode, "plan on".to_string());
+        session.append_note(Note::Date, "date 1".to_string());
+        session.append_note(Note::PlanMode, "plan off".to_string());
+        for index in 0..6 {
+            session.append(EntryKind::User {
+                content: format!("turn {index} {}", "x".repeat(200)),
+            });
+        }
+        let plan = session
+            .plan_compaction(80, "gpt-5", Path::new("/work"))
+            .expect("older turns should be foldable");
+        assert!(item_text(&plan.folded_items).starts_with("plan on\ndate 1\nplan off"));
+        // Each kind's latest note follows the summary: the model still knows.
+        assert_eq!(item_text(&plan.kept_items[..2]), "date 1\nplan off");
+
+        session.apply_compaction("SUMMARY".to_string(), plan.replaced_through);
+        let items = session.request_context_items();
+        // The turn that compacted continued from what later requests send.
+        assert_eq!(items[1..], plan.kept_items[..]);
+        assert_eq!(session.last_note(Note::PlanMode), Some("plan off"));
+        assert_eq!(session.last_note(Note::Host), None);
+
+        // A newer note of a kind replaces the carried one.
+        session.append_note(Note::Date, "date 2".to_string());
+        let items = session.request_context_items();
+        assert_eq!(item_text(&items[1..2]), "plan off");
+        assert!(item_text(&items).ends_with("date 2"));
+        assert!(session.transcript_items().iter().all(|item| !matches!(
+            item,
+            TranscriptItem::User(text) if text.contains("date")
+        )));
+    }
+
+    #[test]
+    fn the_session_prompt_is_saved_once_and_survives_reopening() {
+        let root = test_dir("prompt-journal");
+        let profile = root.join("profile");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut session = SessionStore::new();
+        let session_id = session.session_id().to_string();
+        let prompt = SessionPrompt {
+            head: "Base prompt.".to_string(),
+            date: "2026-10-12".to_string(),
+            ..SessionPrompt::default()
+        };
+        session.set_prompt(prompt.clone());
+        session.append_note(Note::PlanMode, "plan on".to_string());
+        session.save_for_cwd(&profile, &cwd).unwrap();
+        session.append(EntryKind::User {
+            content: "hi".to_string(),
+        });
+        session.save_for_cwd(&profile, &cwd).unwrap();
+        let journal =
+            fs::read_to_string(sessions_dir(&profile, &cwd).join(format!("{session_id}.jsonl")))
+                .unwrap();
+        assert_eq!(journal.matches("Base prompt.").count(), 1);
+
+        let loaded = SessionStore::load_for_cwd(&profile, &cwd, &session_id).unwrap();
+        assert_eq!(loaded.prompt(), Some(&prompt));
+        assert_eq!(loaded.last_note(Note::PlanMode), Some("plan on"));
+        // A snapshot carries it too.
+        let mut loaded = loaded;
+        loaded.set_goal_objective("ship", None).unwrap();
+        loaded.save_for_cwd(&profile, &cwd).unwrap();
+        let reloaded = SessionStore::load_for_cwd(&profile, &cwd, &session_id).unwrap();
+        assert_eq!(reloaded.prompt(), Some(&prompt));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn goal_persists_through_journal_state() {
         let root = test_dir("goal-journal");
         let profile = root.join("profile");
@@ -3136,7 +3297,11 @@ mod tests {
             .plan_compaction(1, "gpt-5", cwd)
             .expect("older turns should be foldable");
         let list = "Files changed in this session:\n- src/new.rs\n- src/lib.rs\n- docs/notes.md\n- /elsewhere/x.rs";
-        assert!(plan.folded_text.contains(list), "{}", plan.folded_text);
+        let request = item_text(&plan.summary_request());
+        assert!(
+            request.ends_with(&format!("{list}\n</compaction_request>")),
+            "{request}"
+        );
         let summary = plan.finish_summary(
             "Wrote and patched files.".to_string(),
             &[plan_item("Fix it", "in_progress")],
@@ -3162,25 +3327,19 @@ mod tests {
         let next = session
             .plan_compaction(1, "gpt-5", cwd)
             .expect("foldable again");
-        assert_eq!(
-            next.folded_text
-                .matches("Files changed in this session:")
-                .count(),
-            1
-        );
-        assert!(next
-            .folded_text
-            .contains("Earlier summary:\nWrote and patched files.\n"));
-        // The plan then is not folded again: the summary gets the plan of then.
-        assert!(
-            !next.folded_text.contains(PLAN_HEADING),
-            "{}",
-            next.folded_text
-        );
-        assert!(next.folded_text.contains("- /elsewhere/x.rs\n- README.md"));
+        // The earlier summary is sent as the last request carried it, so the
+        // provider's cache serves it; the request asks anew, with the files
+        // of the whole branch and without the plan (finish_summary adds it).
+        let folded = item_text(&next.folded_items);
+        assert!(folded.starts_with(&format!("{COMPACTION_PREFIX}\n\nWrote and patched files.")));
+        let request = next.summary_request();
+        let ask = item_text(&request[request.len() - 1..]);
+        assert_eq!(ask.matches("Files changed in this session:").count(), 1);
+        assert!(!ask.contains(PLAN_HEADING), "{ask}");
+        assert!(ask.contains("- /elsewhere/x.rs\n- README.md"));
         // Without changed files, the summary is the model's text.
         let quiet = CompactionPlan {
-            folded_text: String::new(),
+            folded_items: Vec::new(),
             kept_items: Vec::new(),
             replaced_through: 1,
             changed_files: SessionStore::new().changed_files(cwd),
@@ -3446,7 +3605,7 @@ mod tests {
                     item["type"] == "function_call_output" && item["call_id"] == call_id.as_str()
                 });
                 assert!(
-                    kept || plan.folded_text.contains(output),
+                    kept || item_text(&plan.folded_items).contains(output),
                     "keep_recent={keep} lost output of {call_id}"
                 );
             }
@@ -3475,11 +3634,29 @@ mod tests {
             .plan_compaction(1, "gpt-5", Path::new("/work"))
             .expect("older turns should be foldable");
 
-        assert!(!plan.folded_text.contains("CURRENT QUESTION"));
+        assert!(!item_text(&plan.folded_items).contains("CURRENT QUESTION"));
         assert!(plan
             .kept_items
             .iter()
             .any(|item| item.to_string().contains("CURRENT QUESTION")));
+    }
+
+    /// The text of request items: messages' text, tool calls' arguments and
+    /// tool outputs.
+    fn item_text(items: &[Value]) -> String {
+        items
+            .iter()
+            .flat_map(|item| {
+                let parts = item["content"].as_array().cloned().unwrap_or_default();
+                parts
+                    .into_iter()
+                    .filter_map(|part| part["text"].as_str().map(str::to_string))
+                    .chain(item["arguments"].as_str().map(str::to_string))
+                    .chain(item["output"].as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn test_dir(name: &str) -> PathBuf {

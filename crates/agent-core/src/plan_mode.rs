@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 
 pub const TOOL_NAME: &str = "propose_plan";
 
-/// Added to the main agent's system prompt for a turn that starts in plan mode.
+/// Told to the main agent, as a note, when plan mode turns on (see
+/// `prompt::notes_due`); the system prompt stays as the session began.
 pub const PROMPT_ADDENDUM: &str = r#"<plan_mode>
 You are in plan mode. Only read-only tools run: reading, listing and searching files, read-only shell commands (for example git status/diff/log, ls, cat, grep, find), web search and fetch, and subagents (which are in plan mode too). Edits, writes and other changes are refused until the user approves a plan. If the user asks you to make changes, plan them instead.
 
@@ -22,6 +23,9 @@ Write the plan for scanning, with short sections and tables:
 - **Verification**: the tests and checks that prove it works.
 Keep it decision-complete and concise: whoever executes it must not have to make new decisions. A revised plan replaces the earlier one completely.
 </plan_mode>"#;
+
+/// The note when plan mode turns off again.
+pub const ENDED_NOTE: &str = "Plan mode is off now. Tools that change files and run commands work again, as the approval mode allows; propose_plan works only in plan mode.";
 
 /// Added to a subagent's context when it starts in plan mode.
 pub const SUBAGENT_NOTE: &str = " Plan mode applies to you too: only read-only tools run. Report your findings to the parent; do not propose a plan.";

@@ -12,6 +12,18 @@ use std::{
     thread,
 };
 
+/// Every request body the fake model received, oldest first.
+static REQUESTS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+
+/// The request bodies received so far (see `REQUESTS`).
+#[allow(dead_code)]
+pub fn requests() -> Vec<Value> {
+    REQUESTS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+}
+
 /// Tests share one HOME and one fake server; they run one at a time because
 /// the engines share `~/.lynshen/config.json`.
 pub fn setup() -> std::sync::MutexGuard<'static, ()> {
@@ -77,6 +89,10 @@ fn start_fake_model() -> String {
             let Ok(mut stream) = stream else { continue };
             thread::spawn(move || {
                 let body = read_request_body(&mut stream);
+                REQUESTS
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push(body.clone());
                 let reply = script(&body);
                 let _ = match reply.strip_prefix("ERROR ") {
                     Some(message) => {

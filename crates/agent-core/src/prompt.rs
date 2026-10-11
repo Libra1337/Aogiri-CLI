@@ -1,3 +1,4 @@
+use serde_json::{json, Value};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -44,9 +45,8 @@ pub struct PromptContext {
     pub chat: bool,
     /// The shell sandbox's note; empty without a sandbox.
     pub sandbox: String,
-    pub plan_mode: bool,
-    /// What the host adds to every turn (a daemon agent's brief and peers);
-    /// empty without a host.
+    /// The host's lasting text (a daemon agent's brief and peers); empty
+    /// without a host. What changes while the session runs is a note.
     pub host: String,
 }
 
@@ -81,11 +81,12 @@ pub(crate) fn stable_prefix_len(system_prompt: &str) -> Option<usize> {
 /// The whole prompt, as a turn joins its parts (core::TurnPrompt).
 ///
 /// The system prompt is ordered for prompt caching: what is the same across
-/// sessions and turns comes first, so providers can reuse the cached prefix.
-/// Base prompt and tool guidance (fixed per config), project instructions
-/// and skills (fixed per project), the sandbox note, then the working
-/// directory and the date (the date changes daily), plan mode (changes when
-/// the user switches mode) and last the host's text (may change every turn).
+/// sessions comes first, so providers can reuse the cached prefix. Base
+/// prompt and tool guidance (fixed per config), project instructions and
+/// skills (fixed per project), the sandbox note, the working directory and
+/// the date, then the host's lasting text. A session keeps the prompt its
+/// first turn built (`SessionPrompt`); what changes later (plan mode, the
+/// date, the host's state) reaches the model as a note (`Note`).
 #[cfg(test)]
 pub fn build_system_prompt(base: &str, context: &PromptContext) -> String {
     let mut prompt = runtime_prompt(base, context);
@@ -146,7 +147,7 @@ pub fn skills_section(skills: &[SkillPromptItem]) -> String {
 }
 
 /// What follows the skills: the sandbox note, the working directory and the
-/// date, the plan-mode addendum and the host's text.
+/// date, and the host's lasting text.
 pub fn tail_section(context: &PromptContext) -> String {
     let mut tail = String::new();
     if !context.sandbox.trim().is_empty() {
@@ -158,15 +159,127 @@ pub fn tail_section(context: &PromptContext) -> String {
         context.cwd.display(),
         context.date
     ));
-    if context.plan_mode && !context.chat {
-        tail.push_str("\n\n");
-        tail.push_str(crate::plan_mode::PROMPT_ADDENDUM);
-    }
     if !context.host.trim().is_empty() {
         tail.push_str("\n\n");
         tail.push_str(context.host.trim_end());
     }
     tail
+}
+
+/// A session's system prompt in its parts, built when its first turn starts
+/// and kept for the whole session, across reopening: a provider reuses its
+/// prompt cache only for a byte-identical prefix. What changes later reaches
+/// the model as a note instead (see `notes_due`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionPrompt {
+    /// The base prompt with its tool guidance (`runtime_prompt`).
+    pub head: String,
+    pub project: String,
+    pub skills: String,
+    pub tail: String,
+    /// The date `tail` gives.
+    pub date: String,
+}
+
+impl SessionPrompt {
+    pub fn text(&self) -> String {
+        format!("{}{}{}{}", self.head, self.project, self.skills, self.tail)
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "head": self.head,
+            "project": self.project,
+            "skills": self.skills,
+            "tail": self.tail,
+            "date": self.date,
+        })
+    }
+
+    pub fn from_json(value: &Value) -> Option<Self> {
+        let field = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
+        Some(Self {
+            head: field("head")?,
+            project: field("project")?,
+            skills: field("skills")?,
+            tail: field("tail")?,
+            date: field("date")?,
+        })
+    }
+}
+
+/// What a note tells the model about: something that changed since the
+/// session's system prompt was built. The latest note of each kind is what
+/// the model knows (see `notes_due`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Note {
+    PlanMode,
+    Date,
+    /// The host's current state (`HostExtensions::context`).
+    Host,
+}
+
+impl Note {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Note::PlanMode => "plan_mode",
+            Note::Date => "date",
+            Note::Host => "host",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        [Note::PlanMode, Note::Date, Note::Host]
+            .into_iter()
+            .find(|note| note.as_str() == name)
+    }
+}
+
+/// How a note opens: it is a user message the engine adds, not the user's.
+pub const NOTE_OPEN: &str = "<system-reminder>\n";
+const NOTE_CLOSE: &str = "\n</system-reminder>";
+
+fn note(body: &str) -> String {
+    format!("{NOTE_OPEN}{}{NOTE_CLOSE}", body.trim())
+}
+
+/// What the notes describe now: the approval mode's plan mode, today's date
+/// and the host's state.
+pub struct NoteState {
+    pub plan_mode: bool,
+    pub date: String,
+    pub host: String,
+}
+
+/// The notes to add before the next request: each kind whose latest note
+/// (`last`) says something else than the state now. Without one, the model
+/// knows what the system prompt says: plan mode off, the prompt's date, no
+/// host state.
+pub fn notes_due<'a>(
+    now: &NoteState,
+    prompt_date: &str,
+    last: impl Fn(Note) -> Option<&'a str>,
+) -> Vec<(Note, String)> {
+    let mut due = Vec::new();
+    let date = note(&format!("The date is now {}.", now.date));
+    if last(Note::Date).map_or(now.date != prompt_date, |told| told != date) {
+        due.push((Note::Date, date));
+    }
+    let plan = note(if now.plan_mode {
+        crate::plan_mode::PROMPT_ADDENDUM
+    } else {
+        crate::plan_mode::ENDED_NOTE
+    });
+    if last(Note::PlanMode).map_or(now.plan_mode, |told| told != plan) {
+        due.push((Note::PlanMode, plan));
+    }
+    if !now.host.trim().is_empty() {
+        let host = note(&now.host);
+        if last(Note::Host) != Some(host.as_str()) {
+            due.push((Note::Host, host));
+        }
+    }
+    due
 }
 
 pub fn discover_skills(
@@ -484,12 +597,10 @@ mod tests {
             crate::chat::CHAT_SYSTEM_PROMPT,
             &PromptContext {
                 chat: true,
-                plan_mode: true,
                 ..coding_context(crate::config::default_edit_tools())
             },
         );
         assert!(!prompt.contains("Tool use:"));
-        assert!(!prompt.contains("<plan_mode>"));
         assert!(prompt.contains("web_fetch"));
         assert!(prompt.ends_with("Date: 2026-05-27\n</env>"));
     }
@@ -523,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_parts_come_before_the_date_mode_and_host_text() {
+    fn stable_parts_come_before_the_date_and_host_text() {
         let prompt = build_system_prompt(
             "Base prompt",
             &PromptContext {
@@ -537,7 +648,6 @@ mod tests {
                     path: PathBuf::from("/skills/review/SKILL.md"),
                 }],
                 sandbox: "<sandbox mode=\"workspace-write\">\nnote\n</sandbox>".to_string(),
-                plan_mode: true,
                 host: "Peers: ops (busy)".to_string(),
                 ..coding_context(crate::config::default_edit_tools())
             },
@@ -555,7 +665,6 @@ mod tests {
             position("<sandbox"),
             position("<env>"),
             position("Date: 2026-05-27"),
-            position("<plan_mode>"),
             position("Peers: ops (busy)"),
         ];
         assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
@@ -820,7 +929,6 @@ mod tests {
                 path: PathBuf::from("/s/pdf/SKILL.md"),
             }],
             sandbox: "Sandboxed.".to_string(),
-            plan_mode: true,
             host: "Host.".to_string(),
             ..PromptContext::default()
         };
@@ -845,8 +953,9 @@ mod tests {
 
     /// The prompt as `build_system_prompt` wrote it in one piece before it was
     /// split into sections (LynShen 0.4.29), kept to prove the split sends the
-    /// same bytes.
-    fn prompt_before_the_split(base: &str, context: &PromptContext) -> String {
+    /// same bytes. It still added the plan-mode addendum when the turn
+    /// started in plan mode (`plan_mode`).
+    fn prompt_before_the_split(base: &str, context: &PromptContext, plan_mode: bool) -> String {
         let mut prompt = base.trim_end().to_string();
         if !context.chat {
             prompt.push_str("\n\n");
@@ -885,7 +994,7 @@ mod tests {
             context.cwd.display(),
             context.date
         ));
-        if context.plan_mode && !context.chat {
+        if plan_mode && !context.chat {
             prompt.push_str("\n\n");
             prompt.push_str(crate::plan_mode::PROMPT_ADDENDUM);
         }
@@ -896,6 +1005,11 @@ mod tests {
         prompt
     }
 
+    /// The bytes changed once, on purpose: the plan-mode addendum left the
+    /// system prompt, which now stays the same for the whole session so the
+    /// provider can serve it from its cache. Plan mode reaches the model as a
+    /// note instead (`notes_due`). Outside plan mode the bytes are those of
+    /// before; in plan mode they are those of before without the addendum.
     #[test]
     fn the_split_prompt_sends_the_same_bytes_as_before() {
         let full = PromptContext {
@@ -918,7 +1032,6 @@ mod tests {
                 path: PathBuf::from("/s/pdf/SKILL.md"),
             }],
             sandbox: "Sandboxed.\n".to_string(),
-            plan_mode: true,
             host: "Host.\n".to_string(),
             ..PromptContext::default()
         };
@@ -929,14 +1042,94 @@ mod tests {
         };
         let chat = PromptContext {
             chat: true,
-            plan_mode: true,
             ..full.clone()
         };
         for context in [&full, &bare, &chat] {
+            let prompt = build_system_prompt("Base.\n", context);
+            assert_eq!(prompt, prompt_before_the_split("Base.\n", context, false));
+            // A chat session never had plan mode.
+            let in_plan_mode = prompt_before_the_split("Base.\n", context, true);
             assert_eq!(
-                build_system_prompt("Base.\n", context),
-                prompt_before_the_split("Base.\n", context)
+                prompt == in_plan_mode,
+                context.chat,
+                "plan mode changed the old prompt"
             );
+            assert!(!prompt.contains("<plan_mode>"));
         }
+        let in_plan_mode = prompt_before_the_split("Base.\n", &full, true);
+        assert_eq!(
+            in_plan_mode.replacen(&format!("\n\n{}", crate::plan_mode::PROMPT_ADDENDUM), "", 1),
+            build_system_prompt("Base.\n", &full)
+        );
+    }
+
+    #[test]
+    fn a_session_prompt_survives_its_json() {
+        let prompt = SessionPrompt {
+            head: "Base.".to_string(),
+            project: "\n\n<project_context>…".to_string(),
+            skills: String::new(),
+            tail: "\n\n<env>\nDate: 2026-10-12\n</env>".to_string(),
+            date: "2026-10-12".to_string(),
+        };
+        assert_eq!(
+            SessionPrompt::from_json(&prompt.to_json()),
+            Some(prompt.clone())
+        );
+        assert_eq!(
+            prompt.text(),
+            "Base.\n\n<project_context>…\n\n<env>\nDate: 2026-10-12\n</env>"
+        );
+        assert_eq!(SessionPrompt::from_json(&json!({ "head": "x" })), None);
+    }
+
+    #[test]
+    fn notes_tell_what_changed_since_the_prompt_or_the_last_note() {
+        let state = |plan_mode: bool, date: &str, host: &str| NoteState {
+            plan_mode,
+            date: date.to_string(),
+            host: host.to_string(),
+        };
+        let kinds = |due: &[(Note, String)]| due.iter().map(|(note, _)| *note).collect::<Vec<_>>();
+        // As the prompt says: nothing to tell.
+        assert!(notes_due(&state(false, "2026-10-12", ""), "2026-10-12", |_| None).is_empty());
+
+        let due = notes_due(
+            &state(true, "2026-10-13", "Status: running"),
+            "2026-10-12",
+            |_| None,
+        );
+        assert_eq!(kinds(&due), [Note::Date, Note::PlanMode, Note::Host]);
+        assert_eq!(
+            due[0].1,
+            "<system-reminder>\nThe date is now 2026-10-13.\n</system-reminder>"
+        );
+        assert!(due[1].1.starts_with("<system-reminder>\n<plan_mode>"));
+        assert!(due.iter().all(|(_, text)| text.starts_with(NOTE_OPEN)));
+
+        // Once told, the same state needs no note; a change does.
+        let told = |note: Note| {
+            due.iter()
+                .find(|(kind, _)| *kind == note)
+                .map(|(_, text)| text.as_str())
+        };
+        assert!(notes_due(
+            &state(true, "2026-10-13", "Status: running"),
+            "2026-10-12",
+            told
+        )
+        .is_empty());
+        let off = notes_due(
+            &state(false, "2026-10-13", "Status: done"),
+            "2026-10-12",
+            told,
+        );
+        assert_eq!(kinds(&off), [Note::PlanMode, Note::Host]);
+        assert!(off[0].1.contains(crate::plan_mode::ENDED_NOTE));
+        assert_eq!(
+            off[1].1,
+            "<system-reminder>\nStatus: done\n</system-reminder>"
+        );
+        assert_eq!(Note::parse(Note::Host.as_str()), Some(Note::Host));
     }
 }

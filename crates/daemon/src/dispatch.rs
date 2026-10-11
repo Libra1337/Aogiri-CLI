@@ -199,11 +199,12 @@ fn ensure_agent(hub: &Hub) -> Result<(), String> {
 
 const ROLE: &str = "Route the user's requests to the coding sessions on this computer.";
 
-/// What the dispatcher is told every turn: how to work, and where this
-/// dispatch stands.
-pub fn prompt(hub: &Hub, session: &str) -> String {
+/// Where this dispatch stands, told to the dispatcher before a turn when it
+/// changed (its system prompt is `GUIDE` and stays as the session began);
+/// empty before the dispatch exists.
+pub fn context(hub: &Hub, session: &str) -> String {
     let Some(d) = hub.dispatch.get(session) else {
-        return GUIDE.to_string();
+        return String::new();
     };
     let plan = if d["plan"] == true {
         "Plan mode is ON: after `plan`, end your turn. The user's decision arrives as a message; start no task before they confirm."
@@ -225,13 +226,14 @@ pub fn prompt(hub: &Hub, session: &str) -> String {
         tasks.push_str("(no plan yet)\n");
     }
     format!(
-        "{GUIDE}\n\n<dispatch>\nStatus: {}\n{plan}\nEvery task runs in permission mode `{}`, chosen by the user and applied by the system.\nTasks:\n{tasks}</dispatch>",
+        "<dispatch>\nStatus: {}\n{plan}\nEvery task runs in permission mode `{}`, chosen by the user and applied by the system.\nTasks:\n{tasks}</dispatch>",
         text(&d["status"]),
         text(&d["mode"]),
     )
 }
 
-const GUIDE: &str = "You are the dispatcher of LynShen. The user is away from this computer and hands you a batch of requests in one message. You do not write code yourself: you have no file or shell tools. You route the work to the user's coding sessions, then report back.
+/// How the dispatcher works: its system prompt.
+pub const GUIDE: &str = "You are the dispatcher of LynShen. The user is away from this computer and hands you a batch of requests in one message. You do not write code yourself: you have no file or shell tools. You route the work to the user's coding sessions, then report back.
 
 How to work:
 1. Call `workspace_overview` to see the projects and their recent sessions.
