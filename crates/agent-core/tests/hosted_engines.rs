@@ -1508,3 +1508,100 @@ fn an_engine_is_idle_only_when_nothing_runs_or_waits_in_it() {
     pump(&mut core, is_ready);
     assert!(core.is_idle());
 }
+
+#[test]
+fn an_approved_action_holds_the_engine_until_its_outcome_is_read() {
+    let _guard = setup();
+    let dir = temp_dir("idle-action");
+    let mut core = open(&dir, ApprovalMode::Manual);
+    core.set_attended(false);
+
+    core.submit_user_message(write_command("ran", "marker.txt"));
+    let events = pump(&mut core, is_ready);
+    let id = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ActionDeferred(action) => Some(action.id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    core.decide_action(&id, true);
+    // It runs on a thread of its own, and its outcome comes back to this
+    // engine: closing the engine now would lose it.
+    assert!(!core.is_idle());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !dir.join("marker.txt").exists() {
+        assert!(Instant::now() < deadline, "the action never ran");
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Done, but nobody has read the outcome yet.
+    thread::sleep(Duration::from_millis(100));
+    assert!(!core.is_idle());
+    let events = pump(&mut core, is_ready);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ActionDecided { id: decided, allow: true, .. } if *decided == id
+    )));
+    assert!(core.is_idle());
+}
+
+#[test]
+fn a_subagent_that_ran_in_an_engine_keeps_it_open() {
+    let _guard = setup();
+    let dir = temp_dir("idle-subagent");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.set_attended(false);
+
+    let args = serde_json::json!({ "task_name": "helper", "message": "say hi" });
+    let mut events = core.submit_user_message(format!("CALL spawn_agent {args}"));
+    pump_until(&mut core, &mut events, |events, rows| {
+        readies(events) == 1 && rows.iter().all(|row| row["state"] == "completed")
+    });
+    assert_eq!(rows(&core).len(), 1);
+    // Its run and transcript live only in this engine.
+    assert!(!core.is_idle());
+}
+
+#[test]
+fn a_reopened_session_takes_back_what_its_engine_kept_in_memory() {
+    let _guard = setup();
+    let dir = temp_dir("kept");
+    let mut core = open(&dir, ApprovalMode::Manual);
+    core.set_attended(false);
+    core.submit_user_message("RUN: printf no > marker.txt".to_string());
+    let events = pump(&mut core, is_ready);
+    let id = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ActionDeferred(action) => Some(action.id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    core.decide_action(&id, false);
+    pump(&mut core, is_ready);
+    core.set_approval_mode(ApprovalMode::AutoEdit);
+    let kept = core.kept_state();
+    let session = core.session_id().to_string();
+    drop(core);
+
+    // The session's next engine starts from config.json (manual).
+    let mut core = AgentCore::open(dir.clone()).unwrap();
+    core.handle_command(&format!("/resume {session}"));
+    assert_eq!(core.session_id(), session);
+    core.set_attended(false);
+    core.restore_kept_state(kept);
+    assert!(core.state_events().iter().any(|event| matches!(
+        event,
+        AgentEvent::ApprovalMode { mode } if mode == "auto-edit"
+    )));
+    // The declined call stays declined (in manual mode: auto-edit runs a
+    // sandboxed command without asking).
+    core.set_approval_mode(ApprovalMode::Manual);
+    core.submit_user_message("RUN: printf no > marker.txt".to_string());
+    let events = pump(&mut core, is_ready);
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ActionDeferred(_))));
+    assert!(assistant_text(&events).contains("denied by user"));
+    assert!(!dir.join("marker.txt").exists());
+}

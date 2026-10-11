@@ -22,6 +22,10 @@ use std::{
 /// Reopening the session brings it back as it was.
 const IDLE_CLOSE: Duration = Duration::from_secs(10 * 60);
 
+/// How long a session that could not close yet waits before it asks again
+/// (`Hub::retire_idle` takes the sessions lock).
+const CLOSE_RETRY: Duration = Duration::from_secs(5);
+
 /// Opens an engine in `cwd` (resuming `resume` when given) on a new thread,
 /// set up for `agent` when the session belongs to one. Returns the session
 /// id once the engine is ready, with the thread's generation (see
@@ -103,6 +107,12 @@ fn open(
     }
     // After an agent's sandbox, which replaces the default one.
     core.add_writable_dirs(&dirs);
+    // What the session's previous engine held only in memory, when it
+    // closed as idle: its approval mode wins over the agent's, not over a
+    // requirement's gate (below).
+    if let Some(kept) = hub.take_kept(core.session_id()) {
+        core.restore_kept_state(kept);
+    }
     if resume.is_some_and(|id| crate::requirements::gated(hub, id)) {
         core.set_approval_mode(ApprovalMode::Manual);
     }
@@ -137,6 +147,7 @@ fn run(hub: &Hub, mut core: AgentCore, id: &str, ops: Receiver<Value>, generatio
     }
     let mut last_status = None;
     let mut active = Instant::now();
+    let mut next_close_try = Instant::now();
     // An op taken off the channel while deciding to close (see below).
     let mut held: Option<Value> = None;
     loop {
@@ -144,7 +155,11 @@ fn run(hub: &Hub, mut core: AgentCore, id: &str, ops: Receiver<Value>, generatio
             let next = held.take().map_or_else(|| ops.try_recv(), Ok);
             match next {
                 Ok(op) if op["op"] == "tui" => match terminal(hub, core, id, &op, &ops) {
-                    Some(next) => core = next,
+                    // Idle from when the user left the TUI, not from before.
+                    Some(next) => {
+                        core = next;
+                        active = Instant::now();
+                    }
                     None => return,
                 },
                 Ok(op) => {
@@ -180,16 +195,20 @@ fn run(hub: &Hub, mut core: AgentCore, id: &str, ops: Receiver<Value>, generatio
         // Nobody has watched it, and nothing has happened in it, for a while.
         if !core.attended()
             && active.elapsed() >= IDLE_CLOSE
+            && Instant::now() >= next_close_try
             && core.is_idle()
-            && hub.retire_idle(id, generation, || match ops.try_recv() {
+        {
+            let quiet = || match ops.try_recv() {
                 Ok(op) => {
                     held = Some(op);
                     false
                 }
                 Err(_) => true,
-            })
-        {
-            return;
+            };
+            if hub.retire_idle(id, generation, quiet, || core.kept_state()) {
+                return;
+            }
+            next_close_try = Instant::now() + CLOSE_RETRY;
         }
         thread::sleep(Duration::from_millis(30));
     }

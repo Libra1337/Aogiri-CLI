@@ -66,6 +66,21 @@ struct PendingApproval {
     subagent_id: Option<String>,
 }
 
+/// What an engine holds of its session only in memory (see
+/// `AgentCore::kept_state`): the approval and sandbox modes switched for the
+/// session, its "always allow" tools and action decisions, its token and
+/// cost totals and its plan.
+#[derive(Debug, Clone, Default)]
+pub struct KeptState {
+    approval_mode: Option<ApprovalMode>,
+    sandbox_mode: Option<crate::sandbox::SandboxMode>,
+    approved_tools: HashSet<String>,
+    action_decisions: HashMap<String, bool>,
+    /// Input, cached input and output tokens, and cost.
+    totals: (u64, u64, u64, f64),
+    plan: Vec<PlanItem>,
+}
+
 /// Outcome of a deferred action approved and run on a background thread.
 struct ActionOutcome {
     action: DeferredAction,
@@ -169,7 +184,8 @@ pub struct AgentCore {
     /// loosen the approval mode, never tighten it.
     approved_tools: HashSet<String>,
     /// Session approval mode; starts from config and is switched by /permissions
-    /// or the serve `set_approval_mode` op (session-only, not persisted). The
+    /// or the serve `set_approval_mode` op (session-only, not persisted; a
+    /// host hands it to the session's next engine, see `kept_state`). The
     /// running turn and its subagents share it, so a switch applies at once.
     approval_mode: LiveApprovalMode,
     /// False when no client is watching: gated calls become deferred actions
@@ -179,6 +195,9 @@ pub struct AgentCore {
     deferred_actions: HashMap<String, DeferredAction>,
     /// Decisions by action digest, reused for identical calls in this session.
     action_decisions: HashMap<String, bool>,
+    /// Approved actions still running on their threads: each outcome comes
+    /// back on `action_rx`, and this engine must still be there to read it.
+    actions_running: usize,
     action_tx: Sender<ActionOutcome>,
     action_rx: Receiver<ActionOutcome>,
     update_receiver: Option<Receiver<UpdateNotice>>,
@@ -366,6 +385,7 @@ impl AgentCore {
             attended: true,
             deferred_actions: HashMap::new(),
             action_decisions: HashMap::new(),
+            actions_running: 0,
             action_tx,
             action_rx,
             mcp,
@@ -2922,15 +2942,22 @@ impl AgentCore {
         self.attended
     }
 
-    /// Nothing runs or waits in this engine: no turn or queued message, no
-    /// prompt, deferred action, sign-in, plan, goal or resume work, no live
-    /// subagent, waiting background result or shell. Closing it loses
-    /// nothing that reopening the session does not bring back.
+    /// Nothing runs or waits in this engine: no turn, queued message or
+    /// staged image, no prompt, deferred action or approved action still
+    /// running, no sign-in, plan, goal or resume work, no subagent run here
+    /// (its run lives only in this engine), waiting background result or
+    /// shell. A host may then close it: reopening the session brings back
+    /// its conversation, team board, worktree agents and deferred actions,
+    /// and `kept_state` carries what the engine holds only in memory. MCP
+    /// servers start again with the next engine, without what a server
+    /// kept in its own process.
     pub fn is_idle(&self) -> bool {
         !self.running
             && self.queued.is_empty()
+            && self.pending_images.is_empty()
             && self.pending_approvals.is_empty()
             && self.deferred_actions.is_empty()
+            && self.actions_running == 0
             && self.steered_pending.is_empty()
             && self.plan_draft.is_none()
             && self.login_receiver.is_none()
@@ -2939,8 +2966,51 @@ impl AgentCore {
             && !self.overflow_retry_pending
             && !self.resume_summary_running
             && self.subagent_manager.pending_wake().is_none()
-            && !self.subagent_manager.any_live()
+            && !self.subagent_manager.has_unsaved_runs()
             && !self.tool_state.has_live_shells()
+    }
+
+    /// What this engine holds of its session only in memory, for the
+    /// session's next engine (`restore_kept_state`) when a host closes this
+    /// one while the session stays in use.
+    pub fn kept_state(&self) -> KeptState {
+        KeptState {
+            approval_mode: Some(self.approval_mode.get()),
+            sandbox_mode: self.tool_state.sandbox().map(|sandbox| sandbox.mode),
+            approved_tools: self.approved_tools.clone(),
+            action_decisions: self.action_decisions.clone(),
+            totals: (
+                self.total_input_tokens,
+                self.total_cached_input_tokens,
+                self.total_output_tokens,
+                self.total_cost,
+            ),
+            plan: self.plan.clone(),
+        }
+    }
+
+    /// Takes back what the session's previous engine kept (`kept_state`).
+    pub fn restore_kept_state(&mut self, kept: KeptState) {
+        if let Some(mode) = kept.approval_mode {
+            self.set_approval_mode(mode);
+        }
+        if let Some(mode) = kept.sandbox_mode {
+            let mut sandbox = self
+                .tool_state
+                .sandbox()
+                .unwrap_or_else(|| self.config.sandbox.clone());
+            sandbox.mode = mode;
+            self.tool_state.set_sandbox(Some(sandbox));
+        }
+        self.approved_tools.extend(kept.approved_tools);
+        self.action_decisions.extend(kept.action_decisions);
+        (
+            self.total_input_tokens,
+            self.total_cached_input_tokens,
+            self.total_output_tokens,
+            self.total_cost,
+        ) = kept.totals;
+        self.plan = kept.plan;
     }
 
     /// Marks whether a client is watching. Going unattended also converts
@@ -3036,6 +3106,7 @@ impl AgentCore {
         let hooks = self.hooks.clone();
         let tool_state = self.tool_state.clone();
         let host = self.host.clone().filter(|host| host.has_tool(&action.name));
+        self.actions_running += 1;
         thread::spawn(move || {
             let result = if let Some(host) = host {
                 let (output, is_error) =
@@ -3094,6 +3165,7 @@ impl AgentCore {
     fn poll_action_outcomes(&mut self) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         while let Ok(outcome) = self.action_rx.try_recv() {
+            self.actions_running = self.actions_running.saturating_sub(1);
             let action = outcome.action;
             events.push(AgentEvent::ActionDecided {
                 id: action.id.clone(),

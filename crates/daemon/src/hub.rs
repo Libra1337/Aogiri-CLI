@@ -15,6 +15,7 @@ use crate::{
     titles::{self, Turns},
     usage::{SessionInfo, Usage},
 };
+use lynshen_agent_core::KeptState;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -49,6 +50,9 @@ pub struct Hub {
     pub version: &'static str,
     pub relay: Relay,
     sessions: Mutex<HashMap<String, Hosted>>,
+    /// What the engines of sessions closed as idle held only in memory,
+    /// until each session opens again (see `retire_idle`).
+    kept: Mutex<HashMap<String, KeptState>>,
     /// Sessions whose engine is running a turn or has queued messages.
     busy: Mutex<HashSet<String>>,
     /// A newer daemon waits to replace this one (`restart_when_idle`).
@@ -155,6 +159,7 @@ impl Hub {
             agents,
             version,
             sessions: Mutex::new(HashMap::new()),
+            kept: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashSet::new()),
             restart_pending: AtomicBool::new(false),
             claims: Mutex::new(HashMap::new()),
@@ -539,12 +544,15 @@ impl Hub {
     /// waits on its reply, or an op reached it (`quiet` checks the thread's
     /// channel; ops are sent under the sessions lock, so none arrives once
     /// this has decided). True when closed: the thread then ends, and
-    /// `session_ended` tells the clients. Reopening it brings it back.
+    /// `session_ended` tells the clients. Reopening it brings it back, with
+    /// what its engine held only in memory: `kept` is stored before an open
+    /// can find the session closed (see `take_kept`).
     pub(crate) fn retire_idle(
         &self,
         id: &str,
         generation: u64,
         quiet: impl FnOnce() -> bool,
+        kept: impl FnOnce() -> KeptState,
     ) -> bool {
         // Before the sessions lock: a message send holds its state while it
         // forwards (a send that starts meanwhile finds the session claimed).
@@ -568,9 +576,16 @@ impl Hub {
             return false;
         }
         sessions.remove(id);
+        lock(&self.kept).insert(id.to_string(), kept());
         drop(sessions);
         let _ = self.store.record_session_closed(id);
         true
+    }
+
+    /// What a session's engine held only in memory when it closed as idle,
+    /// for the engine that opens it next.
+    pub(crate) fn take_kept(&self, id: &str) -> Option<KeptState> {
+        lock(&self.kept).remove(id)
     }
 
     /// A number unique to one engine thread, tying it to its `Hosted` entry.
@@ -2056,22 +2071,29 @@ mod tests {
         let (ops, _rx) = mpsc::channel();
         let generation = hub.next_generation();
         hub.host("s1".to_string(), ops, dir.clone(), generation);
+        let retire = |quiet: bool, generation: u64| {
+            hub.retire_idle("s1", generation, || quiet, KeptState::default)
+        };
         // Just opened: the client that opened it watches it next.
-        assert!(!hub.retire_idle("s1", generation, || true));
+        assert!(!retire(true, generation));
         let past = Instant::now() - OPEN_GRACE;
         lock(&hub.sessions).get_mut("s1").unwrap().opened = past;
         hub.set_watch(7, "s1", true);
-        assert!(!hub.retire_idle("s1", generation, || true));
+        assert!(!retire(true, generation));
         hub.set_watch(7, "s1", false);
         lock(&hub.busy).insert("s1".into());
-        assert!(!hub.retire_idle("s1", generation, || true));
+        assert!(!retire(true, generation));
         lock(&hub.busy).remove("s1");
         // An op reached it meanwhile, or it belongs to another engine.
-        assert!(!hub.retire_idle("s1", generation, || false));
-        assert!(!hub.retire_idle("s1", generation + 1, || true));
+        assert!(!retire(false, generation));
+        assert!(!retire(true, generation + 1));
         assert!(lock(&hub.sessions).contains_key("s1"));
-        assert!(hub.retire_idle("s1", generation, || true));
+        assert!(hub.take_kept("s1").is_none());
+        assert!(retire(true, generation));
         assert!(!lock(&hub.sessions).contains_key("s1"));
+        // What its engine held in memory waits for the next one.
+        assert!(hub.take_kept("s1").is_some());
+        assert!(hub.take_kept("s1").is_none());
         let _ = fs::remove_dir_all(dir);
     }
 

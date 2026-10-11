@@ -855,3 +855,18 @@ Differences from `lynshen serve`:
   `approval_request` into a deferred action.
 - `decide_action` is recorded in `actions.jsonl` before the engine acts on
   it, so an approved action is never offered again after a restart.
+- An idle LynShen session closes by itself. It closes when nobody has
+  watched it and nothing has happened in it for 10 minutes, and its engine
+  is idle: no turn, queued message, prompt, deferred action or approved
+  action still running, sign-in, plan or goal work, background result or
+  shell. It does not close while a delivered message, a title or handoff
+  being written, or a reply another session waits for holds it. A session
+  that ran subagents stays open: their runs and transcripts live only in
+  its engine. Clients receive `session_closed`. `session_open`, `watch`,
+  `decide_action` and a message from another session open it again. The
+  conversation, task board, worktree agents and undecided deferred actions
+  come back from disk. The approval and sandbox modes, "always allow"
+  tools, action decisions, token totals and plan come back from the
+  daemon's memory, until the daemon restarts. Its MCP servers stop with
+  the engine and start again with the next one, without the state a server
+  kept in its own process.
