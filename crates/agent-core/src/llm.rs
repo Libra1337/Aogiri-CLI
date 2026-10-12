@@ -1191,12 +1191,29 @@ impl OpenAiClient {
         }
         let read_only_hint = self.mcp.tool_read_only_hint(&request.name);
         if self.approval_mode.get() == ApprovalMode::Plan {
-            crate::plan_mode::refusal(&request.name, &request.arguments, read_only_hint)
+            if self.offers_propose_plan() {
+                crate::plan_mode::refusal(&request.name, &request.arguments, read_only_hint)
+            } else {
+                crate::plan_mode::refusal_without_plan_tool(
+                    &request.name,
+                    &request.arguments,
+                    read_only_hint,
+                )
+            }
         } else if self.read_only {
             crate::plan_mode::read_only_refusal(&request.name, &request.arguments, read_only_hint)
         } else {
             None
         }
+    }
+
+    /// Whether the tools this agent is offered include propose_plan (see
+    /// `request_tool_definitions`): not in a chat session, a subagent or a
+    /// host's exclusive session.
+    fn offers_propose_plan(&self) -> bool {
+        self.propose_plan
+            && self.goal_tool_tx.is_some()
+            && !self.host.as_ref().is_some_and(|host| host.exclusive)
     }
 
     /// Context compaction: the model's summary of the conversation `plan`

@@ -692,6 +692,35 @@ fn a_chat_session_is_not_offered_propose_plan() {
 }
 
 #[test]
+fn a_chat_session_in_plan_mode_is_not_sent_to_propose_plan() {
+    let _guard = setup();
+    let chats = lynshen_agent_core::chat::ensure_chats_dir().unwrap();
+    let mut core = AgentCore::open(chats.clone()).unwrap();
+    core.set_approval_mode(ApprovalMode::Plan);
+    let call = json!({ "path": "plan-mode-report.md", "content": "x" });
+    core.submit_user_message(format!("CALL write {call}"));
+    let events = pump(&mut core);
+    // Writes stay refused, as before the tool list was fixed, but the
+    // refusal does not name a tool the session is not offered.
+    let output = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolOutput {
+                output, is_error, ..
+            } => Some((output.clone(), *is_error)),
+            _ => None,
+        })
+        .expect("a tool output");
+    assert!(output.1, "{output:?}");
+    assert!(output.0.contains("Describe the change"), "{output:?}");
+    assert!(!output.0.contains("propose_plan"), "{output:?}");
+    assert!(!chats.join("plan-mode-report.md").exists());
+    // The model answers with text and the turn ends.
+    assert!(assistant_text(&events).starts_with("tool said:"));
+    assert!(!last_request().tools.contains("\"propose_plan\""));
+}
+
+#[test]
 fn each_user_turn_in_plan_mode_ends_with_a_short_reminder() {
     let _guard = setup();
     let mut core = AgentCore::open(temp_dir("plan-reminder")).unwrap();

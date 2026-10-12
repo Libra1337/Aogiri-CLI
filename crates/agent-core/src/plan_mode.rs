@@ -188,6 +188,24 @@ pub fn refusal(name: &str, arguments: &str, mcp_read_only: Option<bool>) -> Opti
     })
 }
 
+/// `refusal` for an agent in plan mode that is not offered propose_plan (a
+/// chat session, a subagent): the same rules, and it is told to describe
+/// the change instead of pointing it at a tool it does not have.
+pub fn refusal_without_plan_tool(
+    name: &str,
+    arguments: &str,
+    mcp_read_only: Option<bool>,
+) -> Option<String> {
+    change(name, arguments, mcp_read_only).map(|change| match change {
+        Change::Command(command) => format!(
+            "plan mode: `{command}` was not run because it is not a known read-only command. Only read-only commands run in plan mode (git status/diff/log/show, ls, cat, head, tail, grep, rg, find, wc and similar, optionally piped together). Say in your answer what you would run instead."
+        ),
+        Change::Tool => format!(
+            "plan mode: {name} was not run. The approval mode is plan: only read-only tools run and nothing in the workspace may change. Describe the change in your answer instead."
+        ),
+    })
+}
+
 /// Why a subagent with a read-only role may not make this call (the same
 /// rules as plan mode), or None when it may run.
 pub fn read_only_refusal(
@@ -565,6 +583,24 @@ mod tests {
             None
         )
         .is_some());
+    }
+
+    #[test]
+    fn without_propose_plan_the_refusal_does_not_point_to_it() {
+        assert_eq!(refusal_without_plan_tool("read", "{}", None), None);
+        assert_eq!(
+            refusal_without_plan_tool("bash", r#"{"command":"git status"}"#, None),
+            None
+        );
+        for (tool, args) in [
+            ("write", "{}"),
+            ("apply_patch", "{}"),
+            ("bash", r#"{"command":"cargo fmt"}"#),
+        ] {
+            let reason = refusal_without_plan_tool(tool, args, None).expect(tool);
+            assert!(reason.starts_with("plan mode:"), "{reason}");
+            assert!(!reason.contains(TOOL_NAME), "{reason}");
+        }
     }
 
     #[test]
