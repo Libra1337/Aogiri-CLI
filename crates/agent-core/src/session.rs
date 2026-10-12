@@ -134,7 +134,8 @@ impl CompactionPlan {
 
     /// The folded items as plain text, then the changed files: the
     /// summarizer's input for a model that answers the summary request with
-    /// tool calls only (see `OpenAiClient::summarize_conversation`).
+    /// tool calls instead of a summary (see
+    /// `OpenAiClient::summarize_conversation`).
     pub fn folded_text(&self) -> String {
         let mut text = String::new();
         for item in &self.folded_items {

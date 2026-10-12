@@ -1196,11 +1196,11 @@ impl OpenAiClient {
     /// request for a summary; it is sent as a turn's request is, with this
     /// client's model, system prompt and tools, so the provider serves the
     /// conversation from its prompt cache, and with less reasoning
-    /// (`summary_effort`). Tool calls in the answer are ignored. An answer
-    /// with nothing else is asked again with tools off; if that brings no
-    /// text either, the conversation goes as plain text to a summarizer
-    /// prompt (no tools, no cache). Errors let the caller fall back to
-    /// sending the full context.
+    /// (`summary_effort`). An answer that calls a tool or has no text is
+    /// not a summary: the request is sent again with tools off; if that
+    /// brings none either, the conversation goes as plain text to a
+    /// summarizer prompt (no tools, no cache). Errors let the caller fall
+    /// back to sending the full context.
     pub fn summarize_conversation(
         &self,
         plan: &crate::session::CompactionPlan,
@@ -1211,8 +1211,9 @@ impl OpenAiClient {
             effort: Some(self.summary_effort()),
             tools_off: false,
         };
-        let summary = self.summary_answer(request.clone(), variant, &mut emit_output_tokens)?;
-        if !summary.is_empty() {
+        if let Some(summary) =
+            self.summary_answer(request.clone(), variant, &mut emit_output_tokens)?
+        {
             return Ok(summary);
         }
         let tools_off = RequestVariant {
@@ -1220,8 +1221,8 @@ impl OpenAiClient {
             ..variant
         };
         match self.summary_answer(request, tools_off, &mut emit_output_tokens) {
-            Ok(summary) if !summary.is_empty() => return Ok(summary),
-            Ok(_) => crate::log_info!("compaction", "the summary request got no text twice"),
+            Ok(Some(summary)) => return Ok(summary),
+            Ok(None) => crate::log_info!("compaction", "the summary request got no summary twice"),
             Err(error) => crate::log_info!(
                 "compaction",
                 "the summary request with tools off failed",
@@ -1238,14 +1239,16 @@ impl OpenAiClient {
         )
     }
 
-    /// The text of the model's answer to a summary request (tool calls left
-    /// out), trimmed; empty when it has none.
+    /// The summary in the model's answer to a summary request, trimmed; None
+    /// when the answer has no text or calls a tool: text next to a tool call
+    /// leads up to the call ("I'll read notes.txt first."), it does not
+    /// summarize the conversation.
     fn summary_answer(
         &self,
         request: Vec<Value>,
         variant: RequestVariant<'_>,
         emit_output_tokens: &mut impl FnMut(u64) -> Result<(), String>,
-    ) -> Result<String, String> {
+    ) -> Result<Option<String>, String> {
         let mut output_tokens = 0u64;
         let mut emit = |event: StreamEvent| {
             if let StreamEvent::Delta(delta) = event {
@@ -1255,13 +1258,19 @@ impl OpenAiClient {
             Ok(())
         };
         let items = self.stream_request(request, variant, &mut emit)?;
+        if items
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        {
+            return Ok(None);
+        }
         let summary = items
             .iter()
-            .filter(|item| item.get("type").and_then(Value::as_str) != Some("function_call"))
             .map(extract_response_text)
             .collect::<Vec<_>>()
             .join("\n");
-        Ok(summary.trim().to_string())
+        let summary = summary.trim();
+        Ok((!summary.is_empty()).then(|| summary.to_string()))
     }
 
     /// The reasoning effort of a summary request: the model's lowest tier

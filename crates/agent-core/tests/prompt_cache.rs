@@ -432,6 +432,32 @@ fn a_summary_answered_with_a_tool_call_is_asked_again_without_tools() {
 }
 
 #[test]
+fn a_summary_answer_that_also_calls_a_tool_is_asked_again_without_tools() {
+    let _guard = setup();
+    let mut core = AgentCore::open(temp_dir("summary-preamble")).unwrap();
+    core.set_approval_mode(ApprovalMode::FullAccess);
+    core.submit_user_message("SUMMARY_PREAMBLE_CALLS_TOOL first".to_string());
+    pump(&mut core);
+    core.submit_user_message("lorem ipsum dolor sit amet ".repeat(6000));
+    pump(&mut core);
+    core.submit_user_message("short again".to_string());
+    pump(&mut core);
+    let start = requests().len();
+
+    let (_, mut events) = core.handle_command("/compact");
+    events.extend(pump(&mut core));
+    // "I'll read notes.txt first." leads up to the call: the summary is the
+    // answer to the request without tools.
+    let summary = compaction_summary(&events);
+    assert!(summary.starts_with("summary without tools"), "{summary}");
+    assert!(!summary.contains("notes.txt first"), "{summary}");
+    let asks = requests()[start..].to_vec();
+    assert_eq!(asks.len(), 2, "{asks:#?}");
+    assert!(asks[0]["tools"].is_array());
+    assert!(asks[1].get("tools").is_none());
+}
+
+#[test]
 fn a_summary_the_model_only_answers_with_tool_calls_falls_back_to_plain_text() {
     let _guard = setup();
     let mut core = AgentCore::open(temp_dir("summary-only-tool-calls")).unwrap();
