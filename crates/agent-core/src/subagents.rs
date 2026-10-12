@@ -1000,11 +1000,18 @@ impl SubagentManager {
         }
     }
 
-    /// A user message for the running main turn: the model reads it before
-    /// its next request, while the turn (and its tools) keep running.
+    /// A user message for the running main turn: the model reads it in its
+    /// next request, while the turn (and its tools) keep running. A response
+    /// that is still streaming is cut off for it (see
+    /// `OpenAiClient::stream_turn_request`).
     pub(crate) fn steer_main(&self, message: &str) {
         let mut state = self.inner.state.lock().unwrap();
         state.user_inbox.push_back(message.to_string());
+    }
+
+    /// Whether a steered message waits for the main turn to read it.
+    pub(crate) fn steer_waiting(&self) -> bool {
+        !self.inner.state.lock().unwrap().user_inbox.is_empty()
     }
 
     /// Messages the user steered into the main turn, oldest first.

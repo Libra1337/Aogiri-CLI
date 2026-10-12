@@ -198,6 +198,11 @@ pub enum AgentEvent {
     ReasoningDelta(String),
     AssistantStart,
     AssistantDelta(String),
+    /// The model response being streamed (its reasoning, text and tool-call
+    /// arguments so far) was cut off for a steered message and is not kept:
+    /// neither the model nor the transcript has it. The turn goes on with a
+    /// new request that carries the message (`UserMessage` follows).
+    ResponseInterrupted,
     /// A model request failed with `reason` and is re-sent after `delay_ms`
     /// as attempt `attempt` of `max_attempts`.
     Retrying {

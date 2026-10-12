@@ -214,7 +214,9 @@ impl SubagentTrace {
                 self.revision += 1;
             }
             // Only the main agent is steered; its plan is the one drafted live.
-            StreamEvent::Steered(_) | StreamEvent::ToolArgumentsDelta { .. } => {}
+            StreamEvent::Steered(_)
+            | StreamEvent::ResponseInterrupted
+            | StreamEvent::ToolArgumentsDelta { .. } => {}
         }
     }
 

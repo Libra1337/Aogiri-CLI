@@ -744,6 +744,7 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
             stats.assistant_chars += delta.len();
             "assistant_delta"
         }
+        AgentEvent::ResponseInterrupted => "response_interrupted",
         AgentEvent::Retrying { .. } => "retrying",
         AgentEvent::ToolStart { .. } => {
             stats.tool_calls += 1;

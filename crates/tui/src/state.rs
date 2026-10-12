@@ -399,6 +399,16 @@ impl TuiState {
                     self.append_assistant_delta(&delta);
                     true
                 }
+                // Cut off for a steered message: what streamed stays shown,
+                // marked, and the next response starts a block of its own.
+                AgentEvent::ResponseInterrupted => {
+                    self.collapse_live_thinking();
+                    self.assistant_index = None;
+                    self.chat
+                        .push(ChatLine::System("Response interrupted.".to_string()));
+                    self.mark_history_dirty();
+                    true
+                }
                 AgentEvent::ToolStart { call_id, name } => {
                     self.collapse_live_thinking();
                     self.activity.start_tool(name.clone());
