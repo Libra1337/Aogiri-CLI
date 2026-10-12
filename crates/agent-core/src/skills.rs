@@ -522,27 +522,258 @@ pub fn uninstall_skill(profile_dir: &Path, id: &str) -> io::Result<bool> {
 
 pub fn set_skill_enabled(profile_dir: &Path, id: &str, enabled: bool) -> io::Result<()> {
     let id = safe_skill_dir(id);
-    let mut disabled = read_disabled_skills(profile_dir)?;
+    let mut state = SkillState::read(profile_dir)?;
     if enabled {
-        disabled.remove(&id);
+        state
+            .disabled_paths
+            .remove(&path_key(&profile_dir.join("skills").join(&id)));
+        state.disabled.remove(&id);
     } else {
-        disabled.insert(id);
+        state.disabled.insert(id);
     }
-    write_disabled_skills(profile_dir, &disabled)
+    state.write(profile_dir)
+}
+
+/// Turns the skill in folder `dir` on or off for every LynShen session. A
+/// folder of `~/.lynshen/skills` named as `/skills disable` names it is
+/// switched by that name; any other (a skill pack's, `~/.agents/skills`, a
+/// project's) by its path.
+pub fn set_skill_dir_enabled(profile_dir: &Path, dir: &Path, enabled: bool) -> io::Result<()> {
+    let root = profile_dir.join("skills");
+    let id = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| dir.parent() == Some(root.as_path()) && safe_skill_dir(name) == *name);
+    let mut state = SkillState::read(profile_dir)?;
+    let key = path_key(dir);
+    match (enabled, id) {
+        (true, id) => {
+            state.disabled_paths.remove(&key);
+            if let Some(id) = id {
+                state.disabled.remove(id);
+            }
+        }
+        (false, Some(id)) => {
+            state.disabled.insert(id.to_string());
+        }
+        (false, None) => {
+            state.disabled_paths.insert(key);
+        }
+    }
+    state.write(profile_dir)
 }
 
 pub fn is_skill_path_enabled(profile_dir: &Path, path: &Path) -> io::Result<bool> {
-    let root = profile_dir.join("skills");
-    let Ok(relative) = path.strip_prefix(&root) else {
-        return Ok(true);
+    Ok(SkillState::read(profile_dir)?.enabled(profile_dir, path))
+}
+
+/// Where a skill LynShen loads comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillScope {
+    /// `~/.lynshen/skills`: installed, imported or created for LynShen.
+    User,
+    /// `~/.agents/skills`, which other coding agents read too.
+    Shared,
+    /// The project's `.lynshen/skills` or `.agents/skills`.
+    Project,
+}
+
+impl SkillScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Shared => "shared",
+            Self::Project => "project",
+        }
+    }
+}
+
+/// One skill found on disk, loaded or not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledSkill {
+    pub name: String,
+    pub description: String,
+    /// The folder holding its SKILL.md.
+    pub dir: PathBuf,
+    pub scope: SkillScope,
+    pub enabled: bool,
+}
+
+/// What keeps a skill from loading, or makes it load other than expected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillProblem {
+    /// An error stops the skill (or every LynShen turn) from loading; a
+    /// warning does not.
+    pub error: bool,
+    /// `unreadable`, `no_description`, `duplicate`, `untrusted` or `state`.
+    pub kind: &'static str,
+    pub path: PathBuf,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillInventory {
+    pub skills: Vec<InstalledSkill>,
+    pub problems: Vec<SkillProblem>,
+    /// Whether the project's skills load; `None` without a project.
+    pub project_trusted: Option<bool>,
+}
+
+/// Every skill LynShen finds for a session in `cwd` (none of a project's
+/// without one), on or off, and what keeps any from loading.
+pub fn installed_skills(cwd: Option<&Path>) -> io::Result<SkillInventory> {
+    let profile = crate::config::profile_dir()?;
+    let trusted = match cwd {
+        Some(cwd) if crate::trust::project_has_local_resources(cwd) => Some(
+            crate::trust::TrustStore::load_or_create()?
+                .decision_for(cwd)
+                .unwrap_or(false),
+        ),
+        Some(_) => Some(true),
+        None => None,
     };
-    let Some(Component::Normal(id)) = relative.components().next() else {
-        return Ok(true);
-    };
-    let Some(id) = id.to_str() else {
-        return Ok(false);
-    };
-    Ok(!read_disabled_skills(profile_dir)?.contains(id))
+    Ok(crate::prompt::skill_inventory(
+        &profile,
+        cwd,
+        trusted,
+        crate::secrets::home_dir().map(|home| home.join(".agents").join("skills")),
+    ))
+}
+
+/// The skills in another agent's folders (Claude Code's), all listed as on:
+/// LynShen does not switch them.
+pub fn skills_in(roots: &[(SkillScope, PathBuf)]) -> SkillInventory {
+    crate::prompt::scan_skill_roots(roots, &|_| true)
+}
+
+/// `set_skill_dir_enabled` for this profile.
+pub fn switch_skill(dir: &Path, enabled: bool) -> io::Result<()> {
+    set_skill_dir_enabled(&crate::config::profile_dir()?, dir, enabled)
+}
+
+/// `remove_skill_dir` for this profile.
+pub fn delete_skill(root: &Path, dir: &Path) -> io::Result<()> {
+    remove_skill_dir(&crate::config::profile_dir()?, root, dir)
+}
+
+/// Deletes the skill folder `dir`, a direct child of `root` holding a
+/// SKILL.md, and forgets its switch when `root` is LynShen's own.
+pub fn remove_skill_dir(profile_dir: &Path, root: &Path, dir: &Path) -> io::Result<()> {
+    ensure_direct_child(root, dir)?;
+    if !dir.join("SKILL.md").is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("not a skill folder: {}", dir.display()),
+        ));
+    }
+    if root == profile_dir.join("skills") {
+        set_skill_dir_enabled(profile_dir, dir, true)?;
+    }
+    fs::remove_dir_all(dir)
+}
+
+/// A new skill `skills_dir/<name>/SKILL.md` for the user to fill in. Names
+/// follow the Agent Skills format: lowercase letters, digits and hyphens.
+pub fn create_skill(skills_dir: &Path, name: &str, description: &str) -> io::Result<PathBuf> {
+    let name = name.trim();
+    let description = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.len() > 64 || validate_skill_id(name).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("skill name must be 1-64 lowercase letters, digits or hyphens: {name}"),
+        ));
+    }
+    if description.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a skill needs a description: the model reads it to decide when to use the skill",
+        ));
+    }
+    let dir = skills_dir.join(name);
+    if dir.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("a skill named {name} already exists"),
+        ));
+    }
+    fs::create_dir_all(&dir)?;
+    let file = dir.join("SKILL.md");
+    fs::write(
+        &file,
+        format!(
+            "---\nname: {name}\ndescription: >-\n  {description}\n---\n\n# {name}\n\nWhen to use this skill, and the steps to follow.\n"
+        ),
+    )?;
+    Ok(file)
+}
+
+/// The skills-state.json switches: folders of `~/.lynshen/skills` by name
+/// (as `/skills disable` sets them) and any other skill folder by path.
+#[derive(Debug, Default)]
+pub(crate) struct SkillState {
+    disabled: BTreeSet<String>,
+    disabled_paths: BTreeSet<String>,
+}
+
+impl SkillState {
+    pub(crate) fn read(profile_dir: &Path) -> io::Result<Self> {
+        let path = profile_dir.join(SKILL_STATE_FILE);
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let content = fs::read_to_string(path)?;
+        let value = serde_json::from_str::<Value>(&content).unwrap_or(Value::Null);
+        let list = |key: &str| {
+            value
+                .get(key)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        };
+        Ok(Self {
+            disabled: list("disabled"),
+            disabled_paths: list("disabled_paths"),
+        })
+    }
+
+    fn write(&self, profile_dir: &Path) -> io::Result<()> {
+        let mut value = serde_json::json!({ "disabled": self.disabled });
+        if !self.disabled_paths.is_empty() {
+            value["disabled_paths"] = serde_json::json!(self.disabled_paths);
+        }
+        write_skill_state(profile_dir, &value)
+    }
+
+    /// Whether the skill whose SKILL.md is `file` loads.
+    pub(crate) fn enabled(&self, profile_dir: &Path, file: &Path) -> bool {
+        if let Ok(relative) = file.strip_prefix(profile_dir.join("skills")) {
+            if let Some(Component::Normal(id)) = relative.components().next() {
+                match id.to_str() {
+                    Some(id) if self.disabled.contains(id) => return false,
+                    None => return false,
+                    _ => {}
+                }
+            }
+        }
+        match file.parent() {
+            Some(dir) if !self.disabled_paths.is_empty() => {
+                !self.disabled_paths.contains(&path_key(dir))
+            }
+            _ => true,
+        }
+    }
+}
+
+/// A skill folder as skills-state.json names it: resolved, so the daemon and
+/// an engine reaching it by different paths agree.
+fn path_key(dir: &Path) -> String {
+    fs::canonicalize(dir)
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub fn installed_skill_ids(profile_dir: &Path) -> io::Result<Vec<String>> {
@@ -550,7 +781,7 @@ pub fn installed_skill_ids(profile_dir: &Path) -> io::Result<Vec<String>> {
     if !root.exists() {
         return Ok(Vec::new());
     }
-    let disabled = read_disabled_skills(profile_dir)?;
+    let disabled = SkillState::read(profile_dir)?.disabled;
     let mut installed = Vec::new();
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -965,7 +1196,14 @@ fn atomic_replace_dir(staging: &Path, destination: &Path) -> io::Result<()> {
 }
 
 fn ensure_direct_child(parent: &Path, child: &Path) -> io::Result<()> {
-    if child.parent() == Some(parent) {
+    // `Path::parent` drops a trailing `..` or `.` as if it were a folder name,
+    // so `<root>/..` would pass as a child of `<root>`: the last component
+    // must be a plain name.
+    let plain_name = matches!(
+        child.components().next_back(),
+        Some(std::path::Component::Normal(_))
+    );
+    if plain_name && child.parent() == Some(parent) {
         Ok(())
     } else {
         Err(io::Error::new(
@@ -975,28 +1213,10 @@ fn ensure_direct_child(parent: &Path, child: &Path) -> io::Result<()> {
     }
 }
 
-fn read_disabled_skills(profile_dir: &Path) -> io::Result<BTreeSet<String>> {
-    let path = profile_dir.join(SKILL_STATE_FILE);
-    if !path.exists() {
-        return Ok(BTreeSet::new());
-    }
-    let content = fs::read_to_string(path)?;
-    let value = serde_json::from_str::<Value>(&content).unwrap_or(Value::Null);
-    Ok(value
-        .get("disabled")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect())
-}
-
-fn write_disabled_skills(profile_dir: &Path, disabled: &BTreeSet<String>) -> io::Result<()> {
+fn write_skill_state(profile_dir: &Path, value: &Value) -> io::Result<()> {
     fs::create_dir_all(profile_dir)?;
     let path = profile_dir.join(SKILL_STATE_FILE);
     let temp = profile_dir.join(format!(".{SKILL_STATE_FILE}.tmp"));
-    let value = serde_json::json!({ "disabled": disabled });
     fs::write(
         &temp,
         format!("{}\n", serde_json::to_string_pretty(&value)?),
@@ -1501,6 +1721,42 @@ mod tests {
         assert!(uninstall_skill(&root, "review").unwrap());
         assert!(!skill_installed(&root.join("skills"), "review"));
         assert!(!uninstall_skill(&root, "review").unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn created_and_removed_skills_keep_to_their_folder() {
+        let root = test_dir("lynshen-skill-create-test");
+        let skills_dir = root.join("skills");
+        let file =
+            create_skill(&skills_dir, "release-notes", "Write release\n notes: short").unwrap();
+        assert_eq!(file, skills_dir.join("release-notes/SKILL.md"));
+        let text = fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            crate::prompt::read_frontmatter_field(&text, "description").as_deref(),
+            Some("Write release notes: short")
+        );
+        assert!(create_skill(&skills_dir, "release-notes", "again").is_err());
+        assert!(create_skill(&skills_dir, "Release Notes", "x").is_err());
+        assert!(create_skill(&skills_dir, "../escape", "x").is_err());
+        assert!(create_skill(&skills_dir, "empty", " ").is_err());
+
+        let dir = skills_dir.join("release-notes");
+        set_skill_dir_enabled(&root, &dir, false).unwrap();
+        // Only a skill folder directly in the root goes.
+        assert!(remove_skill_dir(&root, &skills_dir, &root.join("elsewhere")).is_err());
+        assert!(remove_skill_dir(&root, &skills_dir, &skills_dir).is_err());
+        // `<root>/..` and `<root>/.` are not children of the root, even when
+        // the folder they name holds a SKILL.md.
+        fs::write(root.join("SKILL.md"), "---\nname: x\ndescription: y\n---\n").unwrap();
+        assert!(remove_skill_dir(&root, &skills_dir, &skills_dir.join("..")).is_err());
+        assert!(remove_skill_dir(&root, &skills_dir, &skills_dir.join(".")).is_err());
+        assert!(root.join("SKILL.md").is_file());
+        fs::create_dir_all(skills_dir.join("not-a-skill")).unwrap();
+        assert!(remove_skill_dir(&root, &skills_dir, &skills_dir.join("not-a-skill")).is_err());
+        remove_skill_dir(&root, &skills_dir, &dir).unwrap();
+        assert!(!dir.exists());
+        assert!(SkillState::read(&root).unwrap().disabled.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 

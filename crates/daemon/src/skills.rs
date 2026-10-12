@@ -1,25 +1,54 @@
-//! The skills marketplace for the desktop: github.com/anthropics/skills and
+//! Skills for the desktop: the marketplace (github.com/anthropics/skills and
 //! community skill repositories in one catalog, installed into the personal
-//! skills directory of the session's engine.
+//! skills directory of the session's engine) and the skills on this computer
+//! (listed with their switches and load problems, switched, created and
+//! deleted).
 
 use crate::engines;
-use lynshen_agent_core::skills;
+use lynshen_agent_core::skills::{self, SkillInventory, SkillScope};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn handle(name: &str, op: &Value) -> Result<Value, String> {
-    let dir = install_dir(op["backend"].as_str().unwrap_or("lynshen"))?;
+    let backend = op["backend"].as_str().unwrap_or("lynshen");
+    let text = |key: &str| {
+        op[key]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{name} requires {key}"))
+    };
+    // The project whose own skills to include: an absolute folder.
+    let cwd = op["cwd"]
+        .as_str()
+        .map(Path::new)
+        .filter(|cwd| cwd.is_absolute());
     match name {
-        "skills_catalog" => catalog(dir),
-        "skill_install" => {
-            let text = |key: &str| {
-                op[key]
-                    .as_str()
-                    .ok_or_else(|| format!("skill_install requires {key}"))
-            };
-            install(dir, text("source")?, text("skill")?)
-                .map(|path| json!({ "type": "skill_installed", "path": path }))
+        "skills_catalog" => catalog(install_dir(backend)?),
+        "skill_install" => install(install_dir(backend)?, text("source")?, text("skill")?)
+            .map(|path| json!({ "type": "skill_installed", "path": path })),
+        "skills_list" => list(backend, cwd),
+        "skill_set_enabled" => {
+            let enabled = op["enabled"]
+                .as_bool()
+                .ok_or("skill_set_enabled requires enabled")?;
+            set_enabled(backend, cwd, Path::new(text("path")?), enabled)
         }
+        "skill_uninstall" => {
+            // A listed skill by its folder, or a catalog skill by its id.
+            let dir = match op["path"].as_str() {
+                Some(path) => PathBuf::from(path),
+                None => install_dir(backend)?.join(catalog_id(text("skill")?)?),
+            };
+            uninstall(backend, cwd, &dir)
+                .map(|()| json!({ "type": "skill_uninstalled", "path": dir }))
+        }
+        "skill_create" => skills::create_skill(
+            &skills::profile_skills_dir().map_err(|error| error.to_string())?,
+            text("name")?,
+            op["description"].as_str().unwrap_or_default(),
+        )
+        .map(|path| json!({ "type": "skill_created", "path": path }))
+        .map_err(|error| error.to_string()),
         _ => Err(format!("unknown op {name}")),
     }
 }
@@ -30,11 +59,133 @@ fn install_dir(backend: &str) -> Result<PathBuf, String> {
     if backend != "claude" {
         return skills::profile_skills_dir().map_err(|error| error.to_string());
     }
+    Ok(claude_dir()?.join("skills"))
+}
+
+fn claude_dir() -> Result<PathBuf, String> {
     let home = engines::home();
     if home.as_os_str().is_empty() {
         return Err("home directory not found".to_string());
     }
-    Ok(home.join(".claude").join("skills"))
+    Ok(home.join(".claude"))
+}
+
+/// A catalog id names one folder in the install directory.
+fn catalog_id(id: &str) -> Result<&str, String> {
+    let safe = !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && !id.starts_with('.');
+    safe.then_some(id)
+        .ok_or_else(|| format!("unsafe skill id: {id}"))
+}
+
+/// The folders an engine loads skills from, the personal one first.
+fn roots(backend: &str, cwd: Option<&Path>) -> Result<Vec<(SkillScope, PathBuf)>, String> {
+    let mut roots = vec![(SkillScope::User, install_dir(backend)?)];
+    if backend == "claude" {
+        roots.extend(cwd.map(|cwd| (SkillScope::Project, cwd.join(".claude").join("skills"))));
+        return Ok(roots);
+    }
+    let home = engines::home();
+    if !home.as_os_str().is_empty() {
+        roots.push((SkillScope::Shared, home.join(".agents").join("skills")));
+    }
+    if let Some(cwd) = cwd {
+        roots.push((SkillScope::Project, cwd.join(".lynshen").join("skills")));
+        roots.push((SkillScope::Project, cwd.join(".agents").join("skills")));
+    }
+    Ok(roots)
+}
+
+fn inventory(backend: &str, cwd: Option<&Path>) -> Result<SkillInventory, String> {
+    if backend == "claude" {
+        return Ok(skills::skills_in(&roots(backend, cwd)?));
+    }
+    skills::installed_skills(cwd).map_err(|error| error.to_string())
+}
+
+/// The skills an engine finds, each with its switch (LynShen's only) and
+/// whether it can be deleted here: a folder of the personal directory. A
+/// skill in `~/.agents/skills` is other tools' too, a project's belongs to
+/// the project.
+fn list(backend: &str, cwd: Option<&Path>) -> Result<Value, String> {
+    let inventory = inventory(backend, cwd)?;
+    let roots = roots(backend, cwd)?;
+    let personal = &roots[0].1;
+    let skills: Vec<Value> = inventory
+        .skills
+        .iter()
+        .map(|skill| {
+            json!({
+                "name": skill.name,
+                "description": skill.description,
+                "path": skill.dir,
+                "scope": skill.scope.as_str(),
+                "enabled": skill.enabled,
+                "toggleable": backend != "claude",
+                "removable": skill.scope == SkillScope::User && skill.dir.parent() == Some(personal.as_path()),
+            })
+        })
+        .collect();
+    let problems: Vec<Value> = inventory
+        .problems
+        .iter()
+        .map(|problem| {
+            json!({
+                "level": if problem.error { "error" } else { "warning" },
+                "kind": problem.kind,
+                "path": problem.path,
+                "message": problem.message,
+            })
+        })
+        .collect();
+    let dirs: Vec<Value> = roots
+        .iter()
+        .map(|(scope, path)| json!({ "scope": scope.as_str(), "path": path }))
+        .collect();
+    Ok(json!({
+        "type": "skills_list",
+        "backend": backend,
+        "skills": skills,
+        "problems": problems,
+        "dirs": dirs,
+        "projectTrusted": inventory.project_trusted,
+    }))
+}
+
+/// Switches a skill the list has (nothing else is written to the switches),
+/// then lists again. Claude Code's skills are Claude Code's to switch.
+fn set_enabled(
+    backend: &str,
+    cwd: Option<&Path>,
+    dir: &Path,
+    enabled: bool,
+) -> Result<Value, String> {
+    if backend == "claude" {
+        return Err("LynShen does not switch Claude Code's skills".to_string());
+    }
+    let found = inventory(backend, cwd)?
+        .skills
+        .into_iter()
+        .find(|skill| skill.dir == dir)
+        .ok_or_else(|| format!("no such skill: {}", dir.display()))?;
+    skills::switch_skill(&found.dir, enabled).map_err(|error| error.to_string())?;
+    list(backend, cwd)
+}
+
+fn uninstall(backend: &str, cwd: Option<&Path>, dir: &Path) -> Result<(), String> {
+    let roots = roots(backend, cwd)?;
+    let personal = &roots[0].1;
+    if dir.parent() != Some(personal.as_path()) {
+        return Err(format!(
+            "only a skill in {} can be deleted here: {}",
+            personal.display(),
+            dir.display()
+        ));
+    }
+    skills::delete_skill(personal, dir).map_err(|error| error.to_string())
 }
 
 /// The community repositories, fetched at most once an hour: listing one

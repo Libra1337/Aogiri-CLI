@@ -694,6 +694,106 @@ fn a_trust_decision_reaches_the_kept_system_prompt() {
     assert_eq!(reopened.system, untrusted.system);
 }
 
+/// Skill folders and skills-state.json as they were, once dropped: the
+/// tests share one HOME.
+struct SkillsRestore {
+    dirs: Vec<PathBuf>,
+    state: PathBuf,
+    original: Option<String>,
+}
+
+impl Drop for SkillsRestore {
+    fn drop(&mut self) {
+        for dir in &self.dirs {
+            let _ = fs::remove_dir_all(dir);
+        }
+        match &self.original {
+            Some(original) => {
+                let _ = fs::write(&self.state, original);
+            }
+            None => {
+                let _ = fs::remove_file(&self.state);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_skill_switched_off_or_on_reaches_the_kept_system_prompt() {
+    let _guard = setup();
+    let own_root = lynshen_agent_core::skills::profile_skills_dir().unwrap();
+    let own = own_root.join("tidy-imports");
+    let shared = PathBuf::from(std::env::var("HOME").unwrap())
+        .join(".agents")
+        .join("skills")
+        .join("release-notes");
+    let state = own_root.with_file_name("skills-state.json");
+    let restore = SkillsRestore {
+        dirs: vec![own.clone(), shared.clone(), own_root.join("draft-notes")],
+        original: fs::read_to_string(&state).ok(),
+        state,
+    };
+    for (dir, name, description) in [
+        (&own, "tidy-imports", "Sort and prune imports"),
+        (&shared, "release-notes", "Write the release notes"),
+    ] {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\nSteps.\n"),
+        )
+        .unwrap();
+    }
+    let mut core = AgentCore::open(temp_dir("skill-switch")).unwrap();
+    core.set_approval_mode(ApprovalMode::FullAccess);
+    let turn = |core: &mut AgentCore, message: &str| {
+        core.submit_user_message(message.to_string());
+        pump(core);
+        last_request()
+    };
+    let first = turn(&mut core, "first");
+    assert!(first.system_text().contains("Sort and prune imports"));
+    assert!(first.system_text().contains("Write the release notes"));
+    // Nothing changed: the same bytes.
+    let second = turn(&mut core, "second");
+    assert_eq!(second.system, first.system);
+    assert_eq!(second.messages[..first.messages.len()], first.messages[..]);
+
+    // Off by name (skills-state.json's `disabled`), as `/skills disable` does.
+    core.handle_command("/skills disable tidy-imports");
+    let third = turn(&mut core, "third");
+    assert!(!third.system_text().contains("Sort and prune imports"));
+    assert!(third.system_text().contains("Write the release notes"));
+    // Only the system prompt changed; the conversation is kept as it was.
+    assert_eq!(third.messages[..second.messages.len()], second.messages[..]);
+    assert!(third.notes().is_empty());
+    assert_eq!(turn(&mut core, "fourth").system, third.system);
+
+    // Off by path (`disabled_paths`), as the desktop switches a shared skill.
+    lynshen_agent_core::skills::switch_skill(&shared, false).unwrap();
+    assert!(fs::read_to_string(&restore.state)
+        .unwrap()
+        .contains("\"disabled_paths\""));
+    let fifth = turn(&mut core, "fifth");
+    assert!(!fifth.system_text().contains("Write the release notes"));
+    assert_ne!(fifth.system, third.system);
+    assert_eq!(turn(&mut core, "sixth").system, fifth.system);
+
+    // Both on again: the first turn's bytes.
+    core.handle_command("/skills enable tidy-imports");
+    lynshen_agent_core::skills::switch_skill(&shared, true).unwrap();
+    assert_eq!(turn(&mut core, "seventh").system, first.system);
+
+    // A skill created, then deleted.
+    let created =
+        lynshen_agent_core::skills::create_skill(&own_root, "draft-notes", "Draft notes").unwrap();
+    assert!(turn(&mut core, "eighth")
+        .system_text()
+        .contains("<skill name=\"draft-notes\""));
+    lynshen_agent_core::skills::delete_skill(&own_root, created.parent().unwrap()).unwrap();
+    assert_eq!(turn(&mut core, "ninth").system, first.system);
+}
+
 #[test]
 fn a_chat_session_is_not_offered_propose_plan() {
     let _guard = setup();
