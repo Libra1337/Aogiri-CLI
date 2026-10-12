@@ -44,6 +44,10 @@ in `~/.lynshen/skills-state.json`, never in the skill's own files: `disabled` ho
 folder by its resolved path, so a project skill switched off in one checkout still loads in
 another worktree. A skill that is switched off is not read at all.
 
+A switch, an install, a new skill or a removal applies from each session's next turn. A session
+keeps its system prompt across turns so the provider can reuse its prompt cache; when the skills
+that load change, the next turn builds the prompt again, and the turns after it keep the new one.
+
 Marketplace packages must include `package_sha256`. Downloads are capped at 20 MiB, extracted
 content at 100 MiB and 4,096 files. Zip and tar.gz packages reject absolute paths, parent
 traversal, links, and special files. File permissions are preserved. Extraction happens in a

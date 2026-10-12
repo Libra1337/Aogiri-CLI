@@ -247,6 +247,13 @@ skill folder into `disabled_paths` by its resolved path. A skill switched off
 is not read at all. `skill_uninstall` deletes only a skill folder directly in
 the personal directory of `backend`, and forgets its switch.
 
+A session keeps its system prompt from turn to turn, so the provider can
+serve it from its prompt cache. When the skills that load change (one
+switched on or off, created, installed or deleted, or its name or
+description edited), each LynShen session builds its system prompt again at
+its next turn: one cache miss, then the new prompt is kept. Without such a
+change a turn sends the same prompt bytes.
+
 ## Other engines
 
 `session_create` with `engine: "claude"` runs Claude Code

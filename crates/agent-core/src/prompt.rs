@@ -197,9 +197,11 @@ impl SessionPrompt {
 
     /// Whether `now`, the prompt a turn would build now, was built from
     /// other inputs than this one: another base prompt (prompt.txt, a new
-    /// version), edit tools, project instructions, skills (a trust
-    /// decision) or host text (a daemon agent's brief, handoffs and peers:
-    /// the model saw them current every turn before the prompt was kept).
+    /// version), edit tools, project instructions, skills (one installed,
+    /// created, deleted or switched on or off, or a trust decision: the
+    /// skills section lists only the skills that load) or host text (a
+    /// daemon agent's brief, handoffs and peers: the model saw them current
+    /// every turn before the prompt was kept).
     /// The rest of the tail is left out: its date and sandbox note reach the
     /// model as notes, and the working directory is the session's.
     pub fn outdated_by(&self, now: &SessionPrompt) -> bool {
