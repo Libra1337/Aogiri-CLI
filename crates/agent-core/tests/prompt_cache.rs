@@ -391,6 +391,43 @@ fn a_sandbox_change_reaches_the_model_as_a_note() {
 }
 
 #[test]
+fn a_subagent_is_told_the_sandbox_of_now() {
+    let _guard = setup();
+    let mut core = AgentCore::open(temp_dir("subagent-sandbox")).unwrap();
+    core.set_approval_mode(ApprovalMode::FullAccess);
+    core.set_sandbox(sandbox(SandboxMode::WorkspaceWrite));
+    core.submit_user_message("first".to_string());
+    pump(&mut core);
+    let parent = last_request();
+
+    // `/sandbox read-only`, then a spawn.
+    core.set_sandbox(sandbox(SandboxMode::ReadOnly));
+    let start = requests().len();
+    let args = json!({ "task_name": "checker", "message": "look around" });
+    core.submit_user_message(format!("CALL spawn_agent {args}"));
+    pump(&mut core);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let child = loop {
+        let sent = requests();
+        let child = sent[start..].iter().find(|body| {
+            let last = body["messages"].as_array().and_then(|m| m.last()).cloned();
+            last.is_some_and(|last| text(&last).starts_with("<subagent_task"))
+        });
+        if let Some(child) = child {
+            break Request::from_body(child);
+        }
+        assert!(Instant::now() < deadline, "the subagent sent no request");
+        thread::sleep(Duration::from_millis(20));
+    };
+    // The parent keeps its prompt and is told by a note.
+    assert_eq!(last_request().system, parent.system);
+    let system = child.system_text();
+    assert!(system.contains("<sandbox mode=\"read-only\">"), "{system}");
+    assert!(!system.contains("workspace-write"), "{system}");
+    assert!(system.contains("<subagent_context>"));
+}
+
+#[test]
 fn propose_plan_outside_plan_mode_shows_no_draft() {
     let _guard = setup();
     let mut core = AgentCore::open(temp_dir("draft-outside-plan")).unwrap();

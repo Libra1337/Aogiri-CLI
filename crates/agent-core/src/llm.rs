@@ -85,8 +85,9 @@ pub struct OpenAiClient {
     /// `subagent_models`), resolved against the configured model list.
     subagent_models: Vec<SubagentModelSpec>,
     system_prompt: String,
-    /// The main agent's system prompt, for subagents started on its behalf
-    /// (`agents.review_on_complete`).
+    /// The system prompt the main agent's subagents start from (those it
+    /// spawns and those started on its behalf, `agents.review_on_complete`):
+    /// its own, or the one `set_subagent_prompt` gives.
     root_system_prompt: String,
     prompt_cache_key: String,
     mcp: McpManager,
@@ -800,6 +801,14 @@ impl OpenAiClient {
     /// compaction (see [`MID_TURN_COMPACTION`]); 0 turns it off.
     pub fn set_context_budget(&mut self, tokens: u64) {
         self.context_budget = tokens;
+    }
+
+    /// Sets the system prompt the main agent's subagents start from: the
+    /// session's prompt as built from what holds now (date, sandbox). The
+    /// main agent keeps the session's first prompt and is told the changes
+    /// in notes, which a subagent's conversation does not carry.
+    pub fn set_subagent_prompt(&mut self, prompt: String) {
+        self.root_system_prompt = prompt;
     }
 
     pub fn run_turn_events(
@@ -2069,7 +2078,11 @@ impl OpenAiClient {
             timeout: settings.timeout,
             read_only: settings.read_only,
             depth: self.agent_depth.saturating_add(1),
-            base_prompt: self.system_prompt.clone(),
+            base_prompt: if self.agent_depth == 0 {
+                self.root_system_prompt.clone()
+            } else {
+                self.system_prompt.clone()
+            },
             role: settings
                 .role
                 .filter(|role| !role.instructions.is_empty())

@@ -2485,6 +2485,9 @@ impl AgentCore {
                 return events;
             }
         };
+        // A subagent's conversation does not carry this one's notes: it
+        // starts from the prompt built now (today's date, the sandbox now).
+        let subagent_prompt = prompt.text();
         let prompt = self.session_prompt(prompt);
         let skills_tokens =
             crate::tokens::count_text(&self.config.model, &prompt.skills).tokens as u64;
@@ -2535,6 +2538,7 @@ impl AgentCore {
             self.config.compaction_threshold_percent,
         );
         client.set_context_budget(model_context_budget as u64);
+        client.set_subagent_prompt(subagent_prompt);
         let forced = std::mem::take(&mut self.force_compaction);
         // The request is the conversation plus the prompt and tool definitions.
         let request_tokens = context_tokens + overhead_tokens(&overhead) as usize;
