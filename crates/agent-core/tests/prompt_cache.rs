@@ -419,8 +419,25 @@ fn a_subagent_is_told_the_sandbox_of_now() {
         assert!(Instant::now() < deadline, "the subagent sent no request");
         thread::sleep(Duration::from_millis(20));
     };
-    // The parent keeps its prompt and is told by a note.
-    assert_eq!(last_request().system, parent.system);
+    // The parent keeps its prompt and is told by a note. The subagent may
+    // still be sending requests (and the parent may be woken by its result),
+    // so the parent's requests are the ones without the subagent's context.
+    let sent: Vec<Request> = requests()[start..].iter().map(Request::from_body).collect();
+    let parents: Vec<&Request> = sent
+        .iter()
+        .filter(|request| !request.system_text().contains("<subagent_context>"))
+        .collect();
+    assert!(!parents.is_empty(), "the parent sent no request");
+    for request in &parents {
+        assert_eq!(request.system, parent.system);
+    }
+    let notes = parents[0].notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("<sandbox mode=\"read-only\">")),
+        "{notes:#?}"
+    );
     let system = child.system_text();
     assert!(system.contains("<sandbox mode=\"read-only\">"), "{system}");
     assert!(!system.contains("workspace-write"), "{system}");
