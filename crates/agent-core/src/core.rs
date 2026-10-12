@@ -2546,6 +2546,20 @@ impl AgentCore {
         } else {
             None
         };
+        let compaction = match compaction
+            .map(|plan| {
+                self.compaction_client()
+                    .map(|summarizer| (plan, summarizer))
+            })
+            .transpose()
+        {
+            Ok(compaction) => compaction,
+            Err(error) => {
+                let mut events = save_event;
+                events.push(AgentEvent::Error(error));
+                return events;
+            }
+        };
         let mut events = save_event;
         events.push(AgentEvent::ContextUsage {
             tokens: context_tokens as u64,
@@ -2566,9 +2580,9 @@ impl AgentCore {
         self.running = true;
 
         thread::spawn(move || {
-            let input = if let Some(plan) = compaction {
+            let input = if let Some((plan, summarizer)) = compaction {
                 let _ = tx.send(WorkerEvent::CompactionStart);
-                match client.summarize_conversation(&plan, |output_tokens| {
+                match client.summarize_conversation(&plan, &summarizer, |output_tokens| {
                     tx.send(WorkerEvent::CompactionProgress { output_tokens })
                         .map_err(|error| error.to_string())
                 }) {
@@ -2697,19 +2711,20 @@ impl AgentCore {
         }
         // The summary request goes out as a turn's would (see
         // `summarize_conversation`); this client runs no tools.
-        let client = self.turn_prompt().and_then(|turn| {
+        let clients = self.turn_prompt().and_then(|turn| {
             let system_prompt = self.session_prompt(turn.prompt).text();
             let (goal_tool_tx, _) = mpsc::channel();
-            self.main_client(
+            let client = self.main_client(
                 system_prompt,
                 turn.extra_read_roots,
                 turn.model_headers,
                 goal_tool_tx,
                 None,
-            )
+            )?;
+            Ok((client, self.compaction_client()?))
         });
-        let client = match client {
-            Ok(client) => client,
+        let (client, summarizer) = match clients {
+            Ok(clients) => clients,
             Err(error) => return vec![AgentEvent::Error(error)],
         };
 
@@ -2724,7 +2739,7 @@ impl AgentCore {
 
         thread::spawn(move || {
             let _ = tx.send(WorkerEvent::CompactionStart);
-            match client.summarize_conversation(&plan, |output_tokens| {
+            match client.summarize_conversation(&plan, &summarizer, |output_tokens| {
                 tx.send(WorkerEvent::CompactionProgress { output_tokens })
                     .map_err(|error| error.to_string())
             }) {
@@ -2792,6 +2807,46 @@ impl AgentCore {
             hooks: self.hooks.clone(),
         })
         .map_err(|_| "missing API key in auth.json or env".to_string())
+    }
+
+    /// The client of compact_model: it summarizes the conversation as plain
+    /// text when the summary request brings no summary (see
+    /// `summarize_conversation`). No tools, no system prompt.
+    fn compaction_client(&self) -> Result<OpenAiClient, String> {
+        let (model, reasoning_effort) = self.config.compact();
+        OpenAiClient::from_config(OpenAiClientConfig {
+            model,
+            provider: self.config.provider.clone(),
+            protocol: self.config.protocol.clone(),
+            reasoning_effort,
+            models: Vec::new(),
+            subagent_models: Vec::new(),
+            system_prompt: String::new(),
+            prompt_cache_key: self.session.session_id().to_string(),
+            mcp: McpManager::default(),
+            base_url: self.config.base_url.clone(),
+            max_output_tokens: self.config.compact_model_config().max_output_tokens,
+            api_key: self.provider_api_key().as_deref(),
+            api_key_env: &self.config.api_key_env,
+            retry_attempts: self.config.retry_attempts,
+            connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
+            read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
+            goal_tool_tx: None,
+            propose_plan: false,
+            approval_tx: None,
+            approval_mode: self.approval_mode.clone(),
+            safety_model: None,
+            safety_reasoning_effort: String::new(),
+            model_headers: self.model_headers(),
+            // Summarization clients never expose or execute tools.
+            edit_tools: Vec::new(),
+            extra_read_roots: Vec::new(),
+            tool_state: crate::tools::ToolState::default(),
+            host: None,
+            subagent_manager: None,
+            roles: Vec::new(),
+            hooks: Hooks::default(),
+        })
     }
 
     fn resume_summary_client(&self) -> Result<OpenAiClient, String> {

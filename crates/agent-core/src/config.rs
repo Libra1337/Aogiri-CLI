@@ -276,8 +276,10 @@ pub struct Config {
     pub model: String,
     pub reasoning_effort: String,
     /// Model of the idle session summary (and the safety classifier's
-    /// default). Context compaction runs on `model`: its request starts as
-    /// the turns' do, so the provider serves it from the prompt cache.
+    /// default). Context compaction asks `model` first: its request starts
+    /// as the turns' do, so the provider serves it from the prompt cache.
+    /// When that brings no summary, this model summarizes the conversation
+    /// as plain text.
     pub compact_model: String,
     pub compact_reasoning_effort: String,
     /// Model used by the `auto` approval mode's safety classifier. Absent or

@@ -15,9 +15,10 @@ use lynshen_agent_core::{
     sandbox::{SandboxMode, SandboxPolicy},
     AgentCore, AgentEvent, ApprovalMode,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     fs,
+    path::PathBuf,
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -479,6 +480,70 @@ fn a_summary_the_model_only_answers_with_tool_calls_falls_back_to_plain_text() {
     );
     let last = requests().last().cloned().unwrap();
     assert!(last.get("tools").is_none());
+}
+
+/// config.json with `changes` set, until dropped: the engines opened
+/// meanwhile read them.
+struct ConfigChange {
+    path: PathBuf,
+    original: String,
+}
+
+impl ConfigChange {
+    fn set(changes: Value) -> Self {
+        let path = PathBuf::from(std::env::var("HOME").unwrap())
+            .join(".lynshen")
+            .join("config.json");
+        let original = fs::read_to_string(&path).unwrap();
+        let mut config: Value = serde_json::from_str(&original).unwrap();
+        for (key, value) in changes.as_object().unwrap() {
+            config[key] = value.clone();
+        }
+        fs::write(&path, config.to_string()).unwrap();
+        Self { path, original }
+    }
+}
+
+impl Drop for ConfigChange {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.path, &self.original);
+    }
+}
+
+#[test]
+fn a_refused_summary_request_falls_back_to_plain_text_on_the_compact_model() {
+    let _guard = setup();
+    let _config = ConfigChange::set(json!({
+        "models": [{ "name": "fake-model" }, { "name": "fake-compact" }],
+        "compact_model": "fake-compact",
+    }));
+    let mut core = AgentCore::open(temp_dir("summary-refused")).unwrap();
+    core.set_approval_mode(ApprovalMode::FullAccess);
+    core.submit_user_message("SUMMARY_REFUSED first".to_string());
+    pump(&mut core);
+    core.submit_user_message("lorem ipsum dolor sit amet ".repeat(6000));
+    pump(&mut core);
+    core.submit_user_message("short again".to_string());
+    pump(&mut core);
+    let start = requests().len();
+
+    let (_, mut events) = core.handle_command("/compact");
+    events.extend(pump(&mut core));
+    let summary = compaction_summary(&events);
+    assert!(
+        summary.starts_with(
+            "user said: Summarize this earlier conversation:\n\nUser: SUMMARY_REFUSED first"
+        ),
+        "{summary}"
+    );
+    // The refused request goes as a turn's, the plain text to compact_model;
+    // the refused one is not sent again with tools off.
+    let sent = requests()[start..].to_vec();
+    assert_eq!(sent.len(), 2, "{sent:#?}");
+    assert_eq!(sent[0]["model"], "fake-model");
+    assert!(sent[0]["tools"].is_array());
+    assert_eq!(sent[1]["model"], "fake-compact");
+    assert!(sent[1].get("tools").is_none());
 }
 
 #[test]

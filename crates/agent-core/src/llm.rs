@@ -1197,13 +1197,17 @@ impl OpenAiClient {
     /// client's model, system prompt and tools, so the provider serves the
     /// conversation from its prompt cache, and with less reasoning
     /// (`summary_effort`). An answer that calls a tool or has no text is
-    /// not a summary: the request is sent again with tools off; if that
-    /// brings none either, the conversation goes as plain text to a
-    /// summarizer prompt (no tools, no cache). Errors let the caller fall
-    /// back to sending the full context.
+    /// not a summary: the request is sent again with tools off. If that
+    /// brings none either, or the summary request fails (it also carries the
+    /// system prompt, the tools and images, so it can be refused as too
+    /// long where the plain text is not), the conversation goes as plain
+    /// text to `summarizer`, the client of compact_model (no tools, no
+    /// cache), as compaction did before it used the cache. Three requests at
+    /// most. Errors let the caller fall back to sending the full context.
     pub fn summarize_conversation(
         &self,
         plan: &crate::session::CompactionPlan,
+        summarizer: &OpenAiClient,
         mut emit_output_tokens: impl FnMut(u64) -> Result<(), String>,
     ) -> Result<String, String> {
         let request = plan.summary_request();
@@ -1211,25 +1215,31 @@ impl OpenAiClient {
             effort: Some(self.summary_effort()),
             tools_off: false,
         };
-        if let Some(summary) =
-            self.summary_answer(request.clone(), variant, &mut emit_output_tokens)?
-        {
-            return Ok(summary);
-        }
-        let tools_off = RequestVariant {
-            tools_off: true,
-            ..variant
-        };
-        match self.summary_answer(request, tools_off, &mut emit_output_tokens) {
+        match self.summary_answer(request.clone(), variant, &mut emit_output_tokens) {
             Ok(Some(summary)) => return Ok(summary),
-            Ok(None) => crate::log_info!("compaction", "the summary request got no summary twice"),
-            Err(error) => crate::log_info!(
-                "compaction",
-                "the summary request with tools off failed",
-                error = error
-            ),
+            Ok(None) => {
+                let tools_off = RequestVariant {
+                    tools_off: true,
+                    ..variant
+                };
+                match self.summary_answer(request, tools_off, &mut emit_output_tokens) {
+                    Ok(Some(summary)) => return Ok(summary),
+                    Ok(None) => {
+                        crate::log_info!("compaction", "the summary request got no summary twice")
+                    }
+                    Err(error) => crate::log_info!(
+                        "compaction",
+                        "the summary request with tools off failed",
+                        error = error
+                    ),
+                }
+            }
+            // Sent again with tools off it would fail the same way.
+            Err(error) => {
+                crate::log_info!("compaction", "the summary request failed", error = error)
+            }
         }
-        self.summarize_text(
+        summarizer.summarize_text(
             FLAT_SUMMARY_PROMPT,
             &format!(
                 "Summarize this earlier conversation:\n\n{}",

@@ -81,8 +81,9 @@ pub fn temp_dir(label: &str) -> PathBuf {
 /// summary request (`<compaction_request>`) is answered with a tool call
 /// only when an earlier user message says `SUMMARY_CALLS_TOOL` and the
 /// request offers tools, with a sentence and a tool call when one says
-/// `SUMMARY_PREAMBLE_CALLS_TOOL` and it offers tools, and always with a tool
-/// call when one says `SUMMARY_ONLY_CALLS_TOOL`. In a subagent's task, `[sleep:N]`
+/// `SUMMARY_PREAMBLE_CALLS_TOOL` and it offers tools, always with a tool
+/// call when one says `SUMMARY_ONLY_CALLS_TOOL`, and refused as over the
+/// context window when one says `SUMMARY_REFUSED`. In a subagent's task, `[sleep:N]`
 /// waits N ms before answering and a line `RUN: <command>` runs it;
 /// `[history]` answers with every user message of the request. A message
 /// from another conversation (`<session_message …>`) is scripted by its body.
@@ -293,8 +294,8 @@ fn script(request: &Value) -> String {
 }
 
 /// The answer to a summary request scripted by `SUMMARY_CALLS_TOOL`,
-/// `SUMMARY_PREAMBLE_CALLS_TOOL` or `SUMMARY_ONLY_CALLS_TOOL` (see
-/// `start_fake_model`); None otherwise.
+/// `SUMMARY_PREAMBLE_CALLS_TOOL`, `SUMMARY_ONLY_CALLS_TOOL` or
+/// `SUMMARY_REFUSED` (see `start_fake_model`); None otherwise.
 fn summary_reply(request: &Value, messages: &[Value], text: &str) -> Option<String> {
     if !text.starts_with("<compaction_request>") {
         return None;
@@ -304,6 +305,9 @@ fn summary_reply(request: &Value, messages: &[Value], text: &str) -> Option<Stri
             message["role"] == "user" && content_text(&message["content"]).contains(marker)
         })
     };
+    if said("SUMMARY_REFUSED") {
+        return Some("ERROR maximum context length exceeded".to_string());
+    }
     let has_tools = request["tools"]
         .as_array()
         .is_some_and(|tools| !tools.is_empty());
