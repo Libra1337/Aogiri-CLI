@@ -325,10 +325,19 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         return;
     }
     // Installed skills are instructions and scripts every later session may
-    // run, so only the desktop installs them. Both ops wait on the network.
-    if matches!(name, "skills_catalog" | "skill_install") {
+    // run, so only the desktop installs, switches, creates or deletes them.
+    // The catalog and installs wait on the network, the rest on the disk.
+    if matches!(
+        name,
+        "skills_catalog"
+            | "skill_install"
+            | "skills_list"
+            | "skill_set_enabled"
+            | "skill_uninstall"
+            | "skill_create"
+    ) {
         if !hub.is_local(client) {
-            reply(json!({ "type": "error", "message": "only the desktop can install skills" }));
+            reply(json!({ "type": "error", "message": "only the desktop can manage skills" }));
             return;
         }
         let hub = Arc::clone(hub);

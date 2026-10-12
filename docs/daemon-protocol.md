@@ -183,6 +183,10 @@ every connected client.
 | `report_read` | `report` | `report_read` |
 | `skills_catalog` | optional `backend` (`lynshen`, default, or `claude`) | `skills_catalog` with `skills: [{id, name, description, tags, source, isDefault, installed, license, redistributable, homepage}]`, `warnings` and `installDir` (local clients only). See "Skills" |
 | `skill_install` | `source` (`lynshen` or `anthropic`), `skill` (its `id` in the catalog), optional `backend` | `skill_installed` with `path` (local clients only) |
+| `skills_list` | optional `backend` (`lynshen`, default, or `claude`), optional `cwd` (an absolute project folder) | `skills_list` with `skills: [{name, description, path, scope, enabled, toggleable, removable}]`, `problems: [{level, kind, path, message}]`, `dirs: [{scope, path}]` and `projectTrusted` (local clients only). See "Skills" |
+| `skill_set_enabled` | `path` (a listed skill's folder), `enabled`, optional `cwd` | the new `skills_list` (local clients only, `lynshen` only) |
+| `skill_uninstall` | `path` (a listed skill's folder) or `skill` (a catalog `id`), optional `backend` | `skill_uninstalled` with `path` (local clients only) |
+| `skill_create` | `name` (lowercase letters, digits and hyphens), `description` | `skill_created` with `path`, the new `SKILL.md` in `~/.lynshen/skills/<name>/` (local clients only) |
 
 `decide_action` (a session op) also works for a session that is closed or
 was hosted before a restart: the daemon reopens it first.
@@ -221,6 +225,27 @@ checksummed package, or an Anthropic skill's whole directory at the index's
 pinned commit. The new install replaces an old one only once complete. Both
 ops are refused for paired devices: an installed skill is instructions and
 scripts that later sessions run.
+
+`skills_list` lists the skills an engine finds, switched on or off. For
+`lynshen` they come from `~/.lynshen/skills` (`scope: "user"`),
+`~/.agents/skills` (`"shared"`) and, with `cwd`, the project's
+`.lynshen/skills` and `.agents/skills` (`"project"`, only once the project is
+trusted; `projectTrusted` says whether it is). For `claude` they come from
+`~/.claude/skills` and the project's `.claude/skills`, all `enabled`, and
+`toggleable` is false: LynShen does not switch Claude Code's skills.
+`removable` is true for a folder directly in the personal directory; a shared
+skill is other tools' too and a project's belongs to the project. `problems`
+are what keeps a skill from loading: `unreadable` (an `error` when the skill
+is on, since no LynShen turn can start), `no_description`, `duplicate` (two
+skills of one name), `untrusted` (project skills waiting for `/trust`) and
+`state` (the switches file cannot be read).
+
+`skill_set_enabled` writes `~/.lynshen/skills-state.json`, which every
+LynShen engine reads before each turn: a folder of `~/.lynshen/skills` named
+as `/skills disable` names it goes into `disabled` by that name, any other
+skill folder into `disabled_paths` by its resolved path. A skill switched off
+is not read at all. `skill_uninstall` deletes only a skill folder directly in
+the personal directory of `backend`, and forgets its switch.
 
 ## Other engines
 

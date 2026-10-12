@@ -2726,6 +2726,232 @@ fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
     }
 }
 
+/// The skill commands a new LynShen session in `cwd` offers. Its engine may
+/// list them before the daemon's reply to `session_create` arrives.
+fn session_skills(client: &mut Client, cwd: &PathBuf) -> Vec<String> {
+    client.send(json!({ "op": "session_create", "cwd": cwd, "id": 4242 }));
+    let mut session: Option<String> = None;
+    let mut lists: Vec<Value> = Vec::new();
+    client.until(|f| {
+        if f["id"] == 4242 {
+            session = f["session"].as_str().map(str::to_string);
+        }
+        if f["type"] == "command_list" {
+            lists.push(f.clone());
+        }
+        session
+            .as_deref()
+            .is_some_and(|s| lists.iter().any(|list| list["session"] == s))
+    });
+    let session = session.unwrap();
+    let list = lists
+        .iter()
+        .find(|list| list["session"] == session.as_str())
+        .unwrap();
+    let commands = list["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|command| command["marker"] == "SKILL")
+        .map(|command| command["command"].as_str().unwrap().to_string())
+        .collect();
+    client.send(json!({ "op": "session_close", "session": session }));
+    client.until(|f| f["type"] == "session_closed" && f["session"] == session.as_str());
+    commands
+}
+
+#[test]
+fn the_desktop_lists_switches_creates_and_deletes_skills() {
+    let _guard = setup();
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let personal = home.join(".lynshen/skills");
+    let shared = home.join(".agents/skills");
+    let project = temp_dir("daemon-skills-project");
+    let write = |dir: PathBuf, front_matter: &str| {
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\n{front_matter}\n---\nbody\n"),
+        )
+        .unwrap();
+        dir
+    };
+    let review = write(
+        personal.join("review"),
+        "name: review\ndescription: Review code",
+    );
+    // Imported from another tool, folder name and all.
+    let imported = write(
+        personal.join("Their_Skill"),
+        "name: their-skill\ndescription: Theirs",
+    );
+    let notes = write(
+        shared.join("notes"),
+        "name: notes\ndescription: Notes for every tool",
+    );
+    let deploy = write(
+        project.join(".agents/skills/deploy"),
+        "name: deploy\ndescription: Deploy",
+    );
+    fs::create_dir_all(personal.join("blank")).unwrap();
+    fs::write(personal.join("blank/SKILL.md"), "---\n---\n").unwrap();
+    let daemon = start_daemon();
+    let mut desktop = Client::connect(&daemon);
+    let find = |list: &Value, dir: &PathBuf| {
+        list["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|skill| skill["path"] == json!(dir))
+            .unwrap_or_else(|| panic!("{} in {list}", dir.display()))
+            .clone()
+    };
+
+    let list = request(&mut desktop, json!({ "op": "skills_list", "cwd": project }));
+    assert_eq!(list["type"], "skills_list", "{list}");
+    assert_eq!(list["projectTrusted"], true);
+    for (dir, scope, removable) in [
+        (&review, "user", true),
+        (&imported, "user", true),
+        (&notes, "shared", false),
+        (&deploy, "project", false),
+    ] {
+        let skill = find(&list, dir);
+        assert_eq!(skill["scope"], scope, "{skill}");
+        assert_eq!(skill["enabled"], true, "{skill}");
+        assert_eq!(skill["toggleable"], true, "{skill}");
+        assert_eq!(skill["removable"], removable, "{skill}");
+    }
+    assert!(list["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|problem| problem["kind"] == "no_description" && problem["level"] == "warning"));
+    assert_eq!(
+        list["dirs"][0],
+        json!({ "scope": "user", "path": personal })
+    );
+    let all = ["/deploy", "/notes", "/review", "/their-skill"];
+    assert_eq!(session_skills(&mut desktop, &project), all);
+
+    // Switched off, a skill leaves every new session; the reply is the new list.
+    for dir in [&imported, &notes, &deploy] {
+        let list = request(
+            &mut desktop,
+            json!({ "op": "skill_set_enabled", "path": dir, "enabled": false, "cwd": project }),
+        );
+        assert_eq!(find(&list, dir)["enabled"], false, "{list}");
+    }
+    assert_eq!(session_skills(&mut desktop, &project), ["/review"]);
+    for dir in [&imported, &notes, &deploy] {
+        request(
+            &mut desktop,
+            json!({ "op": "skill_set_enabled", "path": dir, "enabled": true, "cwd": project }),
+        );
+    }
+    assert_eq!(session_skills(&mut desktop, &project), all);
+    // Only a listed skill is switched.
+    let refused = request(
+        &mut desktop,
+        json!({ "op": "skill_set_enabled", "path": home.join("elsewhere"), "enabled": false }),
+    );
+    assert_eq!(refused["type"], "error", "{refused}");
+
+    // Created in the personal folder, ready to edit.
+    let created = request(
+        &mut desktop,
+        json!({ "op": "skill_create", "name": "release-notes", "description": "Write release notes" }),
+    );
+    assert_eq!(
+        created["path"],
+        json!(personal.join("release-notes/SKILL.md")),
+        "{created}"
+    );
+    for op in [
+        json!({ "op": "skill_create", "name": "release-notes", "description": "again" }),
+        json!({ "op": "skill_create", "name": "../escape", "description": "x" }),
+        json!({ "op": "skill_create", "name": "no-description" }),
+    ] {
+        assert_eq!(request(&mut desktop, op)["type"], "error");
+    }
+
+    // Deleted only from the personal folder, by path or by catalog id.
+    for path in [&notes, &deploy, &personal] {
+        let refused = request(
+            &mut desktop,
+            json!({ "op": "skill_uninstall", "path": path }),
+        );
+        assert_eq!(refused["type"], "error", "{refused}");
+        assert!(path.exists());
+    }
+    let deleted = request(
+        &mut desktop,
+        json!({ "op": "skill_uninstall", "path": imported }),
+    );
+    assert_eq!(deleted["type"], "skill_uninstalled", "{deleted}");
+    assert!(!imported.exists());
+    let deleted = request(
+        &mut desktop,
+        json!({ "op": "skill_uninstall", "skill": "release-notes", "backend": "lynshen" }),
+    );
+    assert_eq!(deleted["type"], "skill_uninstalled", "{deleted}");
+    assert_eq!(
+        request(
+            &mut desktop,
+            json!({ "op": "skill_uninstall", "skill": "../review" })
+        )["type"],
+        "error"
+    );
+
+    // Claude Code's skills are listed, not switched.
+    let claude = write(
+        home.join(".claude/skills/frontend"),
+        "name: frontend\ndescription: UI",
+    );
+    let list = request(
+        &mut desktop,
+        json!({ "op": "skills_list", "backend": "claude" }),
+    );
+    let skill = find(&list, &claude);
+    assert_eq!(
+        (skill["toggleable"].clone(), skill["removable"].clone()),
+        (json!(false), json!(true))
+    );
+    let refused = request(
+        &mut desktop,
+        json!({ "op": "skill_set_enabled", "backend": "claude", "path": claude, "enabled": false }),
+    );
+    assert_eq!(refused["type"], "error", "{refused}");
+
+    // A paired device can do none of it.
+    desktop.send(json!({ "op": "pair_start", "id": 1 }));
+    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, response) = http(&daemon, &pair_request(&code));
+    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let mut phone = Client::connect_with(&daemon, body["token"].as_str().unwrap());
+    for op in [
+        "skills_list",
+        "skill_set_enabled",
+        "skill_uninstall",
+        "skill_create",
+    ] {
+        let refused = request(
+            &mut phone,
+            json!({ "op": op, "path": review, "enabled": false, "name": "x", "description": "x" }),
+        );
+        assert_eq!(refused["type"], "error", "{refused}");
+    }
+    assert!(review.exists());
+    for dir in [review, notes] {
+        let _ = fs::remove_dir_all(dir);
+    }
+    let _ = fs::remove_dir_all(home.join(".claude/skills"));
+    let _ = fs::remove_dir_all(personal.join("blank"));
+}
+
 /// Requirement `id` in a `requirements` frame.
 fn requirement<'a>(frame: &'a Value, id: &str) -> Option<&'a Value> {
     (frame["type"] == "requirements")
