@@ -34,6 +34,7 @@ pub fn extensions(hub: Arc<Hub>, agent: String, session: String) -> HostExtensio
             prompt.push_str(&project_prompt(&prompt_hub, &prompt_agent));
             prompt
         }),
+        context: Arc::new(String::new),
         exclusive: false,
         gate: Arc::new(|_| HostGate::Run),
         summary: Arc::new(|_, _| String::new()),
@@ -99,7 +100,8 @@ fn dispatcher(hub: Arc<Hub>, session: String) -> HostExtensions {
                 Err(error) => (json!({ "error": error }).to_string(), true),
             }
         }),
-        prompt: Arc::new(move || crate::dispatch::prompt(&prompt_hub, &prompt_session)),
+        prompt: Arc::new(|| crate::dispatch::GUIDE.to_string()),
+        context: Arc::new(move || crate::dispatch::context(&prompt_hub, &prompt_session)),
         exclusive: true,
         gate: Arc::new(|_| HostGate::Run),
         summary: Arc::new(|_, _| String::new()),

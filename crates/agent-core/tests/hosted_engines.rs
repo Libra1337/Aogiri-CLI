@@ -232,6 +232,7 @@ fn host_tools_run_in_the_host_and_host_prompt_reaches_the_model() {
             ("noted".to_string(), false)
         }),
         prompt: Arc::new(|| "<host-marker>brief goes here</host-marker>".to_string()),
+        context: Arc::new(String::new),
         exclusive: false,
         gate: Arc::new(|_| HostGate::Run),
         summary: Arc::new(|_, _| String::new()),
@@ -282,6 +283,7 @@ fn gated_host(
             (format!("{name} done"), false)
         }),
         prompt: Arc::new(String::new),
+        context: Arc::new(String::new),
         exclusive: false,
         gate: Arc::new(|name| match name {
             "peek" => HostGate::ReadOnly,
@@ -412,6 +414,7 @@ fn an_exclusive_host_leaves_the_engine_no_tools_of_its_own() {
         })],
         run_tool: Arc::new(|_, _, _| ("noted".to_string(), false)),
         prompt: Arc::new(String::new),
+        context: Arc::new(String::new),
         exclusive: true,
         gate: Arc::new(|_| HostGate::Run),
         summary: Arc::new(|_, _| String::new()),
@@ -619,10 +622,14 @@ fn plan_mode_refuses_changes_and_tells_the_model_to_plan() {
     assert!(reply.contains("plan mode"), "{reply}");
     assert!(reply.contains("propose_plan"), "{reply}");
 
-    // The plan-mode rules are part of the prompt.
-    core.submit_user_message("SYSTEM".to_string());
+    // The plan-mode rules reach the model as a note in the conversation;
+    // the system prompt stays as the session began.
+    core.submit_user_message("HISTORY".to_string());
     let events = pump(&mut core, is_ready);
     assert!(assistant_text(&events).contains("</plan_mode>"));
+    core.submit_user_message("SYSTEM".to_string());
+    let events = pump(&mut core, is_ready);
+    assert!(!assistant_text(&events).contains("</plan_mode>"));
 }
 
 #[test]
