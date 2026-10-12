@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 
 pub const TOOL_NAME: &str = "propose_plan";
 
-/// Added to the main agent's system prompt for a turn that starts in plan mode.
+/// Told to the main agent, as a note, when plan mode turns on (see
+/// `prompt::notes_due`); the system prompt stays as the session began.
 pub const PROMPT_ADDENDUM: &str = r#"<plan_mode>
 You are in plan mode. Only read-only tools run: reading, listing and searching files, read-only shell commands (for example git status/diff/log, ls, cat, grep, find), web search and fetch, and subagents (which are in plan mode too). Edits, writes and other changes are refused until the user approves a plan. If the user asks you to make changes, plan them instead.
 
@@ -22,6 +23,13 @@ Write the plan for scanning, with short sections and tables:
 - **Verification**: the tests and checks that prove it works.
 Keep it decision-complete and concise: whoever executes it must not have to make new decisions. A revised plan replaces the earlier one completely.
 </plan_mode>"#;
+
+/// The note each later user turn in plan mode starts with: the rules above
+/// are told once, when plan mode turns on.
+pub const REMINDER: &str = "Plan mode is still on: only read-only tools run. Finish investigating, then deliver the plan with propose_plan; nothing changes until the user approves it.";
+
+/// The note when plan mode turns off again.
+pub const ENDED_NOTE: &str = "Plan mode is off now. Tools that change files and run commands work again, as the approval mode allows; propose_plan works only in plan mode.";
 
 /// Added to a subagent's context when it starts in plan mode.
 pub const SUBAGENT_NOTE: &str = " Plan mode applies to you too: only read-only tools run. Report your findings to the parent; do not propose a plan.";
@@ -176,6 +184,24 @@ pub fn refusal(name: &str, arguments: &str, mcp_read_only: Option<bool>) -> Opti
         ),
         Change::Tool => format!(
             "plan mode: {name} was not run. You are in plan mode, where only read-only tools run and nothing in the workspace may change. Finish investigating, then call {TOOL_NAME} with your plan; the user approves it before anything is changed."
+        ),
+    })
+}
+
+/// `refusal` for an agent in plan mode that is not offered propose_plan (a
+/// chat session, a subagent): the same rules, and it is told to describe
+/// the change instead of pointing it at a tool it does not have.
+pub fn refusal_without_plan_tool(
+    name: &str,
+    arguments: &str,
+    mcp_read_only: Option<bool>,
+) -> Option<String> {
+    change(name, arguments, mcp_read_only).map(|change| match change {
+        Change::Command(command) => format!(
+            "plan mode: `{command}` was not run because it is not a known read-only command. Only read-only commands run in plan mode (git status/diff/log/show, ls, cat, head, tail, grep, rg, find, wc and similar, optionally piped together). Say in your answer what you would run instead."
+        ),
+        Change::Tool => format!(
+            "plan mode: {name} was not run. The approval mode is plan: only read-only tools run and nothing in the workspace may change. Describe the change in your answer instead."
         ),
     })
 }
@@ -557,6 +583,24 @@ mod tests {
             None
         )
         .is_some());
+    }
+
+    #[test]
+    fn without_propose_plan_the_refusal_does_not_point_to_it() {
+        assert_eq!(refusal_without_plan_tool("read", "{}", None), None);
+        assert_eq!(
+            refusal_without_plan_tool("bash", r#"{"command":"git status"}"#, None),
+            None
+        );
+        for (tool, args) in [
+            ("write", "{}"),
+            ("apply_patch", "{}"),
+            ("bash", r#"{"command":"cargo fmt"}"#),
+        ] {
+            let reason = refusal_without_plan_tool(tool, args, None).expect(tool);
+            assert!(reason.starts_with("plan mode:"), "{reason}");
+            assert!(!reason.contains(TOOL_NAME), "{reason}");
+        }
     }
 
     #[test]

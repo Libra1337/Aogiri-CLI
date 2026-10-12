@@ -139,6 +139,7 @@ pub fn extensions(hub: Arc<Hub>, session: String) -> Option<HostExtensions> {
             }
         }),
         prompt: Arc::new(String::new),
+        context: Arc::new(String::new),
         exclusive: false,
         gate: Arc::new(|name| match name {
             "send_to_session" if Setting::current() == Setting::Ask => HostGate::Ask,

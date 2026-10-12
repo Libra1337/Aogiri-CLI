@@ -101,7 +101,7 @@ fn client_with(system_prompt: String, agents: AgentsConfig) -> OpenAiClient {
         connect_timeout: Duration::from_secs(1),
         read_timeout: Duration::from_secs(1),
         goal_tool_tx: Some(goal_tx),
-        has_goal: false,
+        propose_plan: true,
         approval_tx: None,
         approval_mode: LiveApprovalMode::default(),
         safety_model: None,
@@ -269,8 +269,10 @@ const BASELINE_CODING_TOKENS: usize = 4521;
 /// percent. 60 when the budget was set; 61 since the agent team tools
 /// (roles, merge_agent, plan step owners) added about 160 tokens; 69 since
 /// team v2 (task board, resume_agent, pick_attempt, background and attempts)
-/// added about 360.
-const MAX_PERCENT_OF_BASELINE: usize = 69;
+/// added about 360; 75 since every goal tool and propose_plan are always
+/// offered (about 230), so the tool list, cached with the system prompt,
+/// stays the same for the whole session.
+const MAX_PERCENT_OF_BASELINE: usize = 75;
 
 #[test]
 fn default_coding_request_stays_lean() {
@@ -282,8 +284,9 @@ fn default_coding_request_stays_lean() {
     );
 }
 
-/// The share of the baseline before team v2.
-const V1_PERCENT_OF_BASELINE: usize = 61;
+/// The share of the baseline before team v2, plus the fixed goal and plan
+/// tools (see `MAX_PERCENT_OF_BASELINE`).
+const V1_PERCENT_OF_BASELINE: usize = 67;
 
 /// With `agents.team_v2` off the team is v1's: the first request is smaller
 /// than with v2 and back within the budget it had before v2.

@@ -1,5 +1,5 @@
 //! Extensions a host process adds to an engine: extra tools the host runs
-//! itself and text appended to the system prompt each turn. The daemon uses
+//! itself, text for the system prompt and state it reports as it changes. The daemon uses
 //! this for long-lived agents (their brief, messaging and timers) and for
 //! messages between conversations, without agent-core knowing about either.
 
@@ -35,9 +35,13 @@ pub struct HostExtensions {
     /// Function-tool definitions, in the same shape as the built-in tools.
     pub tools: Vec<Value>,
     pub run_tool: HostToolRunner,
-    /// Appended to the system prompt at the start of every turn, so the
-    /// host can reflect state that changed since the last turn.
+    /// Appended to the system prompt, read before each turn. The session
+    /// keeps its prompt while this text stays the same; a change builds the
+    /// prompt again, one cache miss (see `prompt::SessionPrompt`).
     pub prompt: Arc<dyn Fn() -> String + Send + Sync>,
+    /// The host's current state, read before each turn: when it differs from
+    /// what the model was last told, the model gets it as a note.
+    pub context: Arc<dyn Fn() -> String + Send + Sync>,
     /// The session gets these tools only: no built-in, subagent or MCP
     /// tools (the daemon's dispatcher routes work and must not do it).
     pub exclusive: bool,
@@ -77,7 +81,8 @@ impl HostExtensions {
         );
         let exclusive = self.exclusive || other.exclusive;
         let both = Arc::new((self, other));
-        let (run, prompt, gate, summary) = (
+        let (run, prompt, context, gate, summary) = (
+            Arc::clone(&both),
             Arc::clone(&both),
             Arc::clone(&both),
             Arc::clone(&both),
@@ -90,6 +95,9 @@ impl HostExtensions {
                 (pick(&run, name).run_tool)(name, arguments, stopped)
             }),
             prompt: Arc::new(move || format!("{}{}", (prompt.0.prompt)(), (prompt.1.prompt)())),
+            context: Arc::new(move || {
+                format!("{}{}", (context.0.context)(), (context.1.context)())
+            }),
             gate: Arc::new(move |name| (pick(&gate, name).gate)(name)),
             summary: Arc::new(move |name, arguments| {
                 (pick(&summary, name).summary)(name, arguments)
@@ -120,6 +128,7 @@ mod tests {
                 .collect(),
             run_tool: Arc::new(move |name, _, _| (format!("{said}:{name}"), false)),
             prompt: Arc::new(move || format!("<{said}>")),
+            context: Arc::new(move || format!("[{said}]")),
             exclusive: false,
             gate: Arc::new(move |_| gate),
             summary: Arc::new(move |name, _| format!("{said} {name}")),
@@ -147,5 +156,6 @@ mod tests {
         assert_eq!(merged.gate_of("d"), None);
         assert_eq!((merged.summary)("c", "{}"), "two c");
         assert_eq!((merged.prompt)(), "<one><two>");
+        assert_eq!((merged.context)(), "[one][two]");
     }
 }

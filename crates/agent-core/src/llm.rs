@@ -85,8 +85,9 @@ pub struct OpenAiClient {
     /// `subagent_models`), resolved against the configured model list.
     subagent_models: Vec<SubagentModelSpec>,
     system_prompt: String,
-    /// The main agent's system prompt, for subagents started on its behalf
-    /// (`agents.review_on_complete`).
+    /// The system prompt the main agent's subagents start from (those it
+    /// spawns and those started on its behalf, `agents.review_on_complete`):
+    /// its own, or the one `set_subagent_prompt` gives.
     root_system_prompt: String,
     prompt_cache_key: String,
     mcp: McpManager,
@@ -103,10 +104,8 @@ pub struct OpenAiClient {
     context_budget: u64,
     provider_kind: Protocol,
     goal_tool_tx: Option<Sender<GoalToolRequest>>,
-    /// The session has a goal: which goal tools are offered (see
-    /// `goal_tool_definitions`). Set when create_goal succeeds, so the
-    /// turn's next request already offers get_goal and update_goal.
-    has_goal: std::cell::Cell<bool>,
+    /// Offers propose_plan with the goal tools (see `OpenAiClientConfig`).
+    propose_plan: bool,
     approval_tx: Option<Sender<ApprovalRequest>>,
     /// Which tool classes this client gates on the approval channel: the
     /// session's live mode, so a switch applies to the next call mid-turn.
@@ -184,8 +183,10 @@ pub struct OpenAiClientConfig<'a> {
     pub connect_timeout: Duration,
     pub read_timeout: Duration,
     pub goal_tool_tx: Option<Sender<GoalToolRequest>>,
-    /// The session has a goal when the turn starts.
-    pub has_goal: bool,
+    /// With `goal_tool_tx`: also offer propose_plan, for a coding session
+    /// (a chat session has no plan mode). Fixed per session, as the tools
+    /// must be (see `ToolOffer`).
+    pub propose_plan: bool,
     pub approval_tx: Option<Sender<ApprovalRequest>>,
     pub approval_mode: LiveApprovalMode,
     /// Model the `auto` mode safety classifier runs on (same provider/base_url
@@ -480,8 +481,36 @@ enum ParallelToolMessage {
     },
 }
 
+/// How a request differs from a turn's: a compaction's summary request
+/// asks with less reasoning, and its retry with tools off (see
+/// `OpenAiClient::summarize_conversation`).
+#[derive(Clone, Copy, Default)]
+struct RequestVariant<'a> {
+    /// The reasoning effort instead of the client's.
+    effort: Option<&'a str>,
+    /// No tool may be called: `tool_choice` none where the request keeps its
+    /// tools (Responses, Anthropic Messages), no tools on Chat Completions.
+    tools_off: bool,
+}
+
+/// Sets a request body that keeps its tools to call none of them
+/// (`RequestVariant::tools_off`): `tool_choice` none, in the protocol's form.
+fn forbid_tool_calls(body: &mut Value, protocol: Protocol) {
+    body["tool_choice"] = match protocol {
+        Protocol::AnthropicMessages => json!({ "type": "none" }),
+        _ => json!("none"),
+    };
+}
+
+/// The summarizer's prompt when the conversation goes as plain text, the
+/// last resort of `OpenAiClient::summarize_conversation`.
+const FLAT_SUMMARY_PROMPT: &str = "You compress earlier conversation history so it can replace the raw turns while letting the work continue. Write a dense summary that preserves: the user's goals and explicit requests, decisions made, important facts and constraints discovered, files and tools touched with their outcomes, and any unfinished threads. When the input ends with a list of the files changed in this session, that list is added to your summary as it is: do not copy it, but say what changed in those files where it matters. Prefer tight prose or bullet points. Output only the summary.";
+
 /// What decides the tools a request offers: the host's, MCP servers', the
 /// built-ins this engine has (edit tools, web, images), subagents, goals.
+/// Nothing that changes while a session runs (plan mode, whether it has a
+/// goal): the provider caches the tools with the system prompt, so the list
+/// stays the same, and a call that does not fit the moment fails instead.
 pub(crate) struct ToolOffer<'a> {
     pub host: Option<&'a crate::host::HostExtensions>,
     pub mcp: &'a McpManager,
@@ -489,9 +518,10 @@ pub(crate) struct ToolOffer<'a> {
     pub enabled_edit_tools: &'a [String],
     /// The subagent team this engine works in; None without one.
     pub subagents: Option<SubagentOffer<'a>>,
-    /// The goal tools, with whether a goal is set; None without them.
-    pub goals: Option<bool>,
-    pub plan_mode: bool,
+    /// The goal and plan tools (the main agent's).
+    pub goals: bool,
+    /// With `goals`: propose_plan too (not in a chat session).
+    pub propose_plan: bool,
 }
 
 /// What `spawn_agent` and the team tools offer: the team's config, whether
@@ -582,10 +612,10 @@ pub(crate) fn request_tool_definitions(offer: &ToolOffer<'_>) -> Vec<Value> {
             }
         }
     }
-    if let Some(has_goal) = offer.goals {
-        definitions.extend(goal_tool_definitions(has_goal));
+    if offer.goals {
+        definitions.extend(goal_tool_definitions());
         definitions.push(plan_tool_definition());
-        if offer.plan_mode {
+        if offer.propose_plan {
             definitions.push(crate::plan_mode::propose_plan_definition());
         }
     }
@@ -743,7 +773,7 @@ impl OpenAiClient {
             context_budget: 0,
             provider_kind,
             goal_tool_tx: config.goal_tool_tx,
-            has_goal: std::cell::Cell::new(config.has_goal),
+            propose_plan: config.propose_plan,
             approval_tx: config.approval_tx,
             approval_mode: config.approval_mode,
             enabled_edit_tools: config.edit_tools,
@@ -771,6 +801,14 @@ impl OpenAiClient {
     /// compaction (see [`MID_TURN_COMPACTION`]); 0 turns it off.
     pub fn set_context_budget(&mut self, tokens: u64) {
         self.context_budget = tokens;
+    }
+
+    /// Sets the system prompt the main agent's subagents start from: the
+    /// session's prompt as built from what holds now (date, sandbox). The
+    /// main agent keeps the session's first prompt and is told the changes
+    /// in notes, which a subagent's conversation does not carry.
+    pub fn set_subagent_prompt(&mut self, prompt: String) {
+        self.root_system_prompt = prompt;
     }
 
     pub fn run_turn_events(
@@ -826,19 +864,8 @@ impl OpenAiClient {
             }
             self.append_queued_subagent_messages(input, &mut emit)?;
             emit(StreamEvent::CallStart)?;
-            let output_items = match self.provider_kind {
-                Protocol::OpenAiResponses
-                | Protocol::OpenAiCodexResponses
-                | Protocol::AzureOpenAiResponses => {
-                    self.create_response_streaming(input.clone(), &mut emit)?
-                }
-                Protocol::AnthropicMessages => {
-                    self.create_anthropic_message_streaming(input.clone(), &mut emit)?
-                }
-                Protocol::OpenAiChatCompletions => {
-                    self.create_chat_completion_streaming(input.clone(), &mut emit)?
-                }
-            };
+            let output_items =
+                self.stream_request(input.clone(), RequestVariant::default(), &mut emit)?;
             let mut function_calls = Vec::new();
 
             for item in &output_items {
@@ -1164,7 +1191,15 @@ impl OpenAiClient {
         }
         let read_only_hint = self.mcp.tool_read_only_hint(&request.name);
         if self.approval_mode.get() == ApprovalMode::Plan {
-            crate::plan_mode::refusal(&request.name, &request.arguments, read_only_hint)
+            if self.offers_propose_plan() {
+                crate::plan_mode::refusal(&request.name, &request.arguments, read_only_hint)
+            } else {
+                crate::plan_mode::refusal_without_plan_tool(
+                    &request.name,
+                    &request.arguments,
+                    read_only_hint,
+                )
+            }
         } else if self.read_only {
             crate::plan_mode::read_only_refusal(&request.name, &request.arguments, read_only_hint)
         } else {
@@ -1172,19 +1207,124 @@ impl OpenAiClient {
         }
     }
 
-    /// One-shot summarization used for context compaction. No tools, no thinking;
-    /// returns the summary text. Errors (including empty output) let the caller fall
-    /// back to sending the full context.
-    pub fn summarize_with_progress(
+    /// Whether the tools this agent is offered include propose_plan (see
+    /// `request_tool_definitions`): not in a chat session, a subagent or a
+    /// host's exclusive session.
+    fn offers_propose_plan(&self) -> bool {
+        self.propose_plan
+            && self.goal_tool_tx.is_some()
+            && !self.host.as_ref().is_some_and(|host| host.exclusive)
+    }
+
+    /// Context compaction: the model's summary of the conversation `plan`
+    /// folds. The summary request (`CompactionPlan::summary_request`) is the
+    /// conversation as the session's requests carry it, followed by the
+    /// request for a summary; it is sent as a turn's request is, with this
+    /// client's model, system prompt and tools, so the provider serves the
+    /// conversation from its prompt cache, and with less reasoning
+    /// (`summary_effort`). An answer that calls a tool or has no text is
+    /// not a summary: the request is sent again with tools off. If that
+    /// brings none either, or the summary request fails (it also carries the
+    /// system prompt, the tools and images, so it can be refused as too
+    /// long where the plain text is not), the conversation goes as plain
+    /// text to `summarizer`, the client of compact_model (no tools, no
+    /// cache), as compaction did before it used the cache. Three requests at
+    /// most. Errors let the caller fall back to sending the full context.
+    pub fn summarize_conversation(
         &self,
-        conversation: &str,
+        plan: &crate::session::CompactionPlan,
+        summarizer: &OpenAiClient,
         mut emit_output_tokens: impl FnMut(u64) -> Result<(), String>,
     ) -> Result<String, String> {
-        self.summarize_text(
-            "You compress earlier conversation history so it can replace the raw turns while letting the work continue. Write a dense summary that preserves: the user's goals and explicit requests, decisions made, important facts and constraints discovered, files and tools touched with their outcomes, and any unfinished threads. When the input ends with a list of the files changed in this session, that list is added to your summary as it is: do not copy it, but say what changed in those files where it matters. Prefer tight prose or bullet points. Output only the summary.",
-            &format!("Summarize this earlier conversation:\n\n{conversation}"),
-            &mut emit_output_tokens,
+        let request = plan.summary_request();
+        let variant = RequestVariant {
+            effort: Some(self.summary_effort()),
+            tools_off: false,
+        };
+        match self.summary_answer(request.clone(), variant, &mut emit_output_tokens) {
+            Ok(Some(summary)) => return Ok(summary),
+            Ok(None) => {
+                let tools_off = RequestVariant {
+                    tools_off: true,
+                    ..variant
+                };
+                match self.summary_answer(request, tools_off, &mut emit_output_tokens) {
+                    Ok(Some(summary)) => return Ok(summary),
+                    Ok(None) => {
+                        crate::log_info!("compaction", "the summary request got no summary twice")
+                    }
+                    Err(error) => crate::log_info!(
+                        "compaction",
+                        "the summary request with tools off failed",
+                        error = error
+                    ),
+                }
+            }
+            // Sent again with tools off it would fail the same way.
+            Err(error) => {
+                crate::log_info!("compaction", "the summary request failed", error = error)
+            }
+        }
+        summarizer.summarize_text(
+            FLAT_SUMMARY_PROMPT,
+            &format!(
+                "Summarize this earlier conversation:\n\n{}",
+                plan.folded_text()
+            ),
+            emit_output_tokens,
         )
+    }
+
+    /// The summary in the model's answer to a summary request, trimmed; None
+    /// when the answer has no text or calls a tool: text next to a tool call
+    /// leads up to the call ("I'll read notes.txt first."), it does not
+    /// summarize the conversation.
+    fn summary_answer(
+        &self,
+        request: Vec<Value>,
+        variant: RequestVariant<'_>,
+        emit_output_tokens: &mut impl FnMut(u64) -> Result<(), String>,
+    ) -> Result<Option<String>, String> {
+        let mut output_tokens = 0u64;
+        let mut emit = |event: StreamEvent| {
+            if let StreamEvent::Delta(delta) = event {
+                output_tokens = output_tokens.saturating_add(estimate_text_tokens(&delta));
+                emit_output_tokens(output_tokens)?;
+            }
+            Ok(())
+        };
+        let items = self.stream_request(request, variant, &mut emit)?;
+        if items
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        {
+            return Ok(None);
+        }
+        let summary = items
+            .iter()
+            .map(extract_response_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let summary = summary.trim();
+        Ok((!summary.is_empty()).then(|| summary.to_string()))
+    }
+
+    /// The reasoning effort of a summary request: the model's lowest tier
+    /// that still reasons ("low") where the setting is not part of what the
+    /// provider's prompt cache matches. Anthropic's cache keeps the
+    /// conversation only for requests with the same thinking settings, so a
+    /// Messages request keeps the turns' effort; so does a model that does
+    /// not reason or offers no "low".
+    fn summary_effort(&self) -> &str {
+        let effort = self.reasoning_effort.as_str();
+        let lower = self.provider_kind != Protocol::AnthropicMessages
+            && !matches!(effort, "" | "none")
+            && self.reasoning_efforts.iter().any(|tier| tier == "low");
+        if lower {
+            "low"
+        } else {
+            effort
+        }
     }
 
     pub fn summarize_text(
@@ -1288,23 +1428,50 @@ impl OpenAiClient {
         Ok(summary)
     }
 
+    /// One request on this client's protocol, its output items streamed
+    /// through `emit`; `variant` says how it differs from a turn's.
+    fn stream_request(
+        &self,
+        input: Vec<Value>,
+        variant: RequestVariant<'_>,
+        emit: impl FnMut(StreamEvent) -> Result<(), String>,
+    ) -> Result<Vec<Value>, String> {
+        match self.provider_kind {
+            Protocol::OpenAiResponses
+            | Protocol::OpenAiCodexResponses
+            | Protocol::AzureOpenAiResponses => {
+                self.create_response_streaming(input, variant, emit)
+            }
+            Protocol::AnthropicMessages => {
+                self.create_anthropic_message_streaming(input, variant, emit)
+            }
+            Protocol::OpenAiChatCompletions => {
+                self.create_chat_completion_streaming(input, variant, emit)
+            }
+        }
+    }
+
     /// Body for the one-shot summarization call on the OpenAI Responses path.
     /// Matches the main path's `store: false` and output cap.
     fn create_response_streaming(
         &self,
         input: Vec<Value>,
+        variant: RequestVariant<'_>,
         mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<Vec<Value>, String> {
         let tools = self.tool_definitions();
-        let body = responses::request_body(responses::ResponsesRequest {
+        let mut body = responses::request_body(responses::ResponsesRequest {
             model: &self.model,
             instructions: &self.system_prompt,
             prompt_cache_key: &self.prompt_cache_key,
-            reasoning_effort: &self.reasoning_effort,
+            reasoning_effort: variant.effort.unwrap_or(&self.reasoning_effort),
             input,
             tools: &tools,
             max_output_tokens: self.max_output_tokens,
         });
+        if variant.tools_off {
+            forbid_tool_calls(&mut body, self.provider_kind);
+        }
         let url = transport::endpoint(self.provider_kind, &self.base_url);
         self.transport.stream(
             self.provider_kind,
@@ -1318,18 +1485,23 @@ impl OpenAiClient {
     fn create_anthropic_message_streaming(
         &self,
         input: Vec<Value>,
+        variant: RequestVariant<'_>,
         mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<Vec<Value>, String> {
         let tools = anthropic::tool_definitions(&self.tool_definitions());
-        let body = anthropic::request_body(&anthropic::AnthropicRequest {
+        let mut body = anthropic::request_body(&anthropic::AnthropicRequest {
             model: &self.model,
             system_prompt: &self.system_prompt,
             stable_system_len: crate::prompt::stable_prefix_len(&self.system_prompt),
             input: &input,
             tools: &tools,
             max_output_tokens: self.max_output_tokens,
-            reasoning_effort: &self.reasoning_effort,
+            reasoning_effort: variant.effort.unwrap_or(&self.reasoning_effort),
         });
+        // The tools stay: Messages refuses tool_use blocks without them.
+        if variant.tools_off {
+            forbid_tool_calls(&mut body, Protocol::AnthropicMessages);
+        }
         let url = anthropic::messages_url(&self.base_url);
         self.transport.stream(
             Protocol::AnthropicMessages,
@@ -1343,16 +1515,23 @@ impl OpenAiClient {
     fn create_chat_completion_streaming(
         &self,
         input: Vec<Value>,
+        variant: RequestVariant<'_>,
         mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<Vec<Value>, String> {
-        let tools = self.tool_definitions();
+        // `tool_choice` is left out on this protocol (see
+        // `chat::request_body`): tools off is no tools.
+        let tools = if variant.tools_off {
+            Vec::new()
+        } else {
+            self.tool_definitions()
+        };
         let body = chat::request_body(&chat::ChatRequest {
             model: &self.model,
             system_prompt: &self.system_prompt,
             input: &input,
             tools: &tools,
             max_output_tokens: self.max_output_tokens,
-            reasoning_effort: &self.reasoning_effort,
+            reasoning_effort: variant.effort.unwrap_or(&self.reasoning_effort),
         });
         let url = chat::completions_url(&self.base_url);
         self.transport.stream(
@@ -1407,8 +1586,8 @@ impl OpenAiClient {
                 models: self.subagent_models.as_slice(),
                 roles: self.roles.as_slice(),
             }),
-            goals: self.goal_tool_tx.is_some().then(|| self.has_goal.get()),
-            plan_mode: self.approval_mode.get() == ApprovalMode::Plan,
+            goals: self.goal_tool_tx.is_some(),
+            propose_plan: self.propose_plan,
         })
     }
 
@@ -1916,7 +2095,11 @@ impl OpenAiClient {
             timeout: settings.timeout,
             read_only: settings.read_only,
             depth: self.agent_depth.saturating_add(1),
-            base_prompt: self.system_prompt.clone(),
+            base_prompt: if self.agent_depth == 0 {
+                self.root_system_prompt.clone()
+            } else {
+                self.system_prompt.clone()
+            },
             role: settings
                 .role
                 .filter(|role| !role.instructions.is_empty())
@@ -1979,7 +2162,7 @@ impl OpenAiClient {
             // Claude uses Anthropic Messages, the rest Responses).
             provider_kind: spec.protocol,
             goal_tool_tx: None,
-            has_goal: false.into(),
+            propose_plan: false,
             // The child shares the parent's approval channel and live mode.
             approval_tx: self.approval_tx.clone(),
             approval_mode: self.approval_mode.clone(),
@@ -2463,9 +2646,6 @@ impl OpenAiClient {
             output: json!({ "error": error.to_string() }).to_string(),
             is_error: true,
         });
-        if name == "create_goal" && !response.is_error {
-            self.has_goal.set(true);
-        }
         Some(tools::ToolExecutionResult {
             model_output: response.output.clone(),
             output: response.output,
@@ -2730,24 +2910,23 @@ impl OpenAiClient {
 
 /// The most recent user message's text, passed to the safety classifier as
 /// authorization evidence. Content may be a plain string or a parts array.
+/// The engine's notes (`prompt::NOTE_OPEN`) are not the user's words.
 fn last_user_text(input: &[Value]) -> Option<String> {
     for item in input.iter().rev() {
         if item.get("role").and_then(Value::as_str) != Some("user") {
             continue;
         }
-        match item.get("content") {
-            Some(Value::String(text)) => return Some(text.clone()),
-            Some(Value::Array(parts)) => {
-                let text = parts
-                    .iter()
-                    .filter_map(|part| part.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if !text.is_empty() {
-                    return Some(text);
-                }
-            }
-            _ => {}
+        let text = match item.get("content") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => continue,
+        };
+        if !text.is_empty() && !text.starts_with(crate::prompt::NOTE_OPEN) {
+            return Some(text);
         }
     }
     None
@@ -3582,7 +3761,8 @@ fn build_subagent_input(
             let mut seen = 0usize;
             let mut start = 0usize;
             for (index, item) in filtered.iter().enumerate().rev() {
-                if item.get("role").and_then(Value::as_str) == Some("user") {
+                // The engine's notes are user messages but no turn.
+                if item.get("role").and_then(Value::as_str) == Some("user") && !is_note(item) {
                     seen += 1;
                     if seen == turns {
                         start = index;
@@ -3601,6 +3781,19 @@ fn build_subagent_input(
         }]
     }));
     Ok(forked)
+}
+
+/// Whether `item` is one of the engine's notes (`prompt::NOTE_OPEN`).
+fn is_note(item: &Value) -> bool {
+    match item.get("content") {
+        Some(Value::String(text)) => text.starts_with(crate::prompt::NOTE_OPEN),
+        Some(Value::Array(parts)) => parts
+            .first()
+            .and_then(|part| part.get("text"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.starts_with(crate::prompt::NOTE_OPEN)),
+        _ => false,
+    }
 }
 
 fn validate_fork_turns(fork_turns: &str) -> Result<(), String> {
@@ -3635,11 +3828,10 @@ fn filter_pending_subagent_items(
         .collect()
 }
 
-/// The goal tools for a session with or without a goal: create_goal only
-/// without one (it fails once a goal exists), get_goal and update_goal only
-/// with one. A goal created mid-turn switches them from the next request.
-fn goal_tool_definitions(has_goal: bool) -> Vec<Value> {
-    let [get, create, update] = [
+/// The goal tools, offered whether or not the session has a goal (see
+/// `ToolOffer`): create_goal fails once one exists, update_goal without one.
+fn goal_tool_definitions() -> Vec<Value> {
+    vec![
         json!({
             "type": "function",
             "name": "get_goal",
@@ -3652,7 +3844,7 @@ fn goal_tool_definitions(has_goal: bool) -> Vec<Value> {
         json!({
             "type": "function",
             "name": "create_goal",
-            "description": "Set the session goal, only when the user asks for one.",
+            "description": "Set the session goal, only when the user asks for one and the session has none.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3665,7 +3857,7 @@ fn goal_tool_definitions(has_goal: bool) -> Vec<Value> {
         json!({
             "type": "function",
             "name": "update_goal",
-            "description": "Mark the goal complete (all required work done) or blocked (progress cannot continue).",
+            "description": "Mark the session goal complete (all required work done) or blocked (progress cannot continue).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3674,12 +3866,7 @@ fn goal_tool_definitions(has_goal: bool) -> Vec<Value> {
                 "required": ["status"]
             }
         }),
-    ];
-    if has_goal {
-        vec![get, update]
-    } else {
-        vec![create]
-    }
+    ]
 }
 
 fn plan_tool_definition() -> Value {
@@ -4001,6 +4188,27 @@ mod tests {
         assert!(!forked.iter().any(|item| item["call_id"] == "pending_1"));
     }
 
+    #[test]
+    fn fork_turns_does_not_count_notes_as_turns() {
+        let user = |text: &str| json!({ "role": "user", "content": [{ "type": "input_text", "text": text }] });
+        let input = vec![
+            user("first task"),
+            json!({ "type": "message", "content": [{ "type": "output_text", "text": "first answer" }] }),
+            user("<system-reminder>\nThe date is now 2026-10-13.\n</system-reminder>"),
+            user("<system-reminder>\nPlan mode is still on.\n</system-reminder>"),
+            user("second task"),
+        ];
+
+        let forked =
+            build_subagent_input(&input, &HashSet::new(), "2", "/root/child", "inspect").unwrap();
+
+        assert_eq!(forked.len(), 6);
+        assert_eq!(
+            response_content_text(&forked[0], "input_text"),
+            "first task"
+        );
+    }
+
     fn test_client() -> OpenAiClient {
         OpenAiClient::from_config(test_client_config()).unwrap()
     }
@@ -4024,7 +4232,7 @@ mod tests {
             connect_timeout: Duration::from_secs(1),
             read_timeout: Duration::from_secs(1),
             goal_tool_tx: None,
-            has_goal: false,
+            propose_plan: false,
             approval_tx: None,
             approval_mode: LiveApprovalMode::default(),
             safety_model: None,
@@ -4093,10 +4301,11 @@ mod tests {
     }
 
     #[test]
-    fn a_goal_created_mid_turn_gets_its_tools_on_the_next_request() {
+    fn the_tools_stay_the_same_through_goal_and_plan_mode_changes() {
         let mut config = test_client_config();
         let (goal_tx, goal_rx) = mpsc::channel::<GoalToolRequest>();
         config.goal_tool_tx = Some(goal_tx);
+        config.propose_plan = true;
         let handler = std::thread::spawn(move || {
             let request = goal_rx.recv().unwrap();
             let _ = request.response_tx.send(ToolGoalResponse {
@@ -4105,45 +4314,119 @@ mod tests {
             });
         });
         let client = OpenAiClient::from_config(config).unwrap();
-        let goal_names = || {
-            client
-                .tool_definitions()
-                .into_iter()
-                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
-                .filter(|name| name.contains("goal"))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(goal_names(), ["create_goal"]);
+        let tools = client.tool_definitions();
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .filter(|name| name.contains("goal") || name.contains("plan"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "get_goal",
+                "create_goal",
+                "update_goal",
+                "update_plan",
+                "propose_plan"
+            ]
+        );
         let result = client
             .run_goal_tool("create_goal", r#"{"objective":"ship it"}"#)
             .unwrap();
         assert!(!result.is_error);
         handler.join().unwrap();
-        assert_eq!(goal_names(), ["get_goal", "update_goal"]);
-    }
-
-    #[test]
-    fn goal_tools_follow_whether_the_session_has_a_goal() {
-        let names = |has_goal: bool| {
-            let mut config = test_client_config();
-            let (goal_tx, _goal_rx) = mpsc::channel();
-            config.goal_tool_tx = Some(goal_tx);
-            config.has_goal = has_goal;
-            OpenAiClient::from_config(config)
-                .unwrap()
-                .tool_definitions()
-                .into_iter()
-                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
-                .filter(|name| name.contains("goal") || name == "update_plan")
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(names(false), ["create_goal", "update_plan"]);
-        assert_eq!(names(true), ["get_goal", "update_goal", "update_plan"]);
+        client.approval_mode.set(ApprovalMode::Plan);
+        assert_eq!(client.tool_definitions(), tools);
         // A client without the goal channel (a subagent) offers none.
         assert!(!test_client()
             .tool_definitions()
             .iter()
             .any(|tool| tool["name"].as_str().unwrap().contains("goal")));
+    }
+
+    #[test]
+    fn a_chat_session_is_not_offered_propose_plan() {
+        let mut config = test_client_config();
+        let (goal_tx, _goal_rx) = mpsc::channel::<GoalToolRequest>();
+        config.goal_tool_tx = Some(goal_tx);
+        // What core passes for a chat session.
+        config.propose_plan = false;
+        let client = OpenAiClient::from_config(config).unwrap();
+        let names = client.offered_tool_names();
+        assert!(names.iter().any(|name| name == "update_plan"), "{names:?}");
+        assert!(
+            !names.iter().any(|name| name == "propose_plan"),
+            "{names:?}"
+        );
+        // Plan mode does not bring it in: the list stays the session's.
+        client.approval_mode.set(ApprovalMode::Plan);
+        assert_eq!(client.offered_tool_names(), names);
+    }
+
+    #[test]
+    fn a_retried_summary_request_keeps_its_tools_but_may_call_none() {
+        let tools = vec![json!({ "type": "function", "name": "read", "parameters": {} })];
+        let mut responses = responses::request_body(responses::ResponsesRequest {
+            model: "m",
+            instructions: "system",
+            prompt_cache_key: "k",
+            reasoning_effort: "low",
+            input: Vec::new(),
+            tools: &tools,
+            max_output_tokens: 0,
+        });
+        assert_eq!(responses["tool_choice"], "auto");
+        forbid_tool_calls(&mut responses, Protocol::OpenAiResponses);
+        assert_eq!(responses["tool_choice"], "none");
+        assert_eq!(responses["tools"].as_array().map(Vec::len), Some(1));
+
+        let anthropic_tools = anthropic::tool_definitions(&tools);
+        let mut messages = anthropic::request_body(&anthropic::AnthropicRequest {
+            model: "claude-sonnet-4-5",
+            system_prompt: "system",
+            stable_system_len: None,
+            input: &[],
+            tools: &anthropic_tools,
+            max_output_tokens: 0,
+            reasoning_effort: "none",
+        });
+        assert_eq!(messages["tool_choice"], json!({ "type": "auto" }));
+        forbid_tool_calls(&mut messages, Protocol::AnthropicMessages);
+        assert_eq!(messages["tool_choice"], json!({ "type": "none" }));
+        assert_eq!(messages["tools"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn a_summary_request_reasons_less_where_the_cache_allows() {
+        let client_with = |protocol: Protocol, effort: &str, tiers: &[&str]| {
+            let mut client = test_client();
+            client.provider_kind = protocol;
+            client.reasoning_effort = effort.to_string();
+            client.reasoning_efforts = tiers.iter().map(|tier| tier.to_string()).collect();
+            client
+        };
+        let tiers = ["none", "low", "medium", "high"];
+        for protocol in [Protocol::OpenAiResponses, Protocol::OpenAiChatCompletions] {
+            assert_eq!(
+                client_with(protocol, "high", &tiers).summary_effort(),
+                "low"
+            );
+            // A model that does not reason, or has no "low", keeps its setting.
+            assert_eq!(
+                client_with(protocol, "none", &tiers).summary_effort(),
+                "none"
+            );
+            assert_eq!(client_with(protocol, "", &[]).summary_effort(), "");
+            assert_eq!(
+                client_with(protocol, "high", &["none", "high"]).summary_effort(),
+                "high"
+            );
+        }
+        // Anthropic caches the conversation per thinking setting.
+        assert_eq!(
+            client_with(Protocol::AnthropicMessages, "high", &tiers).summary_effort(),
+            "high"
+        );
     }
 
     #[test]
@@ -5385,6 +5668,7 @@ mod tests {
             json!({ "role": "user", "content": [{ "type": "input_text", "text": "first" }] }),
             json!({ "role": "assistant", "content": [{ "type": "output_text", "text": "ok" }] }),
             json!({ "role": "user", "content": "latest" }),
+            json!({ "role": "user", "content": [{ "type": "input_text", "text": "<system-reminder>\nThe date is now 2026-10-13.\n</system-reminder>" }] }),
         ];
         assert_eq!(last_user_text(&input).as_deref(), Some("latest"));
         assert_eq!(last_user_text(&[]), None);

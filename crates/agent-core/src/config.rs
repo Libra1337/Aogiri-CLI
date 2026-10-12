@@ -275,6 +275,11 @@ pub struct Config {
     pub protocol: String,
     pub model: String,
     pub reasoning_effort: String,
+    /// Model of the idle session summary (and the safety classifier's
+    /// default). Context compaction asks `model` first: its request starts
+    /// as the turns' do, so the provider serves it from the prompt cache.
+    /// When that brings no summary, this model summarizes the conversation
+    /// as plain text.
     pub compact_model: String,
     pub compact_reasoning_effort: String,
     /// Model used by the `auto` approval mode's safety classifier. Absent or
@@ -862,7 +867,7 @@ impl Config {
         self.model_config(&self.compact().0)
     }
 
-    /// Compaction model and effort. A provider switch rewrites `model` and
+    /// `compact_model` and its effort. A provider switch rewrites `model` and
     /// `models` but leaves `compact_model` naming the previous provider's
     /// model, which the new endpoint rejects; fall back to the chat model.
     pub fn compact(&self) -> (String, String) {
