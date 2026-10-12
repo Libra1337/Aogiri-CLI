@@ -35,8 +35,9 @@ pub struct HostExtensions {
     /// Function-tool definitions, in the same shape as the built-in tools.
     pub tools: Vec<Value>,
     pub run_tool: HostToolRunner,
-    /// Appended to the system prompt when the session's first turn starts;
-    /// the prompt then stays as it is (see `prompt::SessionPrompt`).
+    /// Appended to the system prompt, read before each turn. The session
+    /// keeps its prompt while this text stays the same; a change builds the
+    /// prompt again, one cache miss (see `prompt::SessionPrompt`).
     pub prompt: Arc<dyn Fn() -> String + Send + Sync>,
     /// The host's current state, read before each turn: when it differs from
     /// what the model was last told, the model gets it as a note.

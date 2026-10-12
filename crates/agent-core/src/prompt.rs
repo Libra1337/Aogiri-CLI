@@ -45,8 +45,9 @@ pub struct PromptContext {
     pub chat: bool,
     /// The shell sandbox's note; empty without a sandbox.
     pub sandbox: String,
-    /// The host's lasting text (a daemon agent's brief and peers); empty
-    /// without a host. What changes while the session runs is a note.
+    /// The host's text (a daemon agent's brief and peers); empty without a
+    /// host. When it changes the kept prompt is built again; the host's
+    /// state (the dispatcher's tasks) is a note instead.
     pub host: String,
 }
 
@@ -84,9 +85,9 @@ pub(crate) fn stable_prefix_len(system_prompt: &str) -> Option<usize> {
 /// sessions comes first, so providers can reuse the cached prefix. Base
 /// prompt and tool guidance (fixed per config), project instructions and
 /// skills (fixed per project), the sandbox note, the working directory and
-/// the date, then the host's lasting text. A session keeps the prompt its
-/// first turn built (`SessionPrompt`); what changes later (plan mode, the
-/// date, the sandbox, the host's state) reaches the model as a note (`Note`).
+/// the date, then the host's text. A session keeps the prompt its first turn
+/// built (`SessionPrompt`); what changes later (plan mode, the date, the
+/// sandbox, the host's state) reaches the model as a note (`Note`).
 #[cfg(test)]
 pub fn build_system_prompt(base: &str, context: &PromptContext) -> String {
     let mut prompt = runtime_prompt(base, context);
@@ -147,7 +148,7 @@ pub fn skills_section(skills: &[SkillPromptItem]) -> String {
 }
 
 /// What follows the skills: the sandbox note, the working directory and the
-/// date, and the host's lasting text.
+/// date, and the host's text.
 pub fn tail_section(context: &PromptContext) -> String {
     let mut tail = String::new();
     if !context.sandbox.trim().is_empty() {
@@ -170,8 +171,9 @@ pub fn tail_section(context: &PromptContext) -> String {
 /// and kept while what it is built from stays the same, across reopening: a
 /// provider reuses its prompt cache only for a byte-identical prefix. The
 /// date and the sandbox change it by a note instead (see `notes_due`); a
-/// change to the base prompt, the edit tools, the project's instructions or
-/// the skills makes the session take the prompt built now (`outdated_by`).
+/// change to the base prompt, the edit tools, the project's instructions,
+/// the skills or the host's text makes the session take the prompt built now
+/// (`outdated_by`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionPrompt {
     /// The base prompt with its tool guidance (`runtime_prompt`).
@@ -183,6 +185,8 @@ pub struct SessionPrompt {
     pub date: String,
     /// The sandbox note `tail` gives; empty without a sandbox.
     pub sandbox: String,
+    /// The host's text `tail` ends with; empty without a host.
+    pub host: String,
 }
 
 impl SessionPrompt {
@@ -192,13 +196,16 @@ impl SessionPrompt {
 
     /// Whether `now`, the prompt a turn would build now, was built from
     /// other inputs than this one: another base prompt (prompt.txt, a new
-    /// version), edit tools, project instructions or skills (a trust
-    /// decision). The tail is left out: its date and sandbox note reach the
-    /// model as notes, the working directory is the session's and the host's
-    /// lasting text is fixed when the prompt is built (the host's state is a
-    /// note too).
+    /// version), edit tools, project instructions, skills (a trust
+    /// decision) or host text (a daemon agent's brief, handoffs and peers:
+    /// the model saw them current every turn before the prompt was kept).
+    /// The rest of the tail is left out: its date and sandbox note reach the
+    /// model as notes, and the working directory is the session's.
     pub fn outdated_by(&self, now: &SessionPrompt) -> bool {
-        self.head != now.head || self.project != now.project || self.skills != now.skills
+        self.head != now.head
+            || self.project != now.project
+            || self.skills != now.skills
+            || self.host != now.host
     }
 
     pub fn to_json(&self) -> Value {
@@ -209,6 +216,7 @@ impl SessionPrompt {
             "tail": self.tail,
             "date": self.date,
             "sandbox": self.sandbox,
+            "host": self.host,
         })
     }
 
@@ -221,6 +229,9 @@ impl SessionPrompt {
             tail: field("tail")?,
             date: field("date")?,
             sandbox: field("sandbox")?,
+            // Saved before it was kept: a host's session builds its prompt
+            // again once.
+            host: field("host").unwrap_or_default(),
         })
     }
 }
@@ -1146,6 +1157,7 @@ mod tests {
             tail: "\n\n<env>\nDate: 2026-10-12\n</env>".to_string(),
             date: "2026-10-12".to_string(),
             sandbox: String::new(),
+            host: "<agent id=\"ops\">".to_string(),
         };
         assert_eq!(
             SessionPrompt::from_json(&prompt.to_json()),
@@ -1167,11 +1179,12 @@ mod tests {
             tail: tail_section(context),
             date: context.date.clone(),
             sandbox: context.sandbox.clone(),
+            host: context.host.clone(),
         }
     }
 
     #[test]
-    fn a_kept_prompt_is_outdated_by_new_instructions_tools_or_skills_only() {
+    fn a_kept_prompt_is_outdated_by_new_instructions_tools_skills_or_host_text_only() {
         let context = PromptContext {
             date: "2026-10-12".to_string(),
             cwd: PathBuf::from("/work"),
@@ -1181,7 +1194,7 @@ mod tests {
                 content: "Run the tests.".to_string(),
             }],
             sandbox: "<sandbox mode=\"workspace-write\">\nnote\n</sandbox>".to_string(),
-            host: "Peers: ops (busy)".to_string(),
+            host: "<state>waiting on CI</state>".to_string(),
             ..PromptContext::default()
         };
         let kept = session_prompt("Base.", &context);
@@ -1189,12 +1202,12 @@ mod tests {
         let later = PromptContext {
             date: "2026-10-13".to_string(),
             sandbox: "<sandbox mode=\"read-only\">\nnote\n</sandbox>".to_string(),
-            host: "Peers: ops (idle)".to_string(),
             ..context.clone()
         };
         assert!(!kept.outdated_by(&session_prompt("Base.", &later)));
         // prompt.txt or a new version's prompt, AGENTS.md, the edit tools,
-        // the skills (a trust decision) each take the prompt built now.
+        // the skills (a trust decision), the host's text (an agent's brief)
+        // each take the prompt built now.
         let edited = PromptContext {
             project_instructions: vec![ProjectInstruction {
                 path: PathBuf::from("/work/AGENTS.md"),
@@ -1214,11 +1227,16 @@ mod tests {
             }],
             ..later.clone()
         };
+        let briefed = PromptContext {
+            host: "<state>CI green</state>".to_string(),
+            ..later.clone()
+        };
         for (base, context) in [
             ("New base.", &later),
             ("Base.", &edited),
             ("Base.", &no_write),
             ("Base.", &trusted),
+            ("Base.", &briefed),
         ] {
             assert!(kept.outdated_by(&session_prompt(base, context)), "{base}");
         }

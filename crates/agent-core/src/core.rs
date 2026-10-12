@@ -2407,6 +2407,7 @@ impl AgentCore {
                 tail: crate::prompt::tail_section(&context),
                 date: context.date,
                 sandbox: context.sandbox,
+                host: context.host,
             },
             project_files,
             extra_read_roots,

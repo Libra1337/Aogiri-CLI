@@ -278,6 +278,59 @@ fn the_host_state_reaches_the_model_as_a_note_when_it_changes() {
     );
 }
 
+#[test]
+fn a_changed_host_text_builds_the_system_prompt_again() {
+    let _guard = setup();
+    let dir = temp_dir("host-prompt");
+    let brief = Arc::new(Mutex::new("<state>v1</state>".to_string()));
+    let host = |brief: &Arc<Mutex<String>>| {
+        let read = Arc::clone(brief);
+        HostExtensions {
+            tools: Vec::new(),
+            run_tool: Arc::new(|_, _, _| (String::new(), true)),
+            prompt: Arc::new(move || read.lock().unwrap().clone()),
+            context: Arc::new(String::new),
+            exclusive: false,
+            gate: Arc::new(|_| HostGate::Run),
+            summary: Arc::new(|_, _| String::new()),
+        }
+    };
+    let mut core = AgentCore::open(dir.clone()).unwrap();
+    core.set_approval_mode(ApprovalMode::FullAccess);
+    core.set_host_extensions(host(&brief));
+    let turn = |core: &mut AgentCore, message: &str| {
+        core.submit_user_message(message.to_string());
+        pump(core);
+        last_request()
+    };
+    let first = turn(&mut core, "first");
+    assert!(first.system_text().ends_with("<state>v1</state>"));
+    // Nothing changed: the same prefix.
+    let second = turn(&mut core, "second");
+    assert_eq!(second.system, first.system);
+    assert_eq!(second.messages[..first.messages.len()], first.messages[..]);
+
+    // The agent's brief changed between turns (its `brief` tool, say).
+    *brief.lock().unwrap() = "<state>v2</state>".to_string();
+    let third = turn(&mut core, "third");
+    assert!(third.system_text().ends_with("<state>v2</state>"));
+    assert_eq!(third.messages[..second.messages.len()], second.messages[..]);
+    assert!(third.notes().is_empty());
+    assert_eq!(turn(&mut core, "fourth").system, third.system);
+
+    // A reopened session takes the host's text as it is now.
+    let session = core.session_id().to_string();
+    drop(core);
+    *brief.lock().unwrap() = "<state>v3</state>".to_string();
+    let mut core = AgentCore::open(dir.clone()).unwrap();
+    core.set_approval_mode(ApprovalMode::FullAccess);
+    core.set_host_extensions(host(&brief));
+    core.handle_command(&format!("/resume {session}"));
+    assert!(turn(&mut core, "reopened")
+        .system_text()
+        .ends_with("<state>v3</state>"));
+}
+
 fn sandbox(mode: SandboxMode) -> Option<SandboxPolicy> {
     Some(SandboxPolicy {
         mode,
