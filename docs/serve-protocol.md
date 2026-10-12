@@ -155,13 +155,26 @@ not cover it; `list` and `create` never ask.
 {"op":"steer"}
 ```
 
-Sends the next queued message into the in-flight turn: the model reads it
-before its next request (once the current tool calls finish), and running
-tools and subagents keep going. Emits `status:"steering"` and the updated
-`pending_messages`; when the model reads it, a `user_message` event (it is
-saved as the user's message). If the turn ends before reading it, it runs as
-the next turn. A queued message with images still stops the turn and starts
-a new one with it. No-op when idle or when the queue is empty.
+Sends the next queued message into the in-flight turn; running tools and
+subagents keep going. Emits `status:"steering"` and the updated
+`pending_messages`.
+
+- While the model's response streams (reasoning, text, or tool-call
+  arguments with no tool running yet), the response is cut off as soon as
+  the next piece of it arrives and nothing of it is kept: not in the
+  conversation the model sees, not in the saved transcript. Emits
+  `response_interrupted`, then a `user_message` event for the message, and
+  a new request (`connecting`, ...) with the message after the
+  conversation so far. A tool call in the cut response never runs. (The
+  transport hands over tool-call arguments only once the response is whole:
+  a response that was writing tool calls is dropped when it ends, before
+  any of them runs.)
+- While tools run, the message waits for them (`status:"steering"` stays
+  until its `user_message` event); the next request carries it.
+
+If the turn ends before reading it, it runs as the next turn. A queued
+message with images still stops the turn and starts a new one with it.
+No-op when idle or when the queue is empty.
 
 ### `unqueue`
 
@@ -400,6 +413,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `reasoning_delta` | `delta` | Reasoning text chunk. |
 | `assistant_start` | — | Assistant reply begins. |
 | `assistant_delta` | `delta` | Reply text chunk. |
+| `response_interrupted` | — | The model response being streamed (its reasoning, text and tool-call arguments so far) was cut off for a steered message (see `steer`) and is not kept. Mark what streamed of it as interrupted; the turn goes on, and the next `reasoning_delta`/`assistant_delta` belong to a new response. |
 | `retrying` | `attempt` | The request is being retried after a transient failure. |
 | `tool_start` | `call_id`, `name` | Tool call begins. |
 | `tool_update` | `call_id`, `name`, `output` | Intermediate tool progress (e.g. long-running bash). |
@@ -742,6 +756,21 @@ Interrupt:
 < {"type":"status","message":"interrupted"}
 ```
 
+Steer while the model reasons:
+
+```jsonl
+< {"type":"reasoning_delta","delta":"..."}
+> {"op":"user_message","content":"use the staging database"}
+< {"type":"pending_messages","messages":["use the staging database"]}
+> {"op":"steer"}
+< {"type":"status","message":"steering"}
+< {"type":"pending_messages","messages":[]}
+< {"type":"response_interrupted"}
+< {"type":"user_message","content":"use the staging database"}
+< {"type":"connecting"}
+< {"type":"reasoning_delta","delta":"..."}   // the new response
+```
+
 ## Mapping to UI
 
 Suggested rendering (as used by LynShen Desktop):
@@ -749,6 +778,7 @@ Suggested rendering (as used by LynShen Desktop):
 | Events | UI |
 | --- | --- |
 | `assistant_start` / `assistant_delta` | streaming message bubble |
+| `response_interrupted` | mark the streaming bubble and thinking section interrupted; later deltas start new ones |
 | `thinking_start` / `reasoning_delta` | collapsible thinking section |
 | `tool_start` / `tool_update` / `tool_output` | tool cards keyed by `call_id` |
 | `approval_request` | approval dialog → `approve` op |

@@ -297,6 +297,11 @@ pub struct ToolGoalResponse {
 pub const MID_TURN_COMPACTION: &str =
     "context_length_exceeded: the conversation passed the compaction threshold mid-turn";
 
+/// How the main agent's stream is stopped when the user steers a message in
+/// (see `OpenAiClient::stream_turn_request`); never shown. Nothing in it may
+/// read as a transient stream error, which the transport would retry.
+const STEER_CUT: &str = "steer: the response was cut off for a message from the user";
+
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// HTTP request is being sent; the connection is being established.
@@ -337,6 +342,10 @@ pub enum StreamEvent {
     },
     /// A user message steered into the running turn reached the model.
     Steered(String),
+    /// The response being streamed was cut off for a steered message: none
+    /// of it is kept (what streamed was only shown), and the next request
+    /// carries the message.
+    ResponseInterrupted,
     /// A fragment of a tool call's arguments while the model writes it.
     ToolArgumentsDelta {
         call_id: String,
@@ -864,8 +873,11 @@ impl OpenAiClient {
             }
             self.append_queued_subagent_messages(input, &mut emit)?;
             emit(StreamEvent::CallStart)?;
-            let output_items =
-                self.stream_request(input.clone(), RequestVariant::default(), &mut emit)?;
+            let Some(output_items) = self.stream_turn_request(input, &mut emit)? else {
+                // The next request carries the steered message.
+                emit(StreamEvent::ResponseInterrupted)?;
+                continue;
+            };
             let mut function_calls = Vec::new();
 
             for item in &output_items {
@@ -1178,6 +1190,62 @@ impl OpenAiClient {
                 return Err(error);
             }
         }
+    }
+
+    /// Sends a turn's next request. The main agent's response is cut off
+    /// when the user steers a message in while it streams
+    /// (`SubagentManager::steer_main`): None then. Nothing of it is kept: its
+    /// reasoning and text were only shown, its items and tool-call arguments
+    /// (which the transport hands over once the response is whole) are not
+    /// passed on. A response whose tool calls are whole is dropped too when
+    /// a message came in before they run; once tools run, the message waits
+    /// for them.
+    fn stream_turn_request(
+        &self,
+        input: &[Value],
+        emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
+    ) -> Result<Option<Vec<Value>>, String> {
+        let request = input.to_vec();
+        let Some(manager) = self
+            .subagent_manager
+            .as_ref()
+            .filter(|_| self.agent_depth == 0)
+        else {
+            return self
+                .stream_request(request, RequestVariant::default(), emit)
+                .map(Some);
+        };
+        let mut cut = false;
+        let mut held = Vec::new();
+        let result = self.stream_request(request, RequestVariant::default(), &mut |event| {
+            if manager.steer_waiting() {
+                cut = true;
+                return Err(STEER_CUT.to_string());
+            }
+            match event {
+                // Passed on once it is clear the response stays.
+                StreamEvent::ResponseItem(_) | StreamEvent::ToolArgumentsDelta { .. } => {
+                    held.push(event);
+                    Ok(())
+                }
+                event => emit(event),
+            }
+        });
+        let items = match result {
+            Ok(items) => items,
+            Err(_) if cut => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let calls_tools = items
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call"));
+        if calls_tools && manager.steer_waiting() {
+            return Ok(None);
+        }
+        for event in held {
+            emit(event)?;
+        }
+        Ok(Some(items))
     }
 
     /// Why plan mode or a read-only role refuses this call; None when it

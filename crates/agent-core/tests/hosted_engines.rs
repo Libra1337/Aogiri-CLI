@@ -9,7 +9,7 @@
 #[path = "support/fake_model.rs"]
 mod fake_model;
 
-use fake_model::{setup, temp_dir};
+use fake_model::{requests, setup, temp_dir};
 use lynshen_agent_core::{AgentCore, AgentEvent, ApprovalMode};
 use std::{
     env, fs,
@@ -823,6 +823,116 @@ fn a_steered_message_joins_the_running_turn_without_stopping_its_tool() {
         .filter(|e| matches!(e, AgentEvent::Status(s) if s == "ready"))
         .count();
     assert_eq!(turns, 1, "one turn, not a restart");
+    // It waited for the tool, as `steering` said: no response was cut off.
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Status(s) if s == "steering")));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ResponseInterrupted)));
+}
+
+/// The text of a chat-completions message.
+fn message_text(message: &serde_json::Value) -> String {
+    match &message["content"] {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// The two requests from `start` on: the one a steer cut off and the one
+/// sent after it. The second is the first one and the steered message,
+/// nothing of the cut response in between: the prefix stays the same.
+fn cut_and_next(start: usize, steered: &str) -> serde_json::Value {
+    let sent = requests()[start..].to_vec();
+    assert_eq!(sent.len(), 2, "{sent:#?}");
+    let (cut, next) = (&sent[0], &sent[1]);
+    let before = cut["messages"].as_array().unwrap();
+    let after = next["messages"].as_array().unwrap();
+    assert_eq!(after.len(), before.len() + 1, "{next:#}");
+    assert_eq!(after[..before.len()], before[..]);
+    assert_eq!(next["tools"], cut["tools"]);
+    assert_eq!(after.last().unwrap()["role"], "user");
+    assert_eq!(message_text(after.last().unwrap()), steered);
+    next.clone()
+}
+
+#[test]
+fn a_steered_message_cuts_off_the_response_being_streamed() {
+    let _guard = setup();
+    let dir = temp_dir("steer-cut");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    let start = requests().len();
+    // 200 reasoning chunks 50 ms apart: ten seconds of streaming.
+    core.submit_user_message("SLOW_REASONING 200".to_string());
+    let mut events = pump(&mut core, |e| matches!(e, AgentEvent::ReasoningDelta(_)));
+    core.submit_user_message("do this instead".to_string());
+    let steered_at = Instant::now();
+    events.extend(core.steer());
+    let cut = pump(&mut core, |e| matches!(e, AgentEvent::ResponseInterrupted));
+    let waited = steered_at.elapsed();
+    assert!(waited < Duration::from_secs(3), "cut after {waited:?}");
+    let done = cut.iter().any(is_ready);
+    events.extend(cut);
+    if !done {
+        events.extend(pump(&mut core, is_ready));
+    }
+
+    // The same turn goes on with the message, which the model answers.
+    let turns = events.iter().filter(|e| is_ready(e)).count();
+    assert_eq!(turns, 1);
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::UserMessage(m) if m == "do this instead")));
+    assert!(assistant_text(&events).ends_with("user said: do this instead"));
+    assert!(!assistant_text(&events).contains("done thinking"));
+    // The next request has none of the reasoning that streamed.
+    let next = cut_and_next(start, "do this instead");
+    assert!(!next.to_string().contains("thinking 1 "), "{next:#}");
+    // Neither has the conversation the next turn sends.
+    core.submit_user_message("and then".to_string());
+    pump(&mut core, is_ready);
+    let last = requests().last().cloned().unwrap();
+    assert!(!last.to_string().contains("thinking 1 "));
+    assert_eq!(
+        last["messages"].as_array().unwrap()[..next["messages"].as_array().unwrap().len()],
+        next["messages"].as_array().unwrap()[..]
+    );
+}
+
+#[test]
+fn a_tool_call_a_steered_message_cut_off_never_runs() {
+    let _guard = setup();
+    let dir = temp_dir("steer-cut-call");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    let start = requests().len();
+    // The call's arguments stream for about a second.
+    core.submit_user_message("SLOW_RUN printf ran > ran.txt".to_string());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while requests().len() == start {
+        assert!(Instant::now() < deadline, "the request was not sent");
+        thread::sleep(Duration::from_millis(5));
+    }
+    thread::sleep(Duration::from_millis(300));
+    core.submit_user_message("never mind".to_string());
+    let mut events = core.steer();
+    events.extend(pump(&mut core, is_ready));
+
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ResponseInterrupted)));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ToolStart { .. })));
+    assert!(!dir.join("ran.txt").exists());
+    let next = cut_and_next(start, "never mind");
+    assert!(!next.to_string().contains("call_slow"), "{next:#}");
+    assert!(assistant_text(&events).ends_with("user said: never mind"));
 }
 
 #[test]

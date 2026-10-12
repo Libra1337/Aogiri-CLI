@@ -91,6 +91,8 @@ struct ActionOutcome {
 enum WorkerEvent {
     /// A steered user message reached the model mid-turn.
     Steered(String),
+    /// The response being streamed was cut off for a steered message.
+    ResponseInterrupted,
     /// A fragment of the propose_plan call's arguments as the model writes it.
     PlanDraft {
         call_id: String,
@@ -754,10 +756,12 @@ impl AgentCore {
         events
     }
 
-    /// Sends the next queued message into the running turn: the model reads
-    /// it before its next request (after the current tool calls finish), and
-    /// running tools and subagents keep going. A message with images, or one
-    /// sent while nothing runs, starts a turn of its own as before.
+    /// Sends the next queued message into the running turn, and running
+    /// tools and subagents keep going. A model response still streaming
+    /// (reasoning, text, tool-call arguments) is cut off and sent again with
+    /// the message (`ResponseInterrupted`); while tools run, the model reads
+    /// it in the request after them. A message with images, or one sent
+    /// while nothing runs, starts a turn of its own as before.
     pub fn steer(&mut self) -> Vec<AgentEvent> {
         if !self.running || self.queued.is_empty() {
             return Vec::new();
@@ -1734,6 +1738,11 @@ impl AgentCore {
                         events.push(AgentEvent::UserMessage(message));
                         events.push(AgentEvent::PendingMessages(self.pending_texts()));
                     }
+                    WorkerEvent::ResponseInterrupted => {
+                        // Its plan call, if any, is not kept either.
+                        self.plan_draft = None;
+                        events.push(AgentEvent::ResponseInterrupted);
+                    }
                     WorkerEvent::ResponseItem(item) => {
                         // The request went through: a later overflow in this
                         // turn may compact and retry again.
@@ -2622,6 +2631,7 @@ impl AgentCore {
                     },
                     StreamEvent::ResponseItem(item) => WorkerEvent::ResponseItem(item),
                     StreamEvent::Steered(message) => WorkerEvent::Steered(message),
+                    StreamEvent::ResponseInterrupted => WorkerEvent::ResponseInterrupted,
                     // Only the plan is shown as it is written; every other
                     // call's arguments arrive whole with its ResponseItem.
                     StreamEvent::ToolArgumentsDelta {

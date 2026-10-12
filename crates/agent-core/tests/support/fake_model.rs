@@ -87,6 +87,9 @@ pub fn temp_dir(label: &str) -> PathBuf {
 /// waits N ms before answering and a line `RUN: <command>` runs it;
 /// `[history]` answers with every user message of the request. A message
 /// from another conversation (`<session_message …>`) is scripted by its body.
+/// `SLOW_REASONING <n>` streams n reasoning chunks 50 ms apart, then a short
+/// answer; `SLOW_RUN <command>` streams a bash call's arguments in chunks
+/// 50 ms apart (about a second in all).
 fn start_fake_model() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -111,8 +114,20 @@ fn start_fake_model() -> String {
                     }
                     None => write!(
                         stream,
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{reply}"
-                    ),
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                    )
+                    .and_then(|()| {
+                        // A slow reply (`sse_slow`) waits between its chunks;
+                        // the client may hang up meanwhile.
+                        for (index, part) in reply.split(PAUSE).enumerate() {
+                            if index > 0 {
+                                stream.flush()?;
+                                thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                            stream.write_all(part.as_bytes())?;
+                        }
+                        Ok(())
+                    }),
                 };
             });
         }
@@ -229,6 +244,42 @@ fn script(request: &Value) -> String {
                 json!({ "choices": [{ "index": 0, "delta": { "tool_calls": tool_calls }, "finish_reason": null }] }),
                 json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] }),
             ]);
+        }
+        if let Some(count) = text
+            .strip_prefix("SLOW_REASONING ")
+            .and_then(|count| count.parse::<usize>().ok())
+        {
+            let mut chunks = (1..=count)
+                .map(|n| json!({ "choices": [{ "index": 0, "delta": { "reasoning_content": format!("thinking {n} ") }, "finish_reason": null }] }))
+                .collect::<Vec<_>>();
+            chunks.push(json!({ "choices": [{ "index": 0, "delta": { "content": "done thinking" }, "finish_reason": null }] }));
+            chunks
+                .push(json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }));
+            return sse_slow(&chunks);
+        }
+        if let Some(command) = text.strip_prefix("SLOW_RUN ") {
+            let arguments = json!({ "command": command }).to_string();
+            let pieces = arguments
+                .as_bytes()
+                .chunks(arguments.len().div_ceil(20))
+                .map(|piece| String::from_utf8_lossy(piece).into_owned())
+                .collect::<Vec<_>>();
+            let mut chunks = pieces
+                .iter()
+                .enumerate()
+                .map(|(n, piece)| {
+                    let call = if n == 0 {
+                        json!({ "index": 0, "id": "call_slow", "type": "function", "function": { "name": "bash", "arguments": piece } })
+                    } else {
+                        json!({ "index": 0, "function": { "arguments": piece } })
+                    };
+                    json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [call] }, "finish_reason": null }] })
+                })
+                .collect::<Vec<_>>();
+            chunks.push(
+                json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] }),
+            );
+            return sse_slow(&chunks);
         }
         if let Some(call) = text.strip_prefix("CALL ") {
             let (name, arguments) = call.split_once(' ').unwrap_or((call, "{}"));
@@ -367,6 +418,19 @@ fn loop_call(messages: &[Value]) -> Option<String> {
         }] }, "finish_reason": null }] }),
         json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] }),
     ]))
+}
+
+/// Where a slow reply waits before it streams on (see `sse_slow`).
+const PAUSE: &str = "\u{1}";
+
+/// `sse` with a pause of 50 ms after each chunk.
+fn sse_slow(chunks: &[Value]) -> String {
+    let mut out = String::new();
+    for chunk in chunks {
+        out.push_str(&format!("data: {chunk}\n\n{PAUSE}"));
+    }
+    out.push_str("data: [DONE]\n\n");
+    out
 }
 
 fn sse(chunks: &[Value]) -> String {

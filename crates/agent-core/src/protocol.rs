@@ -314,6 +314,7 @@ pub fn event_json(event: AgentEvent) -> Value {
         AgentEvent::AssistantDelta(delta) => {
             json!({ "type": "assistant_delta", "delta": delta })
         }
+        AgentEvent::ResponseInterrupted => json!({ "type": "response_interrupted" }),
         AgentEvent::Retrying {
             attempt,
             max_attempts,
