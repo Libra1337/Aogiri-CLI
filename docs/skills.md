@@ -8,7 +8,8 @@ LynShen loads skills from these sources:
 4. the LynShen marketplace returned by `/v1/skills/marketplace`;
 5. one optional extra GitHub source configured in `~/.lynshen/config.json`.
 
-Each skill is a directory containing `SKILL.md`. Frontmatter `name` and `description` fields
+Each skill is a directory containing `SKILL.md`; folders whose names start with a dot (an
+install's staging copy, a tool's trash) are skipped. Frontmatter `name` and `description` fields
 are used for discovery. A skill named `Code Review` is available as `/code-review`; text after
 the slash command is passed to the skill as the user request. `/pin <skill>` keeps a skill's
 instructions in the current session context.
@@ -35,6 +36,13 @@ Install and update target the user skill directory. Disable keeps the files inst
 removes the skill from model context and slash-command discovery. Sync installs or updates the
 marketplace's configured default skills. Project skills are source-controlled local resources,
 so lifecycle commands do not modify them.
+
+LynShen Desktop's Skills settings switch any skill LynShen finds, including ones in
+`~/.agents/skills` and in a project, through the daemon's `skill_set_enabled`. The switches live
+in `~/.lynshen/skills-state.json`, never in the skill's own files: `disabled` holds folders of
+`~/.lynshen/skills` by name (as `/skills disable` writes them), `disabled_paths` any other skill
+folder by its resolved path, so a project skill switched off in one checkout still loads in
+another worktree. A skill that is switched off is not read at all.
 
 Marketplace packages must include `package_sha256`. Downloads are capped at 20 MiB, extracted
 content at 100 MiB and 4,096 files. Zip and tar.gz packages reject absolute paths, parent

@@ -1,3 +1,4 @@
+use crate::skills::{InstalledSkill, SkillInventory, SkillProblem, SkillScope};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -188,26 +189,174 @@ fn discover_skills_from(
     project_trusted: bool,
     user_agents_dir: Option<PathBuf>,
 ) -> io::Result<Vec<SkillPromptItem>> {
+    let state = crate::skills::SkillState::read(profile_dir)?;
     let mut skills = Vec::new();
-    let mut global_skills = Vec::new();
-    read_skills_dir(&profile_dir.join("skills"), &mut global_skills)?;
-    for skill in global_skills {
-        if crate::skills::is_skill_path_enabled(profile_dir, &skill.path)? {
-            skills.push(skill);
+    for (_, root) in skill_roots(profile_dir, Some(cwd), project_trusted, user_agents_dir) {
+        let mut files = Vec::new();
+        skill_files(&root, &mut files)?;
+        // A skill switched off is not read at all.
+        for file in files.iter().filter(|file| state.enabled(profile_dir, file)) {
+            if let Some(skill) = read_skill_file(file)? {
+                skills.push(skill);
+            }
         }
-    }
-    // `~/.agents/skills/` is the cross-tool convention for user-level skills.
-    if let Some(dir) = user_agents_dir {
-        read_skills_dir(&dir, &mut skills)?;
-    }
-    if project_trusted {
-        read_skills_dir(&cwd.join(".lynshen").join("skills"), &mut skills)?;
-        // `.agents/skills/` is the cross-tool convention for project skills.
-        read_skills_dir(&cwd.join(".agents").join("skills"), &mut skills)?;
     }
     skills.sort_by(|left, right| left.name.cmp(&right.name));
     skills.dedup_by(|left, right| left.name == right.name && left.path == right.path);
     Ok(skills)
+}
+
+/// The folders skills load from, in order: the profile's `skills/`, then
+/// `~/.agents/skills/` (the cross-tool convention for user-level skills),
+/// then — once the project is trusted — its `.lynshen/skills/` and
+/// `.agents/skills/` (the cross-tool convention for project skills).
+fn skill_roots(
+    profile_dir: &Path,
+    cwd: Option<&Path>,
+    project_trusted: bool,
+    user_agents_dir: Option<PathBuf>,
+) -> Vec<(SkillScope, PathBuf)> {
+    let mut roots = vec![(SkillScope::User, profile_dir.join("skills"))];
+    if let Some(dir) = user_agents_dir {
+        roots.push((SkillScope::Shared, dir));
+    }
+    if let Some(cwd) = cwd.filter(|_| project_trusted) {
+        roots.extend(project_skill_dirs(cwd).map(|dir| (SkillScope::Project, dir)));
+    }
+    roots
+}
+
+fn project_skill_dirs(cwd: &Path) -> [PathBuf; 2] {
+    [
+        cwd.join(".lynshen").join("skills"),
+        cwd.join(".agents").join("skills"),
+    ]
+}
+
+/// Every skill LynShen would find (see `discover_skills`), switched on or
+/// off, with what keeps any from loading.
+pub(crate) fn skill_inventory(
+    profile_dir: &Path,
+    cwd: Option<&Path>,
+    project_trusted: Option<bool>,
+    user_agents_dir: Option<PathBuf>,
+) -> SkillInventory {
+    let roots = skill_roots(
+        profile_dir,
+        cwd,
+        project_trusted == Some(true),
+        user_agents_dir,
+    );
+    let (state, state_error) = match crate::skills::SkillState::read(profile_dir) {
+        Ok(state) => (state, None),
+        Err(error) => (Default::default(), Some(error)),
+    };
+    let mut inventory = scan_skill_roots(&roots, &|file| state.enabled(profile_dir, file));
+    inventory.project_trusted = project_trusted;
+    if let Some(error) = state_error {
+        inventory.problems.push(SkillProblem {
+            error: true,
+            kind: "state",
+            path: profile_dir.join("skills-state.json"),
+            message: format!("cannot read the skill switches: {error}"),
+        });
+    }
+    if let (Some(cwd), Some(false)) = (cwd, project_trusted) {
+        for dir in project_skill_dirs(cwd)
+            .into_iter()
+            .filter(|dir| dir.exists())
+        {
+            inventory.problems.push(SkillProblem {
+                error: false,
+                kind: "untrusted",
+                path: dir,
+                message: "project skills load once the project is trusted (/trust)".to_string(),
+            });
+        }
+    }
+    inventory
+}
+
+/// The skills under `roots`, each on when `enabled(SKILL.md)` says so.
+/// What cannot be read, or would not load, becomes a problem.
+pub(crate) fn scan_skill_roots(
+    roots: &[(SkillScope, PathBuf)],
+    enabled: &dyn Fn(&Path) -> bool,
+) -> SkillInventory {
+    let mut inventory = SkillInventory::default();
+    let mut problem = |error, kind, path: &Path, message: String| {
+        inventory.problems.push(SkillProblem {
+            error,
+            kind,
+            path: path.to_path_buf(),
+            message,
+        })
+    };
+    let mut skills: Vec<InstalledSkill> = Vec::new();
+    for (scope, root) in roots {
+        let mut files = Vec::new();
+        if let Err(error) = skill_files(root, &mut files) {
+            problem(
+                true,
+                "unreadable",
+                root,
+                format!("cannot read the folder: {error}"),
+            );
+        }
+        for file in files {
+            let on = enabled(&file);
+            match read_skill_file(&file) {
+                Ok(Some(skill)) => skills.push(InstalledSkill {
+                    name: skill.name,
+                    description: skill.description,
+                    dir: file.parent().unwrap_or(root).to_path_buf(),
+                    scope: *scope,
+                    enabled: on,
+                }),
+                Ok(None) => problem(
+                    false,
+                    "no_description",
+                    &file,
+                    "no description, so the skill is not loaded".to_string(),
+                ),
+                // A switched-off skill is not read when a session loads skills.
+                Err(error) if on => problem(
+                    true,
+                    "unreadable",
+                    &file,
+                    format!("cannot read it, so no LynShen turn can start: {error}"),
+                ),
+                Err(error) => problem(
+                    false,
+                    "unreadable",
+                    &file,
+                    format!("cannot read it: {error}"),
+                ),
+            }
+        }
+    }
+    // Two skills of one name both load, and `/name` runs one of them.
+    for (index, skill) in skills.iter().enumerate() {
+        let first = skills[..index]
+            .iter()
+            .find(|other| other.enabled && skill.enabled && other.name == skill.name);
+        if let Some(first) = first {
+            problem(
+                false,
+                "duplicate",
+                &skill.dir,
+                format!("same name as {}", first.dir.display()),
+            );
+        }
+    }
+    skills.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.dir.cmp(&right.dir))
+    });
+    inventory.skills = skills;
+    inventory
 }
 
 pub fn skill_commands(
@@ -347,25 +496,31 @@ fn skill_command_name(name: &str) -> String {
     output.trim_matches('-').to_string()
 }
 
-fn read_skills_dir(dir: &Path, skills: &mut Vec<SkillPromptItem>) -> io::Result<()> {
+/// The SKILL.md files under `dir`: a folder holding one is a skill; a folder
+/// without one is searched further (a skill pack). Hidden folders are not
+/// skills: an install's staging copy, a tool's trash or its own (`.system`).
+fn skill_files(dir: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
     if !dir.exists() {
         return Ok(());
     }
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
+        let hidden = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.'));
+        if hidden {
+            continue;
+        }
         if path.is_dir() {
             let skill_path = path.join("SKILL.md");
             if skill_path.exists() {
-                if let Some(skill) = read_skill_file(&skill_path)? {
-                    skills.push(skill);
-                }
+                files.push(skill_path);
             } else {
-                read_skills_dir(&path, skills)?;
+                skill_files(&path, files)?;
             }
         } else if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
-            if let Some(skill) = read_skill_file(&path)? {
-                skills.push(skill);
-            }
+            files.push(path);
         }
     }
     Ok(())
@@ -801,6 +956,159 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["home-agents"]
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_skill(dir: &Path, front_matter: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\n{front_matter}\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+
+    fn names(skills: &[SkillPromptItem]) -> Vec<&str> {
+        skills.iter().map(|skill| skill.name.as_str()).collect()
+    }
+
+    #[test]
+    fn any_skill_folder_can_be_switched_off_and_is_not_read_while_off() {
+        let root = std::env::temp_dir().join(format!(
+            "lynshen-skill-switch-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let profile = root.join("profile");
+        let cwd = root.join("repo");
+        let shared = root.join("home/.agents/skills");
+        // An imported folder keeps the other tool's name.
+        let imported = profile.join("skills/Code_Review");
+        let packed = profile.join("skills/pack/inner");
+        let project = cwd.join(".agents/skills/deploy");
+        write_skill(&imported, "name: code-review\ndescription: Review");
+        write_skill(&packed, "name: inner\ndescription: In a pack");
+        write_skill(&shared.join("notes"), "name: notes\ndescription: Notes");
+        write_skill(&project, "name: deploy\ndescription: Deploy");
+        let discover = || discover_skills_from(&profile, &cwd, true, Some(shared.clone())).unwrap();
+        assert_eq!(
+            names(&discover()),
+            ["code-review", "deploy", "inner", "notes"]
+        );
+
+        for dir in [&imported, &packed, &shared.join("notes"), &project] {
+            crate::skills::set_skill_dir_enabled(&profile, dir, false).unwrap();
+        }
+        assert_eq!(names(&discover()), Vec::<&str>::new());
+        // A switched-off skill that cannot be read does not stop the turn.
+        fs::write(project.join("SKILL.md"), [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(discover().is_empty());
+
+        crate::skills::set_skill_dir_enabled(&profile, &packed, true).unwrap();
+        crate::skills::set_skill_dir_enabled(&profile, &imported, true).unwrap();
+        assert_eq!(names(&discover()), ["code-review", "inner"]);
+        // A folder named as `/skills disable` names it is switched by that name.
+        let review = profile.join("skills/review");
+        write_skill(&review, "name: review\ndescription: Review");
+        crate::skills::set_skill_dir_enabled(&profile, &review, false).unwrap();
+        assert_eq!(
+            crate::skills::installed_skill_ids(&profile).unwrap(),
+            ["Code_Review", "review (disabled)"]
+        );
+        crate::skills::set_skill_enabled(&profile, "review", true).unwrap();
+        assert_eq!(names(&discover()), ["code-review", "inner", "review"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_inventory_lists_switched_off_skills_and_what_keeps_any_from_loading() {
+        let root = std::env::temp_dir().join(format!(
+            "lynshen-skill-inventory-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let profile = root.join("profile");
+        let cwd = root.join("repo");
+        let shared = root.join("home/.agents/skills");
+        write_skill(
+            &profile.join("skills/review"),
+            "name: review\ndescription: Review",
+        );
+        // Nothing to read a description from.
+        fs::create_dir_all(profile.join("skills/blank")).unwrap();
+        fs::write(profile.join("skills/blank/SKILL.md"), "---\n---\n").unwrap();
+        write_skill(
+            &shared.join("review"),
+            "name: review\ndescription: Another review",
+        );
+        write_skill(&profile.join("skills/off"), "name: off\ndescription: Off");
+        write_skill(
+            &cwd.join(".lynshen/skills/local"),
+            "name: local\ndescription: Local",
+        );
+        // An install's staging copy is not a skill.
+        write_skill(
+            &profile.join("skills/.review-download-1"),
+            "name: review\ndescription: Staged",
+        );
+        fs::write(profile.join("skills/off/SKILL.md"), [0xff, 0xfe]).unwrap();
+        crate::skills::set_skill_enabled(&profile, "off", false).unwrap();
+
+        let untrusted = skill_inventory(&profile, Some(&cwd), Some(false), Some(shared.clone()));
+        let listed = |inventory: &SkillInventory| {
+            inventory
+                .skills
+                .iter()
+                .map(|skill| (skill.name.clone(), skill.scope, skill.enabled))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            listed(&untrusted),
+            [
+                ("review".to_string(), SkillScope::Shared, true),
+                ("review".to_string(), SkillScope::User, true),
+            ]
+        );
+        let kinds = |inventory: &SkillInventory| {
+            let mut kinds = inventory
+                .problems
+                .iter()
+                .map(|problem| (problem.kind, problem.error))
+                .collect::<Vec<_>>();
+            kinds.sort();
+            kinds
+        };
+        assert_eq!(
+            kinds(&untrusted),
+            [
+                ("duplicate", false),
+                ("no_description", false),
+                ("unreadable", false),
+                ("untrusted", false),
+            ]
+        );
+        assert_eq!(untrusted.project_trusted, Some(false));
+
+        let trusted = skill_inventory(&profile, Some(&cwd), Some(true), Some(shared));
+        assert!(trusted
+            .skills
+            .iter()
+            .any(|skill| skill.name == "local" && skill.scope == SkillScope::Project));
+        assert!(!trusted
+            .problems
+            .iter()
+            .any(|problem| problem.kind == "untrusted"));
+        // Switched on, the unreadable skill would fail every turn.
+        crate::skills::set_skill_enabled(&profile, "off", true).unwrap();
+        let on = skill_inventory(&profile, None, None, None);
+        assert!(on
+            .problems
+            .iter()
+            .any(|problem| problem.kind == "unreadable" && problem.error));
         let _ = fs::remove_dir_all(root);
     }
 
