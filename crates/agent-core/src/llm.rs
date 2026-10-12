@@ -3761,7 +3761,8 @@ fn build_subagent_input(
             let mut seen = 0usize;
             let mut start = 0usize;
             for (index, item) in filtered.iter().enumerate().rev() {
-                if item.get("role").and_then(Value::as_str) == Some("user") {
+                // The engine's notes are user messages but no turn.
+                if item.get("role").and_then(Value::as_str) == Some("user") && !is_note(item) {
                     seen += 1;
                     if seen == turns {
                         start = index;
@@ -3780,6 +3781,19 @@ fn build_subagent_input(
         }]
     }));
     Ok(forked)
+}
+
+/// Whether `item` is one of the engine's notes (`prompt::NOTE_OPEN`).
+fn is_note(item: &Value) -> bool {
+    match item.get("content") {
+        Some(Value::String(text)) => text.starts_with(crate::prompt::NOTE_OPEN),
+        Some(Value::Array(parts)) => parts
+            .first()
+            .and_then(|part| part.get("text"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.starts_with(crate::prompt::NOTE_OPEN)),
+        _ => false,
+    }
 }
 
 fn validate_fork_turns(fork_turns: &str) -> Result<(), String> {
@@ -4172,6 +4186,27 @@ mod tests {
         assert_eq!(forked[1]["call_id"], "done_1");
         assert!(response_content_text(&forked[2], "input_text").contains("inspect"));
         assert!(!forked.iter().any(|item| item["call_id"] == "pending_1"));
+    }
+
+    #[test]
+    fn fork_turns_does_not_count_notes_as_turns() {
+        let user = |text: &str| json!({ "role": "user", "content": [{ "type": "input_text", "text": text }] });
+        let input = vec![
+            user("first task"),
+            json!({ "type": "message", "content": [{ "type": "output_text", "text": "first answer" }] }),
+            user("<system-reminder>\nThe date is now 2026-10-13.\n</system-reminder>"),
+            user("<system-reminder>\nPlan mode is still on.\n</system-reminder>"),
+            user("second task"),
+        ];
+
+        let forked =
+            build_subagent_input(&input, &HashSet::new(), "2", "/root/child", "inspect").unwrap();
+
+        assert_eq!(forked.len(), 6);
+        assert_eq!(
+            response_content_text(&forked[0], "input_text"),
+            "first task"
+        );
     }
 
     fn test_client() -> OpenAiClient {

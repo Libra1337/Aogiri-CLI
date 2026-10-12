@@ -627,7 +627,17 @@ impl SessionStore {
         if !matches!(entry.kind, EntryKind::User { .. }) {
             return Err(format!("entry {} is not a user node", id.display()));
         }
-        self.switch_to(entry.parent_id)
+        // Also before the notes the message was sent with: a message sent
+        // from here gets the notes due then (`prompt::notes_due`), so the
+        // same change is not told twice.
+        let mut before = entry.parent_id;
+        while let Some(note) = before
+            .and_then(|id| self.entry(id))
+            .filter(|entry| note_in(entry).is_some())
+        {
+            before = note.parent_id;
+        }
+        self.switch_to(before)
     }
 
     /// User messages on the active branch, oldest first — the rewindable points.
@@ -2967,6 +2977,27 @@ mod tests {
         session.checkout(&second.display()).unwrap();
 
         assert_eq!(session.leaf_id(), Some(first));
+    }
+
+    #[test]
+    fn checkout_entry_id_moves_to_before_the_notes_of_the_message() {
+        let mut session = SessionStore::new();
+        session.append(EntryKind::User {
+            content: "first".to_string(),
+        });
+        let answer = session.append(EntryKind::ResponseItem {
+            item: json!({ "role": "assistant", "content": [{ "type": "output_text", "text": "ok" }] }),
+        });
+        session.append_note(Note::Date, "date 2".to_string());
+        session.append_note(Note::PlanReminder, "still planning".to_string());
+        let second = session.append(EntryKind::User {
+            content: "second".to_string(),
+        });
+
+        session.checkout(&second.display()).unwrap();
+
+        assert_eq!(session.leaf_id(), Some(answer));
+        assert_eq!(session.last_note(Note::Date), None);
     }
 
     #[test]

@@ -721,6 +721,39 @@ fn a_chat_session_in_plan_mode_is_not_sent_to_propose_plan() {
 }
 
 #[test]
+fn a_rewound_message_sent_again_in_plan_mode_gets_one_reminder() {
+    let _guard = setup();
+    let mut core = AgentCore::open(temp_dir("plan-rewind")).unwrap();
+    core.set_approval_mode(ApprovalMode::Plan);
+    let turn = |core: &mut AgentCore, message: &str| {
+        core.submit_user_message(message.to_string());
+        pump(core);
+        last_request()
+    };
+    turn(&mut core, "plan something");
+    let sent = turn(&mut core, "and more");
+    assert_eq!(sent.notes().len(), 2);
+
+    let (_, events) = core.handle_command("/rewind");
+    let id = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::CheckpointView(turns) => turns
+                .iter()
+                .find(|turn| turn.label == "and more")
+                .map(|turn| turn.id.clone()),
+            _ => None,
+        })
+        .expect("a rewind point");
+    core.handle_command(&format!("/rewind {id}"));
+    let again = turn(&mut core, "and more, again");
+    // The same request as before, with the new message.
+    assert_eq!(again.notes(), sent.notes());
+    assert_eq!(again.messages.len(), sent.messages.len());
+    assert_eq!(text(again.messages.last().unwrap()), "and more, again");
+}
+
+#[test]
 fn each_user_turn_in_plan_mode_ends_with_a_short_reminder() {
     let _guard = setup();
     let mut core = AgentCore::open(temp_dir("plan-reminder")).unwrap();
