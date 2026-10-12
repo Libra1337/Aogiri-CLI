@@ -38,7 +38,7 @@ const MAX_LISTED_CHANGED_FILES: usize = 100;
 /// What the summary request asks for (`CompactionPlan::summary_request`).
 /// It goes with the session's own system prompt and tools, so it also says
 /// that no tool may be called.
-const COMPACTION_REQUEST: &str = "The conversation above is about to be replaced by a summary so the work can continue in a fresh context. Do not continue the task and do not call any tool: answer with the summary only.\n\nWrite a dense summary that preserves: the user's goals and explicit requests, decisions made, important facts and constraints discovered, files and tools touched with their outcomes, and any unfinished threads. The current plan from update_plan and the list of files changed in this session (when this request ends with one) are added to your summary as they are: do not copy them, but say what changed in those files where it matters. Prefer tight prose or bullet points. Output only the summary.";
+const COMPACTION_REQUEST: &str = "The conversation above is about to be replaced by a summary so the work can continue in a fresh context. Do not continue the task and do not call any tool: answer with the summary only.\n\nWrite a dense summary that preserves: the user's goals and explicit requests, decisions made, important facts and constraints discovered, files and tools touched with their outcomes, and any unfinished threads. The current plan from update_plan and the list of files changed in this session (when this request ends with one) are added to your summary as they are, in place of the plan and file list an earlier summary ends with: do not copy them, but say what changed in those files where it matters. Prefer tight prose or bullet points. Output only the summary.";
 
 impl EntryId {
     pub fn display(self) -> String {
@@ -135,7 +135,10 @@ impl CompactionPlan {
     /// The folded items as plain text, then the changed files: the
     /// summarizer's input for a model that answers the summary request with
     /// tool calls instead of a summary (see
-    /// `OpenAiClient::summarize_conversation`).
+    /// `OpenAiClient::summarize_conversation`). An earlier summary goes
+    /// without its plan and file list: `finish_summary` adds them anew, from
+    /// the current plan and the whole branch. (The summary request keeps
+    /// them: it starts as the last request did, for the provider's cache.)
     pub fn folded_text(&self) -> String {
         let mut text = String::new();
         for item in &self.folded_items {
@@ -155,6 +158,11 @@ impl CompactionPlan {
                     if said.trim().is_empty() {
                         continue;
                     }
+                    let said = if said.starts_with(COMPACTION_PREFIX) {
+                        without_added_sections(&said)
+                    } else {
+                        &said
+                    };
                     format!("{}: {said}", response_item_speaker(item))
                 }
             };
@@ -1840,6 +1848,16 @@ fn sanitize_tool_pairs(items: Vec<Value>) -> Vec<Value> {
 }
 
 /// The changed-files list as it ends the compaction input and the summary.
+/// A stored summary without the plan and file list `finish_summary` added
+/// to it.
+fn without_added_sections(summary: &str) -> &str {
+    [PLAN_HEADING, CHANGED_FILES_HEADING]
+        .iter()
+        .filter_map(|heading| summary.rfind(&format!("\n\n{heading}\n")))
+        .min()
+        .map_or(summary, |at| &summary[..at])
+}
+
 fn changed_files_section(files: &[String]) -> String {
     let mut section = CHANGED_FILES_HEADING.to_string();
     for file in files.iter().take(MAX_LISTED_CHANGED_FILES) {
@@ -3383,6 +3401,17 @@ mod tests {
         assert_eq!(ask.matches("Files changed in this session:").count(), 1);
         assert!(!ask.contains(PLAN_HEADING), "{ask}");
         assert!(ask.contains("- /elsewhere/x.rs\n- README.md"));
+        // As plain text (no cache), the earlier summary goes without them.
+        let text = next.folded_text();
+        assert!(
+            text.starts_with(&format!(
+                "User: {COMPACTION_PREFIX}\n\nWrote and patched files.\nUser: now test it"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(PLAN_HEADING), "{text}");
+        assert_eq!(text.matches("Files changed in this session:").count(), 1);
+        assert!(text.ends_with("- /elsewhere/x.rs\n- README.md\n"), "{text}");
         // Without changed files, the summary is the model's text.
         let quiet = CompactionPlan {
             folded_items: Vec::new(),
