@@ -1196,7 +1196,14 @@ fn atomic_replace_dir(staging: &Path, destination: &Path) -> io::Result<()> {
 }
 
 fn ensure_direct_child(parent: &Path, child: &Path) -> io::Result<()> {
-    if child.parent() == Some(parent) {
+    // `Path::parent` drops a trailing `..` or `.` as if it were a folder name,
+    // so `<root>/..` would pass as a child of `<root>`: the last component
+    // must be a plain name.
+    let plain_name = matches!(
+        child.components().next_back(),
+        Some(std::path::Component::Normal(_))
+    );
+    if plain_name && child.parent() == Some(parent) {
         Ok(())
     } else {
         Err(io::Error::new(
@@ -1739,6 +1746,12 @@ mod tests {
         // Only a skill folder directly in the root goes.
         assert!(remove_skill_dir(&root, &skills_dir, &root.join("elsewhere")).is_err());
         assert!(remove_skill_dir(&root, &skills_dir, &skills_dir).is_err());
+        // `<root>/..` and `<root>/.` are not children of the root, even when
+        // the folder they name holds a SKILL.md.
+        fs::write(root.join("SKILL.md"), "---\nname: x\ndescription: y\n---\n").unwrap();
+        assert!(remove_skill_dir(&root, &skills_dir, &skills_dir.join("..")).is_err());
+        assert!(remove_skill_dir(&root, &skills_dir, &skills_dir.join(".")).is_err());
+        assert!(root.join("SKILL.md").is_file());
         fs::create_dir_all(skills_dir.join("not-a-skill")).unwrap();
         assert!(remove_skill_dir(&root, &skills_dir, &skills_dir.join("not-a-skill")).is_err());
         remove_skill_dir(&root, &skills_dir, &dir).unwrap();
