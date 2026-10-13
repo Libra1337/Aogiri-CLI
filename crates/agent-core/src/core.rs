@@ -3756,7 +3756,7 @@ impl AgentCore {
             let rules = if global {
                 config
                     .entry("command_rules")
-                    .or_insert_with(|| crate::sandbox::default_rules_json())
+                    .or_insert_with(crate::sandbox::default_rules_json)
             } else {
                 crate::config::project_entry_mut(config, &cwd)
                     .entry("command_rules")
