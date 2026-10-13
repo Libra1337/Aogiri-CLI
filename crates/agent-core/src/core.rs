@@ -864,10 +864,11 @@ impl AgentCore {
             return Vec::new();
         }
         self.stop_current_turn();
-        let mut events = vec![
-            AgentEvent::Info("request interrupted".to_string()),
-            AgentEvent::Status("interrupted".to_string()),
-        ];
+        let mut events = vec![AgentEvent::Info("request interrupted".to_string())];
+        // Else goal continuation starts the next turn at the next poll, and
+        // Stop seems not to work.
+        events.extend(self.pause_goal("the turn was stopped"));
+        events.push(AgentEvent::Status("interrupted".to_string()));
         events.extend(self.drain_subagent_events());
         events
     }
@@ -1883,7 +1884,7 @@ impl AgentCore {
                             .close_all_with_message("parent turn failed");
                         events.extend(self.finish_goal_turn());
                         if error.starts_with(crate::loop_guard::STOP_PREFIX) {
-                            events.extend(self.pause_goal_for_loop_guard());
+                            events.extend(self.pause_goal("the loop guard stopped the turn"));
                         }
                         self.running = false;
                         disconnected = true;
@@ -3946,9 +3947,10 @@ impl AgentCore {
         Some(AgentEvent::Plan(self.plan.clone()))
     }
 
-    /// The loop guard stopped the turn: an active goal is paused, so goal
-    /// continuation does not start the same loop again unattended.
-    fn pause_goal_for_loop_guard(&mut self) -> Vec<AgentEvent> {
+    /// A turn was stopped (by the loop guard, by the user): an active goal
+    /// is paused, so goal continuation does not start the next turn
+    /// unattended. `why` completes "goal paused after ...".
+    fn pause_goal(&mut self, why: &str) -> Vec<AgentEvent> {
         if !self
             .session
             .goal()
@@ -3961,10 +3963,9 @@ impl AgentCore {
         };
         let mut events = vec![
             AgentEvent::Goal(Some(goal_view(&goal))),
-            AgentEvent::Info(
-                "goal paused after the loop guard stopped the turn; /goal resume continues it"
-                    .to_string(),
-            ),
+            AgentEvent::Info(format!(
+                "goal paused after {why}; /goal resume continues it"
+            )),
         ];
         events.extend(self.save_session_event());
         events
