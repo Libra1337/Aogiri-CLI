@@ -134,8 +134,29 @@ asked, interpreters (`python`, `node`, `bash -c`, `powershell -Command`,
 `git push --force`, and a command whose parts start differently
 (`make && npm test`).
 
-File tools (`write`, `edit`, `apply_patch`, …) check writes against the same
-rules in-process, and can read and write the configured directories.
+## File tools
+
+The file tools run in-process, so the OS sandbox does not apply to them;
+they check paths themselves.
+
+- **Reading** (`read`, `ls`, `ripgrep`, `outline`, image inputs): anywhere,
+  except credentials: `~/.ssh`, `~/.gnupg`, `~/.aws`,
+  `~/.lynshen/auth.json`, `~/.lynshen/daemon` (and `%APPDATA%\gnupg` on
+  Windows).
+- **Writing** (`write`, `edit`, `hashline_edit`, `generate_image`): inside
+  the workspace, the read-write directories, temp and the package caches,
+  with `.git`, `.lynshen` and `.agents` read-only and nothing writable in
+  `read-only`. A write anywhere else is an `outside_write` approval: asked
+  in `manual`, `auto-edit` and `plan`, put to the safety model first in
+  `auto`, and run without asking in `full-access`, which reports it
+  (`escalated`). A write into a credentials directory always asks. It is
+  approved once at a time; to stop asking, make the directory writable
+  (`approve` with `add_dir`, or `add_directory`).
+- `apply_patch` changes files inside the workspace only.
+- Checkpoints and `/rewind` cover files inside the workspace only: a file
+  written outside it is not restored, and the tool result says so.
+- Deleting outside the workspace is done with a command (`rm`, ...), which
+  the built-in list always asks about.
 
 ## Worktree subagents
 
@@ -150,7 +171,8 @@ A subagent that works in its own git worktree (`isolation: "worktree"`, the
 - Leaving the sandbox (`escalate: true`) always asks you, whatever the
   approval mode or "always allow", unless an `allow` command rule matches
   (`git commit` by default).
-- Its file tools write only inside the worktree.
+- Its file tools write only inside the worktree; a write elsewhere is
+  refused, not asked.
 
 With the sandbox off (`full-access`, Windows) only the first and last points
 hold: a command started in the worktree can still write elsewhere by an

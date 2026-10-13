@@ -3391,7 +3391,17 @@ impl AgentCore {
         let tx = self.action_tx.clone();
         let mcp = self.mcp.clone();
         let hooks = self.hooks.clone();
-        let tool_state = self.tool_state.clone();
+        // Approved now: a file write outside the workspace may be made.
+        let outside = crate::tools::outside_write_target(
+            &action.name,
+            &action.arguments,
+            &action.cwd,
+            self.tool_state.sandbox().as_ref(),
+        );
+        let tool_state = match outside {
+            Some(path) => self.tool_state.allowing_writes(vec![path]),
+            None => self.tool_state.clone(),
+        };
         let host = self.host.clone().filter(|host| host.has_tool(&action.name));
         self.actions_running += 1;
         thread::spawn(move || {

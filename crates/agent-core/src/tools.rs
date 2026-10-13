@@ -259,22 +259,21 @@ fn run_tool(name: &str, arguments: &str, cwd: &Path) -> String {
     run_tool_with_events(name, arguments, cwd, &[], &test_state(), |_| Ok(())).output
 }
 
-/// `extra_read_roots` lists directories outside the workspace that read-only
-/// file tools may also read (the directories of discovered skills). Mutating
-/// tools stay confined to the workspace.
+/// Runs a built-in tool. The read tools read anywhere but credentials
+/// (`readable_path`), so `_extra_read_roots` (the skills' directories) no
+/// longer widens anything. The write tools write inside the boundary, and
+/// outside it only where `state` allows this call (`write_target`).
 pub fn run_tool_with_events(
     name: &str,
     arguments: &str,
     cwd: &Path,
-    extra_read_roots: &[PathBuf],
+    _extra_read_roots: &[PathBuf],
     state: &ToolState,
     emit: impl FnMut(ToolExecutionEvent) -> Result<(), String>,
 ) -> ToolExecutionResult {
     // A bug inside one tool must come back to the model as a failed call:
     // a panic here would otherwise leave the turn waiting for a result forever.
-    let run = std::panic::AssertUnwindSafe(|| {
-        run_tool_inner(name, arguments, cwd, extra_read_roots, state, emit)
-    });
+    let run = std::panic::AssertUnwindSafe(|| run_tool_inner(name, arguments, cwd, state, emit));
     std::panic::catch_unwind(run).unwrap_or_else(|panic| {
         let reason = panic
             .downcast_ref::<String>()
@@ -293,7 +292,6 @@ fn run_tool_inner(
     name: &str,
     arguments: &str,
     cwd: &Path,
-    extra_read_roots: &[PathBuf],
     state: &ToolState,
     mut emit: impl FnMut(ToolExecutionEvent) -> Result<(), String>,
 ) -> ToolExecutionResult {
@@ -312,16 +310,9 @@ fn run_tool_inner(
     // where they sit in the worktree.
     map_confined_paths(name, &mut args, state);
 
-    // Where the sandbox lets this agent's commands write, the read tools may
-    // read: a screenshot or log a bash command just wrote to /tmp included.
     let sandbox = state.sandbox();
-    let mut read_roots = extra_read_roots.to_vec();
-    if let Some(sandbox) = &sandbox {
-        read_roots.extend(sandbox.tool_read_roots(cwd));
-    }
-    let extra_read_roots = read_roots.as_slice();
-    let result = match name {
-        "read" => read_file(&args, cwd, extra_read_roots, state),
+    let mut result = match name {
+        "read" => read_file(&args, cwd, state),
         "str_replace" | "edit" => str_replace_file(&args, cwd, state),
         "hashline_edit" => hashline_edit_file(&args, cwd, state),
         "write" => write_file(&args, cwd, state),
@@ -338,17 +329,23 @@ fn run_tool_inner(
         }
         "write_stdin" => write_stdin(&args, state),
         "apply_patch" => apply_patch(&args, cwd, sandbox.as_ref(), state, &mut emit),
-        "ls" => list_dir(&args, cwd, extra_read_roots),
-        "ripgrep" => ripgrep(&args, cwd, extra_read_roots),
-        "outline" => outline_file(&args, cwd, extra_read_roots),
+        "ls" => list_dir(&args, cwd),
+        "ripgrep" => ripgrep(&args, cwd),
+        "outline" => outline_file(&args, cwd),
         "checkpoint" => checkpoint_tool(&args, cwd, state),
         "web_fetch" => crate::web::run_fetch(&args, state.web().as_ref()),
         "web_search" => crate::web::run_search(&args, state.web().as_ref()),
-        crate::images::TOOL_NAME => {
-            crate::images::run(&args, cwd, extra_read_roots, state, &mut emit)
-        }
+        crate::images::TOOL_NAME => crate::images::run(&args, cwd, state, &mut emit),
         _ => json!({ "error": format!("unknown tool: {name}") }),
     };
+    if state.outside_writes.is_some() && result.get("error").is_none() {
+        if let Value::Object(map) = &mut result {
+            map.insert(
+                "outside_workspace".to_string(),
+                json!("Written outside the workspace: checkpoints and /rewind do not cover this file."),
+            );
+        }
+    }
     tool_result(name, result, cwd)
 }
 
@@ -385,12 +382,12 @@ fn add_soft_hint(value: &mut Value, warning: &str, suggestion: &str) {
     }
 }
 
-fn read_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf], state: &ToolState) -> Value {
+fn read_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return json!({ "error": "missing path" });
     };
 
-    let path = match readable_path(cwd, path, extra_read_roots) {
+    let path = match readable_path(cwd, path) {
         Ok(path) => path,
         Err(error) => return json!({ "error": error }),
     };
@@ -2415,9 +2412,9 @@ fn apply_patch(
     }
 }
 
-fn list_dir(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
+fn list_dir(args: &Value, cwd: &Path) -> Value {
     let path = match args.get("path").and_then(Value::as_str) {
-        Some(path) => match readable_path(cwd, path, extra_read_roots) {
+        Some(path) => match readable_path(cwd, path) {
             Ok(path) => path,
             Err(error) => return json!({ "error": error }),
         },
@@ -2463,12 +2460,12 @@ fn list_dir(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
     })
 }
 
-fn ripgrep(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
+fn ripgrep(args: &Value, cwd: &Path) -> Value {
     let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
         return json!({ "error": "missing pattern" });
     };
     let search_path = match args.get("path").and_then(Value::as_str) {
-        Some(path) => match readable_path(cwd, path, extra_read_roots) {
+        Some(path) => match readable_path(cwd, path) {
             Ok(path) => path,
             Err(error) => return json!({ "error": error }),
         },
@@ -2598,11 +2595,11 @@ fn add_ripgrep_soft_hint(value: &mut Value, no_limit: bool) {
     }
 }
 
-fn outline_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
+fn outline_file(args: &Value, cwd: &Path) -> Value {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return json!({ "error": "missing path" });
     };
-    let path = match readable_path(cwd, path, extra_read_roots) {
+    let path = match readable_path(cwd, path) {
         Ok(path) => path,
         Err(error) => return json!({ "error": error }),
     };
@@ -2801,6 +2798,9 @@ pub struct ToolState {
     /// A worktree subagent's (worktree, project): its shell commands start
     /// inside the worktree and write nowhere else (see `wrap_confined`).
     confine: Option<Arc<(PathBuf, PathBuf)>>,
+    /// Paths outside the workspace this one call may write: approved by the
+    /// user, or run unasked in full-access (`allowing_writes`).
+    outside_writes: Option<Arc<Vec<PathBuf>>>,
 }
 
 enum ReadCheck {
@@ -2879,6 +2879,28 @@ impl ToolState {
         self.confine.as_ref().map(|confine| confine.0.as_path())
     }
 
+    /// This state for one call that may write `paths` outside the
+    /// workspace: the user approved it (or full-access ran it unasked).
+    pub(crate) fn allowing_writes(&self, paths: Vec<PathBuf>) -> Self {
+        Self {
+            outside_writes: Some(Arc::new(
+                paths
+                    .iter()
+                    .map(|path| normalize_for_policy(path))
+                    .collect(),
+            )),
+            ..self.clone()
+        }
+    }
+
+    /// Whether this call may write `path` outside the workspace.
+    fn may_write_outside(&self, path: &Path) -> bool {
+        let path = normalize_for_policy(path);
+        self.outside_writes
+            .as_ref()
+            .is_some_and(|paths| paths.contains(&path))
+    }
+
     pub fn set_web(&self, web: Option<crate::web::WebTools>) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.web = web;
@@ -2943,6 +2965,7 @@ impl ToolState {
             inner: self.inner.clone(),
             reads: Arc::default(),
             confine: self.confine.clone(),
+            outside_writes: None,
         }
     }
 
@@ -2953,6 +2976,7 @@ impl ToolState {
             inner: self.inner.clone(),
             reads: Arc::default(),
             confine: Some(Arc::new((root, project))),
+            outside_writes: None,
         }
     }
 
@@ -4493,25 +4517,55 @@ pub(crate) fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
     }
 }
 
-/// Resolve `path` and enforce the workspace path policy: file tools only
-/// operate on paths inside the workspace root (`cwd`). This is a permission
-/// policy (resolve + prefix check), not an OS sandbox — shell commands are
-/// intentionally not gated. Symlinks in the existing part of the path are
-/// resolved before the check, so a symlink pointing outside the workspace is
-/// rejected too.
-/// Where a mutating file tool may write: the workspace, or one of the
-/// sandbox's read-write directories, and never where the sandbox forbids.
+/// Where a mutating file tool may write: inside the boundary (the
+/// workspace, the sandbox's read-write directories, temp and the package
+/// caches) where the sandbox does not forbid it, or a path outside it that
+/// this call was approved to write (`ToolState::allowing_writes`). Symlinks
+/// in the existing part of the path are resolved before the check, so a
+/// symlink pointing outside the workspace counts as outside.
 pub(crate) fn write_target(cwd: &Path, path: &str, state: &ToolState) -> Result<PathBuf, String> {
-    let sandbox = state.sandbox();
     let resolved = resolve_path(cwd, path);
-    let target = match &sandbox {
-        Some(sandbox) if sandbox.in_writable_dir(&resolved) => resolved,
-        _ => workspace_path(cwd, path)?,
-    };
-    if let Some(sandbox) = sandbox {
-        sandbox.check_write(cwd, &target)?;
+    if state.may_write_outside(&resolved) {
+        return Ok(resolved);
     }
-    Ok(target)
+    let sandbox = state.sandbox();
+    let inside = ensure_in_workspace(cwd, &resolved).is_ok()
+        || sandbox
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.within_boundary(cwd, &resolved));
+    if !inside {
+        return Err(format!(
+            "{} is outside the workspace and the writable directories: writing it needs the user's approval, which this call does not have",
+            resolved.display()
+        ));
+    }
+    if let Some(sandbox) = sandbox {
+        sandbox.check_write(cwd, &resolved)?;
+    }
+    Ok(resolved)
+}
+
+/// The file a write tool (`write`, `edit`, `str_replace`, `hashline_edit`,
+/// `generate_image`) writes, when it is outside the workspace and the
+/// writable directories: the call then needs approval (`outside_write`).
+pub(crate) fn outside_write_target(
+    name: &str,
+    arguments: &str,
+    cwd: &Path,
+    sandbox: Option<&crate::sandbox::SandboxPolicy>,
+) -> Option<PathBuf> {
+    if !matches!(
+        name,
+        "write" | "edit" | "str_replace" | "hashline_edit" | crate::images::TOOL_NAME
+    ) {
+        return None;
+    }
+    let args = serde_json::from_str::<Value>(arguments).ok()?;
+    let path = args.get("path").and_then(Value::as_str)?;
+    let resolved = resolve_path(cwd, path);
+    let inside = ensure_in_workspace(cwd, &resolved).is_ok()
+        || sandbox.is_some_and(|sandbox| sandbox.within_boundary(cwd, &resolved));
+    (!inside).then(|| normalize_for_policy(&resolved))
 }
 
 pub(crate) fn workspace_path(cwd: &Path, path: &str) -> Result<PathBuf, String> {
@@ -4520,41 +4574,25 @@ pub(crate) fn workspace_path(cwd: &Path, path: &str) -> Result<PathBuf, String> 
     Ok(resolved)
 }
 
-/// Workspace path policy for read-only file tools: the workspace plus any
-/// `extra_roots` (discovered skill directories, the sandbox's own readable
-/// and writable roots). Returns the workspace error unchanged when the path
-/// is under neither. Credentials stay unreadable even when a root contains
-/// them, as they are for a sandboxed command.
-pub(crate) fn readable_path(
-    cwd: &Path,
-    path: &str,
-    extra_roots: &[PathBuf],
-) -> Result<PathBuf, String> {
+/// Path policy for the read-only file tools: anywhere but credentials
+/// (`sandbox::denied_reads`), which stay unreadable as they are for a
+/// sandboxed command.
+pub(crate) fn readable_path(cwd: &Path, path: &str) -> Result<PathBuf, String> {
     let resolved = resolve_path(cwd, path);
-    match ensure_in_workspace(cwd, &resolved) {
-        Ok(()) => Ok(resolved),
-        Err(workspace_error) => {
-            let normalized = normalize_for_policy(&resolved);
-            if crate::sandbox::denied_reads()
-                .iter()
-                .any(|secret| normalized == *secret || normalized.starts_with(secret))
-            {
-                return Err(format!(
-                    "{} holds credentials and is not readable",
-                    resolved.display()
-                ));
-            }
-            if extra_roots.iter().any(|root| {
-                root.canonicalize()
-                    .map(|root| normalized == root || normalized.starts_with(&root))
-                    .unwrap_or(false)
-            }) {
-                Ok(resolved)
-            } else {
-                Err(workspace_error)
-            }
-        }
+    if ensure_in_workspace(cwd, &resolved).is_ok() {
+        return Ok(resolved);
     }
+    let normalized = normalize_for_policy(&resolved);
+    if crate::sandbox::denied_reads()
+        .iter()
+        .any(|secret| normalized == *secret || normalized.starts_with(secret))
+    {
+        return Err(format!(
+            "{} holds credentials and is not readable",
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
 }
 
 /// Errors when `resolved` escapes the workspace root after resolving
@@ -6848,89 +6886,63 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn read_only_tools_allow_extra_read_roots() {
+    fn read_tools_read_outside_the_workspace_and_writes_need_approval() {
         let pid = std::process::id();
         let workspace = env::temp_dir().join(format!("lynshen-read-roots-ws-{pid}"));
-        let skill = env::temp_dir().join(format!("lynshen-read-roots-skill-{pid}"));
         let outside = env::temp_dir().join(format!("lynshen-read-roots-out-{pid}"));
         fs::create_dir_all(&workspace).unwrap();
-        fs::create_dir_all(skill.join("refs")).unwrap();
-        fs::create_dir_all(&outside).unwrap();
-        fs::write(skill.join("SKILL.md"), "skill body").unwrap();
-        fs::write(skill.join("refs/guide.md"), "guide").unwrap();
-        fs::write(outside.join("secret.txt"), "secret").unwrap();
-        let roots = vec![skill.clone()];
-        let run = |name: &str, args: Value| {
-            run_tool_with_events(
-                name,
-                &args.to_string(),
-                &workspace,
-                &roots,
-                &test_state(),
-                |_| Ok(()),
-            )
+        fs::create_dir_all(outside.join("refs")).unwrap();
+        fs::write(outside.join("notes.txt"), "outside notes").unwrap();
+        let run = |name: &str, args: Value, state: &ToolState| {
+            run_tool_with_events(name, &args.to_string(), &workspace, &[], state, |_| Ok(()))
         };
+        let state = test_state();
 
-        // The skill file and files it references resolve under the root.
+        // Reads go anywhere but credentials.
         let result = run(
             "read",
-            json!({ "path": skill.join("SKILL.md").display().to_string() }),
+            json!({ "path": outside.join("notes.txt").display().to_string() }),
+            &state,
         );
         assert!(!result.is_error, "{}", result.output);
-        assert!(result.output.contains("skill body"));
+        assert!(result.output.contains("outside notes"));
         let result = run(
-            "read",
-            json!({ "path": skill.join("refs/guide.md").display().to_string() }),
+            "ls",
+            json!({ "path": outside.display().to_string() }),
+            &state,
         );
-        assert!(!result.is_error, "{}", result.output);
-        let result = run("ls", json!({ "path": skill.display().to_string() }));
         assert!(!result.is_error, "{}", result.output);
 
-        // Paths outside the roots are still rejected.
-        let result = run(
-            "read",
-            json!({ "path": outside.join("secret.txt").display().to_string() }),
-        );
+        // A write outside needs this call's approval.
+        let target = outside.join("new.txt");
+        let args = json!({ "path": target.display().to_string(), "content": "x" });
+        let result = run("write", args.clone(), &state);
         assert!(result.is_error);
         assert!(
-            result.output.contains("escapes the workspace"),
+            result.output.contains("needs the user's approval"),
             "{}",
             result.output
         );
-        // `..` cannot climb out of a root either.
-        let escape = skill
-            .join("..")
-            .join(outside.file_name().unwrap())
-            .join("secret.txt");
-        let result = run("read", json!({ "path": escape.display().to_string() }));
-        assert!(result.is_error, "{}", result.output);
-
-        // Mutating tools stay confined even under a read root.
-        let result = run(
-            "write",
-            json!({
-                "path": skill.join("evil.txt").display().to_string(),
-                "content": "x"
-            }),
-        );
-        assert!(result.is_error);
-        assert!(
-            result.output.contains("escapes the workspace"),
-            "{}",
-            result.output
-        );
+        assert!(!target.exists());
+        let allowed = state.allowing_writes(vec![target.clone()]);
+        let result = run("write", args, &allowed);
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("checkpoints"), "{}", result.output);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "x");
+        // The approval covers that path only.
+        let other =
+            json!({ "path": outside.join("other.txt").display().to_string(), "content": "x" });
+        assert!(run("write", other, &allowed).is_error);
 
         let _ = fs::remove_dir_all(&workspace);
-        let _ = fs::remove_dir_all(&skill);
         let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
-    fn file_tools_reject_paths_outside_the_workspace() {
+    fn file_tools_write_outside_the_workspace_only_when_allowed() {
         let dir = env::temp_dir().join(format!("lynshen-policy-tools-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let cases: [(&str, Value); 7] = [
-            ("read", json!({ "path": "/etc/passwd" })),
+        let writes: [(&str, Value); 3] = [
             ("write", json!({ "path": "../escape.txt", "content": "x" })),
             (
                 "str_replace",
@@ -6940,23 +6952,37 @@ mod tests {
                 "hashline_edit",
                 json!({ "path": "/etc/passwd", "edits": [{ "op": "append", "lines": "x" }] }),
             ),
-            ("ls", json!({ "path": ".." })),
-            ("outline", json!({ "path": "/etc/passwd" })),
-            (
-                "checkpoint",
-                json!({ "action": "create", "name": "cp", "paths": ["../escape.txt"] }),
-            ),
         ];
-        for (tool, args) in cases {
+        for (tool, args) in writes {
             let result = run_tool(tool, &args.to_string(), &dir);
             let value = serde_json::from_str::<Value>(&result).unwrap();
             let error = value
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            assert!(error.contains("escapes the workspace"), "{tool}: {result}");
+            assert!(
+                error.contains("needs the user's approval"),
+                "{tool}: {result}"
+            );
         }
         assert!(!dir.parent().unwrap().join("escape.txt").exists());
+        // Reads are open; checkpoints stay inside the workspace.
+        for (tool, args) in [
+            ("read", json!({ "path": "/etc/hosts" })),
+            ("ls", json!({ "path": ".." })),
+        ] {
+            let result = run_tool(tool, &args.to_string(), &dir);
+            assert!(
+                !result.contains("escapes the workspace"),
+                "{tool}: {result}"
+            );
+        }
+        let result = run_tool(
+            "checkpoint",
+            &json!({ "action": "create", "name": "cp", "paths": ["../escape.txt"] }).to_string(),
+            &dir,
+        );
+        assert!(result.contains("escapes the workspace"), "{result}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -6978,7 +7004,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn file_tools_reject_symlinks_that_point_outside_the_workspace() {
+    fn file_tools_treat_symlinks_out_of_the_workspace_as_outside() {
         let outside =
             env::temp_dir().join(format!("lynshen-policy-outside-{}", std::process::id()));
         fs::create_dir_all(&outside).unwrap();
@@ -6987,17 +7013,21 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
 
+        // Reading through it is a read outside: allowed. Writing through it
+        // is a write outside: it needs approval.
         let result = run_tool(
             "read",
             &json!({ "path": "link/secret.txt" }).to_string(),
             &dir,
         );
-        let value = serde_json::from_str::<Value>(&result).unwrap();
-        let error = value
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        assert!(error.contains("escapes the workspace"), "{result}");
+        assert!(result.contains("secret"), "{result}");
+        let result = run_tool(
+            "write",
+            &json!({ "path": "link/new.txt", "content": "x" }).to_string(),
+            &dir,
+        );
+        assert!(result.contains("needs the user's approval"), "{result}");
+        assert!(!outside.join("new.txt").exists());
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&outside);
@@ -7529,7 +7559,7 @@ new mode 100755
 
     #[cfg(not(windows))]
     #[test]
-    fn a_sandboxed_agent_reads_what_its_commands_wrote_outside_the_workspace() {
+    fn file_writes_inside_the_boundary_need_no_approval() {
         use crate::sandbox::{SandboxMode, SandboxPolicy};
         let dir = test_dir("sandbox-temp-read");
         fs::create_dir_all(&dir).unwrap();
@@ -7543,20 +7573,22 @@ new mode 100755
             )
             .unwrap()
         };
+        let write = json!({ "path": shot.join("new.txt").display().to_string(), "content": "x" });
 
-        // No sandbox: the file tools stay inside the workspace, as before.
+        // No sandbox: reads go anywhere, writes stay in the workspace.
         let plain = ToolState::default();
-        let refused = run("read", json!({ "path": file }), &plain);
+        let read = run("read", json!({ "path": file }), &plain);
+        assert!(read["content"].as_str().unwrap().contains("image bytes"));
+        let refused = run("write", write.clone(), &plain);
         assert!(
             refused["error"]
                 .as_str()
                 .unwrap()
-                .contains("escapes the workspace"),
+                .contains("needs the user's approval"),
             "{refused}"
         );
 
-        // workspace-write: temp is writable for commands, so the read tools
-        // can read a screenshot or log a command just wrote there.
+        // workspace-write: temp is inside the boundary, as for commands.
         let sandboxed = ToolState::default();
         sandboxed.set_sandbox(Some(SandboxPolicy {
             mode: SandboxMode::WorkspaceWrite,
@@ -7565,9 +7597,6 @@ new mode 100755
             network: true,
             rules: Vec::new(),
         }));
-        let read = run("read", json!({ "path": file }), &sandboxed);
-        assert!(read.get("error").is_none(), "{read}");
-        assert!(read["content"].as_str().unwrap().contains("image bytes"));
         for (tool, args) in [
             ("ls", json!({ "path": shot.display().to_string() })),
             ("outline", json!({ "path": file })),
@@ -7579,34 +7608,19 @@ new mode 100755
             let result = run(tool, args, &sandboxed);
             assert!(result.get("error").is_none(), "{tool}: {result}");
         }
+        let written = run("write", write.clone(), &sandboxed);
+        assert!(written.get("error").is_none(), "{written}");
+        assert!(shot.join("new.txt").exists());
 
-        // Writing there is still refused: only reads widen.
-        let write = run(
-            "write",
-            json!({ "path": shot.join("new.txt").display().to_string(), "content": "x" }),
-            &sandboxed,
-        );
-        assert!(
-            write["error"]
-                .as_str()
-                .unwrap()
-                .contains("escapes the workspace"),
-            "{write}"
-        );
-        assert!(!shot.join("new.txt").exists());
-
-        // read-only: no command writes anywhere, so nothing widens either.
+        // read-only: nothing is written, inside or out.
         let read_only = ToolState::default();
         read_only.set_sandbox(Some(SandboxPolicy {
             mode: SandboxMode::ReadOnly,
             ..SandboxPolicy::default_for_platform()
         }));
-        let refused = run("read", json!({ "path": file }), &read_only);
+        let refused = run("write", write, &read_only);
         assert!(
-            refused["error"]
-                .as_str()
-                .unwrap()
-                .contains("escapes the workspace"),
+            refused["error"].as_str().unwrap().contains("read-only"),
             "{refused}"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -7614,18 +7628,18 @@ new mode 100755
     }
 
     #[test]
-    fn read_roots_never_open_credentials() {
+    fn reads_never_open_credentials() {
         let dir = test_dir("read-roots-secret");
         fs::create_dir_all(&dir).unwrap();
         let secrets = crate::sandbox::denied_reads();
         let Some(ssh) = secrets.iter().find(|path| path.ends_with(".ssh")) else {
             return;
         };
-        // Even with the home directory as a read root, ~/.ssh stays closed.
-        let roots = vec![ssh.parent().unwrap().to_path_buf()];
-        let error = readable_path(&dir, &ssh.join("id_rsa").display().to_string(), &roots)
+        // The home directory is readable; ~/.ssh stays closed.
+        let error = readable_path(&dir, &ssh.join("id_rsa").display().to_string())
             .expect_err("credentials must not be readable");
         assert!(error.contains("credentials"), "{error}");
+        assert!(readable_path(&dir, &ssh.parent().unwrap().display().to_string()).is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -7690,13 +7704,11 @@ new mode 100755
             .display()
             .to_string();
         assert_eq!(map_project_path(&sibling, &worktree, &project), None);
-        let refused = run("read", json!({ "path": sibling }));
+        // Reads are not confined: the path is read as it is, not mapped.
+        let read = run("read", json!({ "path": sibling }));
         assert!(
-            refused["error"]
-                .as_str()
-                .unwrap()
-                .contains("escapes the workspace"),
-            "{refused}"
+            !read.to_string().contains("escapes the workspace"),
+            "{read}"
         );
         let own = worktree.join("src/text.py").display().to_string();
         assert_eq!(map_project_path(&own, &worktree, &project), None);

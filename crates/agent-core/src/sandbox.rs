@@ -396,29 +396,6 @@ impl SandboxPolicy {
         }
     }
 
-    /// Directories outside the working directory that the file *read* tools
-    /// may read while this sandbox is active: everywhere this agent's own
-    /// shell commands may write (the read-write directories, temp and the
-    /// package caches), plus the read-only directories. A screenshot or log
-    /// a command just wrote to /tmp is readable; nothing becomes writable.
-    /// Empty of writable roots under `read-only`, where no command writes.
-    pub fn tool_read_roots(&self, cwd: &Path) -> Vec<PathBuf> {
-        let mut roots = self.writable_roots(cwd);
-        roots.extend(self.readable_dirs.iter().map(|dir| real(dir)));
-        roots.extend(self.writable_dirs.iter().map(|dir| real(dir)));
-        roots.sort();
-        roots.dedup();
-        roots
-    }
-
-    /// Whether `path` lies in one of the extra read-write directories.
-    pub fn in_writable_dir(&self, path: &Path) -> bool {
-        let target = real_or_parent(path);
-        self.writable_dirs
-            .iter()
-            .any(|dir| target.starts_with(real(dir)))
-    }
-
     /// The command line to run `program args` in the sandbox from `cwd`.
     /// Unchanged under `full-access`.
     pub fn wrap(
@@ -879,12 +856,14 @@ pub fn home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Credentials no sandboxed command, and no remote client, may read.
+/// Credentials no sandboxed command, no file tool and no remote client may
+/// read: `~/.ssh`, `~/.gnupg`, `~/.aws`, LynShen's own auth and daemon
+/// state, and on Windows GnuPG's `%APPDATA%\gnupg`.
 pub fn denied_reads() -> Vec<PathBuf> {
     let Some(home) = home() else {
         return Vec::new();
     };
-    [
+    let mut denied: Vec<PathBuf> = [
         ".ssh",
         ".gnupg",
         ".aws",
@@ -893,7 +872,13 @@ pub fn denied_reads() -> Vec<PathBuf> {
     ]
     .iter()
     .map(|path| real(&home.join(path)))
-    .collect()
+    .collect();
+    if cfg!(windows) {
+        if let Some(appdata) = env::var_os("APPDATA") {
+            denied.push(real(&PathBuf::from(appdata).join("gnupg")));
+        }
+    }
+    denied
 }
 
 fn temp_dirs() -> Vec<PathBuf> {
