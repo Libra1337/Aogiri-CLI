@@ -21,6 +21,7 @@ mod requirements;
 mod schedules;
 mod session;
 mod session_messages;
+mod skill_market;
 mod skills;
 mod store;
 mod terminal;
