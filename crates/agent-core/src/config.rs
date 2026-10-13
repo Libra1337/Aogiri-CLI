@@ -64,6 +64,11 @@ Communicate directly and concisely. Report behavior-level changes, important ris
 ];
 const PROMPT_FILE_NAME: &str = "prompt.txt";
 const DEFAULT_RETRY_ATTEMPTS: usize = 5;
+/// The most retries a request gets, whatever config.json says: with the
+/// backoff capped at 30 s, about an hour of an outage. A larger count (a
+/// user who wants it never to give up sets 1000000) ends the turn with the
+/// error then instead of retrying out of sight for good.
+pub const MAX_RETRY_ATTEMPTS: usize = 100;
 const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_READ_TIMEOUT_SECONDS: u64 = 300;
 /// Percentage of the model's context window at which older turns are compacted.
@@ -714,7 +719,8 @@ impl Config {
                 default_lynshen_api_url,
             )),
             api_key_env: read_api_key_env(&value),
-            retry_attempts: read_usize(&value, "retry_attempts", DEFAULT_RETRY_ATTEMPTS),
+            retry_attempts: read_usize(&value, "retry_attempts", DEFAULT_RETRY_ATTEMPTS)
+                .min(MAX_RETRY_ATTEMPTS),
             connect_timeout_seconds: read_u64(
                 &value,
                 "connect_timeout_seconds",
@@ -2193,6 +2199,17 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn a_retry_count_past_the_most_reads_as_the_most() {
+        let path = std::env::temp_dir().join("lynshen-retry-cap/config.json");
+        let config = Config::from_value(r#"{ "retry_attempts": 1000000 }"#, path.clone()).unwrap();
+        assert_eq!(config.retry_attempts, MAX_RETRY_ATTEMPTS);
+        let config = Config::from_value(r#"{ "retry_attempts": 7 }"#, path.clone()).unwrap();
+        assert_eq!(config.retry_attempts, 7);
+        let config = Config::from_value("{}", path).unwrap();
+        assert_eq!(config.retry_attempts, DEFAULT_RETRY_ATTEMPTS);
+    }
 
     #[test]
     fn stored_credential_round_trips_through_auth_json() {

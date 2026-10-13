@@ -89,7 +89,10 @@ pub fn temp_dir(label: &str) -> PathBuf {
 /// from another conversation (`<session_message …>`) is scripted by its body.
 /// `SLOW_REASONING <n>` streams n reasoning chunks 50 ms apart, then a short
 /// answer; `SLOW_RUN <command>` streams a bash call's arguments in chunks
-/// 50 ms apart (about a second in all).
+/// 50 ms apart (about a second in all). A network that went quiet:
+/// `STALL` is never answered, `STALL_MIDWAY` streams "partial" and then
+/// nothing (the connection stays open for a minute either way); `BUSY` is
+/// answered 503 with Retry-After: 2.
 fn start_fake_model() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -103,6 +106,17 @@ fn start_fake_model() -> String {
                     .unwrap_or_else(|poison| poison.into_inner())
                     .push(body.clone());
                 let reply = script(&body);
+                if reply == STALL {
+                    thread::sleep(std::time::Duration::from_secs(60));
+                    return;
+                }
+                if reply == BUSY {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy"
+                    );
+                    return;
+                }
                 let _ = match reply.strip_prefix("ERROR ") {
                     Some(message) => {
                         let error = json!({ "error": { "message": message } }).to_string();
@@ -118,13 +132,22 @@ fn start_fake_model() -> String {
                     )
                     .and_then(|()| {
                         // A slow reply (`sse_slow`) waits between its chunks;
-                        // the client may hang up meanwhile.
+                        // the client may hang up meanwhile. One that stalls
+                        // (`HANG`) sends nothing more.
+                        let (reply, hangs) = match reply.split_once(HANG) {
+                            Some((sent, _)) => (sent, true),
+                            None => (reply.as_str(), false),
+                        };
                         for (index, part) in reply.split(PAUSE).enumerate() {
                             if index > 0 {
                                 stream.flush()?;
                                 thread::sleep(std::time::Duration::from_millis(50));
                             }
                             stream.write_all(part.as_bytes())?;
+                        }
+                        if hangs {
+                            stream.flush()?;
+                            thread::sleep(std::time::Duration::from_secs(60));
                         }
                         Ok(())
                     }),
@@ -221,6 +244,15 @@ fn script(request: &Value) -> String {
         ]);
     }
     if last["role"] == "user" {
+        match text.as_str() {
+            "STALL" => return STALL.to_string(),
+            "BUSY" => return BUSY.to_string(),
+            "STALL_MIDWAY" => {
+                let partial = json!({ "choices": [{ "index": 0, "delta": { "content": "partial" }, "finish_reason": null }] });
+                return format!("data: {partial}\n\n{HANG}");
+            }
+            _ => {}
+        }
         let text = text
             .strip_prefix("<session_message ")
             .and_then(|rest| rest.split_once(">\n"))
@@ -422,6 +454,11 @@ fn loop_call(messages: &[Value]) -> Option<String> {
 
 /// Where a slow reply waits before it streams on (see `sse_slow`).
 const PAUSE: &str = "\u{1}";
+/// Where a reply stops for good, the connection left open.
+const HANG: &str = "\u{2}";
+/// Replies that are not HTTP responses (see `start_fake_model`).
+const STALL: &str = "\u{3}STALL";
+const BUSY: &str = "\u{3}BUSY";
 
 /// `sse` with a pause of 50 ms after each chunk.
 fn sse_slow(chunks: &[Value]) -> String {
