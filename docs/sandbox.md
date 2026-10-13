@@ -15,7 +15,8 @@ sessions. A daemon agent uses its own settings from `agent.json`
 | `full-access` | anything: no sandbox |
 
 In every sandboxed mode `~/.ssh`, `~/.gnupg`, `~/.aws`,
-`~/.lynshen/auth.json` and `~/.lynshen/daemon` are unreadable. Network access
+`~/.lynshen/auth.json`, `~/.lynshen/daemon` and the key that decrypts
+Desktop's stored secrets (`secret.key`) are unreadable. Network access
 is on unless `sandbox_network` is false.
 
 Windows has no OS sandbox yet. It defaults to `workspace-write` too, which
@@ -67,7 +68,7 @@ the same length `ask` wins over `allow`. The defaults let `git add` and
 A command line is matched part by part. It is split on `&&`, `||`, `;`,
 `|`, `&`, new lines and command substitutions (`$(…)`, backticks); code
 given inline to a shell (`bash -c "…"`, `powershell -Command …`,
-`cmd /c …`) is split the same way, and so are groups and PowerShell script
+`cmd /c …`, `eval`, `Invoke-Expression`, `watch`) is split the same way, and so are groups and PowerShell script
 blocks (`{ … }`) and the command `find -exec` runs. From each part, leading
 variable assignments and wrappers come off (`sudo`, `doas`, `env`,
 `command`, `time`, `nohup`, `nice`, `timeout`, `xargs`).

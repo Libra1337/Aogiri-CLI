@@ -201,6 +201,12 @@ fn read_key(path: &Path) -> io::Result<Option<SecretKey>> {
     }
 }
 
+/// Where the key that decrypts Desktop's secret envelopes may be: kept
+/// as unreadable as the credentials it opens (`sandbox::denied_reads`).
+pub(crate) fn key_files() -> Vec<PathBuf> {
+    key_candidates()
+}
+
 fn key_candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(path) = env::var_os("LYNSHEN_SECRET_KEY_PATH")

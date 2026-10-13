@@ -1035,7 +1035,8 @@ pub fn real_home() -> Option<PathBuf> {
 
 /// Credentials no sandboxed command, no file tool and no remote client may
 /// read: `~/.ssh`, `~/.gnupg`, `~/.aws`, LynShen's own auth and daemon
-/// state, and on Windows GnuPG's `%APPDATA%\gnupg`.
+/// state, the key that decrypts Desktop's stored secrets, and on Windows
+/// GnuPG's `%APPDATA%\gnupg`.
 pub fn denied_reads() -> Vec<PathBuf> {
     let Some(home) = home() else {
         return Vec::new();
@@ -1053,6 +1054,12 @@ pub fn denied_reads() -> Vec<PathBuf> {
     if cfg!(windows) {
         if let Some(appdata) = env::var_os("APPDATA") {
             denied.push(real(&PathBuf::from(appdata).join("gnupg")));
+        }
+    }
+    for key in crate::secrets::key_files() {
+        let key = real(&key);
+        if !denied.contains(&key) {
+            denied.push(key);
         }
     }
     denied
@@ -1232,6 +1239,14 @@ mod tests {
         fs::create_dir_all(dir.join(".git")).unwrap();
         fs::create_dir_all(dir.join(".lynshen/agents/sub")).unwrap();
         real(&dir)
+    }
+
+    #[test]
+    fn the_key_to_desktop_s_secrets_is_a_credential() {
+        let denied = denied_reads();
+        let home = real(&home().unwrap());
+        assert!(denied.contains(&real(&home.join(".lynshen/secret.key"))));
+        assert!(denied.contains(&real(&home.join(".lynshen/auth.json"))));
     }
 
     #[test]

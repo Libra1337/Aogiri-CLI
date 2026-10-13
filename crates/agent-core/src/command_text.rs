@@ -693,6 +693,33 @@ fn inline_code(segment: &Segment) -> Option<Inline> {
                 .position(|arg| matches!(arg.to_lowercase().as_str(), "/c" | "/k" | "/r"))?;
             Some(Inline::Code(args[flag + 1..].join(" ")))
         }
+        // They run their arguments as a command line.
+        "eval" | "invoke-expression" | "iex" => {
+            let code: Vec<&String> = args
+                .iter()
+                .filter(|arg| !arg.eq_ignore_ascii_case("-command"))
+                .collect();
+            Some(Inline::Code(
+                code.iter()
+                    .map(|arg| arg.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ))
+        }
+        "watch" => {
+            let mut i = 0;
+            while let Some(arg) = args.get(i) {
+                if !arg.starts_with('-') {
+                    break;
+                }
+                i += if matches!(arg.as_str(), "-n" | "--interval" | "-d") {
+                    2
+                } else {
+                    1
+                };
+            }
+            Some(Inline::Code(args.get(i..).unwrap_or_default().join(" ")))
+        }
         _ => None,
     }
 }
@@ -1357,6 +1384,20 @@ mod tests {
         assert_eq!(delete_targets(&parts[1]), strings(&[r"C:\x"]));
         assert!(segments("pwsh -EncodedCommand ZQBjAGgAbwA=")[0].inline_code);
         assert!(segments("cmd /c del /q build")[0].inline_code);
+        // eval, Invoke-Expression and watch run their arguments.
+        for command in [
+            "eval 'git push origin main'",
+            "Invoke-Expression 'git push'",
+            "iex \"git push\"",
+            "watch -n 5 git push",
+        ] {
+            let parts = segments(command);
+            assert!(is_interpreter(&parts[0]), "{command}");
+            assert!(
+                parts.iter().any(|part| git_push(part).is_some()),
+                "{command}: {parts:?}"
+            );
+        }
         // A shell given a script runs whatever the script says.
         assert!(is_interpreter(&segments("bash build.sh")[0]));
         assert!(is_interpreter(&segments("pwsh -File build.ps1")[0]));
