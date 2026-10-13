@@ -38,6 +38,9 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      - name: Test the skills mirror builder
+        run: python3 deploy/skills-mirror/test_build.py
+
   # The release workflow already builds Windows binaries, so keep Windows
   # compiling on every PR. Tests are only run on Linux for now.
   build-windows:

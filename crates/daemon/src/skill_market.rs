@@ -171,40 +171,70 @@ pub fn due(cached: &[Cached], configured: &[(String, String)], now: u64) -> bool
 }
 
 /// Reads the stale sources again (every one when `all`) and stores the
-/// result: the mirror's copy where it has one, GitHub (those sources at
-/// once) for the rest. A source that fails keeps the skills it had.
+/// result.
 fn refresh(configured: &[(String, String)], all: bool) {
-    let old = read();
-    let started = now_ms();
+    let mirror_url = mirror::mirror_url();
+    let mirror_sources = || {
+        mirror_url
+            .as_deref()
+            .map(|url| mirror::fetch_mirror(url).map(|found| found.sources))
+    };
+    let github = |name: &str, repository: &str| skills::fetch_github_source(name, repository);
+    let Some(cached) = read_again(configured, all, &read(), now_ms(), &mirror_sources, &github)
+    else {
+        return;
+    };
+    if let Err(error) = write(&cached) {
+        eprintln!("lynshen daemon: cannot write the skills catalog cache: {error}");
+    }
+}
+
+type MirrorSources<'a> = dyn Fn() -> Option<Result<Vec<SkillSource>, String>> + 'a;
+type GithubSource<'a> = dyn Fn(&str, &str) -> Result<SkillSource, String> + Sync + 'a;
+
+/// The cache after reading the stale sources (every one when `all`) again:
+/// the mirror's copy where it has one (`mirror` is None without a mirror),
+/// GitHub (those sources at once) for the rest. A source that fails keeps
+/// the skills it had; one not read stays as it was. None when no source is
+/// due.
+fn read_again(
+    configured: &[(String, String)],
+    all: bool,
+    old: &[Cached],
+    started: u64,
+    mirror: &MirrorSources,
+    github: &GithubSource,
+) -> Option<Vec<Cached>> {
     let mut rest: Vec<usize> = (0..configured.len())
-        .filter(|&at| all || stale(find(&old, &configured[at].1), started))
+        .filter(|&at| all || stale(find(old, &configured[at].1), started))
         .collect();
     if rest.is_empty() {
-        return;
+        return None;
     }
     let mut fresh: Vec<(usize, Result<(SkillSource, &str), String>)> = Vec::new();
     let mut mirror_error = None;
-    if let Some(url) = mirror::mirror_url() {
-        match mirror::fetch_mirror(&url) {
-            Ok(found) => rest.retain(|&at| match found.source(&configured[at].1) {
+    match mirror() {
+        Some(Ok(sources)) => rest.retain(|&at| {
+            let found = sources
+                .iter()
+                .find(|source| same_repository(&source.repository, &configured[at].1));
+            match found {
                 Some(source) => {
                     fresh.push((at, Ok((source.clone(), "mirror"))));
                     false
                 }
                 None => true,
-            }),
-            Err(error) => mirror_error = Some(error),
-        }
+            }
+        }),
+        Some(Err(error)) => mirror_error = Some(error),
+        None => {}
     }
     let from_github: Vec<(usize, Result<SkillSource, String>)> = thread::scope(|scope| {
         let handles: Vec<_> = rest
             .iter()
             .map(|&at| {
                 let (name, repository) = &configured[at];
-                (
-                    at,
-                    scope.spawn(move || skills::fetch_github_source(name, repository)),
-                )
+                (at, scope.spawn(move || github(name, repository)))
             })
             .collect();
         handles
@@ -230,7 +260,7 @@ fn refresh(configured: &[(String, String)], all: bool) {
     let checked_at = now_ms().max(started);
     let mut cached = Vec::new();
     for (at, (name, repository)) in configured.iter().enumerate() {
-        let previous = find(&old, repository);
+        let previous = find(old, repository);
         let result = fresh.iter().find(|(index, _)| *index == at).map(|(_, r)| r);
         let entry = match result {
             Some(Ok((source, origin))) => Cached {
@@ -271,9 +301,7 @@ fn refresh(configured: &[(String, String)], all: bool) {
         };
         cached.push(entry);
     }
-    if let Err(error) = write(&cached) {
-        eprintln!("lynshen daemon: cannot write the skills catalog cache: {error}");
-    }
+    Some(cached)
 }
 
 /// The background refresh: whether one runs, and whether every source is to
@@ -373,6 +401,88 @@ mod tests {
             checked_at,
             error: error.map(str::to_string),
         }
+    }
+
+    fn source(name: &str, repository: &str, ids: &[&str]) -> SkillSource {
+        SkillSource {
+            name: name.to_string(),
+            repository: repository.to_string(),
+            revision: String::new(),
+            dir: "skills".to_string(),
+            skills: ids
+                .iter()
+                .map(|id| skills::SourceSkill {
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    description: String::new(),
+                    tags: Vec::new(),
+                    license: String::new(),
+                    redistributable: true,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_refresh_takes_the_mirror_first_github_for_the_rest_and_keeps_what_failed() {
+        let repo = |name: &str| format!("https://github.com/o/{name}");
+        let configured: Vec<(String, String)> = ["mirrored", "failing", "fresh", "github"]
+            .iter()
+            .map(|name| (name.to_uppercase(), repo(name)))
+            .collect();
+        let now = 100 * FRESH.as_millis() as u64;
+        let hour = FRESH.as_millis() as u64;
+        let mut failing = entry(&repo("failing"), now - 2 * hour, None);
+        failing.source = source("FAILING", &repo("failing"), &["kept"]);
+        let old = vec![failing, entry(&repo("fresh"), now - 1, None)];
+        let mirror = || Some(Ok(vec![source("Other name", &repo("mirrored"), &["m"])]));
+        let github = |name: &str, repository: &str| {
+            if repository.ends_with("/failing") {
+                Err("api.github.com: connection failed".to_string())
+            } else {
+                Ok(source(name, repository, &["g"]))
+            }
+        };
+
+        let cached = read_again(&configured, false, &old, now, &mirror, &github).unwrap();
+
+        let by = |name: &str| find(&cached, &repo(name)).unwrap().clone();
+        let mirrored = by("mirrored");
+        assert_eq!(mirrored.origin.as_deref(), Some("mirror"));
+        assert_eq!(mirrored.source.name, "MIRRORED");
+        assert_eq!(mirrored.source.skills[0].id, "m");
+        let failed = by("failing");
+        assert_eq!(failed.source.skills[0].id, "kept");
+        assert_eq!(failed.fetched_at, Some(now - 2 * hour));
+        assert!(failed.checked_at >= now);
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("api.github.com: connection failed")
+        );
+        assert_eq!(by("fresh").checked_at, now - 1);
+        assert_eq!(by("github").origin.as_deref(), Some("github"));
+
+        // Without the mirror, its error joins GitHub's; `all` reads the fresh one too.
+        let no_mirror = || Some(Err("software.lynshen.org: timed out".to_string()));
+        let cached = read_again(&configured, true, &old, now, &no_mirror, &github).unwrap();
+        let failed = find(&cached, &repo("failing")).unwrap();
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("api.github.com: connection failed; LynShen mirror: software.lynshen.org: timed out")
+        );
+        assert_eq!(
+            find(&cached, &repo("fresh")).unwrap().origin.as_deref(),
+            Some("github")
+        );
+        assert_eq!(
+            find(&cached, &repo("mirrored")).unwrap().origin.as_deref(),
+            Some("github")
+        );
+
+        // Nothing due, nothing read.
+        let fresh_only = vec![("FRESH".to_string(), repo("fresh"))];
+        let untouched = |_: &str, _: &str| -> Result<SkillSource, String> { panic!("read") };
+        assert!(read_again(&fresh_only, false, &old, now, &|| None, &untouched).is_none());
     }
 
     #[test]

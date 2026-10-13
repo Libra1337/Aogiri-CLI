@@ -23,7 +23,8 @@ const ANTHROPIC_SKILLS_INDEX: &str = include_str!("anthropic-skills.json");
 
 /// Public GitHub repositories of skills the desktop marketplace lists beside
 /// Anthropic's: (shown name, repository). Their skills sit in `skills/<id>/`
-/// or at the top level (`<id>/SKILL.md`); see [`fetch_github_source`].
+/// or at the top level (`<id>/SKILL.md`); see [`fetch_github_source`]. The
+/// skills mirror builds the same list (deploy/skills-mirror/sources.json).
 pub const COMMUNITY_SKILL_SOURCES: [(&str, &str); 3] = [
     ("Ikaleio", "https://github.com/Ikaleio/skills"),
     ("Superpowers", "https://github.com/obra/superpowers"),
@@ -2120,6 +2121,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(!error.to_string().contains("proxy"), "{error}");
+    }
+
+    #[test]
+    fn the_mirror_builds_the_community_sources_the_engine_lists() {
+        let built: Value =
+            serde_json::from_str(include_str!("../../../deploy/skills-mirror/sources.json"))
+                .unwrap();
+        let built: Vec<(&str, &str)> = built
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|source| {
+                (
+                    source["name"].as_str().unwrap(),
+                    source["repository"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(built, COMMUNITY_SKILL_SOURCES);
     }
 
     /// Network: the community repositories list their skills with metadata.
