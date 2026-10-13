@@ -113,6 +113,17 @@ script, a variable (`rm -rf "$DIR"`), an encoded or generated command
 line are not seen through. What is enforced is the OS sandbox on macOS and
 Linux (what a command can write) and the file tools' own checks.
 
+### What the model is told
+
+The system prompt says, in every mode (`full-access` and Windows too), what
+commands may write, how to leave the sandbox (`escalate: true` with a
+`justification`), what file tools may read and write, and which commands
+always ask or never run. A change (`/sandbox`, `set_sandbox`, a directory
+added) reaches the model as a note on its next turn. When a sandboxed
+command fails with "Operation not permitted", `EPERM` or "Read-only file
+system", its result carries a `sandbox_hint` telling the model to run it
+again with `escalate` if it must write outside.
+
 ### How far an approval reaches
 
 A client answers a request once, for the session, or for the project

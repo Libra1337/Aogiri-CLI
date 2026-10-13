@@ -1515,12 +1515,35 @@ fn bash(
         run_command_events(program, &shell_args, None, &workdir, timeout, emit)
             .map(|result| command_result_json(command, Ok(result)))
     };
+    let sandboxed = !escalated && sandbox.is_some_and(|sandbox| sandbox.enforced());
     match result {
         Ok(mut value) => {
             add_command_soft_hint(&mut value);
+            if sandboxed {
+                add_sandbox_hint(&mut value);
+            }
             value
         }
         Err(error) => json!({ "command": command, "error": error }),
+    }
+}
+
+/// A failed command whose output reads like the sandbox stopped it: tell
+/// the model how to get out.
+fn add_sandbox_hint(value: &mut Value) {
+    let failed = value.get("error").is_some()
+        || value
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .is_some_and(|code| code != 0);
+    let output = |key: &str| value.get(key).and_then(Value::as_str).unwrap_or_default();
+    let blocked = ["Operation not permitted", "EPERM", "Read-only file system"]
+        .iter()
+        .any(|sign| output("stderr").contains(sign) || output("stdout").contains(sign));
+    if failed && blocked {
+        value["sandbox_hint"] = json!(
+            "This looks like the sandbox stopped it. If the command must write outside the writable directories, run it again with escalate: true and a one-line justification."
+        );
     }
 }
 
@@ -7721,6 +7744,46 @@ new mode 100755
             Some(worktree.clone())
         );
         let _ = fs::remove_dir_all(&project);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_command_the_sandbox_stops_is_told_to_escalate() {
+        use crate::sandbox::{SandboxMode, SandboxPolicy};
+        let dir = test_dir("sandbox-hint");
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        let state = ToolState::default();
+        state.set_sandbox(Some(SandboxPolicy {
+            mode: SandboxMode::WorkspaceWrite,
+            ..SandboxPolicy::default_for_platform()
+        }));
+        let run = |command: &str| -> Value {
+            serde_json::from_str(
+                &run_tool_with_events(
+                    "bash",
+                    &json!({ "command": command }).to_string(),
+                    &dir,
+                    &[],
+                    &state,
+                    |_| Ok(()),
+                )
+                .output,
+            )
+            .unwrap()
+        };
+        // .git is read-only in the sandbox.
+        let blocked = run("echo x > .git/config");
+        assert!(
+            blocked["sandbox_hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("escalate")),
+            "{blocked}"
+        );
+        assert!(!dir.join(".git/config").exists());
+        // A failure of its own gets no hint.
+        let failed = run("ls missing-file");
+        assert!(failed.get("sandbox_hint").is_none(), "{failed}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

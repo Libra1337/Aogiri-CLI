@@ -624,14 +624,14 @@ pub(crate) fn request_tool_definitions(offer: &ToolOffer<'_>) -> Vec<Value> {
                     "escalate".to_string(),
                     json!({
                         "type": "boolean",
-                        "description": "Run outside the sandbox; needs approval."
+                        "description": "Run outside the sandbox. The approval mode decides whether the user is asked; the user sees it either way."
                     }),
                 );
                 properties.insert(
                     "justification".to_string(),
                     json!({
                         "type": "string",
-                        "description": "With escalate: why, in one line."
+                        "description": "With escalate: why, in one line, for the user."
                     }),
                 );
             }
