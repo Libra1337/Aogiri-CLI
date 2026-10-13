@@ -3883,7 +3883,18 @@ impl AgentCore {
             Err(error) => return vec![AgentEvent::Error(error)],
         };
         if let Some((dir, persist)) = add_dir {
-            events.extend(self.add_directory(&dir.display().to_string(), "rw", &persist));
+            // The call is allowed already: a directory that could not be
+            // saved is reported, not taken for a failed turn.
+            events.extend(
+                self.add_directory(&dir.display().to_string(), "rw", &persist)
+                    .into_iter()
+                    .map(|event| match event {
+                        AgentEvent::Error(message) => {
+                            AgentEvent::Info(format!("the directory was not added: {message}"))
+                        }
+                        event => event,
+                    }),
+            );
         }
         events
     }
@@ -4009,8 +4020,10 @@ impl AgentCore {
         inside: bool,
     ) -> Vec<AgentEvent> {
         use crate::approval::ApprovalScope;
+        // Info, not error: the call was allowed (once), and a client takes
+        // an error during a turn for a failed turn.
         let kept = || {
-            vec![AgentEvent::Error(format!(
+            vec![AgentEvent::Info(format!(
                 "a command rule asks or forbids `{prefix}`: allowed this once, the rule stays"
             ))]
         };
@@ -4052,7 +4065,7 @@ impl AgentCore {
                 return kept();
             }
             self.apply_sandbox();
-            return vec![AgentEvent::Error(format!(
+            return vec![AgentEvent::Info(format!(
                 "could not save the rule for `{prefix}` ({error}); it applies to this session only"
             ))];
         }
