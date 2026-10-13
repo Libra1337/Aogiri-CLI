@@ -85,9 +85,13 @@ fn open(
         if let Ok(mode) = ApprovalMode::parse(&agent.approval_mode) {
             core.set_approval_mode(mode);
         }
-        // Refuse to start rather than run an agent's commands unsandboxed.
+        // Refuse to start rather than run an agent's commands unsandboxed,
+        // also where no OS sandbox enforces its mode (Windows).
         let policy = agent.policy()?;
         policy.check_available()?;
+        if policy.is_sandboxed() && !policy.enforced() {
+            return Err("the sandbox is not supported on this platform; set the sandbox to full-access or run under WSL2".to_string());
+        }
         core.set_sandbox(Some(policy));
         host = Some(crate::agent_tools::extensions(
             Arc::clone(hub),

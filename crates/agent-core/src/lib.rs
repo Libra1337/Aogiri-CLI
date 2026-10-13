@@ -49,7 +49,8 @@ pub use config::{
 pub use core::{title_completion, AgentCore, ApproveOptions, KeptState};
 pub use event::{
     AgentEvent, CommandView, ContextBreakdown, GoalView, LoginProviderView, McpServerView,
-    McpToolView, ModelOptionView, PlanItem, SessionListItemView, TranscriptItem, TreeNodeView,
+    McpToolView, ModelOptionView, PlanItem, SandboxDirectoryView, SandboxView, SessionListItemView,
+    TranscriptItem, TreeNodeView,
 };
 pub use hooks::HookStopper;
 pub use hunks::HunkView;

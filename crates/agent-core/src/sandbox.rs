@@ -10,8 +10,10 @@
 //!
 //! Credentials (`~/.ssh`, `~/.gnupg`, `~/.aws`, LynShen's own auth and daemon
 //! state) are unreadable in every sandboxed mode. macOS uses Seatbelt
-//! (`sandbox-exec`), Linux `bwrap`; Windows supports `full-access` only.
-//! File tools run in-process and check writes against the same rules.
+//! (`sandbox-exec`), Linux `bwrap`. Windows has no OS sandbox: a mode other
+//! than `full-access` is a boundary the model is told about and declares
+//! crossing (`escalate`), not one that is enforced (`enforced`). File tools
+//! run in-process and check writes against the same rules.
 
 use serde_json::{json, Value};
 use std::{
@@ -115,6 +117,18 @@ impl SandboxPolicy {
     /// Whether commands run inside an OS sandbox.
     pub fn is_sandboxed(&self) -> bool {
         self.mode != SandboxMode::FullAccess
+    }
+
+    /// Whether an OS sandbox enforces the mode: macOS and Linux, in a mode
+    /// other than `full-access`. Elsewhere commands run unconfined.
+    pub fn enforced(&self) -> bool {
+        self.is_sandboxed() && OS_SANDBOX
+    }
+
+    /// Why the OS sandbox cannot run here (bubblewrap missing, or blocked by
+    /// AppArmor), with how to fix it; None when it runs or is not used.
+    pub fn unavailable(&self) -> Option<String> {
+        self.check_available().err()
     }
 
     /// What the command rules and the built-in lists say about `command`
@@ -472,12 +486,14 @@ impl SandboxPolicy {
             wrapped.extend(args.iter().map(|arg| arg.to_string()));
             Ok((bwrap.display().to_string(), wrapped))
         } else {
-            Err("the sandbox is not supported on this platform; set the sandbox to full-access or run under WSL2".to_string())
+            // No OS sandbox (Windows): the command runs unconfined.
+            Ok(plain())
         }
     }
 
-    /// Errors when this platform cannot run the sandbox, so a host can refuse
-    /// to start instead of failing on the first command.
+    /// Errors when this platform cannot run the OS sandbox, so a host can
+    /// refuse to start instead of failing on the first command. A platform
+    /// without one (Windows) has nothing to fail: see `enforced`.
     pub fn check_available(&self) -> Result<(), String> {
         if !self.is_sandboxed() {
             return Ok(());
@@ -488,9 +504,10 @@ impl SandboxPolicy {
                 .then_some(())
                 .ok_or_else(|| "sandbox-exec is missing".to_string())
         } else if cfg!(target_os = "linux") {
-            find_bwrap().map(|_| ()).ok_or_else(bwrap_missing)
+            let bwrap = find_bwrap().ok_or_else(bwrap_missing)?;
+            bwrap_runs(&bwrap)
         } else {
-            Err("the sandbox is not supported on this platform; set the sandbox to full-access or run under WSL2".to_string())
+            Ok(())
         }
     }
 
@@ -942,6 +959,36 @@ fn find_bwrap() -> Option<PathBuf> {
             .map(|dir| dir.join("bwrap"))
             .find(|candidate| candidate.is_file())
     })
+}
+
+/// Whether this platform has an OS sandbox LynShen drives.
+const OS_SANDBOX: bool = cfg!(any(target_os = "macos", target_os = "linux"));
+
+/// Starts `bwrap` once per process with the binds every command gets: on
+/// Ubuntu 24.04 and later AppArmor stops it from creating the user
+/// namespace it needs, and every command would fail.
+fn bwrap_runs(bwrap: &Path) -> Result<(), String> {
+    static PROBE: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    PROBE
+        .get_or_init(|| {
+            let output = std::process::Command::new(bwrap)
+                .args([
+                    "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--", "sh", "-c",
+                    ":",
+                ])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|error| format!("bwrap could not start: {error}"))?;
+            if output.status.success() {
+                return Ok(());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!(
+                "bwrap cannot create a sandbox here ({}). AppArmor on Ubuntu 24.04 and later blocks the user namespaces it needs: allow them with `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (or give bwrap an AppArmor profile), or set the sandbox to full-access",
+                stderr.trim()
+            ))
+        })
+        .clone()
 }
 
 fn bwrap_missing() -> String {

@@ -15,6 +15,28 @@ pub struct ContextBreakdown {
     pub messages: u64,
 }
 
+/// The sandbox a session runs with (the `sandbox` event).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxView {
+    pub mode: String,
+    pub network: bool,
+    /// An OS sandbox enforces it: false on Windows and in `full-access`.
+    pub enforced: bool,
+    /// Why the OS sandbox cannot run (bubblewrap missing, AppArmor), with
+    /// the fix.
+    pub unavailable: Option<String>,
+    pub directories: Vec<SandboxDirectoryView>,
+}
+
+/// A directory the session's sandbox adds: its path, `rw` or `ro`, and
+/// where it comes from (`global`, `project` or `session`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxDirectoryView {
+    pub path: String,
+    pub mode: &'static str,
+    pub source: &'static str,
+}
+
 #[derive(Debug, Clone)]
 pub struct TreeNodeView {
     pub id: String,
@@ -340,6 +362,16 @@ pub enum AgentEvent {
     /// A gated call made while no client was watching: recorded instead of
     /// blocking the turn. Decide it later with `AgentCore::decide_action`.
     ActionDeferred(crate::actions::DeferredAction),
+    /// The session's sandbox: at startup and after every change.
+    Sandbox(SandboxView),
+    /// A call that crosses the sandbox or the workspace boundary ran
+    /// without asking anyone: `by` is `mode` (full-access), `rule` (an
+    /// allow rule) or `classifier` (the safety model).
+    Escalated {
+        call_id: String,
+        by: &'static str,
+        info: crate::approval::ApprovalInfo,
+    },
     /// A deferred action was decided. `output` is set when it ran.
     ActionDecided {
         id: String,

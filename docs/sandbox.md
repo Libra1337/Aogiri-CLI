@@ -18,11 +18,21 @@ In every sandboxed mode `~/.ssh`, `~/.gnupg`, `~/.aws`,
 `~/.lynshen/auth.json` and `~/.lynshen/daemon` are unreadable. Network access
 is on unless `sandbox_network` is false.
 
-Windows has no sandbox yet and defaults to `full-access`. On Linux without
-`bwrap` (or where unprivileged user namespaces are disabled) LynShen reports
-the sandbox as unavailable at startup and shell commands fail until you
-install bubblewrap or switch to `full-access`; it never falls back to running
-commands unsandboxed.
+Windows has no OS sandbox yet and defaults to `full-access`. A mode other
+than `full-access` (LynShen Desktop's 全自动 sets `workspace-write`) is
+accepted there but not enforced: commands run with your permissions, the
+model is told the working directory is its boundary and declares crossing
+it (`escalate`), and clients see `enforced: false` in the `sandbox` event.
+A daemon agent still refuses to start with a sandbox Windows cannot
+enforce.
+
+On Linux without `bwrap`, or where AppArmor blocks it (Ubuntu 24.04 and
+later restrict unprivileged user namespaces), LynShen reports the sandbox as
+unavailable at startup (`unavailable` in the `sandbox` event, with the fix)
+and shell commands fail until you install bubblewrap, allow the namespaces
+(`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, or an
+AppArmor profile for bwrap) or switch to `full-access`; it never falls back
+to running commands unsandboxed.
 
 ## Approvals
 
@@ -31,6 +41,15 @@ which still asks for every command. A command that must leave the sandbox
 (commit to git, write elsewhere) is called with `escalate: true` and a
 `justification`, and goes through the approval mode: `auto` asks the safety
 model, `manual` and `auto-edit` ask you, `full-access` runs it.
+
+The approval mode and the sandbox are separate. `full-access` approval
+keeps the sandbox (LynShen Desktop's 全自动): commands still run in it, and
+what leaves it runs without asking but is reported (`escalated`, a line in
+the conversation). Only the built-in list and your `ask` rules ask. Turning
+the sandbox itself off is `set_sandbox` / `/sandbox full-access` (Desktop's
+完全访问, in settings only). Where no OS sandbox enforces the mode
+(Windows), a command without `escalate` is gated by the approval mode as
+if there were no sandbox.
 
 Command rules are checked first, by how the command starts:
 

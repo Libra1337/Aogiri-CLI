@@ -47,6 +47,7 @@ After `hello`, before any command, the engine emits its startup batch:
 {"type":"model_status","provider":"...","model":"...","reasoning_effort":"...","context_window":200000,"context_limit":160000,"max_output_tokens":32000,"reasoning_efforts":["low","medium","high"],"state":"ready"}
 {"type":"command_list","commands":[{"command":"/help","marker":null,"args":"","description":"..."}]}
 {"type":"approval_mode","mode":"manual"}
+{"type":"sandbox","mode":"workspace-write","network":true,"enforced":true,"unavailable":null,"directories":[]}
 {"type":"mcp_servers","servers":[...]}
 {"type":"task_board","tasks":[...]}                          // only when the session's task board has tasks
 {"type":"trust_prompt","cwd":"...","repo_root":"..."}        // only when an untrusted project has local resources
@@ -308,8 +309,26 @@ An `approval_request` event carries, besides the call:
 `status:"approval mode: ..."` and an `approval_mode` event. The change
 applies to new turns; an in-flight turn's gating can only loosen. A call
 waiting for approval that the new mode does not gate runs at once, except
-one that an `ask` command rule stops or a worktree agent leaving its
-sandbox: that one still waits for `approve`.
+one with `must_ask` (an `ask` command rule, the built-in list, a worktree
+agent leaving its sandbox): that one still waits for `approve`. A waiting
+call that leaves the sandbox and runs this way is reported as `escalated`.
+
+The approval mode does not change the sandbox. `full-access` keeps it: a
+command still runs in the sandbox, and one that leaves it (`escalate`) or
+a write outside the workspace runs without asking and emits `escalated`;
+requests with `must_ask` still ask. To turn the sandbox off, use
+`set_sandbox` with `full-access`. LynShen Desktop's modes:
+
+| Desktop | `approval_mode` | sandbox |
+| --- | --- | --- |
+| 谨慎 (careful) | `manual` | `workspace-write` |
+| 计划 (plan) | `plan` | `workspace-write` |
+| 自动 (auto, the default) | `auto` | `workspace-write` |
+| 全自动 (full auto) | `full-access` | `workspace-write`, kept |
+| 完全访问 (full access, in settings only) | `full-access` | `full-access` |
+
+`auto` asks the safety model (`safety_model`) about a command or a
+crossing before asking you; without one it asks you, as `auto-edit` does.
 
 `plan` is plan mode: only read-only tools run (reads, listing, search,
 web search/fetch, read-only shell commands, MCP tools marked
@@ -428,6 +447,21 @@ plan mode, and starts a turn asking for a complete revised plan with the
 returns an `error` event. The text command `/plan <id> approve [mode]
 [notes]` / `/plan <id> revise <feedback>` does the same (the TUI uses it).
 
+### `set_sandbox`
+
+```json
+{"op":"set_sandbox","mode":"workspace-write","network":true}
+```
+
+Sets this session's sandbox: `mode` is `read-only`, `workspace-write` or
+`full-access`; `network` is optional (unchanged when left out). Not saved:
+config.json's `sandbox` and `sandbox_network` set the default. The
+session's next engine (a daemon reopening an idle session) keeps it.
+Emits `sandbox`. When the OS sandbox cannot run here (Linux without a
+working `bwrap`), emits `error` and `sandbox` and changes nothing. On
+Windows a mode other than `full-access` is accepted but not enforced
+(`enforced: false`, see `docs/sandbox.md`).
+
 ### `set_attended`
 
 ```json
@@ -480,6 +514,8 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `model_status` | `provider`, `model`, `reasoning_effort`, `context_window`, `context_limit`, `max_output_tokens`, `reasoning_efforts`, `state` | Current model selection; deduplicated, re-emitted on change. Claude Code sessions add their own fields (`docs/daemon-protocol.md` → Other engines). |
 | `command_list` | `commands: [{command, marker, args, description}]` | Available slash commands incl. custom and MCP prompt commands. |
 | `approval_mode` | `mode` | Current approval mode; emitted at startup and on change. |
+| `sandbox` | `mode`, `network`, `enforced`, `unavailable`, `directories` | The session's sandbox; emitted at startup (and to a client that attaches) and after every change (`set_sandbox`, `/sandbox <mode>`, `add_directory`, `remove_directory`, `approve` with `add_dir`). `enforced`: an OS sandbox applies the mode; false on Windows and in `full-access`. `unavailable`: why the OS sandbox cannot run here (bubblewrap missing, AppArmor blocking it) with the fix, else `null`. `directories`: `[{path, mode, source}]`, the read-write (`rw`) and read-only (`ro`) directories it adds, by where they come from: `global` (config.json `sandbox_directories`, or a daemon agent's directories), `project` (config.json `projects`, and the directories the daemon adds for the project) or `session`. |
+| `escalated` | `call_id`, `kind`, `command`, `justification`, `cwd`, `paths`, `by` | A call that leaves the sandbox or writes outside the workspace (`kind` `escalation` or `outside_write`) ran without asking anyone. `by`: `mode` (`full-access`, or a switch to it freed the call), `rule` (an `allow` rule, also one an approval remembered) or `classifier` (the safety model in `auto`). Clients show it as a line in the conversation. |
 | `agent_runs` | `workflows: []`, `agents: [{id, label, model, effort, state, started_at, duration_ms, tokens, tool_calls, prompt, result, error, type: "subagent", tool_use_id, activity, role, plan_step, isolation, workdir, files_changed, background, attempt_group, attempt}]` | Every subagent of the session, oldest first (the 24 most recent finished ones, and every one with a worktree to merge). `id` is its path (`/root/<task_name>`), `state` ∈ `pending`/`running`/`completed`/`errored`/`interrupted`/`closed`/`budget_exhausted`/`conflict`/`merged`/`discarded`, `started_at` epoch ms (reset by `resume_agent`), `tool_use_id` the parent's `spawn_agent` call (empty for a reviewer started by `agents.review_on_complete`), `activity` its latest action in a few words ("Running cargo test"). `role` and `plan_step` are strings or `null`. `isolation` is `worktree` or `none`; a worktree agent has `workdir` (its worktree, else `null`) and `files_changed` (paths relative to the worktree, once finished). `background`: it keeps running after its parent's turn ends. `attempt_group` (the task name given to `spawn_agent`) and `attempt` (1–4) are set for best-of-N attempts, else `null`. See "Agent team". |
 | `plan_draft` | `id`, `title`, `append` | Plan mode: the plan while the model writes its `propose_plan` call. `append` is the Markdown added since the previous `plan_draft` of the same `id`; `title` is the title so far. The finished plan follows as `proposed_plan` with the same `id`. Not replayed. |
 | `proposed_plan` | `id`, `title`, `markdown`, `status` | Plan mode: a plan from `propose_plan`. `status` is `pending`, then `approved` or `revising` after `approve_plan`. Session replay (`transcript`) carries it as `{"role":"plan","id","title","content","status"}` with the latest status. |

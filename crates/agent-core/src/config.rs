@@ -90,7 +90,9 @@ pub enum ApprovalMode {
     /// AutoEdit plus a safety classifier that auto-approves shell commands it
     /// judges safe; unsafe, ambiguous, or unclassifiable commands still ask.
     Auto,
-    /// Everything runs without approval.
+    /// Everything runs without approval, except calls a person must decide
+    /// (`ask` rules, the built-in list). The sandbox stays: a call that
+    /// leaves it runs and is reported (`escalated`).
     FullAccess,
     /// Planning: only read-only tools run (see `plan_mode::refusal`); the
     /// agent ends by proposing a plan. Gated like `Manual` for anything that

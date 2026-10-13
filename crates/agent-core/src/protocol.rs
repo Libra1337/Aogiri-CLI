@@ -81,6 +81,19 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
                 Err(error) => vec![AgentEvent::Error(error)],
             }
         }
+        // {"op":"set_sandbox","mode":"workspace-write","network":true}
+        "set_sandbox" => {
+            let mode = value
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match crate::sandbox::SandboxMode::parse(mode) {
+                Ok(mode) => {
+                    core.set_sandbox_mode(mode, value.get("network").and_then(Value::as_bool))
+                }
+                Err(error) => vec![AgentEvent::Error(error)],
+            }
+        }
         "set_attended" => match value.get("attended").and_then(Value::as_bool) {
             Some(attended) => core.set_attended(attended),
             None => vec![AgentEvent::Error(
@@ -636,6 +649,28 @@ pub fn event_json(event: AgentEvent) -> Value {
             "is_error": is_error,
         }),
         AgentEvent::Attended(attended) => json!({ "type": "attended", "attended": attended }),
+        AgentEvent::Sandbox(view) => json!({
+            "type": "sandbox",
+            "mode": view.mode,
+            "network": view.network,
+            "enforced": view.enforced,
+            "unavailable": view.unavailable,
+            "directories": view.directories.into_iter().map(|dir| json!({
+                "path": dir.path,
+                "mode": dir.mode,
+                "source": dir.source,
+            })).collect::<Vec<_>>(),
+        }),
+        AgentEvent::Escalated { call_id, by, info } => json!({
+            "type": "escalated",
+            "call_id": call_id,
+            "kind": info.kind.as_str(),
+            "command": info.command,
+            "justification": info.justification,
+            "cwd": info.cwd.display().to_string(),
+            "paths": info.paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+            "by": by,
+        }),
     }
 }
 
@@ -828,6 +863,49 @@ mod tests {
         assert_eq!(
             plan["plan"][0],
             json!({ "step": "Add parser", "status": "in_progress", "agent": "/root/parser", "files": ["src/parse.rs"] })
+        );
+    }
+
+    #[test]
+    fn sandbox_and_escalated_events_have_their_wire_shapes() {
+        let sandbox = event_json(AgentEvent::Sandbox(crate::event::SandboxView {
+            mode: "workspace-write".to_string(),
+            network: true,
+            enforced: false,
+            unavailable: None,
+            directories: vec![crate::event::SandboxDirectoryView {
+                path: "/srv/x".to_string(),
+                mode: "rw",
+                source: "project",
+            }],
+        }));
+        assert_eq!(
+            sandbox,
+            json!({
+                "type": "sandbox", "mode": "workspace-write", "network": true,
+                "enforced": false, "unavailable": null,
+                "directories": [{ "path": "/srv/x", "mode": "rw", "source": "project" }],
+            })
+        );
+        let escalated = event_json(AgentEvent::Escalated {
+            call_id: "call_3".to_string(),
+            by: "mode",
+            info: crate::approval::ApprovalInfo {
+                kind: crate::approval::ApprovalKind::OutsideWrite,
+                justification: Some("save the chart".to_string()),
+                cwd: std::path::PathBuf::from("/work"),
+                command: Some("cp chart.png ~/Desktop/".to_string()),
+                paths: vec![std::path::PathBuf::from("/home/me/Desktop")],
+                ..Default::default()
+            },
+        });
+        assert_eq!(
+            escalated,
+            json!({
+                "type": "escalated", "call_id": "call_3", "kind": "outside_write",
+                "command": "cp chart.png ~/Desktop/", "justification": "save the chart",
+                "cwd": "/work", "paths": ["/home/me/Desktop"], "by": "mode",
+            })
         );
     }
 

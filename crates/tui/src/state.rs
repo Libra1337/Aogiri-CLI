@@ -624,7 +624,21 @@ impl TuiState {
                     self.mark_history_dirty();
                     true
                 }
-                AgentEvent::Attended(_) => false,
+                AgentEvent::Attended(_) | AgentEvent::Sandbox(_) => false,
+                AgentEvent::Escalated { info, .. } => {
+                    let what = match (&info.command, info.paths.first()) {
+                        (Some(command), _) => command.clone(),
+                        (None, Some(path)) => format!("write {}", path.display()),
+                        (None, None) => info.kind.as_str().to_string(),
+                    };
+                    let line = match &info.justification {
+                        Some(reason) => format!("outside the sandbox: {what} — {reason}"),
+                        None => format!("outside the sandbox: {what}"),
+                    };
+                    self.chat.push(ChatLine::System(line));
+                    self.mark_history_dirty();
+                    true
+                }
             };
         }
         changed

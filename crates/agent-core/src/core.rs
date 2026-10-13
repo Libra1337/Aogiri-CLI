@@ -118,6 +118,7 @@ impl SandboxLayers {
 pub struct KeptState {
     approval_mode: Option<ApprovalMode>,
     sandbox_mode: Option<crate::sandbox::SandboxMode>,
+    sandbox_network: Option<bool>,
     /// Directories and command prefixes allowed for the session.
     sandbox_session: crate::sandbox::SandboxLayer,
     approved_tools: HashSet<String>,
@@ -553,6 +554,7 @@ impl AgentCore {
             self.model_status_event(),
             self.command_list_event(),
             self.approval_mode_event(),
+            self.sandbox_event(),
             // Servers still connecting report state "connecting"; a follow-up
             // event is emitted from poll_events when their state settles.
             self.mcp_servers_event(),
@@ -3061,6 +3063,16 @@ impl AgentCore {
             if !current {
                 continue;
             }
+            // Allowed in the worker without asking: report the crossing.
+            if let Some(by) = request.ran_by {
+                let _ = request.response_tx.send(ApprovalDecision::allow_all());
+                events.push(AgentEvent::Escalated {
+                    call_id: request.call_id,
+                    by,
+                    info: request.info,
+                });
+                continue;
+            }
             let gate = self
                 .host
                 .as_ref()
@@ -3075,14 +3087,22 @@ impl AgentCore {
                 && !crate::tools::is_forced_restore(&request.name, &request.arguments);
             if !request.info.must_ask
                 && (allowlisted
-                    || !requires_approval(
+                    || !mode_requires_approval(
                         self.approval_mode.get(),
                         gate,
                         &request.name,
                         &request.arguments,
+                        &request.info,
                     ))
             {
                 let _ = request.response_tx.send(ApprovalDecision::allow_all());
+                if request.info.kind.crosses_boundary() {
+                    events.push(AgentEvent::Escalated {
+                        call_id: request.call_id,
+                        by: "mode",
+                        info: request.info,
+                    });
+                }
                 continue;
             }
             if !self.attended {
@@ -3231,6 +3251,7 @@ impl AgentCore {
         KeptState {
             approval_mode: Some(self.approval_mode.get()),
             sandbox_mode: self.sandbox.base.as_ref().map(|sandbox| sandbox.mode),
+            sandbox_network: self.sandbox.base.as_ref().map(|sandbox| sandbox.network),
             sandbox_session: self.sandbox.session.clone(),
             approved_tools: self.approved_tools.clone(),
             action_decisions: self.action_decisions.clone(),
@@ -3249,10 +3270,14 @@ impl AgentCore {
             self.set_approval_mode(mode);
         }
         if let Some(mode) = kept.sandbox_mode {
-            self.sandbox
+            let base = self
+                .sandbox
                 .base
-                .get_or_insert_with(|| self.config.sandbox.clone())
-                .mode = mode;
+                .get_or_insert_with(|| self.config.sandbox.clone());
+            base.mode = mode;
+            if let Some(network) = kept.sandbox_network {
+                base.network = network;
+            }
         }
         self.sandbox.session = kept.sandbox_session;
         self.apply_sandbox();
@@ -3463,19 +3488,101 @@ impl AgentCore {
             .filter(|(_, pending)| {
                 let gate = host.and_then(|host| host.gate_of(&pending.name));
                 !pending.info.must_ask
-                    && !requires_approval(mode, gate, &pending.name, &pending.arguments)
+                    && !mode_requires_approval(
+                        mode,
+                        gate,
+                        &pending.name,
+                        &pending.arguments,
+                        &pending.info,
+                    )
             })
             .map(|(call, _)| call.clone())
             .collect();
+        let mut events = Vec::new();
         for call in freed {
             if let Some(pending) = self.pending_approvals.remove(&call) {
                 let _ = pending.response_tx.send(ApprovalDecision::allow_all());
+                if pending.info.kind.crosses_boundary() {
+                    events.push(AgentEvent::Escalated {
+                        call_id: call,
+                        by: "mode",
+                        info: pending.info,
+                    });
+                }
             }
         }
-        vec![
-            AgentEvent::Status(format!("approval mode: {}", mode.as_str())),
-            self.approval_mode_event(),
-        ]
+        events.push(AgentEvent::Status(format!(
+            "approval mode: {}",
+            mode.as_str()
+        )));
+        events.push(self.approval_mode_event());
+        events
+    }
+
+    /// The `sandbox` event: the mode, network, whether an OS sandbox
+    /// enforces it, why it cannot run, and the directories it adds by
+    /// source.
+    pub fn sandbox_event(&self) -> AgentEvent {
+        use crate::event::{SandboxDirectoryView, SandboxView};
+        let policy = self.sandbox.merged();
+        let mut directories: Vec<SandboxDirectoryView> = Vec::new();
+        let mut add = |dirs: &[PathBuf], mode: &'static str, source: &'static str| {
+            for dir in dirs {
+                let path = dir.display().to_string();
+                if !directories
+                    .iter()
+                    .any(|known| known.path == path && known.source == source)
+                {
+                    directories.push(SandboxDirectoryView { path, mode, source });
+                }
+            }
+        };
+        if let Some(base) = &self.sandbox.base {
+            add(&base.writable_dirs, "rw", "global");
+            add(&base.readable_dirs, "ro", "global");
+        }
+        for (layer, source) in [
+            (&self.sandbox.project, "project"),
+            (&self.sandbox.session, "session"),
+        ] {
+            add(&layer.writable, "rw", source);
+            add(&layer.readable, "ro", source);
+        }
+        AgentEvent::Sandbox(SandboxView {
+            mode: policy
+                .as_ref()
+                .map_or("full-access", |policy| policy.mode.as_str())
+                .to_string(),
+            network: policy.as_ref().is_none_or(|policy| policy.network),
+            enforced: policy.as_ref().is_some_and(|policy| policy.enforced()),
+            unavailable: policy.as_ref().and_then(|policy| policy.unavailable()),
+            directories,
+        })
+    }
+
+    /// The `set_sandbox` op: this session's sandbox mode and, when given,
+    /// its network. Refused (unchanged) when the OS sandbox cannot run
+    /// here. Emits `sandbox`.
+    pub fn set_sandbox_mode(
+        &mut self,
+        mode: crate::sandbox::SandboxMode,
+        network: Option<bool>,
+    ) -> Vec<AgentEvent> {
+        let mut next = self.sandbox.clone();
+        let base = next.base.get_or_insert_with(|| self.config.sandbox.clone());
+        base.mode = mode;
+        if let Some(network) = network {
+            base.network = network;
+        }
+        if let Some(Err(error)) = next.merged().map(|policy| policy.check_available()) {
+            return vec![
+                AgentEvent::Error(format!("sandbox unavailable: {error}")),
+                self.sandbox_event(),
+            ];
+        }
+        self.sandbox = next;
+        self.apply_sandbox();
+        vec![self.sandbox_event()]
     }
 
     /// `/sandbox [mode]` — show the sandbox, or switch its mode for this
@@ -3527,8 +3634,8 @@ impl AgentCore {
             })
             .collect::<Vec<_>>()
             .join("; ");
-        vec![AgentEvent::Info(format!(
-            "sandbox: {}\n\
+        let mut events = vec![AgentEvent::Info(format!(
+            "sandbox: {}{}\n\
              read-only       - commands cannot write anything\n\
              workspace-write - the working directory, temp and package caches are writable; .git, .lynshen and .agents stay read-only\n\
              full-access     - no sandbox\n\
@@ -3536,11 +3643,20 @@ impl AgentCore {
              command rules: {}\n\
              Inside the sandbox commands need no approval (except in manual mode); a command that must leave it asks per the approval mode. Set defaults in config.json (sandbox, sandbox_network, sandbox_directories, command_rules).",
             policy.mode.as_str(),
+            if policy.is_sandboxed() && !policy.enforced() {
+                " (not enforced: this platform has no OS sandbox)"
+            } else {
+                ""
+            },
             if policy.network { "on" } else { "off" },
             list(&policy.writable_dirs),
             list(&policy.readable_dirs),
             if rules.is_empty() { "none".to_string() } else { rules }
-        ))]
+        ))];
+        if !arg.is_empty() {
+            events.push(self.sandbox_event());
+        }
+        events
     }
 
     /// `/permissions [mode]` — show the current mode, or switch it for this session.
@@ -5889,6 +6005,21 @@ fn requires_approval(
         }
         None => mode.requires_approval(name),
     }
+}
+
+/// `requires_approval` for a request: a call that crosses the sandbox or
+/// the workspace boundary needs a person in every mode but full-access.
+fn mode_requires_approval(
+    mode: ApprovalMode,
+    gate: Option<crate::host::HostGate>,
+    name: &str,
+    arguments: &str,
+    info: &crate::approval::ApprovalInfo,
+) -> bool {
+    if info.kind.crosses_boundary() {
+        return mode != ApprovalMode::FullAccess;
+    }
+    requires_approval(mode, gate, name, arguments)
 }
 
 /// Validates and forwards an approval decision to the parked tool call.

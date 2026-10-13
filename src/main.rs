@@ -784,6 +784,8 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
         AgentEvent::ActionDeferred(_) => "action_deferred",
         AgentEvent::ActionDecided { .. } => "action_decided",
         AgentEvent::Attended(_) => "attended",
+        AgentEvent::Sandbox(_) => "sandbox",
+        AgentEvent::Escalated { .. } => "escalated",
         AgentEvent::ApprovalMode { .. } => "approval_mode",
         AgentEvent::TrustPrompt { .. } => "trust_prompt",
         AgentEvent::ModelView { .. } => "model_view",

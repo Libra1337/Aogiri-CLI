@@ -251,6 +251,10 @@ pub struct ApprovalRequest {
     /// `SandboxGate::Ask`) the core never approves it by the approval mode,
     /// the session's "always allow" or a switch to a looser mode.
     pub info: ApprovalInfo,
+    /// Already allowed without asking (`rule`, `mode` or `classifier`): a
+    /// call that crosses the boundary, which the core approves at once and
+    /// reports as `escalated`.
+    pub ran_by: Option<&'static str>,
     pub response_tx: Sender<ApprovalDecision>,
 }
 
@@ -1059,12 +1063,40 @@ impl OpenAiClient {
                     blocked_results.push(ToolCallResult { request, result });
                     continue;
                 }
+                let info = self.approval_info(&request, cwd, gate, check.as_ref());
+                // Leaving the sandbox or writing outside the workspace: every
+                // mode but full-access asks (auto asks the safety model first).
+                let crossing = info.kind.crosses_boundary();
                 let needs_approval = match gate {
                     SandboxGate::Ask => true,
                     SandboxGate::Run => false,
+                    SandboxGate::Mode if crossing => {
+                        self.approval_tx.is_some()
+                            && self.approval_mode.get() != ApprovalMode::FullAccess
+                    }
                     SandboxGate::Mode | SandboxGate::Forbid => self.call_needs_approval(&request),
                 };
                 if !needs_approval {
+                    // A crossing that runs unasked is still reported
+                    // (`escalated`): the core approves it at once.
+                    if crossing {
+                        let by = if gate == SandboxGate::Run {
+                            "rule"
+                        } else {
+                            "mode"
+                        };
+                        let decision = self.request_approval(&request, cwd, info, Some(by));
+                        if !decision.allow {
+                            emit(StreamEvent::ToolStart {
+                                call_id: request.call_id.clone(),
+                                name: request.name.clone(),
+                            })?;
+                            let result = approval_denied_result(None);
+                            emit_tool_output(&request, &result, &mut emit)?;
+                            blocked_results.push(ToolCallResult { request, result });
+                            continue;
+                        }
+                    }
                     approved_requests.push(request);
                     continue;
                 }
@@ -1074,13 +1106,12 @@ impl OpenAiClient {
                 // A command rule that says "ask" always reaches a person.
                 let classified_allow = gate != SandboxGate::Ask
                     && self.approval_mode.get().classifies_shell()
-                    && is_shell_tool(&request.name)
+                    && (is_shell_tool(&request.name) || crossing)
                     && self.classify_shell_command(&request, cwd, last_user_text(input).as_deref());
-                let decision = if classified_allow {
-                    ApprovalDecision::allow_all()
-                } else {
-                    let info = self.approval_info(&request, cwd, gate, check.as_ref());
-                    self.request_approval(&request, cwd, info)
+                let decision = match (classified_allow, crossing) {
+                    (true, true) => self.request_approval(&request, cwd, info, Some("classifier")),
+                    (true, false) => ApprovalDecision::allow_all(),
+                    (false, _) => self.request_approval(&request, cwd, info, None),
                 };
                 if !decision.allow {
                     emit(StreamEvent::ToolStart {
@@ -2816,8 +2847,9 @@ impl OpenAiClient {
             }
             // Inside the sandbox a command needs no approval; only the
             // strictest mode still asks for every command, as a mode does:
-            // a switch to a looser mode or "always allow" lets it run.
-            _ if sandbox.is_sandboxed() && !escalated => {
+            // a switch to a looser mode or "always allow" lets it run. A
+            // sandbox nothing enforces (Windows) leaves it to the mode.
+            _ if sandbox.enforced() && !escalated => {
                 if self.approval_mode.get() == ApprovalMode::Manual {
                     SandboxGate::Mode
                 } else {
@@ -3014,12 +3046,8 @@ impl OpenAiClient {
             let sandbox = self.tool_state.sandbox();
             let check = check.cloned().unwrap_or_default();
             let rule_asks = check.action == Some(RuleAction::Ask);
-            let crossing = escalated
-                && sandbox
-                    .as_ref()
-                    .is_some_and(|sandbox| sandbox.is_sandboxed());
             let outside: Vec<PathBuf> = match &sandbox {
-                Some(sandbox) if crossing => check
+                Some(sandbox) if sandbox.is_sandboxed() => check
                     .writes
                     .iter()
                     .filter(|path| !sandbox.within_boundary(cwd, path))
@@ -3027,6 +3055,13 @@ impl OpenAiClient {
                     .collect(),
                 _ => Vec::new(),
             };
+            // Out of the sandbox: escalated, or, where no OS sandbox stops
+            // it, writing outside it as far as the command shows.
+            let crossing = sandbox.as_ref().is_some_and(|sandbox| {
+                sandbox.is_sandboxed()
+                    && (escalated || (!sandbox.enforced() && !outside.is_empty()))
+            });
+            let outside = if crossing { outside } else { Vec::new() };
             info.kind = if check.elevation {
                 ApprovalKind::Elevation
             } else if must_ask && rule_asks {
@@ -3089,6 +3124,7 @@ impl OpenAiClient {
         request: &ToolCallRequest,
         cwd: &Path,
         info: ApprovalInfo,
+        ran_by: Option<&'static str>,
     ) -> ApprovalDecision {
         let Some(tx) = &self.approval_tx else {
             return ApprovalDecision::allow_all();
@@ -3121,6 +3157,7 @@ impl OpenAiClient {
                 subagent_id: (self.agent_depth > 0).then(|| self.agent_path.clone()),
                 hunks: hunks::plan_edit_hunks(&request.name, &request.arguments, cwd),
                 info,
+                ran_by,
                 response_tx,
             })
             .is_err()
@@ -6213,6 +6250,7 @@ mod tests {
             },
             Path::new("."),
             ApprovalInfo::default(),
+            None,
         );
         assert!(decision.allow);
         assert!(decision.approved_hunks.is_none());
@@ -6239,6 +6277,7 @@ mod tests {
             },
             Path::new("."),
             ApprovalInfo::default(),
+            None,
         );
         assert!(!decision.allow);
         responder.join().unwrap();
@@ -6282,6 +6321,7 @@ mod tests {
             },
             &dir,
             ApprovalInfo::default(),
+            None,
         );
         assert!(decision.allow);
         assert_eq!(decision.approved_hunks, Some(vec!["f0h1".to_string()]));
