@@ -5609,7 +5609,7 @@ mod tests {
     #[test]
     fn an_ask_rule_asks_in_every_mode_and_manual_asks_as_a_mode() {
         let (tx, _rx) = mpsc::channel();
-        let mut client = approval_test_client(ApprovalMode::FullAccess, Some(tx));
+        let client = approval_test_client(ApprovalMode::FullAccess, Some(tx));
         client
             .tool_state
             .set_sandbox(Some(crate::sandbox::SandboxPolicy {
