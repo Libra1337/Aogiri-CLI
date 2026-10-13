@@ -242,6 +242,10 @@ Structured answer to an `approval_request` event; equivalent to the
 - `hunks` (optional): for edit-tool requests that carried a `hunks` list,
   apply only these hunk ids. Omit or `null` for the whole call. Cannot be
   combined with a `scope` beyond once or with `always`.
+- `add_dir` (optional, with `allow`): `{"path": "/abs/dir", "persist":
+  "session" | "project"}` (default `session`). Allows the call and makes
+  the directory read-write, as `add_directory` does; usually the request's
+  `dir_suggestion`. The directory must exist.
 
 A request with `must_ask` asks every time: no scope and no mode switch
 approve the next one. Validation errors emit `error` and leave the request
@@ -461,6 +465,31 @@ Emits `sandbox`. When the OS sandbox cannot run here (Linux without a
 working `bwrap`), emits `error` and `sandbox` and changes nothing. On
 Windows a mode other than `full-access` is accepted but not enforced
 (`enforced: false`, see `docs/sandbox.md`).
+
+### `add_directory` / `remove_directory`
+
+```json
+{"op":"add_directory","path":"/Users/me/Desktop","mode":"rw","persist":"session"}
+{"op":"remove_directory","path":"/Users/me/Desktop","persist":"session"}
+```
+
+Adds a directory to the sandbox, or takes one out, while the session runs.
+`path` is an existing absolute directory. `mode` is `rw` (default: commands
+and file tools may write it) or `ro` (read-only, also where it sits under
+a writable directory). `persist` (default `session`):
+
+- `session`: this session only (kept by its next engine);
+- `project`: saved in `~/.lynshen/config.json` under
+  `projects[<workspace>].sandbox_directories`, for every session of the
+  project;
+- `global`: saved in the top-level `sandbox_directories`.
+
+`remove_directory` takes the directory out of that source; it is an error
+when it is not there. Directories the daemon adds from the project's own
+list (a project's `dirs` in `workspaces_set`) are reported with source `project`; removing one
+here lasts until the session's engine is opened again, so remove it from
+the project instead. Both ops emit `sandbox`; an invalid path, mode or
+`persist` emits `error` and changes nothing.
 
 ### `set_attended`
 

@@ -722,6 +722,22 @@ impl SandboxLayer {
         }
     }
 
+    /// Adds `dir`, read-write or read-only (moving it from the other list
+    /// when it is there).
+    pub fn add_dir(&mut self, dir: PathBuf, writable: bool) {
+        self.remove_dir(&dir);
+        if writable {
+            self.writable.push(dir);
+        } else {
+            self.readable.push(dir);
+        }
+    }
+
+    /// Removes `dir`; false when it was not there.
+    pub fn remove_dir(&mut self, dir: &Path) -> bool {
+        remove_dir_from(&mut self.writable, dir) | remove_dir_from(&mut self.readable, dir)
+    }
+
     /// Adds an `allow` rule for `prefix`, or makes the rule with that
     /// prefix one.
     pub fn allow(&mut self, prefix: &str) {
@@ -733,6 +749,40 @@ impl SandboxLayer {
             }),
         }
     }
+}
+
+/// Removes `dir` from `dirs` (the same directory named another way too);
+/// false when it was not there.
+pub fn remove_dir_from(dirs: &mut Vec<PathBuf>, dir: &Path) -> bool {
+    let before = dirs.len();
+    let real_dir = real(dir);
+    dirs.retain(|known| known != dir && real(known) != real_dir);
+    dirs.len() != before
+}
+
+/// Sets `dir` to `mode` (`rw` or `ro`) in a `sandbox_directories` array,
+/// adding it when missing.
+pub fn directory_json_set(dirs: &mut Value, dir: &Path, mode: &str) {
+    directory_json_remove(dirs, dir);
+    dirs.as_array_mut()
+        .expect("an array")
+        .push(json!({ "path": dir.display().to_string(), "mode": mode }));
+}
+
+/// Removes `dir` from a `sandbox_directories` array; false when it was not
+/// there.
+pub fn directory_json_remove(dirs: &mut Value, dir: &Path) -> bool {
+    if !dirs.is_array() {
+        *dirs = json!([]);
+    }
+    let list = dirs.as_array_mut().expect("an array");
+    let before = list.len();
+    let real_dir = real(dir);
+    list.retain(|entry| {
+        let path = PathBuf::from(entry["path"].as_str().unwrap_or_default());
+        path != dir && real(&path) != real_dir
+    });
+    list.len() != before
 }
 
 /// Adds `{"prefix", "action": "allow"}` to a `command_rules` array, or makes

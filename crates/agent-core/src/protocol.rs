@@ -81,6 +81,32 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
                 Err(error) => vec![AgentEvent::Error(error)],
             }
         }
+        // {"op":"add_directory","path":"/abs","mode":"rw","persist":"session"}
+        "add_directory" => {
+            let text = |key: &str, default: &'static str| {
+                value
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or(default)
+                    .to_string()
+            };
+            core.add_directory(
+                &text("path", ""),
+                &text("mode", "rw"),
+                &text("persist", "session"),
+            )
+        }
+        // {"op":"remove_directory","path":"/abs","persist":"session"}
+        "remove_directory" => {
+            let text = |key: &str, default: &'static str| {
+                value
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or(default)
+                    .to_string()
+            };
+            core.remove_directory(&text("path", ""), &text("persist", "session"))
+        }
         // {"op":"set_sandbox","mode":"workspace-write","network":true}
         "set_sandbox" => {
             let mode = value
@@ -237,6 +263,21 @@ fn parse_approve_op(value: &Value) -> Result<ParsedApprove, String> {
             .filter(|text| !text.is_empty())
             .map(str::to_string)
     };
+    let add_dir = match value.get("add_dir") {
+        None | Some(Value::Null) => None,
+        Some(dir) => {
+            let path = dir
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+                .ok_or_else(|| "add_dir requires path".to_string())?;
+            let persist = dir
+                .get("persist")
+                .and_then(Value::as_str)
+                .unwrap_or("session");
+            Some((std::path::PathBuf::from(path.trim()), persist.to_string()))
+        }
+    };
     Ok((
         call_id.to_string(),
         allow,
@@ -246,6 +287,7 @@ fn parse_approve_op(value: &Value) -> Result<ParsedApprove, String> {
             prefix: text("prefix"),
             feedback: text("feedback"),
             hunks,
+            add_dir,
         },
     ))
 }
@@ -773,6 +815,22 @@ mod tests {
         assert!(parse_approve_op(&bad)
             .unwrap_err()
             .contains("unknown scope"));
+        let with_dir = json!({
+            "op": "approve", "call_id": "c", "decision": "allow",
+            "add_dir": { "path": "/Users/me/Desktop", "persist": "project" },
+        });
+        assert_eq!(
+            parse_approve_op(&with_dir).unwrap().2.add_dir,
+            Some((
+                std::path::PathBuf::from("/Users/me/Desktop"),
+                "project".to_string()
+            ))
+        );
+        let no_path =
+            json!({ "op": "approve", "call_id": "c", "decision": "allow", "add_dir": {} });
+        assert!(parse_approve_op(&no_path)
+            .unwrap_err()
+            .contains("add_dir requires path"));
     }
 
     #[test]

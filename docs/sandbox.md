@@ -208,6 +208,8 @@ In `~/.lynshen/config.json`:
 - `projects`: settings for one workspace, keyed by its absolute path with
   symlinks resolved (LynShen Desktop's project path). Its directories and
   rules add to the top-level ones when an engine starts in that directory.
+  LynShen Desktop's settings page reads and changes these keys and keeps
+  the ones it does not know.
 - `always_allow_scope`: where a `project` approval saves its rule:
   `"project"` (the default) or `"global"` (the top-level `command_rules`).
 
@@ -215,6 +217,10 @@ The rules apply in this order: the top-level ones, the project's, then the
 session's; `forbid` wins over any other match, otherwise the longest prefix.
 
 `/sandbox` shows the current sandbox; `/sandbox <mode>` switches the mode for
-the current session.
+the current session. A client changes the session's sandbox with
+`set_sandbox`, `add_directory` and `remove_directory`, and makes a directory
+writable from an approval with `add_dir` (`docs/serve-protocol.md`).
+Desktop, Downloads and Documents are not writable unless you add them;
+the approval card offers it the first time the model needs one.
 
 Hook commands are written by you and are not sandboxed.

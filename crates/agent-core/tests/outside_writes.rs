@@ -188,3 +188,151 @@ fn full_access_writes_outside_the_workspace_and_reports_it() {
     );
     assert_eq!(fs::read_to_string(&target).unwrap(), "<svg/>");
 }
+
+fn sandbox_dirs(events: &[AgentEvent]) -> Option<Vec<(String, &'static str, &'static str)>> {
+    events.iter().rev().find_map(|event| match event {
+        AgentEvent::Sandbox(view) => Some(
+            view.directories
+                .iter()
+                .map(|dir| (dir.path.clone(), dir.mode, dir.source))
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
+fn errors(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Error(message) => Some(message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn config() -> serde_json::Value {
+    let path = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".lynshen/config.json");
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[test]
+fn an_approval_can_make_the_directory_writable() {
+    let _guard = setup();
+    let _write = WriteTool::on();
+    let Some(outside) = Outside::new("add-dir") else {
+        return;
+    };
+    let dir = temp_dir("outside-add-dir");
+    let mut core = open(&dir, ApprovalMode::AutoEdit);
+    let path = outside.0.display().to_string();
+
+    let events = call(
+        &mut core,
+        "write",
+        json!({ "path": outside.0.join("a.txt").display().to_string(), "content": "a" }),
+    );
+    let (call_id, _) = approval(&events).expect("asks");
+    let mut events = core.approve_with(
+        &call_id,
+        true,
+        lynshen_agent_core::ApproveOptions {
+            add_dir: Some((outside.0.clone(), "session".to_string())),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        sandbox_dirs(&events),
+        Some(vec![(path.clone(), "rw", "session")])
+    );
+    events.extend(pump(&mut core, is_ready));
+    assert!(outside.0.join("a.txt").exists(), "{events:#?}");
+
+    // The next write there needs nothing.
+    let events = call(
+        &mut core,
+        "write",
+        json!({ "path": outside.0.join("b.txt").display().to_string(), "content": "b" }),
+    );
+    assert!(approval(&events).is_none(), "{events:#?}");
+    assert!(outside.0.join("b.txt").exists());
+
+    // Removed again, it asks again.
+    let events = core.remove_directory(&path, "session");
+    assert_eq!(sandbox_dirs(&events), Some(Vec::new()));
+    let events = call(
+        &mut core,
+        "write",
+        json!({ "path": outside.0.join("c.txt").display().to_string(), "content": "c" }),
+    );
+    let (call_id, _) = approval(&events).expect("asks again");
+    core.approve(&call_id, false, false, None);
+    pump(&mut core, is_ready);
+}
+
+#[test]
+fn directories_are_saved_for_the_project_or_every_project() {
+    let _guard = setup();
+    let _write = WriteTool::on();
+    let Some(outside) = Outside::new("persist") else {
+        return;
+    };
+    let dir = temp_dir("outside-persist");
+    let mut core = open(&dir, ApprovalMode::AutoEdit);
+    let path = outside.0.display().to_string();
+    let key = dir.display().to_string();
+
+    let events = core.add_directory(&path, "rw", "project");
+    assert!(errors(&events).is_empty(), "{events:#?}");
+    assert_eq!(
+        config()["projects"][&key]["sandbox_directories"],
+        json!([{ "path": path, "mode": "rw" }])
+    );
+    // A new engine for the project starts with it.
+    let next = open(&dir, ApprovalMode::AutoEdit);
+    assert_eq!(
+        sandbox_dirs(&next.state_events()),
+        Some(vec![(path.clone(), "rw", "project")])
+    );
+    let events = core.remove_directory(&path, "project");
+    assert_eq!(sandbox_dirs(&events), Some(Vec::new()));
+    assert_eq!(config()["projects"][&key]["sandbox_directories"], json!([]));
+
+    let events = core.add_directory(&path, "ro", "global");
+    assert_eq!(
+        sandbox_dirs(&events),
+        Some(vec![(path.clone(), "ro", "global")])
+    );
+    assert!(config()["sandbox_directories"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({ "path": path, "mode": "ro" })));
+    core.remove_directory(&path, "global");
+    assert!(!config()["sandbox_directories"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({ "path": path, "mode": "ro" })));
+
+    // Errors change nothing.
+    for (events, wanted) in [
+        (
+            core.add_directory("relative/dir", "rw", "session"),
+            "not an existing absolute directory",
+        ),
+        (core.add_directory(&path, "rx", "session"), "rw or ro"),
+        (
+            core.add_directory(&path, "rw", "forever"),
+            "persist must be",
+        ),
+        (
+            core.remove_directory(&path, "session"),
+            "is not a session directory",
+        ),
+    ] {
+        let found = errors(&events);
+        assert!(
+            found.iter().any(|error| error.contains(wanted)),
+            "{wanted}: {found:?}"
+        );
+    }
+}

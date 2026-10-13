@@ -86,6 +86,9 @@ pub struct ApproveOptions {
     pub feedback: Option<String>,
     /// With allow: only these hunks of an edit.
     pub hunks: Option<Vec<String>>,
+    /// With allow: also make this directory writable, for the session or
+    /// the project (`session` | `project`).
+    pub add_dir: Option<(PathBuf, String)>,
 }
 
 /// The sandbox an engine runs with, by where each part comes from. The
@@ -3847,7 +3850,24 @@ impl AgentCore {
         allow: bool,
         options: ApproveOptions,
     ) -> Vec<AgentEvent> {
-        match resolve_approval_decision(
+        // The directory first: a bad one leaves the request waiting.
+        let add_dir = options.add_dir.clone().filter(|_| allow);
+        if let Some((dir, persist)) = &add_dir {
+            if !matches!(persist.as_str(), "session" | "project") {
+                return vec![AgentEvent::Error(
+                    "add_dir persist must be session or project".to_string(),
+                )];
+            }
+            if let Err(error) = check_directory(dir) {
+                return vec![AgentEvent::Error(error)];
+            }
+            if !self.pending_approvals.contains_key(call_id) {
+                return vec![AgentEvent::Error(
+                    "no pending approval for that call".to_string(),
+                )];
+            }
+        }
+        let mut events = match resolve_approval_decision(
             &mut self.pending_approvals,
             &mut self.approved_tools,
             call_id,
@@ -3856,8 +3876,117 @@ impl AgentCore {
         ) {
             Ok(Some((scope, prefix))) => self.remember_prefix(scope, &prefix),
             Ok(None) => Vec::new(),
+            Err(error) => return vec![AgentEvent::Error(error)],
+        };
+        if let Some((dir, persist)) = add_dir {
+            events.extend(self.add_directory(&dir.display().to_string(), "rw", &persist));
+        }
+        events
+    }
+
+    /// The `add_directory` op: makes `path` (an existing absolute
+    /// directory) read-write (`rw`) or read-only (`ro`) for this session,
+    /// the project or every project (`persist`: `session`, `project`,
+    /// `global`); the last two are saved in config.json. Emits `sandbox`.
+    pub fn add_directory(&mut self, path: &str, mode: &str, persist: &str) -> Vec<AgentEvent> {
+        match self.change_directory(path, Some(mode), persist) {
+            Ok(()) => vec![self.sandbox_event()],
             Err(error) => vec![AgentEvent::Error(error)],
         }
+    }
+
+    /// The `remove_directory` op: takes `path` out of the session's, the
+    /// project's or the global directories. Emits `sandbox`.
+    pub fn remove_directory(&mut self, path: &str, persist: &str) -> Vec<AgentEvent> {
+        match self.change_directory(path, None, persist) {
+            Ok(()) => vec![self.sandbox_event()],
+            Err(error) => vec![AgentEvent::Error(error)],
+        }
+    }
+
+    /// Adds (`mode` Some) or removes a directory in one layer of the
+    /// sandbox, and in config.json for `project` and `global`.
+    fn change_directory(
+        &mut self,
+        path: &str,
+        mode: Option<&str>,
+        persist: &str,
+    ) -> Result<(), String> {
+        let dir = PathBuf::from(path.trim());
+        if let Some(mode) = mode {
+            if !matches!(mode, "rw" | "ro") {
+                return Err(format!("directory mode must be rw or ro, not '{mode}'"));
+            }
+            check_directory(&dir)?;
+        } else if !dir.is_absolute() {
+            return Err(format!("not an absolute directory: {}", dir.display()));
+        }
+        let writable = mode == Some("rw");
+        let missing = || format!("{} is not a {persist} directory", dir.display());
+        match persist {
+            "session" => match mode {
+                Some(_) => self.sandbox.session.add_dir(dir.clone(), writable),
+                None => {
+                    if !self.sandbox.session.remove_dir(&dir) {
+                        return Err(missing());
+                    }
+                }
+            },
+            "project" | "global" => {
+                let cwd = self.cwd.clone();
+                let mut in_file = false;
+                crate::config::edit_config_json(self.config.path(), |config| {
+                    let dirs = if persist == "global" {
+                        config
+                            .entry("sandbox_directories")
+                            .or_insert_with(|| json!([]))
+                    } else {
+                        crate::config::project_entry_mut(config, &cwd)
+                            .entry("sandbox_directories")
+                            .or_insert_with(|| json!([]))
+                    };
+                    match mode {
+                        Some(mode) => crate::sandbox::directory_json_set(dirs, &dir, mode),
+                        None => in_file = crate::sandbox::directory_json_remove(dirs, &dir),
+                    }
+                    Ok(())
+                })?;
+                let in_layer = if persist == "global" {
+                    let base = self
+                        .sandbox
+                        .base
+                        .get_or_insert_with(|| self.config.sandbox.clone());
+                    let removed = crate::sandbox::remove_dir_from(&mut base.writable_dirs, &dir)
+                        | crate::sandbox::remove_dir_from(&mut base.readable_dirs, &dir);
+                    if mode.is_some() {
+                        if writable {
+                            base.writable_dirs.push(dir.clone());
+                        } else {
+                            base.readable_dirs.push(dir.clone());
+                        }
+                    }
+                    removed
+                } else {
+                    match mode {
+                        Some(_) => {
+                            self.sandbox.project.add_dir(dir.clone(), writable);
+                            true
+                        }
+                        None => self.sandbox.project.remove_dir(&dir),
+                    }
+                };
+                if mode.is_none() && !in_file && !in_layer {
+                    return Err(missing());
+                }
+            }
+            other => {
+                return Err(format!(
+                    "persist must be session, project or global, not '{other}'"
+                ))
+            }
+        }
+        self.apply_sandbox();
+        Ok(())
     }
 
     /// Commands starting with `prefix` run without asking from now on: for
@@ -6014,6 +6143,18 @@ fn requires_approval(
             mode.requires_approval_for_forced_restore()
         }
         None => mode.requires_approval(name),
+    }
+}
+
+/// An existing absolute directory, as `add_directory` takes.
+fn check_directory(dir: &std::path::Path) -> Result<(), String> {
+    if dir.is_absolute() && dir.is_dir() {
+        Ok(())
+    } else {
+        Err(format!(
+            "not an existing absolute directory: {}",
+            dir.display()
+        ))
     }
 }
 
