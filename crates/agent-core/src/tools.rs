@@ -2375,6 +2375,17 @@ fn apply_patch(
         {
             return json!({ "error": error });
         }
+        // Credentials and LynShen's settings, in a workspace that holds them
+        // (at home): only a write the user approves for that path, which a
+        // patch never has.
+        if is_guarded_write(target) {
+            return json!({
+                "error": format!(
+                    "{} holds credentials or LynShen's settings: apply_patch does not change it; use write or edit, which ask the user",
+                    target.display()
+                )
+            });
+        }
     }
     // As for str_replace: every existing file the patch changes must have
     // been read, and be unchanged since. Files it creates need no read.
@@ -2674,7 +2685,11 @@ fn checkpoint_tool(args: &Value, cwd: &Path, state: &ToolState) -> Value {
                 .flatten()
                 .filter_map(Value::as_str)
             {
-                match workspace_path(cwd, path) {
+                // A copy is a read: credentials stay unreadable (a
+                // workspace at home holds them).
+                match workspace_path(cwd, path)
+                    .and_then(|path| readable_path(cwd, &path.display().to_string()).map(|_| path))
+                {
                     Ok(path) => paths.push(path),
                     Err(error) => return json!({ "error": error }),
                 }

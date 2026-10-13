@@ -207,6 +207,14 @@ fn errors(events: &[AgentEvent]) -> Vec<String> {
         .collect()
 }
 
+fn config_file() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap()).join(".lynshen/config.json")
+}
+
+fn config_text() -> String {
+    fs::read_to_string(config_file()).unwrap()
+}
+
 fn config() -> serde_json::Value {
     let path = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".lynshen/config.json");
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
@@ -338,6 +346,10 @@ fn credentials_and_settings_ask_even_from_a_workspace_at_home() {
         .unwrap();
     fs::create_dir_all(home.join(".ssh")).unwrap();
     fs::write(home.join(".ssh/id_test"), "PRIVATE-KEY-BODY").unwrap();
+    // apply_patch too (WriteTool puts the file back).
+    let mut settings: serde_json::Value = serde_json::from_str(&config_text()).unwrap();
+    settings["edit_tools"] = json!(["hashline_edit", "write", "apply_patch"]);
+    fs::write(config_file(), settings.to_string()).unwrap();
     let mut core = open(&home, ApprovalMode::FullAccess);
 
     // A workspace at home does not make credentials readable.
@@ -347,6 +359,24 @@ fn credentials_and_settings_ask_even_from_a_workspace_at_home() {
         assert!(!output.contains("PRIVATE-KEY-BODY"), "{path}: {output}");
         assert!(output.contains("holds credentials"), "{path}: {output}");
     }
+
+    // Nor through a checkpoint's copy, and no patch changes them.
+    let events = call(
+        &mut core,
+        "checkpoint",
+        json!({ "action": "create", "paths": [".ssh/id_test"] }),
+    );
+    assert!(
+        tool_output(&events).contains("holds credentials"),
+        "{events:#?}"
+    );
+    let patch = "--- /dev/null\n+++ b/.ssh/authorized_keys2\n@@ -0,0 +1 @@\n+ssh-ed25519 AAAA x\n";
+    let events = call(&mut core, "apply_patch", json!({ "patch": patch }));
+    assert!(
+        tool_output(&events).contains("holds credentials"),
+        "{events:#?}"
+    );
+    assert!(!home.join(".ssh/authorized_keys2").exists());
 
     // Writing credentials or LynShen's settings asks, in full-access too.
     for path in [".ssh/authorized_keys", ".lynshen/config.json"] {
