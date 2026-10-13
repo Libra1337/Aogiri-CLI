@@ -130,13 +130,20 @@ fn a_session_approval_remembers_the_command_prefix_not_the_shell() {
     let (call_id, info) = approval(&events).expect("manual asks");
     assert_eq!(info.kind, ApprovalKind::Command);
     assert_eq!(info.prefix.as_deref(), Some("printf ok"));
+    // In an OS sandbox nothing is saved for the project: an allow rule
+    // would let the command out of the sandbox.
+    let enforced = cfg!(any(target_os = "macos", target_os = "linux"));
     assert_eq!(
         info.scopes,
-        vec![
-            ApprovalScope::Once,
-            ApprovalScope::Session,
-            ApprovalScope::Project
-        ]
+        if enforced {
+            vec![ApprovalScope::Once, ApprovalScope::Session]
+        } else {
+            vec![
+                ApprovalScope::Once,
+                ApprovalScope::Session,
+                ApprovalScope::Project,
+            ]
+        }
     );
     let events = allow(
         &mut core,
@@ -153,6 +160,15 @@ fn a_session_approval_remembers_the_command_prefix_not_the_shell() {
     let events = run(&mut core, "printf ok > two.txt");
     assert!(approval(&events).is_none(), "{events:#?}");
     assert_eq!(fs::read_to_string(dir.join("two.txt")).unwrap(), "ok");
+    // What the user allowed ran in the sandbox: leaving it still asks.
+    if enforced {
+        let events = escalate(&mut core, "printf ok > out.txt");
+        let (call_id, info) = approval(&events).expect("leaving the sandbox asks");
+        assert_eq!(info.kind, ApprovalKind::Escalation);
+        core.approve(&call_id, false, false, None);
+        pump(&mut core, is_ready);
+        assert!(!dir.join("out.txt").exists());
+    }
     let events = run(&mut core, "printf other > three.txt");
     let (call_id, _) = approval(&events).expect("the shell is not allowed whole");
     core.approve(&call_id, false, false, None);
@@ -241,30 +257,46 @@ fn a_prefix_may_only_narrow_and_a_scope_must_be_offered() {
     let dir = temp_dir("scope-checks");
     let mut core = open(&dir, ApprovalMode::Manual);
 
-    let events = run(&mut core, "printf narrow > a.txt");
-    let (call_id, _) = approval(&events).expect("asks");
-    let rejected = core.approve_with(
-        &call_id,
-        true,
-        ApproveOptions {
-            scope: Some(ApprovalScope::Session),
-            prefix: Some("printf".to_string()),
-            ..ApproveOptions::default()
-        },
-    );
-    assert!(errors(&rejected)[0].contains("must start with `printf narrow`"));
-    // Still waiting: a narrower prefix is fine.
+    let events = run(&mut core, "printf narrow wide > a.txt");
+    let (call_id, info) = approval(&events).expect("asks");
+    assert_eq!(info.prefix.as_deref(), Some("printf narrow"));
+    // Shorter, or longer with words the command does not have (another
+    // rule's prefix, say): refused, and the request keeps waiting.
+    for prefix in [
+        "printf",
+        "printf narrow other",
+        "printf narrow wide > a.txt",
+    ] {
+        let rejected = core.approve_with(
+            &call_id,
+            true,
+            ApproveOptions {
+                scope: Some(ApprovalScope::Session),
+                prefix: Some(prefix.to_string()),
+                ..ApproveOptions::default()
+            },
+        );
+        assert!(
+            errors(&rejected)[0].contains("must start with `printf narrow`"),
+            "{prefix}: {rejected:#?}"
+        );
+    }
+    // The command's own next words are fine.
     let events = allow(
         &mut core,
         &call_id,
         ApproveOptions {
             scope: Some(ApprovalScope::Session),
-            prefix: Some("printf narrow >".to_string()),
+            prefix: Some("printf narrow wide".to_string()),
             ..ApproveOptions::default()
         },
     );
     assert!(errors(&events).is_empty(), "{events:#?}");
     assert!(dir.join("a.txt").exists());
+    let events = run(&mut core, "printf narrow other > b.txt");
+    let (call_id, _) = approval(&events).expect("only the narrower prefix was allowed");
+    core.approve(&call_id, false, false, None);
+    pump(&mut core, is_ready);
 
     // A delete is approved once at most.
     fs::create_dir_all(dir.join("build")).unwrap();

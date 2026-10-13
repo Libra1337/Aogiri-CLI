@@ -328,3 +328,48 @@ fn directories_are_saved_for_the_project_or_every_project() {
         );
     }
 }
+
+#[test]
+fn credentials_and_settings_ask_even_from_a_workspace_at_home() {
+    let _guard = setup();
+    let _write = WriteTool::on();
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::write(home.join(".ssh/id_test"), "PRIVATE-KEY-BODY").unwrap();
+    let mut core = open(&home, ApprovalMode::FullAccess);
+
+    // A workspace at home does not make credentials readable.
+    for path in ["~/.ssh/id_test", ".ssh/id_test", "./.SSH/../.ssh/id_test"] {
+        let events = call(&mut core, "read", json!({ "path": path }));
+        let output = tool_output(&events);
+        assert!(!output.contains("PRIVATE-KEY-BODY"), "{path}: {output}");
+        assert!(output.contains("holds credentials"), "{path}: {output}");
+    }
+
+    // Writing credentials or LynShen's settings asks, in full-access too.
+    for path in [".ssh/authorized_keys", ".lynshen/config.json"] {
+        let before = fs::read_to_string(home.join(path)).ok();
+        let events = call(&mut core, "write", json!({ "path": path, "content": "{}" }));
+        let (call_id, info) = approval(&events).expect("a person decides");
+        assert!(info.must_ask, "{path}");
+        assert_eq!(info.scopes, vec![ApprovalScope::Once], "{path}");
+        core.approve(&call_id, false, false, None);
+        pump(&mut core, is_ready);
+        assert_eq!(fs::read_to_string(home.join(path)).ok(), before, "{path}");
+    }
+
+    // Nor can home, the root or credentials become writable.
+    for dir in [home.clone(), PathBuf::from("/"), home.join(".ssh")] {
+        let events = core.add_directory(&dir.display().to_string(), "rw", "session");
+        assert!(
+            errors(&events)
+                .iter()
+                .any(|error| error.contains("cannot be made writable")),
+            "{}: {events:#?}",
+            dir.display()
+        );
+    }
+    let _ = fs::remove_dir_all(home.join(".ssh"));
+}

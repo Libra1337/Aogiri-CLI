@@ -3170,9 +3170,11 @@ impl AgentCore {
     ) -> (ApprovalDecision, Option<AgentEvent>) {
         let digest = action_digest(&name, &arguments, &cwd);
         match self.action_decisions.get(&digest) {
-            Some(true) => return (ApprovalDecision::allow_all(), None),
+            // A call a person must decide is decided each time: an earlier
+            // yes to the same call does not cover this one.
+            Some(true) if !info.must_ask => return (ApprovalDecision::allow_all(), None),
             Some(false) => return (ApprovalDecision::deny(), None),
-            None => {}
+            _ => {}
         }
         if let Some(open) = self
             .deferred_actions
@@ -3860,7 +3862,7 @@ impl AgentCore {
                     "add_dir persist must be session or project".to_string(),
                 )];
             }
-            if let Err(error) = check_directory(dir) {
+            if let Err(error) = check_writable_directory(dir) {
                 return vec![AgentEvent::Error(error)];
             }
             if !self.pending_approvals.contains_key(call_id) {
@@ -3876,7 +3878,7 @@ impl AgentCore {
             allow,
             &options,
         ) {
-            Ok(Some((scope, prefix))) => self.remember_prefix(scope, &prefix),
+            Ok(Some((scope, prefix, inside))) => self.remember_prefix(scope, &prefix, inside),
             Ok(None) => Vec::new(),
             Err(error) => return vec![AgentEvent::Error(error)],
         };
@@ -3919,7 +3921,11 @@ impl AgentCore {
             if !matches!(mode, "rw" | "ro") {
                 return Err(format!("directory mode must be rw or ro, not '{mode}'"));
             }
-            check_directory(&dir)?;
+            if mode == "rw" {
+                check_writable_directory(&dir)?;
+            } else {
+                check_directory(&dir)?;
+            }
         } else if !dir.is_absolute() {
             return Err(format!("not an absolute directory: {}", dir.display()));
         }
@@ -3993,15 +3999,32 @@ impl AgentCore {
 
     /// Commands starting with `prefix` run without asking from now on: for
     /// the session, or saved as an `allow` rule for the project (globally
-    /// with `always_allow_scope: "global"`).
+    /// with `always_allow_scope: "global"`). `inside`: the approval was for
+    /// a command in the OS sandbox, and stays there (session only). A rule
+    /// that asks or forbids the prefix is never turned into an allow.
     fn remember_prefix(
         &mut self,
         scope: crate::approval::ApprovalScope,
         prefix: &str,
+        inside: bool,
     ) -> Vec<AgentEvent> {
         use crate::approval::ApprovalScope;
+        let kept = || {
+            vec![AgentEvent::Error(format!(
+                "a command rule asks or forbids `{prefix}`: allowed this once, the rule stays"
+            ))]
+        };
         if scope == ApprovalScope::Session {
-            self.sandbox.session.allow(prefix);
+            if inside {
+                self.sandbox.session.allow_in_sandbox(prefix);
+                self.apply_sandbox();
+                return vec![AgentEvent::Info(format!(
+                    "commands starting with `{prefix}` run in the sandbox without asking for the rest of this session"
+                ))];
+            }
+            if !self.sandbox.session.allow(prefix) {
+                return kept();
+            }
             self.apply_sandbox();
             return vec![AgentEvent::Info(format!(
                 "commands starting with `{prefix}` run without asking for the rest of this session"
@@ -4009,6 +4032,7 @@ impl AgentCore {
         }
         let global = crate::config::always_allow_global(self.config.path());
         let cwd = self.cwd.clone();
+        let mut added = true;
         let saved = crate::config::edit_config_json(self.config.path(), |config| {
             let rules = if global {
                 config
@@ -4019,18 +4043,23 @@ impl AgentCore {
                     .entry("command_rules")
                     .or_insert_with(|| json!([]))
             };
-            crate::sandbox::allow_rule_json(rules, prefix);
+            added = crate::sandbox::allow_rule_json(rules, prefix);
             Ok(())
         });
         if let Err(error) = saved {
             // It still applies to this session.
-            self.sandbox.session.allow(prefix);
+            if !self.sandbox.session.allow(prefix) {
+                return kept();
+            }
             self.apply_sandbox();
             return vec![AgentEvent::Error(format!(
                 "could not save the rule for `{prefix}` ({error}); it applies to this session only"
             ))];
         }
-        if global {
+        if !added {
+            return kept();
+        }
+        let layer_added = if global {
             let base = self
                 .sandbox
                 .base
@@ -4039,10 +4068,14 @@ impl AgentCore {
                 rules: std::mem::take(&mut base.rules),
                 ..Default::default()
             };
-            layer.allow(prefix);
+            let added = layer.allow(prefix);
             base.rules = layer.rules;
+            added
         } else {
-            self.sandbox.project.allow(prefix);
+            self.sandbox.project.allow(prefix)
+        };
+        if !layer_added {
+            return kept();
         }
         self.apply_sandbox();
         vec![AgentEvent::Info(format!(
@@ -6160,6 +6193,26 @@ fn check_directory(dir: &std::path::Path) -> Result<(), String> {
     }
 }
 
+/// `check_directory` for a directory made writable: not the root, the
+/// home directory or a directory around it (that would leave no sandbox),
+/// nor credentials or LynShen's settings.
+fn check_writable_directory(dir: &std::path::Path) -> Result<(), String> {
+    check_directory(dir)?;
+    let real = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let home = crate::sandbox::real_home();
+    let around_home = home.as_ref().is_some_and(|home| home.starts_with(&real));
+    let guarded = crate::sandbox::guarded_writes()
+        .iter()
+        .any(|guarded| real.starts_with(guarded) || guarded.starts_with(&real));
+    if real.parent().is_none() || around_home || guarded {
+        return Err(format!(
+            "{} cannot be made writable: it is the root, the home directory or holds credentials or LynShen's settings",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
 /// `requires_approval` for a request: a call that crosses the sandbox or
 /// the workspace boundary needs a person in every mode but full-access.
 fn mode_requires_approval(
@@ -6186,7 +6239,7 @@ fn resolve_approval_decision(
     call_id: &str,
     allow: bool,
     options: &ApproveOptions,
-) -> Result<Option<(crate::approval::ApprovalScope, String)>, String> {
+) -> Result<Option<(crate::approval::ApprovalScope, String, bool)>, String> {
     use crate::approval::ApprovalScope;
     let pending = pending_approvals
         .get(call_id)
@@ -6253,16 +6306,26 @@ fn resolve_approval_decision(
             Some(prefix) => {
                 let words: Vec<&str> = prefix.split_whitespace().collect();
                 let offered_words: Vec<&str> = offered.split_whitespace().collect();
-                if !words.starts_with(&offered_words) {
+                // Longer only with the command's own next words: what the
+                // user saw, never other words (or a rule's prefix).
+                let command = pending.info.command.as_deref().unwrap_or_default();
+                let seen = crate::command_text::segments(command).iter().any(|part| {
+                    let part: Vec<&str> = crate::command_text::allow_words(part)
+                        .iter()
+                        .map(String::as_str)
+                        .collect();
+                    part.starts_with(&offered_words) && part.starts_with(&words)
+                });
+                if !words.starts_with(&offered_words) || !seen {
                     return Err(format!(
-                        "prefix `{prefix}` must start with `{offered}`: it can only be narrower"
+                        "prefix `{prefix}` must start with `{offered}` and continue with the command's own words: it can only be narrower"
                     ));
                 }
                 words.join(" ")
             }
             None => offered,
         };
-        Some((scope, prefix))
+        Some((scope, prefix, pending.info.inside_sandbox))
     } else {
         None
     };

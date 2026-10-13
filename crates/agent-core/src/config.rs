@@ -781,6 +781,7 @@ impl Config {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let _lock = lock_config(&self.path)?;
 
         let mut value = json!({
             "provider": self.provider,
@@ -1132,11 +1133,6 @@ impl AuthStore {
     }
 }
 
-/// Write `contents` to `path` atomically via a temp file in the same
-/// directory plus rename, so a crash or interrupt mid-write never leaves a
-/// truncated file behind. The temp name carries the pid so concurrent saves
-/// do not collide. `mode` (Unix) is set on the temp file before any content
-/// is written, so a credentials file is never readable by others.
 /// config.json keys of the sandbox (see `Config::save`).
 const SANDBOX_KEYS: [&str; 4] = [
     "sandbox",
@@ -1176,6 +1172,9 @@ pub(crate) fn edit_config_json(
     path: &Path,
     edit: impl FnOnce(&mut serde_json::Map<String, Value>) -> Result<(), String>,
 ) -> Result<(), String> {
+    // Read, change and write as one step against other writers (another
+    // engine saving a rule, `Config::save`), so neither loses the other's.
+    let _lock = lock_config(path).map_err(|error| error.to_string())?;
     let mut value = match fs::read_to_string(path) {
         Ok(text) => serde_json::from_str::<Value>(&text)
             .map_err(|error| format!("config.json is not valid JSON: {error}"))?,
@@ -1216,6 +1215,26 @@ pub(crate) fn project_entry_mut<'a>(
     entry.as_object_mut().expect("an object")
 }
 
+/// Holds `<config>.lock` locked until the returned file is dropped:
+/// config.json's writers (`edit_config_json`, `Config::save`) in every
+/// process read, change and write it one at a time.
+fn lock_config(path: &Path) -> io::Result<fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_file_name(format!("{name}.lock")))?;
+    file.lock()?;
+    Ok(file)
+}
+
 /// Whether "always allow" saves its rule for every project
 /// (`always_allow_scope: "global"` in config.json) instead of this one.
 pub(crate) fn always_allow_global(path: &Path) -> bool {
@@ -1225,6 +1244,11 @@ pub(crate) fn always_allow_global(path: &Path) -> bool {
         .is_some_and(|value| value["always_allow_scope"] == "global")
 }
 
+/// Write `contents` to `path` atomically via a temp file in the same
+/// directory plus rename, so a crash or interrupt mid-write never leaves a
+/// truncated file behind. The temp name carries the pid so concurrent saves
+/// do not collide. `mode` (Unix) is set on the temp file before any content
+/// is written, so a credentials file is never readable by others.
 fn write_atomically(path: &Path, contents: &str, mode: Option<u32>) -> io::Result<()> {
     let file_name = path
         .file_name()
@@ -3395,6 +3419,54 @@ mod tests {
 
         let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["model"], "gpt-6-sol");
+        assert_eq!(saved["asr"]["engine"], "whisper");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_config_writers_keep_each_other_s_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "lynshen-config-writers-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        fs::write(&path, "{\"asr\":{\"engine\":\"whisper\"}}\n").unwrap();
+        let config = Config::from_value("{}", path.clone()).unwrap();
+        // Rules saved from several engines at once, while one saves its
+        // settings: every rule is kept, and so is the key nobody knows.
+        let writers: Vec<_> = (0..6)
+            .map(|writer| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for n in 0..8 {
+                        edit_config_json(&path, |config| {
+                            let rules = config.entry("command_rules").or_insert_with(|| json!([]));
+                            crate::sandbox::allow_rule_json(rules, &format!("tool{writer} run{n}"));
+                            Ok(())
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..8 {
+            config.save().unwrap();
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let ours = saved["command_rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|rule| rule["prefix"].as_str().unwrap().starts_with("tool"))
+            .count();
+        assert_eq!(ours, 48, "{saved}");
         assert_eq!(saved["asr"]["engine"], "whisper");
         let _ = fs::remove_dir_all(&dir);
     }

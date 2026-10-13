@@ -26,6 +26,11 @@ pub struct Segment {
     pub inline_code: bool,
     /// Targets of output redirections (`> f`, `>> f`, `2> f`, `&> f`).
     pub redirects: Vec<String>,
+    /// Nothing before the program changes what runs or how: no variable
+    /// assignment (`PATH=.`, `LD_PRELOAD=…`), no `env`, `xargs` or
+    /// elevation, only wrappers such as `time` or `nohup`. An allow rule
+    /// matches only such a part (see `allow_words`).
+    pub plain: bool,
 }
 
 impl Segment {
@@ -91,6 +96,7 @@ fn collect_segments(command: &str, elevated: bool, depth: usize, out: &mut Vec<S
             elevated: elevated || stripped.elevated,
             inline_code: false,
             redirects,
+            plain: stripped.plain,
         };
         if is_start_process_runas(&segment) {
             segment.elevated = true;
@@ -117,8 +123,72 @@ fn collect_segments(command: &str, elevated: bool, depth: usize, out: &mut Vec<S
             }
             continue;
         }
+        // `find … -exec cmd {} ;`: the command it runs is a command too (a
+        // delete is the find's own, see `delete_targets`).
+        let executed = find_executes(&segment);
+        let nested_elevated = segment.elevated;
         out.push(segment);
+        if depth < 4 {
+            for words in executed {
+                let mut inner = Vec::new();
+                collect_segments(&join_words(&words), nested_elevated, depth + 1, &mut inner);
+                if inner.first().is_some_and(|first| !is_delete(first)) {
+                    out.extend(inner);
+                }
+            }
+        }
     }
+}
+
+/// The commands `find` runs with `-exec`, `-execdir`, `-ok` and `-okdir`,
+/// without the `{}` placeholder.
+fn find_executes(segment: &Segment) -> Vec<Vec<String>> {
+    if segment.program() != "find" {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let args = segment.args();
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        i += 1;
+        if !matches!(arg.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
+            continue;
+        }
+        let mut words = Vec::new();
+        while let Some(word) = args.get(i) {
+            i += 1;
+            if word == ";" || word == "+" {
+                break;
+            }
+            if word != "{}" {
+                words.push(word.clone());
+            }
+        }
+        if !words.is_empty() {
+            out.push(words);
+        }
+    }
+    out
+}
+
+/// Words back into one command line, quoted where the shell would split
+/// them.
+fn join_words(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|word| {
+            if !word.is_empty()
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,".contains(c))
+            {
+                word.clone()
+            } else {
+                format!("'{}'", word.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn is_null_device(target: &str) -> bool {
@@ -174,7 +244,10 @@ fn lex(command: &str) -> Vec<Vec<Token>> {
                 in_word = true;
                 i += 1;
                 while i < chars.len() && chars[i] != '"' {
-                    if chars[i] == '\\' && matches!(at(i + 1), Some('"' | '\\' | '$' | '`')) {
+                    if chars[i] == '\\'
+                        && matches!(at(i + 1), Some('"' | '\\' | '$' | '`'))
+                        && !is_windows_path(&word)
+                    {
                         word.push(chars[i + 1]);
                         i += 2;
                         continue;
@@ -185,11 +258,13 @@ fn lex(command: &str) -> Vec<Vec<Token>> {
                 i += 1;
             }
             // A backslash escapes the shell's own characters; before any
-            // other character it is kept, so a Windows path stays whole.
+            // other character it is kept, so a Windows path stays whole. In
+            // a word that is a Windows path it is the path's (`C:\ -Recurse`
+            // in PowerShell, where `\` escapes nothing).
             '\\' if matches!(
                 at(i + 1),
                 Some(' ' | '"' | '\'' | '\\' | ';' | '&' | '|' | '>' | '<' | '$' | '`' | '(' | ')')
-            ) =>
+            ) && !is_windows_path(&word) =>
             {
                 word.push(chars[i + 1]);
                 in_word = true;
@@ -315,6 +390,35 @@ fn lex(command: &str) -> Vec<Vec<Token>> {
                 end_segment(&mut current, &mut segments);
                 i += 2;
             }
+            // `${NAME}`: one word, braces and all.
+            '$' if at(i + 1) == Some('{') => {
+                in_word = true;
+                while let Some(c) = at(i) {
+                    word.push(c);
+                    i += 1;
+                    if c == '}' {
+                        break;
+                    }
+                }
+            }
+            // `{}` (find's placeholder) is a word.
+            '{' if !in_word && at(i + 1) == Some('}') => {
+                word.push_str("{}");
+                in_word = true;
+                i += 2;
+            }
+            // A group (`{ cmd; }`) or a PowerShell script block
+            // (`ForEach-Object { Remove-Item $_ }`): what follows is a
+            // command. Inside a word (`file.{c,h}`, `@{a=1}`) it is text.
+            '{' if !in_word => {
+                end_segment(&mut current, &mut segments);
+                i += 1;
+            }
+            '}' if !(in_word && word.contains('{')) => {
+                end_word(&mut word, &mut in_word, &mut current);
+                end_segment(&mut current, &mut segments);
+                i += 1;
+            }
             _ => {
                 word.push(c);
                 in_word = true;
@@ -327,11 +431,21 @@ fn lex(command: &str) -> Vec<Vec<Token>> {
     segments
 }
 
+/// `C:…` or `\\server…`: a Windows path, whose backslashes are
+/// separators.
+fn is_windows_path(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || word.starts_with("\\\\")
+}
+
 struct Stripped {
     words: Vec<String>,
     elevated: bool,
     /// The command `su -c` or `runas` runs, given as one string.
     inner: Option<String>,
+    /// See `Segment::plain`.
+    plain: bool,
 }
 
 fn is_assignment(word: &str) -> bool {
@@ -370,13 +484,26 @@ fn skip_options(words: &[String], mut index: usize, with_value: &[&str]) -> usiz
 /// Takes leading variable assignments and wrappers off `raw`.
 fn strip_wrappers(raw: &[String]) -> Stripped {
     let mut elevated = false;
+    let mut plain = true;
     let mut i = 0;
     while let Some(word) = raw.get(i) {
-        if is_assignment(word) || matches!(word.as_str(), "!" | "{" | "}") {
+        if matches!(word.as_str(), "!" | "{" | "}") {
             i += 1;
             continue;
         }
-        match program_name(word).as_str() {
+        if is_assignment(word) {
+            plain = false;
+            i += 1;
+            continue;
+        }
+        let program = program_name(word);
+        if matches!(
+            program.as_str(),
+            "sudo" | "doas" | "pkexec" | "gsudo" | "runas" | "su" | "env" | "xargs"
+        ) {
+            plain = false;
+        }
+        match program.as_str() {
             "sudo" => {
                 elevated = true;
                 i = skip_options(
@@ -409,6 +536,7 @@ fn strip_wrappers(raw: &[String]) -> Stripped {
                     words: rest.iter().map(|word| word.to_string()).collect(),
                     elevated,
                     inner: (rest.len() == 1).then(|| rest[0].to_string()),
+                    plain,
                 };
             }
             "su" => {
@@ -422,6 +550,7 @@ fn strip_wrappers(raw: &[String]) -> Stripped {
                     words: raw[i..].to_vec(),
                     elevated: true,
                     inner: code,
+                    plain,
                 };
             }
             "env" => {
@@ -440,6 +569,7 @@ fn strip_wrappers(raw: &[String]) -> Stripped {
                         words: Vec::new(),
                         elevated,
                         inner: None,
+                        plain,
                     };
                 }
                 i = skip_options(raw, i + 1, &[]);
@@ -480,6 +610,7 @@ fn strip_wrappers(raw: &[String]) -> Stripped {
         words: raw.get(i..).unwrap_or_default().to_vec(),
         elevated,
         inner: None,
+        plain,
     }
 }
 
@@ -561,6 +692,7 @@ pub fn is_interpreter(segment: &Segment) -> bool {
     let program = segment.program();
     program.starts_with("python")
         || program.starts_with("pypy")
+        || is_shell(&program)
         || matches!(
             program.as_str(),
             "py" | "node"
@@ -576,13 +708,49 @@ pub fn is_interpreter(segment: &Segment) -> bool {
                 | "eval"
                 | "invoke-expression"
                 | "iex"
+                | "source"
+                | "."
         )
 }
 
-/// Programs that delete files.
-pub fn is_delete(segment: &Segment) -> bool {
+/// A shell: given a script (`bash build.sh`) it runs whatever the script
+/// says, as it does with inline code.
+fn is_shell(program: &str) -> bool {
     matches!(
-        segment.program().as_str(),
+        program,
+        "bash"
+            | "sh"
+            | "zsh"
+            | "dash"
+            | "ksh"
+            | "ash"
+            | "fish"
+            | "mksh"
+            | "csh"
+            | "tcsh"
+            | "powershell"
+            | "pwsh"
+            | "cmd"
+    )
+}
+
+/// Programs that delete files, and `find` with `-delete` or running one.
+pub fn is_delete(segment: &Segment) -> bool {
+    let program = segment.program();
+    if program == "find" {
+        return segment.args().iter().any(|arg| arg == "-delete")
+            || find_executes(segment).iter().any(|words| {
+                words
+                    .first()
+                    .is_some_and(|word| is_delete_program(&program_name(word)))
+            });
+    }
+    is_delete_program(&program)
+}
+
+fn is_delete_program(program: &str) -> bool {
+    matches!(
+        program,
         "rm" | "rmdir" | "unlink" | "shred" | "srm" | "del" | "erase" | "rd" | "remove-item" | "ri"
     )
 }
@@ -595,6 +763,19 @@ pub fn delete_targets(segment: &Segment) -> Vec<String> {
     let program = segment.program();
     let args = segment.args();
     let mut targets = Vec::new();
+    if program == "find" {
+        // The starting points, before the first test or action; `.` when
+        // there are none.
+        targets.extend(
+            args.iter()
+                .take_while(|arg| !arg.starts_with('-') && *arg != "(" && *arg != "!")
+                .cloned(),
+        );
+        if targets.is_empty() {
+            targets.push(".".to_string());
+        }
+        return targets;
+    }
     if program == "remove-item" || program == "ri" || (program == "rm" && windows_style(args)) {
         let mut i = 0;
         while let Some(arg) = args.get(i) {
@@ -755,7 +936,12 @@ pub fn git_push(segment: &Segment) -> Option<bool> {
             break;
         }
     }
-    if args.get(i).map(String::as_str) != Some("push") {
+    // Windows finds `git PUSH` too (git-push.exe on a case-insensitive
+    // file system).
+    if !args
+        .get(i)
+        .is_some_and(|arg| arg.eq_ignore_ascii_case("push"))
+    {
         return None;
     }
     let force = args[i + 1..].iter().any(|arg| {
@@ -876,70 +1062,65 @@ pub fn system_setting(segment: &Segment) -> Option<&'static str> {
 
 /// Commands that only move around, print or filter: a command line is
 /// allowed by the rules when every other part is, and they do not count for
-/// the prefix offered with an approval. Not with a redirection.
+/// the prefix offered with an approval. Not with a redirection, nor with an
+/// option that writes a file (`sort -o`, `uniq in out`) or runs a program
+/// (`rg --pre`). `export` and `set` are not: they change what later parts
+/// run (`export PATH=.:$PATH`).
 pub fn is_neutral(segment: &Segment) -> bool {
-    segment.redirects.is_empty()
-        && matches!(
-            segment.program().as_str(),
-            "cd" | "pushd"
-                | "popd"
-                | "pwd"
-                | "true"
-                | "false"
-                | ":"
-                | "echo"
-                | "printf"
-                | "sleep"
-                | "set"
-                | "export"
-                | "clear"
-                | "cls"
-                | "head"
-                | "tail"
-                | "grep"
-                | "egrep"
-                | "fgrep"
-                | "rg"
-                | "sort"
-                | "uniq"
-                | "wc"
-                | "cut"
-                | "tr"
-                | "jq"
-                | "less"
-                | "more"
-                | "cat"
-                | "column"
-                | "nl"
-                | "test"
-                | "["
-                | "[["
-                | "which"
-                | "type"
-                | "date"
-                | "basename"
-                | "dirname"
-                | "write-output"
-                | "write-host"
-                | "select-object"
-                | "select-string"
-                | "format-table"
-                | "format-list"
-                | "out-string"
-                | "measure-object"
-                | "sort-object"
-                | "where-object"
-        )
+    if !segment.redirects.is_empty() {
+        return false;
+    }
+    let args = segment.lower_args();
+    let positional = || args.iter().filter(|arg| !arg.starts_with('-')).count();
+    match segment.program().as_str() {
+        "sort" => !args.iter().any(|arg| {
+            arg.starts_with("--output")
+                || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('o'))
+        }),
+        "uniq" => positional() <= 1,
+        "rg" | "grep" | "egrep" | "fgrep" => !args.iter().any(|arg| arg.starts_with("--pre")),
+        "cd" | "pushd" | "popd" | "pwd" | "true" | "false" | ":" | "echo" | "printf" | "sleep"
+        | "clear" | "cls" | "head" | "tail" | "wc" | "cut" | "tr" | "jq" | "less" | "more"
+        | "cat" | "column" | "nl" | "test" | "[" | "[[" | "which" | "type" | "date"
+        | "basename" | "dirname" | "write-output" | "write-host" | "select-object"
+        | "select-string" | "format-table" | "format-list" | "out-string" | "measure-object"
+        | "sort-object" | "where-object" => true,
+        _ => false,
+    }
 }
 
-/// The command prefix an approval for `segment` can remember: its first two
-/// words as written (one for a one-word command).
+/// The command prefix an approval for `segment` can remember: its words as
+/// written up to the first word after the program that is not an option
+/// (`npm install`, `npx -y create-vite`, `make`), at most four. None for a
+/// part an allow rule would not match (`allow_words`) or with a word that
+/// has white space in it.
 pub fn prefix(segment: &Segment) -> Option<String> {
-    let words: Vec<&str> = segment.words.iter().take(2).map(String::as_str).collect();
-    if words.is_empty() || words.iter().any(|word| word.trim().is_empty()) {
+    if !segment.plain {
         return None;
     }
-    Some(words.join(" "))
+    let mut words: Vec<&str> = Vec::new();
+    for word in &segment.words {
+        if word.is_empty() || word.chars().any(char::is_whitespace) {
+            return None;
+        }
+        words.push(word);
+        if (words.len() > 1 && !word.starts_with('-')) || words.len() == 4 {
+            break;
+        }
+    }
+    (!words.is_empty()).then(|| words.join(" "))
+}
+
+/// The words an `allow` rule is matched against: the part as written,
+/// wrappers such as `time` taken off only when nothing before the program
+/// changes what runs (`Segment::plain`). `PATH=. git commit`, `env … git
+/// commit` or `./git commit` do not match `git commit`.
+pub fn allow_words(segment: &Segment) -> &[String] {
+    if segment.plain {
+        &segment.words
+    } else {
+        &segment.raw
+    }
 }
 
 /// The absolute path `word` names, from `cwd`: `~`, `$HOME`, `${HOME}`,
@@ -952,13 +1133,36 @@ pub fn resolve_word(word: &str, cwd: &Path, home: Option<&Path>) -> Option<PathB
         return None;
     }
     let mut text = word.to_string();
-    for (variable, rest_at) in [
-        ("~", 1),
-        ("$HOME", 5),
-        ("${HOME}", 7),
-        ("%USERPROFILE%", 13),
-        ("$env:USERPROFILE", 16),
-        ("$env:HOME", 9),
+    // `~name`: that user's home directory. Only the current user's is
+    // known; another's is not a path this can follow.
+    if let Some(rest) = text.strip_prefix('~') {
+        let end = rest.find(['/', '\\']).unwrap_or(rest.len());
+        let (name, after) = rest.split_at(end);
+        if !name.is_empty() {
+            let home = home?;
+            let own = home
+                .file_name()
+                .is_some_and(|own| own.to_string_lossy().eq_ignore_ascii_case(name));
+            if !own {
+                return None;
+            }
+            text = format!("{}{}", home.display(), after);
+        }
+    }
+    let temp = std::env::temp_dir();
+    for (variable, base) in [
+        ("~", home),
+        ("$HOME", home),
+        ("${HOME}", home),
+        ("%USERPROFILE%", home),
+        ("$env:USERPROFILE", home),
+        ("$env:HOME", home),
+        ("$TMPDIR", Some(temp.as_path())),
+        ("${TMPDIR}", Some(temp.as_path())),
+        ("%TEMP%", Some(temp.as_path())),
+        ("%TMP%", Some(temp.as_path())),
+        ("$env:TEMP", Some(temp.as_path())),
+        ("$env:TMP", Some(temp.as_path())),
     ] {
         let matches = if variable.starts_with('%') || variable.starts_with("$env") {
             text.to_lowercase().starts_with(&variable.to_lowercase())
@@ -966,12 +1170,12 @@ pub fn resolve_word(word: &str, cwd: &Path, home: Option<&Path>) -> Option<PathB
             text.starts_with(variable)
         };
         if matches {
-            let rest = &text[rest_at..];
+            let rest = &text[variable.len()..];
             if !(rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\')) {
                 continue;
             }
-            let home = home?;
-            text = format!("{}{}", home.display(), rest);
+            let base = base?;
+            text = format!("{}{}", base.display(), rest);
             break;
         }
     }
@@ -1116,7 +1320,11 @@ mod tests {
         assert_eq!(delete_targets(&parts[1]), strings(&[r"C:\x"]));
         assert!(segments("pwsh -EncodedCommand ZQBjAGgAbwA=")[0].inline_code);
         assert!(segments("cmd /c del /q build")[0].inline_code);
-        assert!(!is_interpreter(&segments("bash build.sh")[0]));
+        // A shell given a script runs whatever the script says.
+        assert!(is_interpreter(&segments("bash build.sh")[0]));
+        assert!(is_interpreter(&segments("pwsh -File build.ps1")[0]));
+        assert!(is_interpreter(&segments("source env.sh")[0]));
+        assert!(!is_interpreter(&segments("make build")[0]));
         assert!(is_interpreter(&segments("python3 -m pip install x")[0]));
     }
 
@@ -1129,6 +1337,11 @@ mod tests {
         );
         let del = &segments(r"del /s /q C:\temp\x")[0];
         assert_eq!(delete_targets(del), strings(&[r"C:\temp\x"]));
+        // PowerShell: a backslash before a space ends the path.
+        let root = &segments(r"Remove-Item C:\ -Recurse -Force")[0];
+        assert_eq!(delete_targets(root), strings(&[r"C:\"]));
+        let quoted = &segments(r#"Remove-Item "C:\Users\me\" -Recurse"#)[0];
+        assert_eq!(delete_targets(quoted), strings(&[r"C:\Users\me\"]));
         assert_eq!(
             write_targets(&segments("cp -r src ~/Desktop/out")[0]),
             strings(&["~/Desktop/out"])
@@ -1200,24 +1413,144 @@ mod tests {
         );
         assert_eq!(resolve_word("$OUT/x", cwd, home), None);
         assert_eq!(resolve_word("-rf", cwd, home), None);
+        // `~name` is a home directory, not a file in the working directory.
+        assert_eq!(resolve_word("~user/x", cwd, home), None);
         assert_eq!(
-            resolve_word("~user/x", cwd, home),
-            Some(PathBuf::from("/work/app/~user/x"))
+            resolve_word("~me/x", cwd, home),
+            Some(PathBuf::from("/home/me/x"))
+        );
+        assert_eq!(
+            resolve_word("~me", cwd, home),
+            Some(PathBuf::from("/home/me"))
+        );
+        assert_eq!(
+            resolve_word("$TMPDIR/x", cwd, home),
+            Some(normalize(&std::env::temp_dir().join("x")))
         );
     }
 
     #[test]
-    fn prefixes_take_two_words() {
+    fn prefixes_take_the_program_and_its_first_word() {
         assert_eq!(
             prefix(&segments("npm install lodash")[0]).as_deref(),
             Some("npm install")
         );
         assert_eq!(prefix(&segments("make")[0]).as_deref(), Some("make"));
+        // Options do not end it: `npx -y` would allow any package.
         assert_eq!(
-            prefix(&segments("sudo apt install x")[0]).as_deref(),
-            Some("apt install")
+            prefix(&segments("npx -y create-vite app")[0]).as_deref(),
+            Some("npx -y create-vite")
         );
+        assert_eq!(prefix(&segments("ls -la")[0]).as_deref(), Some("ls -la"));
+        assert_eq!(
+            prefix(&segments("time cargo test -q")[0]).as_deref(),
+            Some("cargo test")
+        );
+        // A part an allow rule would not match offers none.
+        for command in [
+            "sudo apt install x",
+            "PATH=. git commit -m x",
+            "env LD_PRELOAD=/tmp/x.so npm install",
+            "git commit -m 'a b'",
+        ] {
+            let part = segments(command).remove(0);
+            if command.starts_with("git commit -m") {
+                assert_eq!(prefix(&part).as_deref(), Some("git commit"), "{command}");
+            } else {
+                assert_eq!(prefix(&part), None, "{command}");
+            }
+        }
         assert!(is_neutral(&segments("cd app")[0]));
         assert!(!is_neutral(&segments("echo x > f")[0]));
+    }
+
+    #[test]
+    fn allow_words_keep_what_changes_the_program() {
+        let words = |command: &str| allow_words(&segments(command)[0]).to_vec();
+        assert_eq!(
+            words("git commit -m x"),
+            strings(&["git", "commit", "-m", "x"])
+        );
+        assert_eq!(words("nohup git commit"), strings(&["git", "commit"]));
+        assert_eq!(words("./git commit"), strings(&["./git", "commit"]));
+        assert_eq!(
+            words("PATH=. git commit"),
+            strings(&["PATH=.", "git", "commit"])
+        );
+        assert_eq!(
+            words("env GIT_DIR=x git commit"),
+            strings(&["env", "GIT_DIR=x", "git", "commit"])
+        );
+        assert_eq!(
+            words("xargs git commit"),
+            strings(&["xargs", "git", "commit"])
+        );
+    }
+
+    #[test]
+    fn neutral_parts_neither_write_nor_run_code() {
+        for command in ["cd app", "grep -n x f", "sort f", "uniq f", "tail -f log"] {
+            assert!(is_neutral(&segments(command)[0]), "{command}");
+        }
+        for command in [
+            "export PATH=.:$PATH",
+            "set PATH=C:\\evil",
+            "sort -o ~/.zshrc f",
+            "sort -uo out f",
+            "uniq in.txt ~/.bashrc",
+            "rg --pre ./x pattern",
+            "echo x >> f",
+        ] {
+            assert!(!is_neutral(&segments(command)[0]), "{command}");
+        }
+    }
+
+    #[test]
+    fn script_blocks_and_groups_are_commands() {
+        let parts =
+            segments("Get-ChildItem C:\\x | ForEach-Object { Remove-Item $_.FullName -Recurse }");
+        assert!(parts.iter().any(is_delete), "{parts:?}");
+        let parts = segments("if ($x) {Remove-Item C:\\ -Recurse}");
+        assert!(parts.iter().any(is_delete), "{parts:?}");
+        let parts = segments("{ git push; }");
+        assert_eq!(git_push(&parts[0]), Some(false));
+        // Braces inside a word stay text.
+        assert_eq!(
+            words("cp src/{a,b}.c ${HOME}/x @{a=1}"),
+            vec![strings(&["cp", "src/{a,b}.c", "${HOME}/x", "@{a=1}"])]
+        );
+        assert_eq!(
+            words("find . -name x -exec grep -l y {} +"),
+            vec![
+                strings(&["find", ".", "-name", "x", "-exec", "grep", "-l", "y", "{}", "+"]),
+                strings(&["grep", "-l", "y"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn find_can_delete_and_run_commands() {
+        let delete = &segments("find ~ -name '*.log' -delete")[0];
+        assert!(is_delete(delete));
+        assert_eq!(delete_targets(delete), strings(&["~"]));
+        let exec = segments("find /srv build -exec rm -rf {} +");
+        assert!(is_delete(&exec[0]));
+        assert_eq!(delete_targets(&exec[0]), strings(&["/srv", "build"]));
+        assert_eq!(exec.len(), 1, "the rm is the find's: {exec:?}");
+        assert!(!is_delete(&segments("find . -name x")[0]));
+        let pushed = segments("find . -maxdepth 0 -exec git push \\;");
+        assert_eq!(git_push(&pushed[1]), Some(false));
+        assert!(segments("find . -exec sh -c 'x' \\;")[1].inline_code);
+    }
+
+    #[test]
+    fn a_push_is_found_in_any_case() {
+        for command in [
+            "GIT PUSH origin",
+            "git.exe Push",
+            r"C:\Git\cmd\git.EXE push -F",
+        ] {
+            assert!(git_push(&segments(command)[0]).is_some(), "{command}");
+        }
     }
 }

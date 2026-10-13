@@ -99,6 +99,12 @@ pub struct CommandCheck {
     pub prefix: Option<String>,
     /// The paths its text shows it writes.
     pub writes: Vec<PathBuf>,
+    /// A write its text shows lands outside the boundary (the workspace,
+    /// the read-write directories, temp and the package caches).
+    pub writes_outside: bool,
+    /// It deletes something its text does not name (a variable, a command
+    /// substitution, `xargs rm`): outside the sandbox that may be anywhere.
+    pub unknown_delete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +117,10 @@ pub struct SandboxPolicy {
     pub readable_dirs: Vec<PathBuf>,
     pub network: bool,
     pub rules: Vec<CommandRule>,
+    /// Command prefixes allowed for this session inside the sandbox only:
+    /// manual mode stops asking for them, an escalation still asks (see
+    /// `allowed_in_sandbox`).
+    pub sandboxed_allow: Vec<String>,
 }
 
 impl SandboxPolicy {
@@ -151,6 +161,7 @@ impl SandboxPolicy {
         use crate::command_text as text;
         let home = home().map(|home| real(&home));
         let credentials = denied_reads();
+        let settings = agent_settings();
         let roots = dirs.map(|(_, workspace)| self.boundary_roots(workspace));
         let workspace = dirs.map(|(_, workspace)| real(workspace));
         let mut check = CommandCheck::default();
@@ -159,6 +170,7 @@ impl SandboxPolicy {
         let mut all_allowed = true;
         let mut counted = 0;
         let mut prefixes: Vec<String> = Vec::new();
+        let mut no_prefix = false;
         let parts = text::segments(command);
         for part in &parts {
             let user = self.user_rule(part);
@@ -184,30 +196,44 @@ impl SandboxPolicy {
             }
             if let Some((cwd, _)) = dirs {
                 let resolve = |word: &str| text::resolve_word(word, cwd, home.as_deref());
-                for target in text::delete_targets(part).iter().filter_map(|w| resolve(w)) {
-                    let real_target = real_or_parent(&target);
-                    let protected = target.parent().is_none()
-                        || home
-                            .as_ref()
-                            .is_some_and(|home| real_target == *home || target == *home)
-                        || workspace.as_ref().is_some_and(|workspace| {
-                            workspace != &real_target && workspace.starts_with(&real_target)
-                        });
-                    if protected {
-                        part_forbid.get_or_insert_with(|| {
-                            format!(
-                                "never run: it deletes {}, the root, the home directory or a parent of the workspace",
-                                target.display()
-                            )
-                        });
-                    } else if !roots
-                        .iter()
-                        .flatten()
-                        .any(|root| real_target.starts_with(root))
-                    {
-                        part_ask.get_or_insert_with(|| {
-                            format!("it deletes {}, outside the workspace", target.display())
-                        });
+                if text::is_delete(part) {
+                    let targets = text::delete_targets(part);
+                    if targets.is_empty() {
+                        check.unknown_delete = true;
+                    }
+                    for word in &targets {
+                        let Some(target) = resolve(word) else {
+                            check.unknown_delete = true;
+                            continue;
+                        };
+                        let real_target = real_or_parent(&target);
+                        // The root, the home directory or a directory around
+                        // it, or around the workspace.
+                        let around = |dir: &PathBuf| {
+                            dir.starts_with(&real_target) || dir.starts_with(&target)
+                        };
+                        let protected = target.parent().is_none()
+                            || real_target.parent().is_none()
+                            || home.as_ref().is_some_and(around)
+                            || workspace.as_ref().is_some_and(|workspace| {
+                                workspace != &real_target && workspace.starts_with(&real_target)
+                            });
+                        if protected {
+                            part_forbid.get_or_insert_with(|| {
+                                format!(
+                                    "never run: it deletes {}, the root, the home directory or a parent of the workspace",
+                                    target.display()
+                                )
+                            });
+                        } else if !roots
+                            .iter()
+                            .flatten()
+                            .any(|root| real_target.starts_with(root))
+                        {
+                            part_ask.get_or_insert_with(|| {
+                                format!("it deletes {}, outside the workspace", target.display())
+                            });
+                        }
                     }
                 }
                 let mentioned = part
@@ -218,16 +244,29 @@ impl SandboxPolicy {
                     .filter_map(|word| resolve(word));
                 for path in mentioned {
                     let real_path = real_or_parent(&path);
-                    if credentials
-                        .iter()
-                        .any(|secret| real_path.starts_with(secret) || path.starts_with(secret))
-                    {
+                    let inside = |guarded: &PathBuf| {
+                        real_path.starts_with(guarded) || path.starts_with(guarded)
+                    };
+                    if credentials.iter().any(inside) {
                         part_ask.get_or_insert_with(|| {
                             format!("it touches credentials ({})", path.display())
+                        });
+                    } else if !text::is_neutral(part) && settings.iter().any(inside) {
+                        // Its own settings: their rules decide what asks.
+                        part_ask.get_or_insert_with(|| {
+                            format!("it changes LynShen's settings ({})", path.display())
                         });
                     }
                 }
                 for target in text::write_targets(part).iter().filter_map(|w| resolve(w)) {
+                    let real_target = real_or_parent(&target);
+                    if !roots
+                        .iter()
+                        .flatten()
+                        .any(|root| real_target.starts_with(root))
+                    {
+                        check.writes_outside = true;
+                    }
                     if !check.writes.contains(&target) {
                         check.writes.push(target);
                     }
@@ -242,17 +281,24 @@ impl SandboxPolicy {
             if !text::is_neutral(part) {
                 counted += 1;
                 all_allowed &= user == Some(RuleAction::Allow);
-                if let Some(prefix) = text::prefix(part) {
-                    if !prefixes.contains(&prefix) {
-                        prefixes.push(prefix);
-                    }
+                match text::prefix(part) {
+                    Some(prefix) if !prefixes.contains(&prefix) => prefixes.push(prefix),
+                    Some(_) => {}
+                    None => no_prefix = true,
                 }
             }
         }
         if counted == 0 {
             prefixes.extend(parts.first().and_then(text::prefix));
         }
-        check.prefix = (prefixes.len() == 1).then(|| prefixes.remove(0));
+        // A write outside goes where the user saw it go, once: no rule
+        // covers it, and no prefix is remembered for it (a client makes
+        // the directory writable instead).
+        if check.writes_outside {
+            all_allowed = false;
+            check.once_only = true;
+        }
+        check.prefix = (!no_prefix && prefixes.len() == 1).then(|| prefixes.remove(0));
         (check.action, check.reason) = match (forbid, ask) {
             (Some(reason), _) => (Some(RuleAction::Forbid), Some(reason)),
             (None, Some(reason)) => (Some(RuleAction::Ask), Some(reason)),
@@ -262,35 +308,74 @@ impl SandboxPolicy {
         check
     }
 
+    /// Whether every part of `command` but the neutral ones starts with a
+    /// prefix allowed inside the sandbox (`sandboxed_allow`).
+    pub fn allowed_in_sandbox(&self, command: &str) -> bool {
+        use crate::command_text as text;
+        if self.sandboxed_allow.is_empty() {
+            return false;
+        }
+        let mut counted = 0;
+        for part in text::segments(command) {
+            if text::is_neutral(&part) {
+                continue;
+            }
+            counted += 1;
+            let words = text::allow_words(&part);
+            if !self
+                .sandboxed_allow
+                .iter()
+                .any(|prefix| words_start_with(words, prefix, false))
+            {
+                return false;
+            }
+        }
+        counted > 0
+    }
+
     /// The command rule for one part of a command line: `forbid` wins over
-    /// any other match, otherwise the longest matching prefix. A rule matches
-    /// the part as written, without its wrappers, or with the program named
-    /// by its file name (`/usr/bin/git push` matches `git push`).
+    /// any other match, otherwise the longest matching prefix, `ask` before
+    /// `allow` at the same length. `ask` and `forbid` match the part in any
+    /// case, as written, without its wrappers or with the program named by
+    /// its file name (`/usr/bin/git push`, `GIT.EXE PUSH`); `allow` matches
+    /// only the words as written (`command_text::allow_words`), so
+    /// `./git commit` or `PATH=. git commit` is not `git commit`.
     fn user_rule(&self, part: &crate::command_text::Segment) -> Option<RuleAction> {
         let mut named = part.words.clone();
         if let Some(first) = named.first_mut() {
             *first = crate::command_text::program_name(first);
         }
-        let variants = [&part.raw, &part.words, &named];
-        let matches: Vec<&CommandRule> = self
-            .rules
-            .iter()
-            .filter(|rule| {
-                let prefix: Vec<&str> = rule.prefix.split_whitespace().collect();
-                !prefix.is_empty()
-                    && variants.iter().any(|words| {
-                        words.len() >= prefix.len()
-                            && words.iter().zip(&prefix).all(|(word, want)| word == want)
-                    })
-            })
-            .collect();
-        if matches.iter().any(|rule| rule.action == RuleAction::Forbid) {
-            return Some(RuleAction::Forbid);
+        let loose = [&part.raw, &part.words, &named];
+        let exact = crate::command_text::allow_words(part);
+        let mut best: Option<(usize, RuleAction)> = None;
+        for rule in &self.rules {
+            let matched = match rule.action {
+                RuleAction::Allow => words_start_with(exact, &rule.prefix, false),
+                RuleAction::Ask | RuleAction::Forbid => loose
+                    .iter()
+                    .any(|words| words_start_with(words, &rule.prefix, true)),
+            };
+            if !matched {
+                continue;
+            }
+            if rule.action == RuleAction::Forbid {
+                return Some(RuleAction::Forbid);
+            }
+            let length = rule.prefix.split_whitespace().count();
+            let better = match best {
+                None => true,
+                Some((known, action)) => {
+                    length > known
+                        || (length == known
+                            && action == RuleAction::Allow
+                            && rule.action == RuleAction::Ask)
+                }
+            };
+            if better {
+                best = Some((length, rule.action));
+            }
         }
-        matches
-            .into_iter()
-            .max_by_key(|rule| rule.prefix.split_whitespace().count())
-            .map(|rule| rule.action)
+        best.map(|(_, action)| action)
     }
 
     /// Where the agent may write without crossing the boundary, whatever
@@ -671,19 +756,17 @@ impl SandboxPolicy {
 
 impl SandboxPolicy {
     /// The default: the working directory writable, network on, commits
-    /// allowed to leave the sandbox and pushes always asked. Windows has no
-    /// sandbox yet and starts at `full-access`.
+    /// allowed to leave the sandbox and pushes always asked. On Windows too:
+    /// nothing enforces it there (`enforced`), but the model is told the
+    /// boundary and declares crossing it, and file tools keep to it.
     pub fn default_for_platform() -> Self {
         Self {
-            mode: if cfg!(windows) {
-                SandboxMode::FullAccess
-            } else {
-                SandboxMode::WorkspaceWrite
-            },
+            mode: SandboxMode::WorkspaceWrite,
             writable_dirs: Vec::new(),
             readable_dirs: Vec::new(),
             network: true,
             rules: rules_from_json(&default_rules_json()).expect("default rules parse"),
+            sandboxed_allow: Vec::new(),
         }
     }
 
@@ -700,6 +783,11 @@ impl SandboxPolicy {
             }
         }
         self.rules.extend(layer.rules.iter().cloned());
+        for prefix in &layer.sandboxed {
+            if !self.sandboxed_allow.contains(prefix) {
+                self.sandboxed_allow.push(prefix.clone());
+            }
+        }
         self
     }
 }
@@ -711,6 +799,9 @@ pub struct SandboxLayer {
     pub writable: Vec<PathBuf>,
     pub readable: Vec<PathBuf>,
     pub rules: Vec<CommandRule>,
+    /// Command prefixes allowed inside the sandbox only (the session's; see
+    /// `SandboxPolicy::sandboxed_allow`).
+    pub sandboxed: Vec<String>,
 }
 
 impl SandboxLayer {
@@ -731,6 +822,7 @@ impl SandboxLayer {
             writable,
             readable,
             rules,
+            sandboxed: Vec::new(),
         }
     }
 
@@ -750,15 +842,29 @@ impl SandboxLayer {
         remove_dir_from(&mut self.writable, dir) | remove_dir_from(&mut self.readable, dir)
     }
 
-    /// Adds an `allow` rule for `prefix`, or makes the rule with that
-    /// prefix one.
-    pub fn allow(&mut self, prefix: &str) {
-        match self.rules.iter_mut().find(|rule| rule.prefix == prefix) {
-            Some(rule) => rule.action = RuleAction::Allow,
-            None => self.rules.push(CommandRule {
-                prefix: prefix.to_string(),
-                action: RuleAction::Allow,
-            }),
+    /// Adds an `allow` rule for `prefix`. A rule that asks or forbids the
+    /// same prefix stays as it is (false): an approval never loosens one.
+    pub fn allow(&mut self, prefix: &str) -> bool {
+        match self
+            .rules
+            .iter()
+            .find(|rule| rule.prefix.eq_ignore_ascii_case(prefix))
+        {
+            Some(rule) => rule.action == RuleAction::Allow,
+            None => {
+                self.rules.push(CommandRule {
+                    prefix: prefix.to_string(),
+                    action: RuleAction::Allow,
+                });
+                true
+            }
+        }
+    }
+
+    /// Allows `prefix` inside the sandbox only.
+    pub fn allow_in_sandbox(&mut self, prefix: &str) {
+        if !self.sandboxed.iter().any(|known| known == prefix) {
+            self.sandboxed.push(prefix.to_string());
         }
     }
 }
@@ -797,19 +903,23 @@ pub fn directory_json_remove(dirs: &mut Value, dir: &Path) -> bool {
     list.len() != before
 }
 
-/// Adds `{"prefix", "action": "allow"}` to a `command_rules` array, or makes
-/// the rule with that prefix an allow rule.
-pub fn allow_rule_json(rules: &mut Value, prefix: &str) {
+/// Adds `{"prefix", "action": "allow"}` to a `command_rules` array. A rule
+/// for the same prefix stays as it is (false when it asks or forbids).
+pub fn allow_rule_json(rules: &mut Value, prefix: &str) -> bool {
     if !rules.is_array() {
         *rules = json!([]);
     }
     let list = rules.as_array_mut().expect("an array");
-    match list
-        .iter_mut()
-        .find(|rule| rule["prefix"].as_str().map(str::trim) == Some(prefix))
-    {
-        Some(rule) => rule["action"] = json!("allow"),
-        None => list.push(json!({ "prefix": prefix, "action": "allow" })),
+    match list.iter().find(|rule| {
+        rule["prefix"]
+            .as_str()
+            .is_some_and(|known| known.trim().eq_ignore_ascii_case(prefix))
+    }) {
+        Some(rule) => rule["action"] == "allow",
+        None => {
+            list.push(json!({ "prefix": prefix, "action": "allow" }));
+            true
+        }
     }
 }
 
@@ -918,6 +1028,11 @@ pub fn home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The home directory with symlinks resolved, as paths are compared.
+pub fn real_home() -> Option<PathBuf> {
+    home().map(|home| real(&home))
+}
+
 /// Credentials no sandboxed command, no file tool and no remote client may
 /// read: `~/.ssh`, `~/.gnupg`, `~/.aws`, LynShen's own auth and daemon
 /// state, and on Windows GnuPG's `%APPDATA%\gnupg`.
@@ -941,6 +1056,37 @@ pub fn denied_reads() -> Vec<PathBuf> {
         }
     }
     denied
+}
+
+/// LynShen's own settings (config.json): a write there changes which
+/// commands ask, so it always asks.
+pub fn agent_settings() -> Vec<PathBuf> {
+    home()
+        .map(|home| vec![real(&home.join(".lynshen/config.json"))])
+        .unwrap_or_default()
+}
+
+/// Paths a write always asks for, whatever the mode or the writable
+/// directories: credentials and LynShen's settings.
+pub fn guarded_writes() -> Vec<PathBuf> {
+    let mut guarded = denied_reads();
+    guarded.extend(agent_settings());
+    guarded
+}
+
+/// Whether `words` start with the words of `prefix` (in any case with
+/// `any_case`).
+fn words_start_with(words: &[String], prefix: &str, any_case: bool) -> bool {
+    let prefix: Vec<&str> = prefix.split_whitespace().collect();
+    !prefix.is_empty()
+        && words.len() >= prefix.len()
+        && words.iter().zip(&prefix).all(|(word, want)| {
+            if any_case {
+                word.to_lowercase() == want.to_lowercase()
+            } else {
+                word == want
+            }
+        })
 }
 
 fn temp_dirs() -> Vec<PathBuf> {
@@ -1076,6 +1222,7 @@ mod tests {
                     action: RuleAction::Forbid,
                 },
             ],
+            sandboxed_allow: Vec::new(),
         }
     }
 
@@ -1085,6 +1232,14 @@ mod tests {
         fs::create_dir_all(dir.join(".git")).unwrap();
         fs::create_dir_all(dir.join(".lynshen/agents/sub")).unwrap();
         real(&dir)
+    }
+
+    #[test]
+    fn every_platform_starts_with_the_workspace_boundary() {
+        let default = SandboxPolicy::default_for_platform();
+        assert_eq!(default.mode, SandboxMode::WorkspaceWrite);
+        assert_eq!(default.enforced(), OS_SANDBOX);
+        assert!(default.prompt().contains("escalate: true"));
     }
 
     #[test]
@@ -1131,13 +1286,106 @@ mod tests {
             policy.rule_for("make; git push --force origin | tail"),
             Some(Forbid)
         );
-        // Wrappers and the program's path come off.
-        assert_eq!(
-            policy.rule_for("FOO=1 command git commit -m x"),
-            Some(Allow)
-        );
-        assert_eq!(policy.rule_for("/usr/bin/git commit -m x"), Some(Allow));
+        // An allow rule matches the words as written: only wrappers that
+        // do not change the program come off. A variable, `env`, `export`
+        // or another path can make `git` anything.
+        assert_eq!(policy.rule_for("nohup time git commit -m x"), Some(Allow));
+        let only_allow = SandboxPolicy {
+            rules: vec![CommandRule {
+                prefix: "git commit".into(),
+                action: Allow,
+            }],
+            ..policy.clone()
+        };
+        for command in [
+            "FOO=1 command git commit -m x",
+            "PATH=. git commit -m x",
+            "GIT_CONFIG_PARAMETERS=\"'core.hooksPath'='/tmp/h'\" git commit -m x",
+            "env LD_PRELOAD=/tmp/x.so git commit -m x",
+            "/usr/bin/git commit -m x",
+            "./git commit -m x",
+            "export PATH=.:$PATH && git commit -m x",
+            "GIT COMMIT -m x",
+        ] {
+            assert_eq!(only_allow.rule_for(command), None, "{command}");
+            assert_ne!(policy.rule_for(command), Some(Allow), "{command}");
+        }
+        // Ask and forbid match however it is written.
+        assert_eq!(policy.rule_for("/usr/bin/git status"), Some(Ask));
+        assert_eq!(policy.rule_for("GIT.EXE STATUS"), Some(Ask));
+        assert_eq!(policy.rule_for("FOO=1 git Push --FORCE"), Some(Forbid));
         assert_eq!(policy.rule_for("echo $(git status)"), Some(Ask));
+    }
+
+    #[test]
+    fn an_ask_rule_beats_an_allow_rule_of_the_same_length() {
+        let mut policy = policy(SandboxMode::WorkspaceWrite);
+        let rule = |prefix: &str, action| CommandRule {
+            prefix: prefix.to_string(),
+            action,
+        };
+        for rules in [
+            vec![
+                rule("npm publish", RuleAction::Ask),
+                rule("npm publish", RuleAction::Allow),
+            ],
+            vec![
+                rule("npm publish", RuleAction::Allow),
+                rule("npm publish", RuleAction::Ask),
+            ],
+        ] {
+            policy.rules = rules;
+            assert_eq!(policy.rule_for("npm publish"), Some(RuleAction::Ask));
+        }
+        // An approval never turns an ask or forbid rule into an allow.
+        let mut layer = SandboxLayer {
+            rules: vec![rule("npm publish", RuleAction::Ask)],
+            ..SandboxLayer::default()
+        };
+        assert!(!layer.allow("npm publish"));
+        assert_eq!(layer.rules, vec![rule("npm publish", RuleAction::Ask)]);
+        assert!(layer.allow("npm test"));
+        let mut saved = json!([{ "prefix": "curl", "action": "forbid" }]);
+        assert!(!allow_rule_json(&mut saved, "curl"));
+        assert_eq!(saved, json!([{ "prefix": "curl", "action": "forbid" }]));
+    }
+
+    #[test]
+    fn an_allow_rule_does_not_cover_a_write_outside_or_an_unknown_delete() {
+        let dir = work("allow-outside");
+        let mut policy = policy(SandboxMode::WorkspaceWrite);
+        policy.rules.push(CommandRule {
+            prefix: "npm install".into(),
+            action: RuleAction::Allow,
+        });
+        let check = |command: &str| policy.check_command(command, Some((&dir, &dir)));
+        assert_eq!(check("npm install").action, Some(RuleAction::Allow));
+        assert_eq!(
+            check("npm install > log.txt").action,
+            Some(RuleAction::Allow)
+        );
+        let outside = check("npm install > /srv/www/index.html");
+        assert_eq!(outside.action, None, "{outside:?}");
+        assert!(outside.writes_outside && outside.once_only);
+        let copy = check("cp shot.png /srv/www/");
+        assert!(copy.writes_outside && copy.once_only, "{copy:?}");
+        for command in ["rm -rf $OUT", "rm -rf $(pwd)/..", "ls | xargs rm", "rm"] {
+            assert!(check(command).unknown_delete, "{command}");
+        }
+        assert!(!check("rm -rf build $TMPDIR/x").unknown_delete);
+    }
+
+    #[test]
+    fn a_session_may_allow_a_prefix_inside_the_sandbox_only() {
+        let mut policy = policy(SandboxMode::WorkspaceWrite);
+        assert!(!policy.allowed_in_sandbox("cargo test"));
+        policy.sandboxed_allow = vec!["cargo test".to_string()];
+        assert!(policy.allowed_in_sandbox("cd x && cargo test -q | tail"));
+        assert!(!policy.allowed_in_sandbox("cargo test && make"));
+        assert!(!policy.allowed_in_sandbox("PATH=. cargo test"));
+        assert!(!policy.allowed_in_sandbox("cd x"));
+        // It is not an allow rule: leaving the sandbox still asks.
+        assert_eq!(policy.rule_for("cargo test"), None);
     }
 
     #[test]
@@ -1171,13 +1419,21 @@ mod tests {
         }
         assert!(check("sudo make install").elevation);
         let parent = dir.parent().unwrap().display().to_string();
+        let home = home().unwrap();
+        let own = home.file_name().unwrap().to_string_lossy().to_string();
+        let above_home = home.parent().unwrap().display().to_string();
         for command in [
             "rm -rf /".to_string(),
             "rm -rf ~".to_string(),
+            format!("rm -rf ~{own}"),
+            format!("rm -rf {above_home}"),
             "sudo rm -rf $HOME/*".to_string(),
             "rmdir ..".to_string(),
             format!("rm -r {parent}"),
             "bash -c 'rm -rf /'".to_string(),
+            "find ~ -name '*.tmp' -delete".to_string(),
+            "find / -exec rm -rf {} +".to_string(),
+            "ls | ForEach-Object { Remove-Item ~ -Recurse }".to_string(),
         ] {
             let check = check(&command);
             assert_eq!(check.action, Some(Forbid), "{command}: {check:?}");

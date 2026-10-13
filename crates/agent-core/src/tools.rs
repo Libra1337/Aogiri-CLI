@@ -1561,18 +1561,23 @@ fn command_workdir(args: &Value, cwd: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// What `write_stdin` types: `text`, else `chars` (the gate checks the
+/// same text the tool sends).
+pub(crate) fn stdin_text(args: &Value) -> &str {
+    args.get("text")
+        .filter(|value| !value.is_null())
+        .or_else(|| args.get("chars"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
 fn write_stdin(args: &Value, state: &ToolState) -> Value {
     let session_id = match optional_u64(args, "session_id") {
         Ok(Some(session_id)) => session_id,
         Ok(None) => return json!({ "error": "missing session_id" }),
         Err(error) => return json!({ "error": error }),
     };
-    let text = args
-        .get("text")
-        .filter(|value| !value.is_null())
-        .or_else(|| args.get("chars"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let text = stdin_text(args);
     let yield_time = match optional_u64(args, "yield_time_ms") {
         Ok(yield_time) => Duration::from_millis(yield_time.unwrap_or(1000)),
         Err(error) => return json!({ "session_id": session_id, "error": error }),
@@ -4549,7 +4554,17 @@ pub(crate) fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
 pub(crate) fn write_target(cwd: &Path, path: &str, state: &ToolState) -> Result<PathBuf, String> {
     let resolved = resolve_path(cwd, path);
     if state.may_write_outside(&resolved) {
-        return Ok(resolved);
+        // The path as it was approved, not through a link changed since.
+        return Ok(normalize_for_policy(&resolved));
+    }
+    // Credentials and LynShen's settings are written only with an approval
+    // for that very path, wherever they are (a workspace at home, a
+    // writable directory around them).
+    if is_guarded_write(&resolved) {
+        return Err(format!(
+            "{} holds credentials or LynShen's settings: writing it needs the user's approval, which this call does not have",
+            resolved.display()
+        ));
     }
     let sandbox = state.sandbox();
     let inside = ensure_in_workspace(cwd, &resolved).is_ok()
@@ -4588,7 +4603,16 @@ pub(crate) fn outside_write_target(
     let resolved = resolve_path(cwd, path);
     let inside = ensure_in_workspace(cwd, &resolved).is_ok()
         || sandbox.is_some_and(|sandbox| sandbox.within_boundary(cwd, &resolved));
-    (!inside).then(|| normalize_for_policy(&resolved))
+    (!inside || is_guarded_write(&resolved)).then(|| normalize_for_policy(&resolved))
+}
+
+/// Whether `path` is (in) credentials or LynShen's settings
+/// (`sandbox::guarded_writes`).
+fn is_guarded_write(path: &Path) -> bool {
+    let normalized = normalize_for_policy(path);
+    crate::sandbox::guarded_writes()
+        .iter()
+        .any(|guarded| normalized.starts_with(guarded))
 }
 
 pub(crate) fn workspace_path(cwd: &Path, path: &str) -> Result<PathBuf, String> {
@@ -4602,9 +4626,8 @@ pub(crate) fn workspace_path(cwd: &Path, path: &str) -> Result<PathBuf, String> 
 /// sandboxed command.
 pub(crate) fn readable_path(cwd: &Path, path: &str) -> Result<PathBuf, String> {
     let resolved = resolve_path(cwd, path);
-    if ensure_in_workspace(cwd, &resolved).is_ok() {
-        return Ok(resolved);
-    }
+    // Checked first: a workspace at home (or around a credentials
+    // directory) does not make them readable.
     let normalized = normalize_for_policy(&resolved);
     if crate::sandbox::denied_reads()
         .iter()
@@ -7619,6 +7642,7 @@ new mode 100755
             readable_dirs: Vec::new(),
             network: true,
             rules: Vec::new(),
+            sandboxed_allow: Vec::new(),
         }));
         for (tool, args) in [
             ("ls", json!({ "path": shot.display().to_string() })),
@@ -7800,6 +7824,7 @@ new mode 100755
             readable_dirs: Vec::new(),
             network: true,
             rules: Vec::new(),
+            sandboxed_allow: Vec::new(),
         };
         state.set_sandbox(Some(policy.clone()));
         let write = |state: &ToolState, path: String| -> Value {

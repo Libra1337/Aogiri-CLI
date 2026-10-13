@@ -118,6 +118,7 @@ impl Agent {
             readable_dirs: dirs("ro"),
             network: self.network,
             rules: self.command_rules.clone(),
+            sandboxed_allow: Vec::new(),
         })
     }
 }

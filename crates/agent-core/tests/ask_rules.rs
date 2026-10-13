@@ -170,6 +170,39 @@ fn always_allowing_bash_for_the_session_does_not_cover_an_ask_rule() {
 }
 
 #[test]
+fn an_unattended_ask_rule_call_is_decided_every_time() {
+    let _guard = setup();
+    let dir = temp_dir("ask-unattended");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.set_attended(false);
+    let deferred = |events: &[AgentEvent]| {
+        events.iter().find_map(|event| match event {
+            AgentEvent::ActionDeferred(action) => Some(action.id.clone()),
+            _ => None,
+        })
+    };
+
+    core.submit_user_message("RUN: printf asked > first.txt".to_string());
+    let events = pump(&mut core, is_ready);
+    let id = deferred(&events).expect("recorded, not run");
+    assert!(!dir.join("first.txt").exists());
+    core.decide_action(&id, true);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !dir.join("first.txt").exists() && std::time::Instant::now() < deadline {
+        core.poll_events();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(dir.join("first.txt").exists());
+
+    // The same call again: an earlier yes does not decide it.
+    fs::remove_file(dir.join("first.txt")).unwrap();
+    core.submit_user_message("RUN: printf asked > first.txt".to_string());
+    let events = pump(&mut core, is_ready);
+    assert!(deferred(&events).is_some(), "{events:#?}");
+    assert!(!dir.join("first.txt").exists());
+}
+
+#[test]
 fn switching_to_full_access_does_not_approve_a_waiting_ask_rule_call() {
     let _guard = setup();
     let dir = temp_dir("ask-switch");

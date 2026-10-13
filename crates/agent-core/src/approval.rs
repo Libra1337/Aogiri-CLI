@@ -124,6 +124,10 @@ pub struct ApprovalInfo {
     /// An elevation the user completes: `terminal` (they run it in their own
     /// terminal) or `uac` (Windows asks once approved).
     pub elevation: Option<&'static str>,
+    /// A command that runs inside an enforced OS sandbox: a session
+    /// approval allows its prefix there only, not out of the sandbox (not
+    /// on the wire).
+    pub inside_sandbox: bool,
 }
 
 impl ApprovalInfo {
@@ -183,11 +187,12 @@ pub fn dir_suggestion(
                 let first = parts.next()?;
                 let mut dir = home.join(first);
                 let is_dir_target = rest.components().count() == 1;
-                if first
-                    .as_os_str()
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .starts_with("onedrive")
+                let name = first.as_os_str().to_string_lossy().to_lowercase();
+                // OneDrive's folders, and folders that hold many apps'
+                // settings (`~/Library/LaunchAgents`, not all of
+                // `~/Library`): one level deeper.
+                if name.starts_with("onedrive")
+                    || matches!(name.as_str(), "library" | "appdata" | ".config" | ".local")
                 {
                     if let Some(second) = parts.next() {
                         if rest.components().count() > 2 {
@@ -210,15 +215,30 @@ pub fn dir_suggestion(
                 }
             }
         };
-    if suggestion.parent().is_none()
-        || home.is_some_and(|home| suggestion == home)
-        || credentials
+    offerable(&suggestion, home, credentials).then_some(suggestion)
+}
+
+/// A directory a client may offer to make writable: not a root, the home
+/// directory or one around it, nor one with or in credentials.
+fn offerable(dir: &Path, home: Option<&Path>, credentials: &[PathBuf]) -> bool {
+    dir.parent().is_some()
+        && !home.is_some_and(|home| home.starts_with(dir))
+        && !credentials
             .iter()
-            .any(|secret| suggestion.starts_with(secret) || secret.starts_with(&suggestion))
-    {
-        return None;
-    }
-    Some(suggestion)
+            .any(|secret| dir.starts_with(secret) || secret.starts_with(dir))
+}
+
+/// `dir_suggestion` as a directory that exists (`add_dir` takes only
+/// those): the suggestion, or the nearest directory above it that exists
+/// and may be offered.
+pub fn existing_dir_suggestion(
+    path: &Path,
+    home: Option<&Path>,
+    credentials: &[PathBuf],
+) -> Option<PathBuf> {
+    let suggestion = dir_suggestion(path, home, credentials)?;
+    let existing = suggestion.ancestors().find(|dir| dir.is_dir())?;
+    offerable(existing, home, credentials).then(|| existing.to_path_buf())
 }
 
 #[cfg(test)]
@@ -245,6 +265,51 @@ mod tests {
         assert_eq!(suggest("/home/me/notes.txt"), None);
         assert_eq!(suggest("/home/me/.ssh/config"), None);
         assert_eq!(suggest("/a.txt"), None);
+        assert_eq!(
+            suggest("/home/me/Library/LaunchAgents/x.plist"),
+            Some(home.join("Library/LaunchAgents"))
+        );
+        assert_eq!(
+            suggest("/home/me/.config/tool/x.toml"),
+            Some(home.join(".config/tool"))
+        );
+        // LynShen's own directory holds its credentials: never offered.
+        let secrets = vec![home.join(".lynshen/auth.json")];
+        assert_eq!(
+            dir_suggestion(
+                Path::new("/home/me/.lynshen/config.json"),
+                Some(home),
+                &secrets
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_suggestion_is_a_directory_that_exists() {
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("lynshen-suggest-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("www")).unwrap();
+        let suggest = |path: &Path| existing_dir_suggestion(path, None, &[]);
+        assert_eq!(
+            suggest(&base.join("www/index.html")),
+            Some(base.join("www"))
+        );
+        // Not there yet: the nearest directory that is.
+        assert_eq!(
+            suggest(&base.join("www/new/deep/x.txt")),
+            Some(base.join("www"))
+        );
+        // Never the home directory or a directory around it.
+        let home = base.join("www/me");
+        std::fs::create_dir_all(&home).unwrap();
+        assert_eq!(
+            existing_dir_suggestion(&base.join("www/x.txt"), Some(&home), &[]),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -264,6 +329,7 @@ mod tests {
                 ApprovalScope::Project,
             ],
             elevation: None,
+            inside_sandbox: false,
         };
         let mut value = json!({});
         info.wire_fields(&mut value);

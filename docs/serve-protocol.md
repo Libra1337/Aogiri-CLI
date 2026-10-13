@@ -222,16 +222,22 @@ Structured answer to an `approval_request` event; equivalent to the
   - `session`: for `edit` and `tool` requests, that tool stops asking for
     the rest of the session. For a command, commands starting with
     `prefix` run without asking for the rest of the session, also outside
-    the sandbox: it is an `allow` rule for the session. The shell is never
-    allowed as a whole tool.
+    the sandbox: it is an `allow` rule for the session. For a `command`
+    that runs inside an enforced OS sandbox (manual mode on macOS and
+    Linux) it applies inside the sandbox only: the same command still asks
+    to leave it. The shell is never allowed as a whole tool. A rule that
+    asks or forbids the same prefix stays as it is (`error`; the call is
+    allowed once).
   - `project`: `prefix` is saved as an `allow` command rule in
     `~/.lynshen/config.json`, under `projects[<workspace>].command_rules`,
     or in the top-level `command_rules` when `always_allow_scope` is
     `"global"` (`docs/sandbox.md` → "Settings"). It applies at once, and
     to later sessions.
 - `prefix` (optional): the prefix to remember instead of the request's. It
-  must start with the request's `prefix`, word by word: it can only make
-  the rule narrower.
+  must start with the request's `prefix` and may continue only with the
+  command's own next words (`npm install lodash` for `npm install lodash
+  --save`), word by word: it can only make the rule narrower, never add
+  words the user did not see.
 - `always` (optional, older clients): the same as `scope: "session"`. On a
   request whose `scopes` are only `["once"]` it allows the call once.
 - `feedback` (optional, with `deny`): the user's reason, given to the
@@ -245,7 +251,9 @@ Structured answer to an `approval_request` event; equivalent to the
 - `add_dir` (optional, with `allow`): `{"path": "/abs/dir", "persist":
   "session" | "project"}` (default `session`). Allows the call and makes
   the directory read-write, as `add_directory` does; usually the request's
-  `dir_suggestion`. The directory must exist.
+  `dir_suggestion`. The directory must exist, and may not be the root, the
+  home directory or one around it, or hold credentials or LynShen's
+  settings.
 
 A request with `must_ask` asks every time: no scope and no mode switch
 approve the next one. Validation errors emit `error` and leave the request
@@ -258,7 +266,8 @@ An `approval_request` event carries, besides the call:
 - `kind`: what the user decides.
   - `edit`: a file edit inside the workspace (manual mode).
   - `command`: a command inside the sandbox (manual mode), or any command
-    where there is no sandbox to leave.
+    where there is no sandbox to leave. Also what `write_stdin` types into
+    a running shell.
   - `escalation`: a command that leaves the sandbox (`escalate: true`).
   - `outside_write`: a write outside the working directory and the
     writable directories, by a file tool or by a command whose target the
@@ -266,7 +275,7 @@ An `approval_request` event carries, besides the call:
   - `elevation`: `sudo`, `su`, `doas`, `pkexec`, `gsudo`, `runas`,
     `Start-Process -Verb RunAs`.
   - `rule`: an `ask` command rule, or the built-in list that always asks
-    (`docs/sandbox.md`).
+    (`docs/sandbox.md`), also for what `write_stdin` types.
   - `tool`: any other tool (MCP tools, `merge_agent`, a checkpoint restore,
     ...).
 - `must_ask`: a person must decide. The approval mode, "always allow" and
@@ -281,22 +290,27 @@ An `approval_request` event carries, besides the call:
   or when the command text does not show them.
 - `dir_suggestion`: a directory the client can offer to make writable
   (`approve` with `add_dir`): under the home directory its first directory
-  (`~/Desktop` for `~/Desktop/a/b.txt`), elsewhere the file's directory.
-  `null` without `paths`, and never the home directory, a root or a
-  credentials directory.
+  (`~/Desktop` for `~/Desktop/a/b.txt`; two levels under `Library`,
+  `AppData`, `.config`, `.local` and OneDrive), elsewhere the file's
+  directory; the nearest one that exists. `null` without `paths`, and
+  never the home directory or one around it, a root, LynShen's own
+  directory or a credentials directory.
 - `prefix`: the command prefix a `session` or `project` approval
-  remembers (the first two words of the command, without wrappers such as
-  `sudo` or `env`), or `null`.
+  remembers: the program as written and its words up to the first one
+  that is not an option (`npm install`, `npx -y create-vite`, `make`),
+  without wrappers such as `time` or `nohup`; or `null`.
 - `scopes`: how far the engine lets an approval reach, a subset of
   `["once", "session", "project"]`.
   - `["once"]` for a request that must be asked, an interpreter (`python`,
-    `node`, `bash -c`, `powershell -Command`, ...), a delete (`rm`,
-    `Remove-Item`, ...), an elevation, `git push --force`, a command whose
-    parts start differently (`make && npm test`), a file tool's write
-    outside the workspace (offer `add_dir` instead) and a forced
-    checkpoint restore.
-  - `["once", "session"]` for `edit` and `tool`: `session` stops asking
-    for that tool in this session.
+    `node`, a shell: `bash -c`, `bash build.sh`, `powershell -Command`,
+    ...), a delete (`rm`, `Remove-Item`, ...), an elevation,
+    `git push --force`, a command whose parts start differently
+    (`make && npm test`), a part with a variable assignment, `env` or
+    `xargs` in front, a write outside the workspace by a file tool or a
+    command (offer `add_dir` instead) and a forced checkpoint restore.
+  - `["once", "session"]` for `edit` and `tool` (`session` stops asking
+    for that tool in this session), and for a `command` inside an enforced
+    OS sandbox (`session` stops asking for its prefix there only).
   - `["once", "session", "project"]` for other commands, with `prefix`.
 - `elevation`: `null`, or for `kind: "elevation"` how the user completes
   it: `"terminal"` (macOS and Linux: the user runs the command in their own
@@ -463,8 +477,9 @@ config.json's `sandbox` and `sandbox_network` set the default. The
 session's next engine (a daemon reopening an idle session) keeps it.
 Emits `sandbox`. When the OS sandbox cannot run here (Linux without a
 working `bwrap`), emits `error` and `sandbox` and changes nothing. On
-Windows a mode other than `full-access` is accepted but not enforced
-(`enforced: false`, see `docs/sandbox.md`).
+Windows a mode other than `full-access` (`workspace-write` is the default
+there too) is accepted but not enforced (`enforced: false`, see
+`docs/sandbox.md`).
 
 ### `add_directory` / `remove_directory`
 

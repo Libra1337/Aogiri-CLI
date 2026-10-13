@@ -133,6 +133,27 @@ fn an_allow_rule_lets_an_escalation_out_and_says_so() {
     assert_eq!(escalated(&events)[0].0, "rule");
     assert!(dir.join("r.txt").exists());
 
+    // Only as written: a variable, `env`, another path for the program or a
+    // `PATH` exported before can make it something else.
+    for command in [
+        "PATH=. printf ruled > v.txt",
+        "env FOO=1 printf ruled > v.txt",
+        "/usr/bin/printf ruled > v.txt",
+        "export PATH=.:$PATH; printf ruled > v.txt",
+    ] {
+        let events = escalate(&mut core, command);
+        let call_id = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ApprovalRequest { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{command} asks: {events:#?}"));
+        core.approve(&call_id, false, false, None);
+        pump(&mut core, is_ready);
+    }
+    assert!(!dir.join("v.txt").exists());
+
     // Without the rule auto-edit asks; a switch to full-access lets the
     // waiting call out, and that is reported too.
     let events = escalate(&mut core, "printf waited > w.txt");
