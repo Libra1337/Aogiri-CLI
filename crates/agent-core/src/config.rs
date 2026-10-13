@@ -90,7 +90,9 @@ pub enum ApprovalMode {
     /// AutoEdit plus a safety classifier that auto-approves shell commands it
     /// judges safe; unsafe, ambiguous, or unclassifiable commands still ask.
     Auto,
-    /// Everything runs without approval.
+    /// Everything runs without approval, except calls a person must decide
+    /// (`ask` rules, the built-in list). The sandbox stays: a call that
+    /// leaves it runs and is reported (`escalated`).
     FullAccess,
     /// Planning: only read-only tools run (see `plan_mode::refusal`); the
     /// agent ends by proposing a plan. Gated like `Manual` for anything that
@@ -344,6 +346,10 @@ pub struct Config {
     /// Sandbox for shell commands (`sandbox`, `sandbox_network`,
     /// `sandbox_directories`, `command_rules` in config.json).
     pub sandbox: crate::sandbox::SandboxPolicy,
+    /// Per-project sandbox settings (`projects` in config.json), keyed by
+    /// the workspace's path (see `project_key`). Read only: changes are
+    /// written to the file (`edit_config_json`).
+    pub projects: Value,
     /// Engine behind `web_search`: `model` (the default) or `gateway`; see
     /// `crate::web`.
     pub web_search_engine: String,
@@ -605,6 +611,7 @@ impl Config {
                 extra_skills_source: None,
                 mcp_servers: Vec::new(),
                 sandbox: crate::sandbox::SandboxPolicy::default_for_platform(),
+                projects: Value::Null,
                 web_search_engine: crate::web::DEFAULT_SEARCH_ENGINE.to_string(),
                 web_search_model: crate::web::DEFAULT_SEARCH_MODEL.to_string(),
                 web_fetch_engine: crate::web::DEFAULT_FETCH_ENGINE.to_string(),
@@ -744,6 +751,7 @@ impl Config {
             extra_skills_source: read_optional_string(&value, "extra_skills_source"),
             mcp_servers: read_mcp_servers(&value),
             sandbox: read_sandbox(&value)?,
+            projects: value.get("projects").cloned().unwrap_or(Value::Null),
             web_search_engine: known_search_engine(read_web_engine(
                 &value,
                 "web_search_engine",
@@ -773,6 +781,7 @@ impl Config {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let _lock = lock_config(&self.path)?;
 
         let mut value = json!({
             "provider": self.provider,
@@ -827,7 +836,15 @@ impl Config {
             .map_err(|_| ())
             .and_then(|text| serde_json::from_str::<Value>(&text).map_err(|_| ()))
         {
-            if let Value::Object(known) = value {
+            if let Value::Object(mut known) = value {
+                // The sandbox settings change on disk (`edit_config_json`),
+                // never in memory: an engine that read them earlier must not
+                // write back what another one has changed since.
+                for key in SANDBOX_KEYS {
+                    if saved.contains_key(key) {
+                        known.remove(key);
+                    }
+                }
                 saved.extend(known);
                 value = Value::Object(saved);
             }
@@ -841,6 +858,11 @@ impl Config {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The `projects` entry of config.json for the workspace `cwd`.
+    pub fn project_settings(&self, cwd: &Path) -> Option<&Value> {
+        project_entry(&self.projects, cwd)
     }
 
     /// Re-reads, in one read of config.json, the settings Desktop changes
@@ -1109,6 +1131,117 @@ impl AuthStore {
             Some(0o600),
         )
     }
+}
+
+/// config.json keys of the sandbox (see `Config::save`).
+const SANDBOX_KEYS: [&str; 4] = [
+    "sandbox",
+    "sandbox_network",
+    "sandbox_directories",
+    "command_rules",
+];
+
+/// The key of a workspace in config.json's `projects`: its absolute path
+/// with symlinks resolved (and without Windows' `\\?\` prefix), as LynShen
+/// Desktop names a project.
+pub fn project_key(cwd: &Path) -> String {
+    let path = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let text = path.display().to_string();
+    text.strip_prefix(r"\\?\")
+        .map(str::to_string)
+        .unwrap_or(text)
+}
+
+/// The entry of `projects` for the workspace `cwd`: under its key, or
+/// under a key naming the same directory another way.
+pub(crate) fn project_entry<'a>(projects: &'a Value, cwd: &Path) -> Option<&'a Value> {
+    let projects = projects.as_object()?;
+    let key = project_key(cwd);
+    projects.get(&key).or_else(|| {
+        projects
+            .iter()
+            .find(|(name, _)| project_key(Path::new(name)) == key)
+            .map(|(_, entry)| entry)
+    })
+}
+
+/// Changes config.json in place: `edit` gets the parsed file (an empty
+/// object when there is none) and the result is written back atomically,
+/// every other key kept.
+pub(crate) fn edit_config_json(
+    path: &Path,
+    edit: impl FnOnce(&mut serde_json::Map<String, Value>) -> Result<(), String>,
+) -> Result<(), String> {
+    // Read, change and write as one step against other writers (another
+    // engine saving a rule, `Config::save`), so neither loses the other's.
+    let _lock = lock_config(path).map_err(|error| error.to_string())?;
+    let mut value = match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str::<Value>(&text)
+            .map_err(|error| format!("config.json is not valid JSON: {error}"))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "config.json is not a JSON object".to_string())?;
+    edit(object)?;
+    let text = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
+    write_atomically(path, &format!("{text}\n"), None)
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+/// The object of `projects[project_key(cwd)]` in a parsed config.json,
+/// made when missing (an entry under another spelling of the same path is
+/// used).
+pub(crate) fn project_entry_mut<'a>(
+    config: &'a mut serde_json::Map<String, Value>,
+    cwd: &Path,
+) -> &'a mut serde_json::Map<String, Value> {
+    let projects = config.entry("projects").or_insert_with(|| json!({}));
+    if !projects.is_object() {
+        *projects = json!({});
+    }
+    let projects = projects.as_object_mut().expect("an object");
+    let key = project_key(cwd);
+    let key = projects
+        .keys()
+        .find(|name| project_key(Path::new(name)) == key)
+        .cloned()
+        .unwrap_or(key);
+    let entry = projects.entry(key).or_insert_with(|| json!({}));
+    if !entry.is_object() {
+        *entry = json!({});
+    }
+    entry.as_object_mut().expect("an object")
+}
+
+/// Holds `<config>.lock` locked until the returned file is dropped:
+/// config.json's writers (`edit_config_json`, `Config::save`) in every
+/// process read, change and write it one at a time.
+fn lock_config(path: &Path) -> io::Result<fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_file_name(format!("{name}.lock")))?;
+    file.lock()?;
+    Ok(file)
+}
+
+/// Whether "always allow" saves its rule for every project
+/// (`always_allow_scope: "global"` in config.json) instead of this one.
+pub(crate) fn always_allow_global(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .is_some_and(|value| value["always_allow_scope"] == "global")
 }
 
 /// Write `contents` to `path` atomically via a temp file in the same
@@ -2545,6 +2678,7 @@ mod tests {
             extra_skills_source: None,
             mcp_servers: Vec::new(),
             sandbox: crate::sandbox::SandboxPolicy::default_for_platform(),
+            projects: Value::Null,
             web_search_engine: crate::web::DEFAULT_SEARCH_ENGINE.to_string(),
             web_search_model: crate::web::DEFAULT_SEARCH_MODEL.to_string(),
             web_fetch_engine: crate::web::DEFAULT_FETCH_ENGINE.to_string(),
@@ -3285,6 +3419,54 @@ mod tests {
 
         let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["model"], "gpt-6-sol");
+        assert_eq!(saved["asr"]["engine"], "whisper");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_config_writers_keep_each_other_s_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "lynshen-config-writers-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        fs::write(&path, "{\"asr\":{\"engine\":\"whisper\"}}\n").unwrap();
+        let config = Config::from_value("{}", path.clone()).unwrap();
+        // Rules saved from several engines at once, while one saves its
+        // settings: every rule is kept, and so is the key nobody knows.
+        let writers: Vec<_> = (0..6)
+            .map(|writer| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for n in 0..8 {
+                        edit_config_json(&path, |config| {
+                            let rules = config.entry("command_rules").or_insert_with(|| json!([]));
+                            crate::sandbox::allow_rule_json(rules, &format!("tool{writer} run{n}"));
+                            Ok(())
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..8 {
+            config.save().unwrap();
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let ours = saved["command_rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|rule| rule["prefix"].as_str().unwrap().starts_with("tool"))
+            .count();
+        assert_eq!(ours, 48, "{saved}");
         assert_eq!(saved["asr"]["engine"], "whisper");
         let _ = fs::remove_dir_all(&dir);
     }

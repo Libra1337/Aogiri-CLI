@@ -339,7 +339,7 @@ fn run_headless(args: Vec<String>, approval_mode: Option<ApprovalMode>) -> io::R
         ..Default::default()
     };
     let started = Instant::now();
-    let mut pending_denials: Vec<(String, String)> = Vec::new();
+    let mut pending_denials: Vec<(String, String, bool)> = Vec::new();
     for event in core.submit_user_message(prompt) {
         if matches!(event, AgentEvent::Error(_)) {
             done = true;
@@ -383,13 +383,21 @@ fn auto_deny_approvals(
     core: &mut AgentCore,
     stdout: &mut impl Write,
     stats: &mut HeadlessStats,
-    pending: &mut Vec<(String, String)>,
+    pending: &mut Vec<(String, String, bool)>,
 ) -> io::Result<()> {
-    for (call_id, name) in pending.drain(..) {
+    for (call_id, name, must_ask) in pending.drain(..) {
         stats.denied_approvals += 1;
-        let info = AgentEvent::Info(format!(
-            "auto-denying {name} ({call_id}): approvals cannot be answered in --headless mode; rerun with --approval-mode auto, auto-edit, or full-access to allow this class of tools"
-        ));
+        // A call a person must decide (git push, sudo, a delete outside the
+        // workspace, an ask rule) asks in every mode: no flag lets it run.
+        let info = AgentEvent::Info(if must_ask {
+            format!(
+                "auto-denying {name} ({call_id}): it always needs a person to approve it (an ask rule or the built-in list: sudo, git push, deletes outside the workspace, ...), in every approval mode, so it cannot run in --headless mode"
+            )
+        } else {
+            format!(
+                "auto-denying {name} ({call_id}): approvals cannot be answered in --headless mode; rerun with --approval-mode auto, auto-edit, or full-access to allow this class of tools"
+            )
+        });
         record_headless_event(&info, stats);
         write_event(stdout, info)?;
         for event in core.approve(&call_id, false, false, None) {
@@ -401,9 +409,15 @@ fn auto_deny_approvals(
 }
 
 /// Queues an approval request for auto-denial so headless can never hang on one.
-fn queue_headless_denial(event: &AgentEvent, pending_denials: &mut Vec<(String, String)>) {
-    if let AgentEvent::ApprovalRequest { call_id, name, .. } = event {
-        pending_denials.push((call_id.clone(), name.clone()));
+fn queue_headless_denial(event: &AgentEvent, pending_denials: &mut Vec<(String, String, bool)>) {
+    if let AgentEvent::ApprovalRequest {
+        call_id,
+        name,
+        info,
+        ..
+    } = event
+    {
+        pending_denials.push((call_id.clone(), name.clone(), info.must_ask));
     }
 }
 
@@ -784,6 +798,8 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
         AgentEvent::ActionDeferred(_) => "action_deferred",
         AgentEvent::ActionDecided { .. } => "action_decided",
         AgentEvent::Attended(_) => "attended",
+        AgentEvent::Sandbox(_) => "sandbox",
+        AgentEvent::Escalated { .. } => "escalated",
         AgentEvent::ApprovalMode { .. } => "approval_mode",
         AgentEvent::TrustPrompt { .. } => "trust_prompt",
         AgentEvent::ModelView { .. } => "model_view",
@@ -884,10 +900,31 @@ mod tests {
                 summary: "rm -rf".to_string(),
                 subagent_id: None,
                 hunks: None,
+                info: Default::default(),
+            },
+            &mut pending,
+        );
+        queue_headless_denial(
+            &AgentEvent::ApprovalRequest {
+                call_id: "call_2".to_string(),
+                name: "bash".to_string(),
+                summary: "git push".to_string(),
+                subagent_id: None,
+                hunks: None,
+                info: lynshen_agent_core::approval::ApprovalInfo {
+                    must_ask: true,
+                    ..Default::default()
+                },
             },
             &mut pending,
         );
         queue_headless_denial(&AgentEvent::Connecting, &mut pending);
-        assert_eq!(pending, vec![("call_1".to_string(), "bash".to_string())]);
+        assert_eq!(
+            pending,
+            vec![
+                ("call_1".to_string(), "bash".to_string(), false),
+                ("call_2".to_string(), "bash".to_string(), true),
+            ]
+        );
     }
 }

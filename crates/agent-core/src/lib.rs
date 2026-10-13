@@ -1,6 +1,8 @@
 pub mod actions;
+pub mod approval;
 mod board;
 pub mod chat;
+pub mod command_text;
 mod commands;
 mod config;
 mod core;
@@ -44,10 +46,11 @@ pub use config::{
     builtin_providers, lynshen_visible_models, models_for_provider, ApprovalMode, ModelConfig,
     SubagentModel,
 };
-pub use core::{title_completion, AgentCore, KeptState};
+pub use core::{title_completion, AgentCore, ApproveOptions, KeptState};
 pub use event::{
     AgentEvent, CommandView, ContextBreakdown, GoalView, LoginProviderView, McpServerView,
-    McpToolView, ModelOptionView, PlanItem, SessionListItemView, TranscriptItem, TreeNodeView,
+    McpToolView, ModelOptionView, PlanItem, SandboxDirectoryView, SandboxView, SessionListItemView,
+    TranscriptItem, TreeNodeView,
 };
 pub use hooks::HookStopper;
 pub use hunks::HunkView;

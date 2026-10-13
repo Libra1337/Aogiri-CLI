@@ -476,10 +476,16 @@ impl TuiState {
                     summary,
                     subagent_id,
                     hunks,
+                    info,
                 } => {
                     // Stop the thinking clock here: time spent waiting on the
                     // user's decision is not the model's thinking time.
                     self.collapse_live_thinking();
+                    // Why the model asks to leave the sandbox, when it said.
+                    let summary = match &info.justification {
+                        Some(reason) => format!("{summary} — {reason}"),
+                        None => summary,
+                    };
                     // Show which subagent asked; main-agent requests are unprefixed.
                     let summary = match subagent_id {
                         Some(id) => format!("[agent {id}] {summary}"),
@@ -618,7 +624,21 @@ impl TuiState {
                     self.mark_history_dirty();
                     true
                 }
-                AgentEvent::Attended(_) => false,
+                AgentEvent::Attended(_) | AgentEvent::Sandbox(_) => false,
+                AgentEvent::Escalated { info, .. } => {
+                    let what = match (&info.command, info.paths.first()) {
+                        (Some(command), _) => command.clone(),
+                        (None, Some(path)) => format!("write {}", path.display()),
+                        (None, None) => info.kind.as_str().to_string(),
+                    };
+                    let line = match &info.justification {
+                        Some(reason) => format!("outside the sandbox: {what} — {reason}"),
+                        None => format!("outside the sandbox: {what}"),
+                    };
+                    self.chat.push(ChatLine::System(line));
+                    self.mark_history_dirty();
+                    true
+                }
             };
         }
         changed

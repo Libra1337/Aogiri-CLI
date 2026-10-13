@@ -479,6 +479,7 @@ fn a_sandboxed_engine_runs_commands_inside_and_asks_to_leave() {
                 action: RuleAction::Forbid,
             },
         ],
+        sandboxed_allow: Vec::new(),
     }));
     let approvals = |events: &[AgentEvent]| {
         events

@@ -1257,6 +1257,7 @@ fn approval_wait_does_not_extend_thinking_duration() {
             summary: "run it".to_string(),
             subagent_id: None,
             hunks: None,
+            info: Default::default(),
         },
     ]);
     let index = app

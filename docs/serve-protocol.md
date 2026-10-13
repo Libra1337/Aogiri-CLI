@@ -47,6 +47,7 @@ After `hello`, before any command, the engine emits its startup batch:
 {"type":"model_status","provider":"...","model":"...","reasoning_effort":"...","context_window":200000,"context_limit":160000,"max_output_tokens":32000,"reasoning_efforts":["low","medium","high"],"state":"ready"}
 {"type":"command_list","commands":[{"command":"/help","marker":null,"args":"","description":"..."}]}
 {"type":"approval_mode","mode":"manual"}
+{"type":"sandbox","mode":"workspace-write","network":true,"enforced":true,"unavailable":null,"directories":[]}
 {"type":"mcp_servers","servers":[...]}
 {"type":"task_board","tasks":[...]}                          // only when the session's task board has tasks
 {"type":"trust_prompt","cwd":"...","repo_root":"..."}        // only when an untrusted project has local resources
@@ -204,24 +205,117 @@ stop those too. No-op when idle.
 ### `approve`
 
 ```json
-{"op":"approve","call_id":"call_9","decision":"allow","always":false,"hunks":["f0h1"]}
+{"op":"approve","call_id":"call_9","decision":"allow","scope":"session","prefix":"npm install"}
+{"op":"approve","call_id":"call_9","decision":"allow","hunks":["f0h1"]}
+{"op":"approve","call_id":"call_9","decision":"deny","feedback":"Use pnpm instead."}
 ```
 
 Structured answer to an `approval_request` event; equivalent to the
-`/approve` slash command.
+`/approve` slash command (`/approve <call-id> <allow|deny>
+[once|session|project|always] [--hunks id1,id2]`).
 
 - `call_id` (required): the `call_id` from the request.
 - `decision` (required): `"allow"` or `"deny"`.
-- `always` (optional, default `false`): on allow, add the tool to the
-  per-session allowlist so it stops asking. A call that an `ask` command
-  rule stops, or a worktree agent leaving its sandbox, still asks every
-  time (`docs/sandbox.md`).
+- `scope` (optional, default `"once"`): how far an allow reaches; one of
+  the request's `scopes` (see "Approval requests"), else an error.
+  - `once`: this call only.
+  - `session`: for `edit` and `tool` requests, that tool stops asking for
+    the rest of the session. For a command, commands starting with
+    `prefix` run without asking for the rest of the session, also outside
+    the sandbox: it is an `allow` rule for the session. For a `command`
+    that runs inside an enforced OS sandbox (manual mode on macOS and
+    Linux) it applies inside the sandbox only: the same command still asks
+    to leave it. The shell is never allowed as a whole tool. A rule that
+    asks or forbids the same prefix stays as it is (`error`; the call is
+    allowed once).
+  - `project`: `prefix` is saved as an `allow` command rule in
+    `~/.lynshen/config.json`, under `projects[<workspace>].command_rules`,
+    or in the top-level `command_rules` when `always_allow_scope` is
+    `"global"` (`docs/sandbox.md` → "Settings"). It applies at once, and
+    to later sessions.
+- `prefix` (optional): the prefix to remember instead of the request's. It
+  must start with the request's `prefix` and may continue only with the
+  command's own next words (`npm install lodash` for `npm install lodash
+  --save`), word by word: it can only make the rule narrower, never add
+  words the user did not see.
+- `always` (optional, older clients): the same as `scope: "session"`. On a
+  request whose `scopes` are only `["once"]` it allows the call once.
+- `feedback` (optional, with `deny`): the user's reason, given to the
+  model with the refusal as it is. A client that offers "run it in my
+  terminal" for `elevation: "terminal"` fills its terminal with the command
+  and denies with feedback such as "The user will run this command in
+  their own terminal; wait for them to tell you the result."
 - `hunks` (optional): for edit-tool requests that carried a `hunks` list,
   apply only these hunk ids. Omit or `null` for the whole call. Cannot be
-  combined with `always`.
+  combined with a `scope` beyond once or with `always`.
+- `add_dir` (optional, with `allow`): `{"path": "/abs/dir", "persist":
+  "session" | "project"}` (default `session`). Allows the call and makes
+  the directory read-write, as `add_directory` does; usually the request's
+  `dir_suggestion`. The directory must exist, and may not be the root, the
+  home directory or one around it, or hold credentials or LynShen's
+  settings.
 
-Validation errors emit `error` and leave the request pending, so the client
-can retry with a corrected op.
+A request with `must_ask` asks every time: no scope and no mode switch
+approve the next one. Validation errors emit `error` and leave the request
+pending, so the client can retry with a corrected op.
+
+### Approval requests
+
+An `approval_request` event carries, besides the call:
+
+- `kind`: what the user decides.
+  - `edit`: a file edit inside the workspace (manual mode).
+  - `command`: a command inside the sandbox (manual mode), or any command
+    where there is no sandbox to leave. Also what `write_stdin` types into
+    a running shell.
+  - `escalation`: a command that leaves the sandbox (`escalate: true`).
+  - `outside_write`: a write outside the working directory and the
+    writable directories, by a file tool or by a command whose target the
+    command text shows (`cp a ~/Desktop/`, `> ~/notes.txt`).
+  - `elevation`: `sudo`, `su`, `doas`, `pkexec`, `gsudo`, `runas`,
+    `Start-Process -Verb RunAs`.
+  - `rule`: an `ask` command rule, or the built-in list that always asks
+    (`docs/sandbox.md`), also for what `write_stdin` types.
+  - `tool`: any other tool (MCP tools, `merge_agent`, a checkpoint restore,
+    ...).
+- `must_ask`: a person must decide. The approval mode, "always allow" and
+  a switch to a looser mode never approve it.
+- `justification`: the model's reason (a shell call's `justification`), or
+  `null`.
+- `cwd`: where the call runs (a command's `workdir`, else the agent's
+  directory).
+- `command`: the shell command as the model wrote it, or `null`.
+- `paths`: the paths outside the working directory and the writable
+  directories that the call writes (absolute). Empty when there are none,
+  or when the command text does not show them.
+- `dir_suggestion`: a directory the client can offer to make writable
+  (`approve` with `add_dir`): under the home directory its first directory
+  (`~/Desktop` for `~/Desktop/a/b.txt`; two levels under `Library`,
+  `AppData`, `.config`, `.local` and OneDrive), elsewhere the file's
+  directory; the nearest one that exists. `null` without `paths`, and
+  never the home directory or one around it, a root, LynShen's own
+  directory or a credentials directory.
+- `prefix`: the command prefix a `session` or `project` approval
+  remembers: the program as written and its words up to the first one
+  that is not an option (`npm install`, `npx -y create-vite`, `make`),
+  without wrappers such as `time` or `nohup`; or `null`.
+- `scopes`: how far the engine lets an approval reach, a subset of
+  `["once", "session", "project"]`.
+  - `["once"]` for a request that must be asked, an interpreter (`python`,
+    `node`, a shell: `bash -c`, `bash build.sh`, `powershell -Command`,
+    ...), a delete (`rm`, `Remove-Item`, ...), an elevation,
+    `git push --force`, a command whose parts start differently
+    (`make && npm test`), a part with a variable assignment, `env` or
+    `xargs` in front, a write outside the workspace by a file tool or a
+    command (offer `add_dir` instead) and a forced checkpoint restore.
+  - `["once", "session"]` for `edit` and `tool` (`session` stops asking
+    for that tool in this session), and for a `command` inside an enforced
+    OS sandbox (`session` stops asking for its prefix there only).
+  - `["once", "session", "project"]` for other commands, with `prefix`.
+- `elevation`: `null`, or for `kind: "elevation"` how the user completes
+  it: `"terminal"` (macOS and Linux: the user runs the command in their own
+  terminal, where they can type a password) or `"uac"` (Windows: once
+  approved, Windows asks through UAC).
 
 ### `set_approval_mode`
 
@@ -233,8 +327,26 @@ can retry with a corrected op.
 `status:"approval mode: ..."` and an `approval_mode` event. The change
 applies to new turns; an in-flight turn's gating can only loosen. A call
 waiting for approval that the new mode does not gate runs at once, except
-one that an `ask` command rule stops or a worktree agent leaving its
-sandbox: that one still waits for `approve`.
+one with `must_ask` (an `ask` command rule, the built-in list, a worktree
+agent leaving its sandbox): that one still waits for `approve`. A waiting
+call that leaves the sandbox and runs this way is reported as `escalated`.
+
+The approval mode does not change the sandbox. `full-access` keeps it: a
+command still runs in the sandbox, and one that leaves it (`escalate`) or
+a write outside the workspace runs without asking and emits `escalated`;
+requests with `must_ask` still ask. To turn the sandbox off, use
+`set_sandbox` with `full-access`. LynShen Desktop's modes:
+
+| Desktop | `approval_mode` | sandbox |
+| --- | --- | --- |
+| 谨慎 (careful) | `manual` | `workspace-write` |
+| 计划 (plan) | `plan` | `workspace-write` |
+| 自动 (auto, the default) | `auto` | `workspace-write` |
+| 全自动 (full auto) | `full-access` | `workspace-write`, kept |
+| 完全访问 (full access, in settings only) | `full-access` | `full-access` |
+
+`auto` asks the safety model (`safety_model`) about a command or a
+crossing before asking you; without one it asks you, as `auto-edit` does.
 
 `plan` is plan mode: only read-only tools run (reads, listing, search,
 web search/fetch, read-only shell commands, MCP tools marked
@@ -353,6 +465,47 @@ plan mode, and starts a turn asking for a complete revised plan with the
 returns an `error` event. The text command `/plan <id> approve [mode]
 [notes]` / `/plan <id> revise <feedback>` does the same (the TUI uses it).
 
+### `set_sandbox`
+
+```json
+{"op":"set_sandbox","mode":"workspace-write","network":true}
+```
+
+Sets this session's sandbox: `mode` is `read-only`, `workspace-write` or
+`full-access`; `network` is optional (unchanged when left out). Not saved:
+config.json's `sandbox` and `sandbox_network` set the default. The
+session's next engine (a daemon reopening an idle session) keeps it.
+Emits `sandbox`. When the OS sandbox cannot run here (Linux without a
+working `bwrap`), emits `error` and `sandbox` and changes nothing. On
+Windows a mode other than `full-access` (`workspace-write` is the default
+there too) is accepted but not enforced (`enforced: false`, see
+`docs/sandbox.md`).
+
+### `add_directory` / `remove_directory`
+
+```json
+{"op":"add_directory","path":"/Users/me/Desktop","mode":"rw","persist":"session"}
+{"op":"remove_directory","path":"/Users/me/Desktop","persist":"session"}
+```
+
+Adds a directory to the sandbox, or takes one out, while the session runs.
+`path` is an existing absolute directory. `mode` is `rw` (default: commands
+and file tools may write it) or `ro` (read-only, also where it sits under
+a writable directory). `persist` (default `session`):
+
+- `session`: this session only (kept by its next engine);
+- `project`: saved in `~/.lynshen/config.json` under
+  `projects[<workspace>].sandbox_directories`, for every session of the
+  project;
+- `global`: saved in the top-level `sandbox_directories`.
+
+`remove_directory` takes the directory out of that source; it is an error
+when it is not there. Directories the daemon adds from the project's own
+list (a project's `dirs` in `workspaces_set`) are reported with source `project`; removing one
+here lasts until the session's engine is opened again, so remove it from
+the project instead. Both ops emit `sandbox`; an invalid path, mode or
+`persist` emits `error` and changes nothing.
+
 ### `set_attended`
 
 ```json
@@ -405,6 +558,8 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `model_status` | `provider`, `model`, `reasoning_effort`, `context_window`, `context_limit`, `max_output_tokens`, `reasoning_efforts`, `state` | Current model selection; deduplicated, re-emitted on change. Claude Code sessions add their own fields (`docs/daemon-protocol.md` → Other engines). |
 | `command_list` | `commands: [{command, marker, args, description}]` | Available slash commands incl. custom and MCP prompt commands. |
 | `approval_mode` | `mode` | Current approval mode; emitted at startup and on change. |
+| `sandbox` | `mode`, `network`, `enforced`, `unavailable`, `directories` | The session's sandbox; emitted at startup (and to a client that attaches) and after every change (`set_sandbox`, `/sandbox <mode>`, `add_directory`, `remove_directory`, `approve` with `add_dir`). `enforced`: an OS sandbox applies the mode; false on Windows and in `full-access`. `unavailable`: why the OS sandbox cannot run here (bubblewrap missing, AppArmor blocking it) with the fix, else `null`. `directories`: `[{path, mode, source}]`, the read-write (`rw`) and read-only (`ro`) directories it adds, by where they come from: `global` (config.json `sandbox_directories`, or a daemon agent's directories), `project` (config.json `projects`, and the directories the daemon adds for the project) or `session`. |
+| `escalated` | `call_id`, `kind`, `command`, `justification`, `cwd`, `paths`, `by` | A call that leaves the sandbox or writes outside the workspace (`kind` `escalation` or `outside_write`) ran without asking anyone. `by`: `mode` (`full-access`, or a switch to it freed the call), `rule` (an `allow` rule, also one an approval remembered) or `classifier` (the safety model in `auto`). Clients show it as a line in the conversation. |
 | `agent_runs` | `workflows: []`, `agents: [{id, label, model, effort, state, started_at, duration_ms, tokens, tool_calls, prompt, result, error, type: "subagent", tool_use_id, activity, role, plan_step, isolation, workdir, files_changed, background, attempt_group, attempt}]` | Every subagent of the session, oldest first (the 24 most recent finished ones, and every one with a worktree to merge). `id` is its path (`/root/<task_name>`), `state` ∈ `pending`/`running`/`completed`/`errored`/`interrupted`/`closed`/`budget_exhausted`/`conflict`/`merged`/`discarded`, `started_at` epoch ms (reset by `resume_agent`), `tool_use_id` the parent's `spawn_agent` call (empty for a reviewer started by `agents.review_on_complete`), `activity` its latest action in a few words ("Running cargo test"). `role` and `plan_step` are strings or `null`. `isolation` is `worktree` or `none`; a worktree agent has `workdir` (its worktree, else `null`) and `files_changed` (paths relative to the worktree, once finished). `background`: it keeps running after its parent's turn ends. `attempt_group` (the task name given to `spawn_agent`) and `attempt` (1–4) are set for best-of-N attempts, else `null`. See "Agent team". |
 | `plan_draft` | `id`, `title`, `append` | Plan mode: the plan while the model writes its `propose_plan` call. `append` is the Markdown added since the previous `plan_draft` of the same `id`; `title` is the title so far. The finished plan follows as `proposed_plan` with the same `id`. Not replayed. |
 | `proposed_plan` | `id`, `title`, `markdown`, `status` | Plan mode: a plan from `propose_plan`. `status` is `pending`, then `approved` or `revising` after `approve_plan`. Session replay (`transcript`) carries it as `{"role":"plan","id","title","content","status"}` with the latest status. |
@@ -423,8 +578,8 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `tool_start` | `call_id`, `name` | Tool call begins. |
 | `tool_update` | `call_id`, `name`, `output` | Intermediate tool progress (e.g. long-running bash). |
 | `tool_output` | `call_id`, `name`, `output`, `is_error` | Tool call finished. |
-| `approval_request` | `call_id`, `name`, `summary`, `subagent_id`, `hunks` | A gated tool call waits for an `approve` op. `hunks` is a list of `{id, file, header, lines}` for partial approval, `null` otherwise. `subagent_id` is set when a subagent issued the call. |
-| `action_deferred` | `id`, `session_id`, `cwd`, `call_id`, `name`, `arguments`, `summary`, `subagent_id`, `digest`, `created_at` | An unattended session recorded a gated call instead of prompting; decide it with `decide_action`. |
+| `approval_request` | `call_id`, `name`, `summary`, `subagent_id`, `hunks`, `kind`, `must_ask`, `justification`, `cwd`, `command`, `paths`, `dir_suggestion`, `prefix`, `scopes`, `elevation` | A gated tool call waits for an `approve` op. `hunks` is a list of `{id, file, header, lines}` for partial approval, `null` otherwise. `subagent_id` is set when a subagent issued the call. The other fields are described in "Approval requests". |
+| `action_deferred` | `id`, `session_id`, `cwd`, `call_id`, `name`, `arguments`, `summary`, `subagent_id`, `digest`, `created_at`, `kind`, `justification` | An unattended session recorded a gated call instead of prompting; decide it with `decide_action`. `kind` and `justification` are as in `approval_request` (`null` in a record saved by an older version). |
 | `action_decided` | `id`, `decision`, `output`, `is_error` | A deferred action was decided; `output` is the tool result when it ran, `null` when declined. |
 | `attended` | `attended` | Current attended state, after `set_attended`. |
 | `subagent_lifecycle` | `path`, `status`, `message`, `label`, `model`, `tool_use_id`, `role`, `plan_step`, `background`, `attempt_group`, `attempt` | Subagent spawn/progress/finish notices. `status` is a state of `agent_runs` or `message` (a message was queued for it); `pending` with message `resumed` when `resume_agent` runs it again. `role`, `plan_step` and `attempt_group` are strings or `null`, `attempt` a number or `null`, `background` a boolean (as in `agent_runs`). |
@@ -749,7 +904,7 @@ A normal turn looks like:
 Approval round-trip:
 
 ```jsonl
-< {"type":"approval_request","call_id":"call_2","name":"bash","summary":"rm -rf build","subagent_id":null,"hunks":null}
+< {"type":"approval_request","call_id":"call_2","name":"bash","summary":"rm -rf build","subagent_id":null,"hunks":null,"kind":"command","must_ask":false,"justification":null,"cwd":"/work/app","command":"rm -rf build","paths":[],"dir_suggestion":null,"prefix":null,"scopes":["once"],"elevation":null}
 > {"op":"approve","call_id":"call_2","decision":"deny"}
 ```
 

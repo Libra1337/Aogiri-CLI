@@ -2,7 +2,7 @@
 //! events serialize to `{"type": ...}` objects and client ops arrive as
 //! `{"op": ...}` objects. See `docs/serve-protocol.md`.
 
-use crate::{event::AgentEvent, AgentCore, ApprovalMode};
+use crate::{event::AgentEvent, AgentCore, ApprovalMode, ApproveOptions};
 use serde_json::{json, Value};
 
 /// Wire protocol version, announced in the `hello` event. Clients refuse to
@@ -65,9 +65,10 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
         "interrupt" => core.interrupt(),
         // Structured twin of the `/approve` text command (GUI convenience):
         // {"op":"approve","call_id":"...","decision":"allow|deny",
-        //  "hunks":["f0h1"],"always":false} — routes to the same handler.
+        //  "scope":"once|session|project","prefix":"npm install",
+        //  "feedback":"...","hunks":["f0h1"],"always":false}.
         "approve" => match parse_approve_op(value) {
-            Ok((call_id, allow, always, hunks)) => core.approve(&call_id, allow, always, hunks),
+            Ok((call_id, allow, options)) => core.approve_with(&call_id, allow, options),
             Err(error) => vec![AgentEvent::Error(error)],
         },
         "set_approval_mode" => {
@@ -77,6 +78,45 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
                 .unwrap_or_default();
             match ApprovalMode::parse(mode) {
                 Ok(mode) => core.set_approval_mode(mode),
+                Err(error) => vec![AgentEvent::Error(error)],
+            }
+        }
+        // {"op":"add_directory","path":"/abs","mode":"rw","persist":"session"}
+        "add_directory" => {
+            let text = |key: &str, default: &'static str| {
+                value
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or(default)
+                    .to_string()
+            };
+            core.add_directory(
+                &text("path", ""),
+                &text("mode", "rw"),
+                &text("persist", "session"),
+            )
+        }
+        // {"op":"remove_directory","path":"/abs","persist":"session"}
+        "remove_directory" => {
+            let text = |key: &str, default: &'static str| {
+                value
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or(default)
+                    .to_string()
+            };
+            core.remove_directory(&text("path", ""), &text("persist", "session"))
+        }
+        // {"op":"set_sandbox","mode":"workspace-write","network":true}
+        "set_sandbox" => {
+            let mode = value
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match crate::sandbox::SandboxMode::parse(mode) {
+                Ok(mode) => {
+                    core.set_sandbox_mode(mode, value.get("network").and_then(Value::as_bool))
+                }
                 Err(error) => vec![AgentEvent::Error(error)],
             }
         }
@@ -173,12 +213,13 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
     (false, events)
 }
 
-/// `(call_id, allow, always, hunks)` parsed from the serve `approve` op.
-type ParsedApprove = (String, bool, bool, Option<Vec<String>>);
+/// `(call_id, allow, options)` parsed from the serve `approve` op.
+type ParsedApprove = (String, bool, ApproveOptions);
 
-/// Parses the serve `approve` op into `(call_id, allow, always, hunks)`.
-/// Combination rules (always vs hunks, unknown ids) are validated by
-/// `AgentCore::approve` so text and structured paths behave identically.
+/// Parses the serve `approve` op into `(call_id, allow, options)`.
+/// Combination rules (scope vs hunks, unknown ids, the prefix) are
+/// validated by `AgentCore::approve_with` so text and structured paths
+/// behave identically.
 fn parse_approve_op(value: &Value) -> Result<ParsedApprove, String> {
     let call_id = value
         .get("call_id")
@@ -208,7 +249,47 @@ fn parse_approve_op(value: &Value) -> Result<ParsedApprove, String> {
         }
         Some(_) => return Err("hunks must be an array of hunk id strings".to_string()),
     };
-    Ok((call_id.to_string(), allow, always, hunks))
+    let scope = match value.get("scope") {
+        None | Some(Value::Null) => None,
+        Some(scope) => Some(crate::approval::ApprovalScope::parse(
+            scope.as_str().unwrap_or_default(),
+        )?),
+    };
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    let add_dir = match value.get("add_dir") {
+        None | Some(Value::Null) => None,
+        Some(dir) => {
+            let path = dir
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+                .ok_or_else(|| "add_dir requires path".to_string())?;
+            let persist = dir
+                .get("persist")
+                .and_then(Value::as_str)
+                .unwrap_or("session");
+            Some((std::path::PathBuf::from(path.trim()), persist.to_string()))
+        }
+    };
+    Ok((
+        call_id.to_string(),
+        allow,
+        ApproveOptions {
+            scope,
+            always,
+            prefix: text("prefix"),
+            feedback: text("feedback"),
+            hunks,
+            add_dir,
+        },
+    ))
 }
 
 pub fn event_json(event: AgentEvent) -> Value {
@@ -468,21 +549,26 @@ pub fn event_json(event: AgentEvent) -> Value {
             summary,
             subagent_id,
             hunks,
-        } => json!({
-            "type": "approval_request",
-            "call_id": call_id,
-            "name": name,
-            "summary": summary,
-            "subagent_id": subagent_id,
-            // Edit tools: the selectable hunks of the pending change; answer
-            // with the `approve` op (or /approve --hunks) to apply a subset.
-            "hunks": hunks.map(|hunks| hunks.into_iter().map(|hunk| json!({
-                "id": hunk.id,
-                "file": hunk.file,
-                "header": hunk.header,
-                "lines": hunk.lines,
-            })).collect::<Vec<_>>()),
-        }),
+            info,
+        } => {
+            let mut value = json!({
+                "type": "approval_request",
+                "call_id": call_id,
+                "name": name,
+                "summary": summary,
+                "subagent_id": subagent_id,
+                // Edit tools: the selectable hunks of the pending change; answer
+                // with the `approve` op (or /approve --hunks) to apply a subset.
+                "hunks": hunks.map(|hunks| hunks.into_iter().map(|hunk| json!({
+                    "id": hunk.id,
+                    "file": hunk.file,
+                    "header": hunk.header,
+                    "lines": hunk.lines,
+                })).collect::<Vec<_>>()),
+            });
+            info.wire_fields(&mut value);
+            value
+        }
         AgentEvent::ApprovalMode { mode } => json!({
             "type": "approval_mode",
             "mode": mode,
@@ -605,6 +691,28 @@ pub fn event_json(event: AgentEvent) -> Value {
             "is_error": is_error,
         }),
         AgentEvent::Attended(attended) => json!({ "type": "attended", "attended": attended }),
+        AgentEvent::Sandbox(view) => json!({
+            "type": "sandbox",
+            "mode": view.mode,
+            "network": view.network,
+            "enforced": view.enforced,
+            "unavailable": view.unavailable,
+            "directories": view.directories.into_iter().map(|dir| json!({
+                "path": dir.path,
+                "mode": dir.mode,
+                "source": dir.source,
+            })).collect::<Vec<_>>(),
+        }),
+        AgentEvent::Escalated { call_id, by, info } => json!({
+            "type": "escalated",
+            "call_id": call_id,
+            "kind": info.kind.as_str(),
+            "command": info.command,
+            "justification": info.justification,
+            "cwd": info.cwd.display().to_string(),
+            "paths": info.paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+            "by": by,
+        }),
     }
 }
 
@@ -653,15 +761,17 @@ mod tests {
             (
                 "call_9".to_string(),
                 true,
-                false,
-                Some(vec!["f0h1".to_string(), "f1h2".to_string()])
+                ApproveOptions {
+                    hunks: Some(vec!["f0h1".to_string(), "f1h2".to_string()]),
+                    ..ApproveOptions::default()
+                }
             )
         );
 
         let plain_deny = json!({ "op": "approve", "call_id": "call_9", "decision": "deny" });
         assert_eq!(
             parse_approve_op(&plain_deny).unwrap(),
-            ("call_9".to_string(), false, false, None)
+            ("call_9".to_string(), false, ApproveOptions::default())
         );
 
         let always = json!({
@@ -670,8 +780,57 @@ mod tests {
         });
         assert_eq!(
             parse_approve_op(&always).unwrap(),
-            ("call_9".to_string(), true, true, None)
+            (
+                "call_9".to_string(),
+                true,
+                ApproveOptions {
+                    always: true,
+                    ..ApproveOptions::default()
+                }
+            )
         );
+
+        let scoped = json!({
+            "op": "approve", "call_id": "call_9", "decision": "allow",
+            "scope": "project", "prefix": "npm install --save",
+        });
+        assert_eq!(
+            parse_approve_op(&scoped).unwrap().2,
+            ApproveOptions {
+                scope: Some(crate::approval::ApprovalScope::Project),
+                prefix: Some("npm install --save".to_string()),
+                ..ApproveOptions::default()
+            }
+        );
+        let told = json!({
+            "op": "approve", "call_id": "call_9", "decision": "deny",
+            "feedback": "Use pnpm instead.",
+        });
+        assert_eq!(
+            parse_approve_op(&told).unwrap().2.feedback.as_deref(),
+            Some("Use pnpm instead.")
+        );
+        let bad =
+            json!({ "op": "approve", "call_id": "c", "decision": "allow", "scope": "forever" });
+        assert!(parse_approve_op(&bad)
+            .unwrap_err()
+            .contains("unknown scope"));
+        let with_dir = json!({
+            "op": "approve", "call_id": "c", "decision": "allow",
+            "add_dir": { "path": "/Users/me/Desktop", "persist": "project" },
+        });
+        assert_eq!(
+            parse_approve_op(&with_dir).unwrap().2.add_dir,
+            Some((
+                std::path::PathBuf::from("/Users/me/Desktop"),
+                "project".to_string()
+            ))
+        );
+        let no_path =
+            json!({ "op": "approve", "call_id": "c", "decision": "allow", "add_dir": {} });
+        assert!(parse_approve_op(&no_path)
+            .unwrap_err()
+            .contains("add_dir requires path"));
     }
 
     #[test]
@@ -766,12 +925,56 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_and_escalated_events_have_their_wire_shapes() {
+        let sandbox = event_json(AgentEvent::Sandbox(crate::event::SandboxView {
+            mode: "workspace-write".to_string(),
+            network: true,
+            enforced: false,
+            unavailable: None,
+            directories: vec![crate::event::SandboxDirectoryView {
+                path: "/srv/x".to_string(),
+                mode: "rw",
+                source: "project",
+            }],
+        }));
+        assert_eq!(
+            sandbox,
+            json!({
+                "type": "sandbox", "mode": "workspace-write", "network": true,
+                "enforced": false, "unavailable": null,
+                "directories": [{ "path": "/srv/x", "mode": "rw", "source": "project" }],
+            })
+        );
+        let escalated = event_json(AgentEvent::Escalated {
+            call_id: "call_3".to_string(),
+            by: "mode",
+            info: crate::approval::ApprovalInfo {
+                kind: crate::approval::ApprovalKind::OutsideWrite,
+                justification: Some("save the chart".to_string()),
+                cwd: std::path::PathBuf::from("/work"),
+                command: Some("cp chart.png ~/Desktop/".to_string()),
+                paths: vec![std::path::PathBuf::from("/home/me/Desktop")],
+                ..Default::default()
+            },
+        });
+        assert_eq!(
+            escalated,
+            json!({
+                "type": "escalated", "call_id": "call_3", "kind": "outside_write",
+                "command": "cp chart.png ~/Desktop/", "justification": "save the chart",
+                "cwd": "/work", "paths": ["/home/me/Desktop"], "by": "mode",
+            })
+        );
+    }
+
+    #[test]
     fn approval_request_event_serializes_hunks_for_the_wire() {
         let event = AgentEvent::ApprovalRequest {
             call_id: "call_7".to_string(),
             name: "apply_patch".to_string(),
             summary: "src/lib.rs".to_string(),
             subagent_id: None,
+            info: crate::approval::ApprovalInfo::default(),
             hunks: Some(vec![crate::HunkView {
                 id: "f0h1".to_string(),
                 file: "src/lib.rs".to_string(),
@@ -790,10 +993,27 @@ mod tests {
         let plain = AgentEvent::ApprovalRequest {
             call_id: "call_8".to_string(),
             name: "bash".to_string(),
-            summary: "ls".to_string(),
+            summary: "git push".to_string(),
             subagent_id: None,
             hunks: None,
+            info: crate::approval::ApprovalInfo {
+                kind: crate::approval::ApprovalKind::Rule,
+                must_ask: true,
+                cwd: std::path::PathBuf::from("/work"),
+                command: Some("git push".to_string()),
+                scopes: vec![crate::approval::ApprovalScope::Once],
+                ..Default::default()
+            },
         };
-        assert_eq!(event_json(plain)["hunks"], Value::Null);
+        let plain = event_json(plain);
+        assert_eq!(plain["hunks"], Value::Null);
+        assert_eq!(plain["kind"], "rule");
+        assert_eq!(plain["must_ask"], true);
+        assert_eq!(plain["command"], "git push");
+        assert_eq!(plain["cwd"], "/work");
+        assert_eq!(plain["scopes"], json!(["once"]));
+        assert_eq!(plain["paths"], json!([]));
+        assert_eq!(plain["prefix"], Value::Null);
+        assert_eq!(plain["elevation"], Value::Null);
     }
 }

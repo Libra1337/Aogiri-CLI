@@ -270,11 +270,10 @@ struct Generated {
 pub(crate) fn run(
     args: &Value,
     cwd: &Path,
-    extra_read_roots: &[PathBuf],
     state: &ToolState,
     emit: &mut impl FnMut(ToolExecutionEvent) -> Result<(), String>,
 ) -> Value {
-    match run_inner(args, cwd, extra_read_roots, state, emit) {
+    match run_inner(args, cwd, state, emit) {
         Ok(value) => value,
         Err(error) => json!({ "error": error }),
     }
@@ -283,7 +282,6 @@ pub(crate) fn run(
 fn run_inner(
     args: &Value,
     cwd: &Path,
-    extra_read_roots: &[PathBuf],
     state: &ToolState,
     emit: &mut impl FnMut(ToolExecutionEvent) -> Result<(), String>,
 ) -> Result<Value, String> {
@@ -296,7 +294,7 @@ fn run_inner(
     let inputs = request
         .images
         .iter()
-        .map(|path| read_input_image(cwd, path, extra_read_roots))
+        .map(|path| read_input_image(cwd, path))
         .collect::<Result<Vec<_>, _>>()?;
 
     let generated = generate_with_progress(&tools, &model, &request, inputs, emit, |rx| {
@@ -613,12 +611,8 @@ fn read_limited(response: ureq::Response, limit: u64) -> Result<Vec<u8>, String>
     Ok(bytes)
 }
 
-fn read_input_image(
-    cwd: &Path,
-    path: &str,
-    extra_read_roots: &[PathBuf],
-) -> Result<InputImage, String> {
-    let resolved = crate::tools::readable_path(cwd, path, extra_read_roots)?;
+fn read_input_image(cwd: &Path, path: &str) -> Result<InputImage, String> {
+    let resolved = crate::tools::readable_path(cwd, path)?;
     let mime = crate::tools::image_mime(&resolved)
         .filter(|mime| matches!(*mime, "image/png" | "image/jpeg" | "image/webp"))
         .ok_or_else(|| format!("{path}: input images must be png, jpg or webp"))?;
@@ -923,7 +917,7 @@ mod tests {
     }
 
     fn run_tool(args: Value, cwd: &Path, state: &ToolState) -> Value {
-        run(&args, cwd, &[], state, &mut |_| Ok(()))
+        run(&args, cwd, state, &mut |_| Ok(()))
     }
 
     fn body_json(request: &[u8]) -> Value {
@@ -1278,7 +1272,6 @@ mod tests {
         let result = run(
             &json!({ "prompt": "fox", "path": "art/fox" }),
             &dir,
-            &[],
             &state,
             &mut |_| {
                 updates += 1;
@@ -1319,7 +1312,7 @@ mod tests {
             result["error"]
                 .as_str()
                 .unwrap()
-                .contains("escapes the workspace"),
+                .contains("needs the user's approval"),
             "{result}"
         );
         let _ = fs::remove_dir_all(dir);

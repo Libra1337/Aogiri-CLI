@@ -10,8 +10,10 @@
 //!
 //! Credentials (`~/.ssh`, `~/.gnupg`, `~/.aws`, LynShen's own auth and daemon
 //! state) are unreadable in every sandboxed mode. macOS uses Seatbelt
-//! (`sandbox-exec`), Linux `bwrap`; Windows supports `full-access` only.
-//! File tools run in-process and check writes against the same rules.
+//! (`sandbox-exec`), Linux `bwrap`. Windows has no OS sandbox: a mode other
+//! than `full-access` is a boundary the model is told about and declares
+//! crossing (`escalate`), not one that is enforced (`enforced`). File tools
+//! run in-process and check writes against the same rules.
 
 use serde_json::{json, Value};
 use std::{
@@ -77,6 +79,34 @@ pub struct CommandRule {
     pub action: RuleAction,
 }
 
+/// What the command rules and the built-in lists say about a command (see
+/// `SandboxPolicy::check_command`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandCheck {
+    /// `Forbid`: a part never runs. `Ask`: a person must decide, in every
+    /// approval mode. `Allow`: a rule allows every part. None: the approval
+    /// mode decides.
+    pub action: Option<RuleAction>,
+    /// Why it is forbidden or must be asked.
+    pub reason: Option<String>,
+    /// A part runs with elevated privileges (sudo, su, doas, runas, ...).
+    pub elevation: bool,
+    /// No approval may reach beyond this call: an interpreter, a delete, an
+    /// elevation, a forced push.
+    pub once_only: bool,
+    /// The prefix a session or project approval would remember; None when
+    /// its parts start differently.
+    pub prefix: Option<String>,
+    /// The paths its text shows it writes.
+    pub writes: Vec<PathBuf>,
+    /// A write its text shows lands outside the boundary (the workspace,
+    /// the read-write directories, temp and the package caches).
+    pub writes_outside: bool,
+    /// It deletes something its text does not name (a variable, a command
+    /// substitution, `xargs rm`): outside the sandbox that may be anywhere.
+    pub unknown_delete: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SandboxPolicy {
     pub mode: SandboxMode,
@@ -87,6 +117,10 @@ pub struct SandboxPolicy {
     pub readable_dirs: Vec<PathBuf>,
     pub network: bool,
     pub rules: Vec<CommandRule>,
+    /// Command prefixes allowed for this session inside the sandbox only:
+    /// manual mode stops asking for them, an escalation still asks (see
+    /// `allowed_in_sandbox`).
+    pub sandboxed_allow: Vec<String>,
 }
 
 impl SandboxPolicy {
@@ -95,25 +129,273 @@ impl SandboxPolicy {
         self.mode != SandboxMode::FullAccess
     }
 
-    /// The rule that applies to `command`: `forbid` wins over any other
-    /// match, otherwise the longest matching prefix.
+    /// Whether an OS sandbox enforces the mode: macOS and Linux, in a mode
+    /// other than `full-access`. Elsewhere commands run unconfined.
+    pub fn enforced(&self) -> bool {
+        self.is_sandboxed() && OS_SANDBOX
+    }
+
+    /// Why the OS sandbox cannot run here (bubblewrap missing, or blocked by
+    /// AppArmor), with how to fix it; None when it runs or is not used.
+    pub fn unavailable(&self) -> Option<String> {
+        self.check_available().err()
+    }
+
+    /// What the command rules and the built-in lists say about `command`
+    /// (see `check_command`), without the checks that need its directory.
     pub fn rule_for(&self, command: &str) -> Option<RuleAction> {
-        let words: Vec<&str> = command.split_whitespace().collect();
-        let matches: Vec<&CommandRule> = self
-            .rules
-            .iter()
-            .filter(|rule| {
-                let prefix: Vec<&str> = rule.prefix.split_whitespace().collect();
-                !prefix.is_empty() && words.starts_with(&prefix)
-            })
-            .collect();
-        if matches.iter().any(|rule| rule.action == RuleAction::Forbid) {
-            return Some(RuleAction::Forbid);
+        self.check_command(command, None).action
+    }
+
+    /// What the command rules and the built-in lists say about `command`,
+    /// run from `dirs` = (its directory, the agent's workspace).
+    ///
+    /// The command is split into its parts (`&&`, `||`, `;`, `|`, ...; see
+    /// `command_text`), wrappers such as `sudo` or `env` come off, and each
+    /// part is matched on its own: `forbid` (a rule or the built-in list)
+    /// wins, then the built-in list that always asks, then the longest
+    /// matching rule. The command is forbidden when a part is, must be asked
+    /// when a part must, and allowed when every part but the neutral ones
+    /// (`cd`, `echo`, `grep`, ...) is.
+    pub fn check_command(&self, command: &str, dirs: Option<(&Path, &Path)>) -> CommandCheck {
+        use crate::command_text as text;
+        let home = home().map(|home| real(&home));
+        let credentials = denied_reads();
+        let settings = agent_settings();
+        let roots = dirs.map(|(_, workspace)| self.boundary_roots(workspace));
+        let workspace = dirs.map(|(_, workspace)| real(workspace));
+        let mut check = CommandCheck::default();
+        let mut forbid: Option<String> = None;
+        let mut ask: Option<String> = None;
+        let mut all_allowed = true;
+        let mut counted = 0;
+        let mut prefixes: Vec<String> = Vec::new();
+        let mut no_prefix = false;
+        let parts = text::segments(command);
+        for part in &parts {
+            let user = self.user_rule(part);
+            let mut part_forbid = (user == Some(RuleAction::Forbid))
+                .then(|| "forbidden by the agent's command rules".to_string());
+            let mut part_ask = (user == Some(RuleAction::Ask))
+                .then(|| "it matches an ask command rule".to_string());
+            let elevated = part.elevated
+                || matches!(
+                    part.program().as_str(),
+                    "sudo" | "su" | "doas" | "pkexec" | "gsudo" | "runas"
+                );
+            if elevated {
+                check.elevation = true;
+                part_ask.get_or_insert_with(|| "it runs with elevated privileges".to_string());
+            }
+            if let Some(force) = text::git_push(part) {
+                check.once_only |= force;
+                part_ask.get_or_insert_with(|| "it pushes to a git remote".to_string());
+            }
+            if let Some(setting) = text::system_setting(part) {
+                part_ask.get_or_insert_with(|| format!("it {setting}"));
+            }
+            if let Some((cwd, _)) = dirs {
+                let resolve = |word: &str| text::resolve_word(word, cwd, home.as_deref());
+                if text::is_delete(part) {
+                    let targets = text::delete_targets(part);
+                    if targets.is_empty() {
+                        check.unknown_delete = true;
+                    }
+                    for word in &targets {
+                        let Some(target) = resolve(word) else {
+                            check.unknown_delete = true;
+                            continue;
+                        };
+                        let real_target = real_or_parent(&target);
+                        // The root, the home directory or a directory around
+                        // it, or around the workspace.
+                        let around = |dir: &PathBuf| {
+                            dir.starts_with(&real_target) || dir.starts_with(&target)
+                        };
+                        let protected = target.parent().is_none()
+                            || real_target.parent().is_none()
+                            || home.as_ref().is_some_and(around)
+                            || workspace.as_ref().is_some_and(|workspace| {
+                                workspace != &real_target && workspace.starts_with(&real_target)
+                            });
+                        if protected {
+                            part_forbid.get_or_insert_with(|| {
+                                format!(
+                                    "never run: it deletes {}, the root, the home directory or a parent of the workspace",
+                                    target.display()
+                                )
+                            });
+                        } else if !roots
+                            .iter()
+                            .flatten()
+                            .any(|root| real_target.starts_with(root))
+                        {
+                            part_ask.get_or_insert_with(|| {
+                                format!("it deletes {}, outside the workspace", target.display())
+                            });
+                        }
+                    }
+                }
+                let mentioned = part
+                    .raw
+                    .iter()
+                    .chain(&part.redirects)
+                    .filter(|word| text::looks_like_path(word))
+                    .filter_map(|word| resolve(word));
+                for path in mentioned {
+                    let real_path = real_or_parent(&path);
+                    let inside = |guarded: &PathBuf| {
+                        real_path.starts_with(guarded) || path.starts_with(guarded)
+                    };
+                    if credentials.iter().any(inside) {
+                        part_ask.get_or_insert_with(|| {
+                            format!("it touches credentials ({})", path.display())
+                        });
+                    } else if !text::is_neutral(part) && settings.iter().any(inside) {
+                        // Its own settings: their rules decide what asks.
+                        part_ask.get_or_insert_with(|| {
+                            format!("it changes LynShen's settings ({})", path.display())
+                        });
+                    }
+                }
+                for target in text::write_targets(part).iter().filter_map(|w| resolve(w)) {
+                    let real_target = real_or_parent(&target);
+                    if !roots
+                        .iter()
+                        .flatten()
+                        .any(|root| real_target.starts_with(root))
+                    {
+                        check.writes_outside = true;
+                    }
+                    if !check.writes.contains(&target) {
+                        check.writes.push(target);
+                    }
+                }
+            }
+            check.once_only |= text::is_interpreter(part) || text::is_delete(part) || elevated;
+            if let Some(reason) = part_forbid {
+                forbid.get_or_insert(reason);
+            } else if let Some(reason) = part_ask {
+                ask.get_or_insert(reason);
+            }
+            if !text::is_neutral(part) {
+                counted += 1;
+                all_allowed &= user == Some(RuleAction::Allow);
+                match text::prefix(part) {
+                    Some(prefix) if !prefixes.contains(&prefix) => prefixes.push(prefix),
+                    Some(_) => {}
+                    None => no_prefix = true,
+                }
+            }
         }
-        matches
-            .into_iter()
-            .max_by_key(|rule| rule.prefix.split_whitespace().count())
-            .map(|rule| rule.action)
+        if counted == 0 {
+            prefixes.extend(parts.first().and_then(text::prefix));
+        }
+        // A write outside goes where the user saw it go, once: no rule
+        // covers it, and no prefix is remembered for it (a client makes
+        // the directory writable instead).
+        if check.writes_outside {
+            all_allowed = false;
+            check.once_only = true;
+        }
+        check.prefix = (!no_prefix && prefixes.len() == 1).then(|| prefixes.remove(0));
+        (check.action, check.reason) = match (forbid, ask) {
+            (Some(reason), _) => (Some(RuleAction::Forbid), Some(reason)),
+            (None, Some(reason)) => (Some(RuleAction::Ask), Some(reason)),
+            _ if counted > 0 && all_allowed => (Some(RuleAction::Allow), None),
+            _ => (None, None),
+        };
+        check
+    }
+
+    /// Whether every part of `command` but the neutral ones starts with a
+    /// prefix allowed inside the sandbox (`sandboxed_allow`).
+    pub fn allowed_in_sandbox(&self, command: &str) -> bool {
+        use crate::command_text as text;
+        if self.sandboxed_allow.is_empty() {
+            return false;
+        }
+        let mut counted = 0;
+        for part in text::segments(command) {
+            if text::is_neutral(&part) {
+                continue;
+            }
+            counted += 1;
+            let words = text::allow_words(&part);
+            if !self
+                .sandboxed_allow
+                .iter()
+                .any(|prefix| words_start_with(words, prefix, false))
+            {
+                return false;
+            }
+        }
+        counted > 0
+    }
+
+    /// The command rule for one part of a command line: `forbid` wins over
+    /// any other match, otherwise the longest matching prefix, `ask` before
+    /// `allow` at the same length. `ask` and `forbid` match the part in any
+    /// case, as written, without its wrappers or with the program named by
+    /// its file name (`/usr/bin/git push`, `GIT.EXE PUSH`); `allow` matches
+    /// only the words as written (`command_text::allow_words`), so
+    /// `./git commit` or `PATH=. git commit` is not `git commit`.
+    fn user_rule(&self, part: &crate::command_text::Segment) -> Option<RuleAction> {
+        let mut named = part.words.clone();
+        if let Some(first) = named.first_mut() {
+            *first = crate::command_text::program_name(first);
+        }
+        let loose = [&part.raw, &part.words, &named];
+        let exact = crate::command_text::allow_words(part);
+        let mut best: Option<(usize, RuleAction)> = None;
+        for rule in &self.rules {
+            let matched = match rule.action {
+                RuleAction::Allow => words_start_with(exact, &rule.prefix, false),
+                RuleAction::Ask | RuleAction::Forbid => loose
+                    .iter()
+                    .any(|words| words_start_with(words, &rule.prefix, true)),
+            };
+            if !matched {
+                continue;
+            }
+            if rule.action == RuleAction::Forbid {
+                return Some(RuleAction::Forbid);
+            }
+            let length = rule.prefix.split_whitespace().count();
+            let better = match best {
+                None => true,
+                Some((known, action)) => {
+                    length > known
+                        || (length == known
+                            && action == RuleAction::Allow
+                            && rule.action == RuleAction::Ask)
+                }
+            };
+            if better {
+                best = Some((length, rule.action));
+            }
+        }
+        best.map(|(_, action)| action)
+    }
+
+    /// Where the agent may write without crossing the boundary, whatever
+    /// the mode: the workspace, the read-write directories, temp and the
+    /// package caches.
+    fn boundary_roots(&self, workspace: &Path) -> Vec<PathBuf> {
+        let mut roots = vec![workspace.to_path_buf()];
+        roots.extend(self.writable_dirs.iter().cloned());
+        roots.extend(temp_dirs());
+        roots.extend(cache_dirs());
+        roots.iter().map(|root| real(root)).collect()
+    }
+
+    /// Whether a write to `path` stays inside the boundary (see
+    /// `boundary_roots`).
+    pub fn within_boundary(&self, workspace: &Path, path: &Path) -> bool {
+        let target = real_or_parent(path);
+        self.boundary_roots(workspace)
+            .iter()
+            .any(|root| target.starts_with(root))
     }
 
     /// Directories a command started in `cwd` may write.
@@ -199,29 +481,6 @@ impl SandboxPolicy {
         }
     }
 
-    /// Directories outside the working directory that the file *read* tools
-    /// may read while this sandbox is active: everywhere this agent's own
-    /// shell commands may write (the read-write directories, temp and the
-    /// package caches), plus the read-only directories. A screenshot or log
-    /// a command just wrote to /tmp is readable; nothing becomes writable.
-    /// Empty of writable roots under `read-only`, where no command writes.
-    pub fn tool_read_roots(&self, cwd: &Path) -> Vec<PathBuf> {
-        let mut roots = self.writable_roots(cwd);
-        roots.extend(self.readable_dirs.iter().map(|dir| real(dir)));
-        roots.extend(self.writable_dirs.iter().map(|dir| real(dir)));
-        roots.sort();
-        roots.dedup();
-        roots
-    }
-
-    /// Whether `path` lies in one of the extra read-write directories.
-    pub fn in_writable_dir(&self, path: &Path) -> bool {
-        let target = real_or_parent(path);
-        self.writable_dirs
-            .iter()
-            .any(|dir| target.starts_with(real(dir)))
-    }
-
     /// The command line to run `program args` in the sandbox from `cwd`.
     /// Unchanged under `full-access`.
     pub fn wrap(
@@ -289,12 +548,14 @@ impl SandboxPolicy {
             wrapped.extend(args.iter().map(|arg| arg.to_string()));
             Ok((bwrap.display().to_string(), wrapped))
         } else {
-            Err("the sandbox is not supported on this platform; set the sandbox to full-access or run under WSL2".to_string())
+            // No OS sandbox (Windows): the command runs unconfined.
+            Ok(plain())
         }
     }
 
-    /// Errors when this platform cannot run the sandbox, so a host can refuse
-    /// to start instead of failing on the first command.
+    /// Errors when this platform cannot run the OS sandbox, so a host can
+    /// refuse to start instead of failing on the first command. A platform
+    /// without one (Windows) has nothing to fail: see `enforced`.
     pub fn check_available(&self) -> Result<(), String> {
         if !self.is_sandboxed() {
             return Ok(());
@@ -305,9 +566,10 @@ impl SandboxPolicy {
                 .then_some(())
                 .ok_or_else(|| "sandbox-exec is missing".to_string())
         } else if cfg!(target_os = "linux") {
-            find_bwrap().map(|_| ()).ok_or_else(bwrap_missing)
+            let bwrap = find_bwrap().ok_or_else(bwrap_missing)?;
+            bwrap_runs(&bwrap)
         } else {
-            Err("the sandbox is not supported on this platform; set the sandbox to full-access or run under WSL2".to_string())
+            Ok(())
         }
     }
 
@@ -436,65 +698,227 @@ impl SandboxPolicy {
         args
     }
 
-    /// A paragraph for the system prompt describing the sandbox.
+    /// The system prompt's note on the sandbox: what commands and file
+    /// tools may do, how to get more, and what always asks. Never empty,
+    /// so the model is told in every mode, `full-access` and Windows too.
     pub fn prompt(&self) -> String {
-        if !self.is_sandboxed() {
-            return String::new();
-        }
-        let writable = match self.mode {
-            SandboxMode::ReadOnly => "Nothing is writable.".to_string(),
-            _ => format!(
-                "Writable: the working directory{}, temp and package-cache directories; .git, .lynshen and .agents inside them are read-only.",
-                if self.writable_dirs.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        ", {}",
-                        self.writable_dirs
-                            .iter()
-                            .map(|dir| dir.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                }
-            ),
+        let list = |dirs: &[PathBuf]| {
+            dirs.iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         };
-        let readable = if self.readable_dirs.is_empty() {
+        let extra = if self.writable_dirs.is_empty() {
             String::new()
         } else {
-            format!(
-                " Also readable with file tools: {}.",
-                self.readable_dirs
-                    .iter()
-                    .map(|dir| dir.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+            format!(", {}", list(&self.writable_dirs))
+        };
+        let read_only = if self.readable_dirs.is_empty() {
+            String::new()
+        } else {
+            format!(" Read-only: {}.", list(&self.readable_dirs))
+        };
+        let escalate =
+            "with `escalate: true` and a one-line `justification`; it may need approval.";
+        let (tag, shell) = if !self.is_sandboxed() {
+            (
+                format!("<sandbox mode=\"{}\">", self.mode.as_str()),
+                "No sandbox: commands run with the user's permissions.".to_string(),
+            )
+        } else if !self.enforced() {
+            (
+                format!("<sandbox mode=\"{}\" enforced=\"false\">", self.mode.as_str()),
+                format!(
+                    "No OS sandbox on this platform: commands run with the user's permissions. Your boundary is the working directory{extra}, temp and package caches.{read_only} Run a command that writes outside it, installs software or changes settings {escalate}"
+                ),
+            )
+        } else {
+            let writable = match self.mode {
+                SandboxMode::ReadOnly => "Nothing is writable.".to_string(),
+                _ => format!(
+                    "Writable: the working directory{extra}, temp and package caches; .git, .lynshen and .agents in them are read-only."
+                ),
+            };
+            (
+                format!("<sandbox mode=\"{}\">", self.mode.as_str()),
+                format!(
+                    "Commands run in an OS sandbox. {writable}{read_only} Network is {}; credentials such as ~/.ssh are unreadable. For more (git commit, installing software, writing elsewhere{}), run the command {escalate}",
+                    if self.network { "on" } else { "off" },
+                    if self.network { "" } else { ", network" },
+                ),
             )
         };
         format!(
-            "<sandbox mode=\"{}\">\nShell commands run in a sandbox. {writable}{readable} Network is {}. Credentials such as ~/.ssh are unreadable. A command that needs more (committing to git, writing elsewhere{}) runs outside the sandbox with `escalate: true` and a one-line `justification`, once approved.\n</sandbox>",
-            self.mode.as_str(),
-            if self.network { "on" } else { "off" },
-            if self.network { "" } else { ", network access" },
+            "{tag}\n{shell}\nFile tools read anywhere but credentials; writing outside the writable directories may need approval. Always asked, in every mode: sudo, git push, deleting outside the workspace, system settings, credentials.\n</sandbox>"
         )
     }
 }
 
 impl SandboxPolicy {
     /// The default: the working directory writable, network on, commits
-    /// allowed to leave the sandbox and pushes always asked. Windows has no
-    /// sandbox yet and starts at `full-access`.
+    /// allowed to leave the sandbox and pushes always asked. On Windows too:
+    /// nothing enforces it there (`enforced`), but the model is told the
+    /// boundary and declares crossing it, and file tools keep to it.
     pub fn default_for_platform() -> Self {
         Self {
-            mode: if cfg!(windows) {
-                SandboxMode::FullAccess
-            } else {
-                SandboxMode::WorkspaceWrite
-            },
+            mode: SandboxMode::WorkspaceWrite,
             writable_dirs: Vec::new(),
             readable_dirs: Vec::new(),
             network: true,
             rules: rules_from_json(&default_rules_json()).expect("default rules parse"),
+            sandboxed_allow: Vec::new(),
+        }
+    }
+
+    /// This policy with `layer`'s directories and rules added.
+    pub fn with_layer(mut self, layer: &SandboxLayer) -> Self {
+        for dir in &layer.writable {
+            if !self.writable_dirs.contains(dir) {
+                self.writable_dirs.push(dir.clone());
+            }
+        }
+        for dir in &layer.readable {
+            if !self.readable_dirs.contains(dir) {
+                self.readable_dirs.push(dir.clone());
+            }
+        }
+        self.rules.extend(layer.rules.iter().cloned());
+        for prefix in &layer.sandboxed {
+            if !self.sandboxed_allow.contains(prefix) {
+                self.sandboxed_allow.push(prefix.clone());
+            }
+        }
+        self
+    }
+}
+
+/// Directories and command rules a sandbox gets from one source: a
+/// project's settings (`projects` in config.json) or the session.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SandboxLayer {
+    pub writable: Vec<PathBuf>,
+    pub readable: Vec<PathBuf>,
+    pub rules: Vec<CommandRule>,
+    /// Command prefixes allowed inside the sandbox only (the session's; see
+    /// `SandboxPolicy::sandboxed_allow`).
+    pub sandboxed: Vec<String>,
+}
+
+impl SandboxLayer {
+    /// `{"sandbox_directories": [...], "command_rules": [...]}`, as a
+    /// `projects` entry of config.json holds them. A directory that no
+    /// longer exists is dropped, and an invalid rule skipped.
+    pub fn from_json(value: &Value) -> Self {
+        let (writable, readable) =
+            directories_from_json(&value["sandbox_directories"], false).unwrap_or_default();
+        let rules = value["command_rules"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|rule| rules_from_json(&json!([rule])).ok())
+            .flatten()
+            .collect();
+        Self {
+            writable,
+            readable,
+            rules,
+            sandboxed: Vec::new(),
+        }
+    }
+
+    /// Adds `dir`, read-write or read-only (moving it from the other list
+    /// when it is there).
+    pub fn add_dir(&mut self, dir: PathBuf, writable: bool) {
+        self.remove_dir(&dir);
+        if writable {
+            self.writable.push(dir);
+        } else {
+            self.readable.push(dir);
+        }
+    }
+
+    /// Removes `dir`; false when it was not there.
+    pub fn remove_dir(&mut self, dir: &Path) -> bool {
+        remove_dir_from(&mut self.writable, dir) | remove_dir_from(&mut self.readable, dir)
+    }
+
+    /// Adds an `allow` rule for `prefix`. A rule that asks or forbids the
+    /// same prefix stays as it is (false): an approval never loosens one.
+    pub fn allow(&mut self, prefix: &str) -> bool {
+        match self
+            .rules
+            .iter()
+            .find(|rule| rule.prefix.eq_ignore_ascii_case(prefix))
+        {
+            Some(rule) => rule.action == RuleAction::Allow,
+            None => {
+                self.rules.push(CommandRule {
+                    prefix: prefix.to_string(),
+                    action: RuleAction::Allow,
+                });
+                true
+            }
+        }
+    }
+
+    /// Allows `prefix` inside the sandbox only.
+    pub fn allow_in_sandbox(&mut self, prefix: &str) {
+        if !self.sandboxed.iter().any(|known| known == prefix) {
+            self.sandboxed.push(prefix.to_string());
+        }
+    }
+}
+
+/// Removes `dir` from `dirs` (the same directory named another way too);
+/// false when it was not there.
+pub fn remove_dir_from(dirs: &mut Vec<PathBuf>, dir: &Path) -> bool {
+    let before = dirs.len();
+    let real_dir = real(dir);
+    dirs.retain(|known| known != dir && real(known) != real_dir);
+    dirs.len() != before
+}
+
+/// Sets `dir` to `mode` (`rw` or `ro`) in a `sandbox_directories` array,
+/// adding it when missing.
+pub fn directory_json_set(dirs: &mut Value, dir: &Path, mode: &str) {
+    directory_json_remove(dirs, dir);
+    dirs.as_array_mut()
+        .expect("an array")
+        .push(json!({ "path": dir.display().to_string(), "mode": mode }));
+}
+
+/// Removes `dir` from a `sandbox_directories` array; false when it was not
+/// there.
+pub fn directory_json_remove(dirs: &mut Value, dir: &Path) -> bool {
+    if !dirs.is_array() {
+        *dirs = json!([]);
+    }
+    let list = dirs.as_array_mut().expect("an array");
+    let before = list.len();
+    let real_dir = real(dir);
+    list.retain(|entry| {
+        let path = PathBuf::from(entry["path"].as_str().unwrap_or_default());
+        path != dir && real(&path) != real_dir
+    });
+    list.len() != before
+}
+
+/// Adds `{"prefix", "action": "allow"}` to a `command_rules` array. A rule
+/// for the same prefix stays as it is (false when it asks or forbids).
+pub fn allow_rule_json(rules: &mut Value, prefix: &str) -> bool {
+    if !rules.is_array() {
+        *rules = json!([]);
+    }
+    let list = rules.as_array_mut().expect("an array");
+    match list.iter().find(|rule| {
+        rule["prefix"]
+            .as_str()
+            .is_some_and(|known| known.trim().eq_ignore_ascii_case(prefix))
+    }) {
+        Some(rule) => rule["action"] == "allow",
+        None => {
+            list.push(json!({ "prefix": prefix, "action": "allow" }));
+            true
         }
     }
 }
@@ -598,18 +1022,26 @@ fn gitdir_target(git_file: &Path) -> Option<PathBuf> {
     })
 }
 
-fn home() -> Option<PathBuf> {
+pub fn home() -> Option<PathBuf> {
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .map(PathBuf::from)
 }
 
-/// Credentials no sandboxed command, and no remote client, may read.
+/// The home directory with symlinks resolved, as paths are compared.
+pub fn real_home() -> Option<PathBuf> {
+    home().map(|home| real(&home))
+}
+
+/// Credentials no sandboxed command, no file tool and no remote client may
+/// read: `~/.ssh`, `~/.gnupg`, `~/.aws`, LynShen's own auth and daemon
+/// state, the key that decrypts Desktop's stored secrets, and on Windows
+/// GnuPG's `%APPDATA%\gnupg`.
 pub fn denied_reads() -> Vec<PathBuf> {
     let Some(home) = home() else {
         return Vec::new();
     };
-    [
+    let mut denied: Vec<PathBuf> = [
         ".ssh",
         ".gnupg",
         ".aws",
@@ -618,7 +1050,50 @@ pub fn denied_reads() -> Vec<PathBuf> {
     ]
     .iter()
     .map(|path| real(&home.join(path)))
-    .collect()
+    .collect();
+    if cfg!(windows) {
+        if let Some(appdata) = env::var_os("APPDATA") {
+            denied.push(real(&PathBuf::from(appdata).join("gnupg")));
+        }
+    }
+    for key in crate::secrets::key_files() {
+        let key = real(&key);
+        if !denied.contains(&key) {
+            denied.push(key);
+        }
+    }
+    denied
+}
+
+/// LynShen's own settings (config.json): a write there changes which
+/// commands ask, so it always asks.
+pub fn agent_settings() -> Vec<PathBuf> {
+    home()
+        .map(|home| vec![real(&home.join(".lynshen/config.json"))])
+        .unwrap_or_default()
+}
+
+/// Paths a write always asks for, whatever the mode or the writable
+/// directories: credentials and LynShen's settings.
+pub fn guarded_writes() -> Vec<PathBuf> {
+    let mut guarded = denied_reads();
+    guarded.extend(agent_settings());
+    guarded
+}
+
+/// Whether `words` start with the words of `prefix` (in any case with
+/// `any_case`).
+fn words_start_with(words: &[String], prefix: &str, any_case: bool) -> bool {
+    let prefix: Vec<&str> = prefix.split_whitespace().collect();
+    !prefix.is_empty()
+        && words.len() >= prefix.len()
+        && words.iter().zip(&prefix).all(|(word, want)| {
+            if any_case {
+                word.to_lowercase() == want.to_lowercase()
+            } else {
+                word == want
+            }
+        })
 }
 
 fn temp_dirs() -> Vec<PathBuf> {
@@ -686,6 +1161,36 @@ fn find_bwrap() -> Option<PathBuf> {
     })
 }
 
+/// Whether this platform has an OS sandbox LynShen drives.
+const OS_SANDBOX: bool = cfg!(any(target_os = "macos", target_os = "linux"));
+
+/// Starts `bwrap` once per process with the binds every command gets: on
+/// Ubuntu 24.04 and later AppArmor stops it from creating the user
+/// namespace it needs, and every command would fail.
+fn bwrap_runs(bwrap: &Path) -> Result<(), String> {
+    static PROBE: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    PROBE
+        .get_or_init(|| {
+            let output = std::process::Command::new(bwrap)
+                .args([
+                    "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--", "sh", "-c",
+                    ":",
+                ])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|error| format!("bwrap could not start: {error}"))?;
+            if output.status.success() {
+                return Ok(());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!(
+                "bwrap cannot create a sandbox here ({}). AppArmor on Ubuntu 24.04 and later blocks the user namespaces it needs: allow them with `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (or give bwrap an AppArmor profile), or set the sandbox to full-access",
+                stderr.trim()
+            ))
+        })
+        .clone()
+}
+
 fn bwrap_missing() -> String {
     "the sandbox needs bubblewrap (bwrap) on PATH: install it (apt install bubblewrap / dnf install bubblewrap), or set the sandbox to full-access".to_string()
 }
@@ -724,6 +1229,7 @@ mod tests {
                     action: RuleAction::Forbid,
                 },
             ],
+            sandboxed_allow: Vec::new(),
         }
     }
 
@@ -733,6 +1239,254 @@ mod tests {
         fs::create_dir_all(dir.join(".git")).unwrap();
         fs::create_dir_all(dir.join(".lynshen/agents/sub")).unwrap();
         real(&dir)
+    }
+
+    #[test]
+    fn the_key_to_desktop_s_secrets_is_a_credential() {
+        let denied = denied_reads();
+        let home = real(&home().unwrap());
+        assert!(denied.contains(&real(&home.join(".lynshen/secret.key"))));
+        assert!(denied.contains(&real(&home.join(".lynshen/auth.json"))));
+    }
+
+    #[test]
+    fn every_platform_starts_with_the_workspace_boundary() {
+        let default = SandboxPolicy::default_for_platform();
+        assert_eq!(default.mode, SandboxMode::WorkspaceWrite);
+        assert_eq!(default.enforced(), OS_SANDBOX);
+        assert!(default.prompt().contains("escalate: true"));
+    }
+
+    #[test]
+    fn the_prompt_tells_the_model_what_it_can_do_in_every_mode() {
+        let mut policy = policy(SandboxMode::WorkspaceWrite);
+        policy.writable_dirs = vec![PathBuf::from("/srv/shared")];
+        let prompt = policy.prompt();
+        if OS_SANDBOX {
+            assert!(
+                prompt.starts_with("<sandbox mode=\"workspace-write\">"),
+                "{prompt}"
+            );
+            assert!(prompt.contains("/srv/shared"), "{prompt}");
+            assert!(prompt.contains("escalate: true"), "{prompt}");
+        } else {
+            assert!(prompt.contains("enforced=\"false\""), "{prompt}");
+            assert!(prompt.contains("No OS sandbox"), "{prompt}");
+        }
+        let full = SandboxPolicy {
+            mode: SandboxMode::FullAccess,
+            ..policy.clone()
+        }
+        .prompt();
+        assert!(full.starts_with("<sandbox mode=\"full-access\">"), "{full}");
+        assert!(full.contains("No sandbox"), "{full}");
+        // Every mode says what file tools may do and what always asks.
+        for prompt in [&prompt, &full] {
+            assert!(prompt.contains("File tools read anywhere but credentials"));
+            assert!(prompt.contains("Always asked, in every mode: sudo, git push"));
+            assert!(prompt.ends_with("</sandbox>"));
+        }
+    }
+
+    #[test]
+    fn every_part_of_a_command_line_is_matched_on_its_own() {
+        use RuleAction::{Allow, Ask, Forbid};
+        let policy = policy(SandboxMode::WorkspaceWrite);
+        // Allowed only when every part is; moving around does not count.
+        assert_eq!(policy.rule_for("cd app && git commit -m x"), Some(Allow));
+        assert_eq!(policy.rule_for("git commit -m x && make"), None);
+        // One part that asks or is forbidden decides.
+        assert_eq!(policy.rule_for("make && git status"), Some(Ask));
+        assert_eq!(
+            policy.rule_for("make; git push --force origin | tail"),
+            Some(Forbid)
+        );
+        // An allow rule matches the words as written: only wrappers that
+        // do not change the program come off. A variable, `env`, `export`
+        // or another path can make `git` anything.
+        assert_eq!(policy.rule_for("nohup time git commit -m x"), Some(Allow));
+        let only_allow = SandboxPolicy {
+            rules: vec![CommandRule {
+                prefix: "git commit".into(),
+                action: Allow,
+            }],
+            ..policy.clone()
+        };
+        for command in [
+            "FOO=1 command git commit -m x",
+            "PATH=. git commit -m x",
+            "GIT_CONFIG_PARAMETERS=\"'core.hooksPath'='/tmp/h'\" git commit -m x",
+            "env LD_PRELOAD=/tmp/x.so git commit -m x",
+            "/usr/bin/git commit -m x",
+            "./git commit -m x",
+            "export PATH=.:$PATH && git commit -m x",
+            "GIT COMMIT -m x",
+        ] {
+            assert_eq!(only_allow.rule_for(command), None, "{command}");
+            assert_ne!(policy.rule_for(command), Some(Allow), "{command}");
+        }
+        // Ask and forbid match however it is written.
+        assert_eq!(policy.rule_for("/usr/bin/git status"), Some(Ask));
+        assert_eq!(policy.rule_for("GIT.EXE STATUS"), Some(Ask));
+        assert_eq!(policy.rule_for("FOO=1 git Push --FORCE"), Some(Forbid));
+        assert_eq!(policy.rule_for("echo $(git status)"), Some(Ask));
+    }
+
+    #[test]
+    fn an_ask_rule_beats_an_allow_rule_of_the_same_length() {
+        let mut policy = policy(SandboxMode::WorkspaceWrite);
+        let rule = |prefix: &str, action| CommandRule {
+            prefix: prefix.to_string(),
+            action,
+        };
+        for rules in [
+            vec![
+                rule("npm publish", RuleAction::Ask),
+                rule("npm publish", RuleAction::Allow),
+            ],
+            vec![
+                rule("npm publish", RuleAction::Allow),
+                rule("npm publish", RuleAction::Ask),
+            ],
+        ] {
+            policy.rules = rules;
+            assert_eq!(policy.rule_for("npm publish"), Some(RuleAction::Ask));
+        }
+        // An approval never turns an ask or forbid rule into an allow.
+        let mut layer = SandboxLayer {
+            rules: vec![rule("npm publish", RuleAction::Ask)],
+            ..SandboxLayer::default()
+        };
+        assert!(!layer.allow("npm publish"));
+        assert_eq!(layer.rules, vec![rule("npm publish", RuleAction::Ask)]);
+        assert!(layer.allow("npm test"));
+        let mut saved = json!([{ "prefix": "curl", "action": "forbid" }]);
+        assert!(!allow_rule_json(&mut saved, "curl"));
+        assert_eq!(saved, json!([{ "prefix": "curl", "action": "forbid" }]));
+    }
+
+    #[test]
+    fn an_allow_rule_does_not_cover_a_write_outside_or_an_unknown_delete() {
+        let dir = work("allow-outside");
+        let mut policy = policy(SandboxMode::WorkspaceWrite);
+        policy.rules.push(CommandRule {
+            prefix: "npm install".into(),
+            action: RuleAction::Allow,
+        });
+        let check = |command: &str| policy.check_command(command, Some((&dir, &dir)));
+        assert_eq!(check("npm install").action, Some(RuleAction::Allow));
+        assert_eq!(
+            check("npm install > log.txt").action,
+            Some(RuleAction::Allow)
+        );
+        let outside = check("npm install > /srv/www/index.html");
+        assert_eq!(outside.action, None, "{outside:?}");
+        assert!(outside.writes_outside && outside.once_only);
+        let copy = check("cp shot.png /srv/www/");
+        assert!(copy.writes_outside && copy.once_only, "{copy:?}");
+        for command in ["rm -rf $OUT", "rm -rf $(pwd)/..", "ls | xargs rm", "rm"] {
+            assert!(check(command).unknown_delete, "{command}");
+        }
+        assert!(!check("rm -rf build $TMPDIR/x").unknown_delete);
+    }
+
+    #[test]
+    fn a_session_may_allow_a_prefix_inside_the_sandbox_only() {
+        let mut policy = policy(SandboxMode::WorkspaceWrite);
+        assert!(!policy.allowed_in_sandbox("cargo test"));
+        policy.sandboxed_allow = vec!["cargo test".to_string()];
+        assert!(policy.allowed_in_sandbox("cd x && cargo test -q | tail"));
+        assert!(!policy.allowed_in_sandbox("cargo test && make"));
+        assert!(!policy.allowed_in_sandbox("PATH=. cargo test"));
+        assert!(!policy.allowed_in_sandbox("cd x"));
+        // It is not an allow rule: leaving the sandbox still asks.
+        assert_eq!(policy.rule_for("cargo test"), None);
+    }
+
+    #[test]
+    fn the_built_in_lists_ask_or_refuse_whatever_the_rules_say() {
+        use RuleAction::{Allow, Ask, Forbid};
+        let dir = work("built-in");
+        let mut policy = policy(SandboxMode::FullAccess);
+        policy.rules = ["sudo", "git push", "rm", "launchctl", "cat", "reg"]
+            .into_iter()
+            .map(|prefix| CommandRule {
+                prefix: prefix.to_string(),
+                action: Allow,
+            })
+            .collect();
+        let check = |command: &str| policy.check_command(command, Some((&dir, &dir)));
+        for command in [
+            "sudo make install",
+            "doas reboot",
+            "Start-Process powershell -Verb RunAs",
+            "git push origin main",
+            "launchctl load ~/Library/LaunchAgents/x.plist",
+            r"reg add HKLM\Software\X /v Y /d 1",
+            "Set-ExecutionPolicy Bypass",
+            "rm -f /etc/hosts.bak",
+            "cat ~/.ssh/id_ed25519",
+            "echo key >> ~/.ssh/authorized_keys",
+        ] {
+            let check = check(command);
+            assert_eq!(check.action, Some(Ask), "{command}: {check:?}");
+            assert!(check.reason.is_some(), "{command}");
+        }
+        assert!(check("sudo make install").elevation);
+        let parent = dir.parent().unwrap().display().to_string();
+        let home = home().unwrap();
+        let own = home.file_name().unwrap().to_string_lossy().to_string();
+        let above_home = home.parent().unwrap().display().to_string();
+        for command in [
+            "rm -rf /".to_string(),
+            "rm -rf ~".to_string(),
+            format!("rm -rf ~{own}"),
+            format!("rm -rf {above_home}"),
+            "sudo rm -rf $HOME/*".to_string(),
+            "rmdir ..".to_string(),
+            format!("rm -r {parent}"),
+            "bash -c 'rm -rf /'".to_string(),
+            "find ~ -name '*.tmp' -delete".to_string(),
+            "find / -exec rm -rf {} +".to_string(),
+            "ls | ForEach-Object { Remove-Item ~ -Recurse }".to_string(),
+        ] {
+            let check = check(&command);
+            assert_eq!(check.action, Some(Forbid), "{command}: {check:?}");
+            assert!(check.reason.unwrap().starts_with("never run"), "{command}");
+        }
+        // Inside the workspace, temp and the read-write directories a delete
+        // is the rules' to decide.
+        assert_eq!(check("rm -rf build target").action, Some(Allow));
+        assert_eq!(check("rm -f /tmp/x.log").action, Some(Allow));
+        // `cat` is neutral: nothing asks, nothing allows.
+        assert_eq!(check("cat ~/.lynshen/config.json").action, None);
+    }
+
+    #[test]
+    fn a_check_names_what_an_approval_may_remember() {
+        let dir = work("remember");
+        let policy = policy(SandboxMode::WorkspaceWrite);
+        let check = |command: &str| policy.check_command(command, Some((&dir, &dir)));
+        assert_eq!(
+            check("cd web && npm install --save x").prefix.as_deref(),
+            Some("npm install")
+        );
+        assert_eq!(check("make && npm test").prefix, None);
+        assert!(!check("npm install").once_only);
+        for command in [
+            "python3 x.py",
+            "node -e 1",
+            "rm a.txt",
+            "sudo ls",
+            "git push -f",
+            "pwsh -c ls",
+        ] {
+            assert!(check(command).once_only, "{command}");
+        }
+        assert_eq!(
+            check("cp out.png /srv/www/").writes,
+            vec![PathBuf::from("/srv/www")]
+        );
     }
 
     #[test]
