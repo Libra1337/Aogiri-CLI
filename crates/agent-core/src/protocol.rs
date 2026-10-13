@@ -2,7 +2,7 @@
 //! events serialize to `{"type": ...}` objects and client ops arrive as
 //! `{"op": ...}` objects. See `docs/serve-protocol.md`.
 
-use crate::{event::AgentEvent, AgentCore, ApprovalMode};
+use crate::{event::AgentEvent, AgentCore, ApprovalMode, ApproveOptions};
 use serde_json::{json, Value};
 
 /// Wire protocol version, announced in the `hello` event. Clients refuse to
@@ -65,9 +65,10 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
         "interrupt" => core.interrupt(),
         // Structured twin of the `/approve` text command (GUI convenience):
         // {"op":"approve","call_id":"...","decision":"allow|deny",
-        //  "hunks":["f0h1"],"always":false} — routes to the same handler.
+        //  "scope":"once|session|project","prefix":"npm install",
+        //  "feedback":"...","hunks":["f0h1"],"always":false}.
         "approve" => match parse_approve_op(value) {
-            Ok((call_id, allow, always, hunks)) => core.approve(&call_id, allow, always, hunks),
+            Ok((call_id, allow, options)) => core.approve_with(&call_id, allow, options),
             Err(error) => vec![AgentEvent::Error(error)],
         },
         "set_approval_mode" => {
@@ -173,12 +174,13 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
     (false, events)
 }
 
-/// `(call_id, allow, always, hunks)` parsed from the serve `approve` op.
-type ParsedApprove = (String, bool, bool, Option<Vec<String>>);
+/// `(call_id, allow, options)` parsed from the serve `approve` op.
+type ParsedApprove = (String, bool, ApproveOptions);
 
-/// Parses the serve `approve` op into `(call_id, allow, always, hunks)`.
-/// Combination rules (always vs hunks, unknown ids) are validated by
-/// `AgentCore::approve` so text and structured paths behave identically.
+/// Parses the serve `approve` op into `(call_id, allow, options)`.
+/// Combination rules (scope vs hunks, unknown ids, the prefix) are
+/// validated by `AgentCore::approve_with` so text and structured paths
+/// behave identically.
 fn parse_approve_op(value: &Value) -> Result<ParsedApprove, String> {
     let call_id = value
         .get("call_id")
@@ -208,7 +210,31 @@ fn parse_approve_op(value: &Value) -> Result<ParsedApprove, String> {
         }
         Some(_) => return Err("hunks must be an array of hunk id strings".to_string()),
     };
-    Ok((call_id.to_string(), allow, always, hunks))
+    let scope = match value.get("scope") {
+        None | Some(Value::Null) => None,
+        Some(scope) => Some(crate::approval::ApprovalScope::parse(
+            scope.as_str().unwrap_or_default(),
+        )?),
+    };
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    Ok((
+        call_id.to_string(),
+        allow,
+        ApproveOptions {
+            scope,
+            always,
+            prefix: text("prefix"),
+            feedback: text("feedback"),
+            hunks,
+        },
+    ))
 }
 
 pub fn event_json(event: AgentEvent) -> Value {
@@ -658,15 +684,17 @@ mod tests {
             (
                 "call_9".to_string(),
                 true,
-                false,
-                Some(vec!["f0h1".to_string(), "f1h2".to_string()])
+                ApproveOptions {
+                    hunks: Some(vec!["f0h1".to_string(), "f1h2".to_string()]),
+                    ..ApproveOptions::default()
+                }
             )
         );
 
         let plain_deny = json!({ "op": "approve", "call_id": "call_9", "decision": "deny" });
         assert_eq!(
             parse_approve_op(&plain_deny).unwrap(),
-            ("call_9".to_string(), false, false, None)
+            ("call_9".to_string(), false, ApproveOptions::default())
         );
 
         let always = json!({
@@ -675,8 +703,41 @@ mod tests {
         });
         assert_eq!(
             parse_approve_op(&always).unwrap(),
-            ("call_9".to_string(), true, true, None)
+            (
+                "call_9".to_string(),
+                true,
+                ApproveOptions {
+                    always: true,
+                    ..ApproveOptions::default()
+                }
+            )
         );
+
+        let scoped = json!({
+            "op": "approve", "call_id": "call_9", "decision": "allow",
+            "scope": "project", "prefix": "npm install --save",
+        });
+        assert_eq!(
+            parse_approve_op(&scoped).unwrap().2,
+            ApproveOptions {
+                scope: Some(crate::approval::ApprovalScope::Project),
+                prefix: Some("npm install --save".to_string()),
+                ..ApproveOptions::default()
+            }
+        );
+        let told = json!({
+            "op": "approve", "call_id": "call_9", "decision": "deny",
+            "feedback": "Use pnpm instead.",
+        });
+        assert_eq!(
+            parse_approve_op(&told).unwrap().2.feedback.as_deref(),
+            Some("Use pnpm instead.")
+        );
+        let bad =
+            json!({ "op": "approve", "call_id": "c", "decision": "allow", "scope": "forever" });
+        assert!(parse_approve_op(&bad)
+            .unwrap_err()
+            .contains("unknown scope"));
     }
 
     #[test]

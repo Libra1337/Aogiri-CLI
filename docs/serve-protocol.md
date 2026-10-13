@@ -204,24 +204,47 @@ stop those too. No-op when idle.
 ### `approve`
 
 ```json
-{"op":"approve","call_id":"call_9","decision":"allow","always":false,"hunks":["f0h1"]}
+{"op":"approve","call_id":"call_9","decision":"allow","scope":"session","prefix":"npm install"}
+{"op":"approve","call_id":"call_9","decision":"allow","hunks":["f0h1"]}
+{"op":"approve","call_id":"call_9","decision":"deny","feedback":"Use pnpm instead."}
 ```
 
 Structured answer to an `approval_request` event; equivalent to the
-`/approve` slash command.
+`/approve` slash command (`/approve <call-id> <allow|deny>
+[once|session|project|always] [--hunks id1,id2]`).
 
 - `call_id` (required): the `call_id` from the request.
 - `decision` (required): `"allow"` or `"deny"`.
-- `always` (optional, default `false`): on allow, add the tool to the
-  per-session allowlist so it stops asking. A call that an `ask` command
-  rule stops, or a worktree agent leaving its sandbox, still asks every
-  time (`docs/sandbox.md`).
+- `scope` (optional, default `"once"`): how far an allow reaches; one of
+  the request's `scopes` (see "Approval requests"), else an error.
+  - `once`: this call only.
+  - `session`: for `edit` and `tool` requests, that tool stops asking for
+    the rest of the session. For a command, commands starting with
+    `prefix` run without asking for the rest of the session, also outside
+    the sandbox: it is an `allow` rule for the session. The shell is never
+    allowed as a whole tool.
+  - `project`: `prefix` is saved as an `allow` command rule in
+    `~/.lynshen/config.json`, under `projects[<workspace>].command_rules`,
+    or in the top-level `command_rules` when `always_allow_scope` is
+    `"global"` (`docs/sandbox.md` → "Settings"). It applies at once, and
+    to later sessions.
+- `prefix` (optional): the prefix to remember instead of the request's. It
+  must start with the request's `prefix`, word by word: it can only make
+  the rule narrower.
+- `always` (optional, older clients): the same as `scope: "session"`. On a
+  request whose `scopes` are only `["once"]` it allows the call once.
+- `feedback` (optional, with `deny`): the user's reason, given to the
+  model with the refusal as it is. A client that offers "run it in my
+  terminal" for `elevation: "terminal"` fills its terminal with the command
+  and denies with feedback such as "The user will run this command in
+  their own terminal; wait for them to tell you the result."
 - `hunks` (optional): for edit-tool requests that carried a `hunks` list,
   apply only these hunk ids. Omit or `null` for the whole call. Cannot be
-  combined with `always`.
+  combined with a `scope` beyond once or with `always`.
 
-Validation errors emit `error` and leave the request pending, so the client
-can retry with a corrected op.
+A request with `must_ask` asks every time: no scope and no mode switch
+approve the next one. Validation errors emit `error` and leave the request
+pending, so the client can retry with a corrected op.
 
 ### Approval requests
 

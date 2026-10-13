@@ -695,6 +695,81 @@ impl SandboxPolicy {
             rules: rules_from_json(&default_rules_json()).expect("default rules parse"),
         }
     }
+
+    /// This policy with `layer`'s directories and rules added.
+    pub fn with_layer(mut self, layer: &SandboxLayer) -> Self {
+        for dir in &layer.writable {
+            if !self.writable_dirs.contains(dir) {
+                self.writable_dirs.push(dir.clone());
+            }
+        }
+        for dir in &layer.readable {
+            if !self.readable_dirs.contains(dir) {
+                self.readable_dirs.push(dir.clone());
+            }
+        }
+        self.rules.extend(layer.rules.iter().cloned());
+        self
+    }
+}
+
+/// Directories and command rules a sandbox gets from one source: a
+/// project's settings (`projects` in config.json) or the session.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SandboxLayer {
+    pub writable: Vec<PathBuf>,
+    pub readable: Vec<PathBuf>,
+    pub rules: Vec<CommandRule>,
+}
+
+impl SandboxLayer {
+    /// `{"sandbox_directories": [...], "command_rules": [...]}`, as a
+    /// `projects` entry of config.json holds them. A directory that no
+    /// longer exists is dropped, and an invalid rule skipped.
+    pub fn from_json(value: &Value) -> Self {
+        let (writable, readable) =
+            directories_from_json(&value["sandbox_directories"], false).unwrap_or_default();
+        let rules = value["command_rules"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|rule| rules_from_json(&json!([rule])).ok())
+            .flatten()
+            .collect();
+        Self {
+            writable,
+            readable,
+            rules,
+        }
+    }
+
+    /// Adds an `allow` rule for `prefix`, or makes the rule with that
+    /// prefix one.
+    pub fn allow(&mut self, prefix: &str) {
+        match self.rules.iter_mut().find(|rule| rule.prefix == prefix) {
+            Some(rule) => rule.action = RuleAction::Allow,
+            None => self.rules.push(CommandRule {
+                prefix: prefix.to_string(),
+                action: RuleAction::Allow,
+            }),
+        }
+    }
+}
+
+/// Adds `{"prefix", "action": "allow"}` to a `command_rules` array, or makes
+/// the rule with that prefix an allow rule.
+pub fn allow_rule_json(rules: &mut Value, prefix: &str) {
+    if !rules.is_array() {
+        *rules = json!([]);
+    }
+    let list = rules.as_array_mut().expect("an array");
+    match list
+        .iter_mut()
+        .find(|rule| rule["prefix"].as_str().map(str::trim) == Some(prefix))
+    {
+        Some(rule) => rule["action"] = json!("allow"),
+        None => list.push(json!({ "prefix": prefix, "action": "allow" })),
+    }
 }
 
 pub fn default_rules_json() -> Value {

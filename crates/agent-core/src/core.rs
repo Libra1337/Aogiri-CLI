@@ -69,6 +69,47 @@ struct PendingApproval {
     info: crate::approval::ApprovalInfo,
 }
 
+/// What an `approve` asks besides allow or deny (see
+/// `AgentCore::approve_with`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ApproveOptions {
+    /// How far an allow reaches: one of the request's `scopes`. None: once,
+    /// or `session` with `always`.
+    pub scope: Option<crate::approval::ApprovalScope>,
+    /// The older "always allow": `session` where the request offers it,
+    /// once where it does not.
+    pub always: bool,
+    /// The prefix a session or project allow remembers instead of the
+    /// request's; it must start with the request's words.
+    pub prefix: Option<String>,
+    /// With deny: told to the model as the user's reason.
+    pub feedback: Option<String>,
+    /// With allow: only these hunks of an edit.
+    pub hunks: Option<Vec<String>>,
+}
+
+/// The sandbox an engine runs with, by where each part comes from. The
+/// tool state holds them merged (`merged`).
+#[derive(Debug, Clone, Default)]
+struct SandboxLayers {
+    /// config.json's sandbox, or a daemon agent's: the mode, network, and
+    /// the global directories and rules. None: no sandbox.
+    base: Option<crate::sandbox::SandboxPolicy>,
+    /// config.json's `projects` entry for this workspace, and the
+    /// directories the daemon adds for the project.
+    project: crate::sandbox::SandboxLayer,
+    /// Added in this session.
+    session: crate::sandbox::SandboxLayer,
+}
+
+impl SandboxLayers {
+    fn merged(&self) -> Option<crate::sandbox::SandboxPolicy> {
+        self.base
+            .clone()
+            .map(|base| base.with_layer(&self.project).with_layer(&self.session))
+    }
+}
+
 /// What an engine holds of its session only in memory (see
 /// `AgentCore::kept_state`): the approval and sandbox modes switched for the
 /// session, its "always allow" tools and action decisions, and its token and
@@ -77,6 +118,8 @@ struct PendingApproval {
 pub struct KeptState {
     approval_mode: Option<ApprovalMode>,
     sandbox_mode: Option<crate::sandbox::SandboxMode>,
+    /// Directories and command prefixes allowed for the session.
+    sandbox_session: crate::sandbox::SandboxLayer,
     approved_tools: HashSet<String>,
     action_decisions: HashMap<String, bool>,
     /// Input, cached input and output tokens, and cost.
@@ -252,6 +295,8 @@ pub struct AgentCore {
     hooks: Hooks,
     /// Files read and shells started by this engine (see `tools::ToolState`).
     tool_state: crate::tools::ToolState,
+    /// The sandbox by source; `tool_state` holds it merged.
+    sandbox: SandboxLayers,
     /// What the last assembled request carried besides the conversation
     /// (`messages` left 0): counted into auto-compaction and reported with
     /// the context gauge.
@@ -315,7 +360,15 @@ impl AgentCore {
             crate::log_error!("auth", "failed to load auth", error = error.to_string());
         })?;
         let tool_state = crate::tools::ToolState::default();
-        tool_state.set_sandbox(Some(config.sandbox.clone()));
+        let sandbox = SandboxLayers {
+            base: Some(config.sandbox.clone()),
+            project: config
+                .project_settings(&cwd)
+                .map(crate::sandbox::SandboxLayer::from_json)
+                .unwrap_or_default(),
+            session: Default::default(),
+        };
+        tool_state.set_sandbox(sandbox.merged());
         // Subagent worktrees left behind by earlier sessions, past their keep
         // time; git may take a moment, so off the startup path.
         let keep_days = config.agents.keep_worktrees_days;
@@ -379,6 +432,7 @@ impl AgentCore {
             project_trusted,
             hooks,
             tool_state,
+            sandbox,
             host: None,
             chat,
             plan: Vec::new(),
@@ -418,20 +472,31 @@ impl AgentCore {
     }
 
     /// Runs this engine's shell commands in `sandbox` and checks file writes
-    /// against it (None: no sandbox). Applies to the next tool call.
+    /// against it (None: no sandbox). Applies to the next tool call. The
+    /// project's and the session's directories and rules still apply.
     pub fn set_sandbox(&mut self, sandbox: Option<crate::sandbox::SandboxPolicy>) {
-        self.tool_state.set_sandbox(sandbox);
+        self.sandbox.base = sandbox;
+        self.apply_sandbox();
     }
 
     /// Counts `dirs` as workspace: file tools may write them, and sandboxed
-    /// commands too.
+    /// commands too. A host adds a project's directories this way.
     pub fn add_writable_dirs(&mut self, dirs: &[PathBuf]) {
-        let mut sandbox = self
-            .tool_state
-            .sandbox()
-            .unwrap_or_else(|| self.config.sandbox.clone());
-        sandbox.writable_dirs.extend_from_slice(dirs);
-        self.tool_state.set_sandbox(Some(sandbox));
+        if self.sandbox.base.is_none() {
+            self.sandbox.base = Some(self.config.sandbox.clone());
+        }
+        for dir in dirs {
+            if !self.sandbox.project.writable.contains(dir) {
+                self.sandbox.project.writable.push(dir.clone());
+            }
+        }
+        self.apply_sandbox();
+    }
+
+    /// Hands the merged sandbox to the tools; the running turn and its
+    /// subagents use it from their next call.
+    fn apply_sandbox(&self) {
+        self.tool_state.set_sandbox(self.sandbox.merged());
     }
 
     /// Adds host tools and prompt text; they apply from the next turn.
@@ -988,7 +1053,7 @@ impl AgentCore {
                 Some(id) => self.checkpoint_restore_events(id),
             },
             "/approve" => match parse_approve_args(args.trim()) {
-                Ok((call_id, allow, always, hunks)) => self.approve(&call_id, allow, always, hunks),
+                Ok((call_id, allow, options)) => self.approve_with(&call_id, allow, options),
                 Err(error) => vec![AgentEvent::Error(error)],
             },
             "/plan" => self.plan_command_events(args.trim()),
@@ -3001,8 +3066,11 @@ impl AgentCore {
                 .as_ref()
                 .and_then(|host| host.gate_of(&request.name));
             // "Always allow checkpoint" was given for a plain restore: a
-            // forced one is asked every time.
-            let allowlisted = gate != Some(crate::host::HostGate::Ask)
+            // forced one is asked every time. A shell tool is never allowed
+            // whole: a session allow remembers a command prefix instead.
+            let allowlisted = !request.info.kind.is_command()
+                && !request.info.kind.crosses_boundary()
+                && gate != Some(crate::host::HostGate::Ask)
                 && self.approved_tools.contains(&request.name)
                 && !crate::tools::is_forced_restore(&request.name, &request.arguments);
             if !request.info.must_ask
@@ -3162,7 +3230,8 @@ impl AgentCore {
     pub fn kept_state(&self) -> KeptState {
         KeptState {
             approval_mode: Some(self.approval_mode.get()),
-            sandbox_mode: self.tool_state.sandbox().map(|sandbox| sandbox.mode),
+            sandbox_mode: self.sandbox.base.as_ref().map(|sandbox| sandbox.mode),
+            sandbox_session: self.sandbox.session.clone(),
             approved_tools: self.approved_tools.clone(),
             action_decisions: self.action_decisions.clone(),
             totals: (
@@ -3180,13 +3249,13 @@ impl AgentCore {
             self.set_approval_mode(mode);
         }
         if let Some(mode) = kept.sandbox_mode {
-            let mut sandbox = self
-                .tool_state
-                .sandbox()
-                .unwrap_or_else(|| self.config.sandbox.clone());
-            sandbox.mode = mode;
-            self.tool_state.set_sandbox(Some(sandbox));
+            self.sandbox
+                .base
+                .get_or_insert_with(|| self.config.sandbox.clone())
+                .mode = mode;
         }
+        self.sandbox.session = kept.sandbox_session;
+        self.apply_sandbox();
         self.approved_tools.extend(kept.approved_tools);
         self.action_decisions.extend(kept.action_decisions);
         (
@@ -3423,7 +3492,11 @@ impl AgentCore {
                     if let Err(error) = policy.check_available() {
                         return vec![AgentEvent::Error(format!("sandbox unavailable: {error}"))];
                     }
-                    self.tool_state.set_sandbox(Some(policy.clone()));
+                    self.sandbox
+                        .base
+                        .get_or_insert_with(|| self.config.sandbox.clone())
+                        .mode = mode;
+                    self.apply_sandbox();
                 }
                 Err(error) => {
                     return vec![AgentEvent::Error(format!(
@@ -3614,9 +3687,9 @@ impl AgentCore {
     }
 
     /// Forward the client's allow/deny decision to the parked tool call. With
-    /// `always`, the tool is added to the per-session allowlist. `hunks`
-    /// restricts an allow to a subset of an edit call's hunk ids (also used by
-    /// the serve `approve` op). On a validation error the request stays
+    /// `always`, the call is allowed for the session as far as it may be
+    /// (see `approve_with`). `hunks` restricts an allow to a subset of an
+    /// edit call's hunk ids. On a validation error the request stays
     /// pending so the client can retry with a corrected command.
     pub fn approve(
         &mut self,
@@ -3625,17 +3698,101 @@ impl AgentCore {
         always: bool,
         hunks: Option<Vec<String>>,
     ) -> Vec<AgentEvent> {
+        self.approve_with(
+            call_id,
+            allow,
+            ApproveOptions {
+                always,
+                hunks,
+                ..ApproveOptions::default()
+            },
+        )
+    }
+
+    /// The `approve` op: forwards the decision, and with a `scope` beyond
+    /// once remembers it. `session` stops asking for the edit or tool in
+    /// this session, or for commands starting with the prefix; `project`
+    /// saves the prefix as an `allow` rule for the project (or every
+    /// project, per `always_allow_scope`). A deny's `feedback` reaches the
+    /// model. On a validation error the request stays pending.
+    pub fn approve_with(
+        &mut self,
+        call_id: &str,
+        allow: bool,
+        options: ApproveOptions,
+    ) -> Vec<AgentEvent> {
         match resolve_approval_decision(
             &mut self.pending_approvals,
             &mut self.approved_tools,
             call_id,
             allow,
-            always,
-            hunks,
+            &options,
         ) {
-            Ok(()) => Vec::new(),
+            Ok(Some((scope, prefix))) => self.remember_prefix(scope, &prefix),
+            Ok(None) => Vec::new(),
             Err(error) => vec![AgentEvent::Error(error)],
         }
+    }
+
+    /// Commands starting with `prefix` run without asking from now on: for
+    /// the session, or saved as an `allow` rule for the project (globally
+    /// with `always_allow_scope: "global"`).
+    fn remember_prefix(
+        &mut self,
+        scope: crate::approval::ApprovalScope,
+        prefix: &str,
+    ) -> Vec<AgentEvent> {
+        use crate::approval::ApprovalScope;
+        if scope == ApprovalScope::Session {
+            self.sandbox.session.allow(prefix);
+            self.apply_sandbox();
+            return vec![AgentEvent::Info(format!(
+                "commands starting with `{prefix}` run without asking for the rest of this session"
+            ))];
+        }
+        let global = crate::config::always_allow_global(self.config.path());
+        let cwd = self.cwd.clone();
+        let saved = crate::config::edit_config_json(self.config.path(), |config| {
+            let rules = if global {
+                config
+                    .entry("command_rules")
+                    .or_insert_with(|| crate::sandbox::default_rules_json())
+            } else {
+                crate::config::project_entry_mut(config, &cwd)
+                    .entry("command_rules")
+                    .or_insert_with(|| json!([]))
+            };
+            crate::sandbox::allow_rule_json(rules, prefix);
+            Ok(())
+        });
+        if let Err(error) = saved {
+            // It still applies to this session.
+            self.sandbox.session.allow(prefix);
+            self.apply_sandbox();
+            return vec![AgentEvent::Error(format!(
+                "could not save the rule for `{prefix}` ({error}); it applies to this session only"
+            ))];
+        }
+        if global {
+            let base = self
+                .sandbox
+                .base
+                .get_or_insert_with(|| self.config.sandbox.clone());
+            let mut layer = crate::sandbox::SandboxLayer {
+                rules: std::mem::take(&mut base.rules),
+                ..Default::default()
+            };
+            layer.allow(prefix);
+            base.rules = layer.rules;
+        } else {
+            self.sandbox.project.allow(prefix);
+        }
+        self.apply_sandbox();
+        vec![AgentEvent::Info(format!(
+            "commands starting with `{prefix}` run without asking in {}: saved as an allow rule in {}",
+            if global { "every project" } else { "this project" },
+            self.config.path().display()
+        ))]
     }
 
     fn poll_goal_tool_requests(&mut self) -> Vec<AgentEvent> {
@@ -5636,14 +5793,16 @@ fn format_resume_detail(summary: &SessionSummary) -> String {
     }
 }
 
-const APPROVE_USAGE: &str = "usage: /approve <call-id> <allow|deny> [always] [--hunks id1,id2]";
+const APPROVE_USAGE: &str =
+    "usage: /approve <call-id> <allow|deny> [once|session|always|project] [--hunks id1,id2]";
 
-/// `(call_id, allow, always, hunks)` parsed from an approval command.
-type ParsedApprove = (String, bool, bool, Option<Vec<String>>);
+/// `(call_id, allow, options)` parsed from an approval command.
+type ParsedApprove = (String, bool, ApproveOptions);
 
-/// Parses `/approve <call-id> <allow|deny> [always|once] [--hunks id1,id2]`.
-/// `always` allowlists the tool for the session and is incompatible with
-/// `--hunks`; `--hunks` requires `allow`.
+/// Parses `/approve <call-id> <allow|deny> [once|session|always|project]
+/// [--hunks id1,id2]`. `always` is the older `session` (see
+/// `ApproveOptions::always`); a scope is incompatible with `--hunks`, and
+/// `--hunks` requires `allow`.
 fn parse_approve_args(args: &str) -> Result<ParsedApprove, String> {
     let mut parts = args.split_whitespace();
     let call_id = parts
@@ -5656,10 +5815,13 @@ fn parse_approve_args(args: &str) -> Result<ParsedApprove, String> {
         _ => return Err(APPROVE_USAGE.to_string()),
     };
     let mut always = false;
+    let mut scope = None;
     let mut hunks = None;
     while let Some(token) = parts.next() {
         match token {
             "always" => always = true,
+            "session" => scope = Some(crate::approval::ApprovalScope::Session),
+            "project" => scope = Some(crate::approval::ApprovalScope::Project),
             // The TUI picker submits "allow once" for a one-shot allow.
             "once" => {}
             "--hunks" => {
@@ -5675,7 +5837,7 @@ fn parse_approve_args(args: &str) -> Result<ParsedApprove, String> {
         }
     }
     if hunks.is_some() {
-        if always {
+        if always || scope.is_some() {
             return Err(
                 "--hunks cannot be combined with always; approve the whole call to allowlist the tool"
                     .to_string(),
@@ -5687,7 +5849,16 @@ fn parse_approve_args(args: &str) -> Result<ParsedApprove, String> {
             );
         }
     }
-    Ok((call_id, allow, always, hunks))
+    Ok((
+        call_id,
+        allow,
+        ApproveOptions {
+            scope,
+            always,
+            hunks,
+            ..ApproveOptions::default()
+        },
+    ))
 }
 
 fn parse_hunk_id_list(list: &str) -> Result<Vec<String>, String> {
@@ -5722,20 +5893,27 @@ fn requires_approval(
 
 /// Validates and forwards an approval decision to the parked tool call.
 /// Errors leave the request pending (nothing is removed or sent), so a typo
-/// in a hunk id never denies or approves the call as a side effect.
+/// in a hunk id never denies or approves the call as a side effect. An
+/// edit or tool allowed for the session joins `approved_tools`; a command
+/// allowed beyond once returns the scope and prefix to remember.
 fn resolve_approval_decision(
     pending_approvals: &mut HashMap<String, PendingApproval>,
     approved_tools: &mut HashSet<String>,
     call_id: &str,
     allow: bool,
-    always: bool,
-    hunks: Option<Vec<String>>,
-) -> Result<(), String> {
+    options: &ApproveOptions,
+) -> Result<Option<(crate::approval::ApprovalScope, String)>, String> {
+    use crate::approval::ApprovalScope;
     let pending = pending_approvals
         .get(call_id)
         .ok_or_else(|| "no pending approval for that call".to_string())?;
-    if let Some(requested) = &hunks {
-        if always {
+    let requested_scope = options.scope.unwrap_or(if options.always {
+        ApprovalScope::Session
+    } else {
+        ApprovalScope::Once
+    });
+    if let Some(requested) = &options.hunks {
+        if requested_scope != ApprovalScope::Once {
             return Err(
                 "--hunks cannot be combined with always; approve the whole call to allowlist the tool"
                     .to_string(),
@@ -5763,13 +5941,54 @@ fn resolve_approval_decision(
             }
         }
     }
+    // An explicit scope must be one the request offers; the older
+    // `always` falls back to once where session is not offered.
+    let scope = if !allow || pending.info.allows(requested_scope) {
+        requested_scope
+    } else if options.scope.is_none() {
+        ApprovalScope::Once
+    } else {
+        return Err(format!(
+            "call {call_id} can be allowed only {}",
+            pending
+                .info
+                .scopes
+                .iter()
+                .map(|scope| scope.as_str())
+                .collect::<Vec<_>>()
+                .join(" or ")
+        ));
+    };
+    let remember = if allow && scope != ApprovalScope::Once && pending.info.kind.is_command() {
+        let offered = pending
+            .info
+            .prefix
+            .clone()
+            .ok_or_else(|| format!("call {call_id} has no command prefix to remember"))?;
+        let prefix = match &options.prefix {
+            Some(prefix) => {
+                let words: Vec<&str> = prefix.split_whitespace().collect();
+                let offered_words: Vec<&str> = offered.split_whitespace().collect();
+                if !words.starts_with(&offered_words) {
+                    return Err(format!(
+                        "prefix `{prefix}` must start with `{offered}`: it can only be narrower"
+                    ));
+                }
+                words.join(" ")
+            }
+            None => offered,
+        };
+        Some((scope, prefix))
+    } else {
+        None
+    };
     let pending = pending_approvals
         .remove(call_id)
         .expect("pending approval checked above");
-    if allow && always {
+    if allow && scope == ApprovalScope::Session && !pending.info.kind.is_command() {
         approved_tools.insert(pending.name);
     }
-    let approved_hunks = hunks.map(|ids| {
+    let approved_hunks = options.hunks.clone().map(|ids| {
         let mut seen = HashSet::new();
         ids.into_iter()
             .filter(|id| seen.insert(id.clone()))
@@ -5779,8 +5998,18 @@ fn resolve_approval_decision(
         allow,
         approved_hunks,
         deferred: None,
+        feedback: if allow {
+            None
+        } else {
+            options
+                .feedback
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        },
     });
-    Ok(())
+    Ok(remember)
 }
 
 /// Label and key-prompt flag for a catalog login flow, or None when LynShen
@@ -6056,7 +6285,14 @@ mod approval_decision_tests {
                 arguments: String::new(),
                 cwd: PathBuf::new(),
                 subagent_id: None,
-                info: crate::approval::ApprovalInfo::default(),
+                info: crate::approval::ApprovalInfo {
+                    kind: crate::approval::ApprovalKind::Edit,
+                    scopes: vec![
+                        crate::approval::ApprovalScope::Once,
+                        crate::approval::ApprovalScope::Session,
+                    ],
+                    ..Default::default()
+                },
             },
         );
         (map, response_rx)
@@ -6064,34 +6300,40 @@ mod approval_decision_tests {
 
     #[test]
     fn approve_parses_plain_allow_deny_always_and_hunks() {
+        let plain = ApproveOptions::default();
         assert_eq!(
             parse_approve_args("call_1 allow").unwrap(),
-            ("call_1".to_string(), true, false, None)
+            ("call_1".to_string(), true, plain.clone())
         );
         assert_eq!(
             parse_approve_args("call_1 allow once").unwrap(),
-            ("call_1".to_string(), true, false, None)
+            ("call_1".to_string(), true, plain.clone())
         );
         assert_eq!(
-            parse_approve_args("call_1 allow always").unwrap(),
-            ("call_1".to_string(), true, true, None)
+            parse_approve_args("call_1 allow always").unwrap().2,
+            ApproveOptions {
+                always: true,
+                ..ApproveOptions::default()
+            }
+        );
+        assert_eq!(
+            parse_approve_args("call_1 allow project").unwrap().2.scope,
+            Some(crate::approval::ApprovalScope::Project)
         );
         assert_eq!(
             parse_approve_args("call_1 deny").unwrap(),
-            ("call_1".to_string(), false, false, None)
+            ("call_1".to_string(), false, plain)
         );
         let with_hunks = parse_approve_args("call_1 allow --hunks f0h1,f0h3").unwrap();
         assert_eq!(
-            with_hunks,
-            (
-                "call_1".to_string(),
-                true,
-                false,
-                Some(vec!["f0h1".to_string(), "f0h3".to_string()])
-            )
+            with_hunks.2.hunks,
+            Some(vec!["f0h1".to_string(), "f0h3".to_string()])
         );
         assert_eq!(
-            parse_approve_args("call_1 allow --hunks=f1h2").unwrap().3,
+            parse_approve_args("call_1 allow --hunks=f1h2")
+                .unwrap()
+                .2
+                .hunks,
             Some(vec!["f1h2".to_string()])
         );
     }
@@ -6127,8 +6369,10 @@ mod approval_decision_tests {
             &mut approved_tools,
             "call_1",
             true,
-            false,
-            Some(vec!["f9h9".to_string()]),
+            &ApproveOptions {
+                hunks: Some(vec!["f9h9".to_string()]),
+                ..ApproveOptions::default()
+            },
         )
         .unwrap_err();
 
@@ -6151,12 +6395,14 @@ mod approval_decision_tests {
             &mut approved_tools,
             "call_1",
             true,
-            false,
-            Some(vec![
-                "f0h2".to_string(),
-                "f0h2".to_string(),
-                "f0h1".to_string(),
-            ]),
+            &ApproveOptions {
+                hunks: Some(vec![
+                    "f0h2".to_string(),
+                    "f0h2".to_string(),
+                    "f0h1".to_string(),
+                ]),
+                ..ApproveOptions::default()
+            },
         )
         .unwrap();
 
@@ -6180,8 +6426,10 @@ mod approval_decision_tests {
             &mut approved_tools,
             "call_1",
             true,
-            false,
-            Some(vec!["f0h1".to_string()]),
+            &ApproveOptions {
+                hunks: Some(vec!["f0h1".to_string()]),
+                ..ApproveOptions::default()
+            },
         )
         .unwrap_err();
 
@@ -6199,8 +6447,10 @@ mod approval_decision_tests {
             &mut approved_tools,
             "call_1",
             true,
-            true,
-            None,
+            &ApproveOptions {
+                always: true,
+                ..ApproveOptions::default()
+            },
         )
         .unwrap();
 

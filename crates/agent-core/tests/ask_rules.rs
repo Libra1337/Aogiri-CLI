@@ -133,8 +133,9 @@ fn always_allowing_bash_for_the_session_does_not_cover_an_ask_rule() {
     let dir = temp_dir("ask-always");
     let mut core = open(&dir, ApprovalMode::Manual);
 
-    // "Always allow" on an ordinary command: the next one runs unasked.
-    let events = run(&mut core, "printf one > one.txt");
+    // "Always allow" on an ordinary command: the next one that starts the
+    // same way runs unasked.
+    let events = run(&mut core, "printf two > one.txt");
     let (call_id, _) = approval(&events).expect("manual asks");
     core.approve(&call_id, true, true, None);
     pump(&mut core, is_ready);

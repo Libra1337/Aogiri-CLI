@@ -46,7 +46,7 @@ pub use config::{
     builtin_providers, lynshen_visible_models, models_for_provider, ApprovalMode, ModelConfig,
     SubagentModel,
 };
-pub use core::{title_completion, AgentCore, KeptState};
+pub use core::{title_completion, AgentCore, ApproveOptions, KeptState};
 pub use event::{
     AgentEvent, CommandView, ContextBreakdown, GoalView, LoginProviderView, McpServerView,
     McpToolView, ModelOptionView, PlanItem, SessionListItemView, TranscriptItem, TreeNodeView,

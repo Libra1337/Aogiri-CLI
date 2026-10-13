@@ -44,6 +44,27 @@ Command rules are checked first, by how the command starts:
 defaults let `git add` and `git commit` leave the sandbox and always ask
 before `git push`.
 
+### How far an approval reaches
+
+A client answers a request once, for the session, or for the project
+(`approve` with `scope`, `docs/serve-protocol.md`):
+
+- **session**: for a command, commands that start with the same words
+  (`npm install`, the first two words without `sudo`, `env` and similar
+  wrappers) run without asking for the rest of the session, inside or
+  outside the sandbox. For a file edit or another tool, that tool stops
+  asking. The shell is never allowed as a whole.
+- **project**: the prefix is saved as an `allow` rule for the project in
+  `~/.lynshen/config.json` (`projects`, see "Settings"), or for every
+  project with `always_allow_scope: "global"`. Nothing is written into the
+  repository.
+
+Only once, never for the session or the project: requests that must be
+asked, interpreters (`python`, `node`, `bash -c`, `powershell -Command`,
+...), deletes (`rm`, `Remove-Item`, ...), elevation (`sudo`, `runas`, ...),
+`git push --force`, and a command whose parts start differently
+(`make && npm test`).
+
 File tools (`write`, `edit`, `apply_patch`, …) check writes against the same
 rules in-process, and can read and write the configured directories.
 
@@ -82,9 +103,25 @@ In `~/.lynshen/config.json`:
     { "prefix": "git add", "action": "allow" },
     { "prefix": "git commit", "action": "allow" },
     { "prefix": "git push", "action": "ask" }
-  ]
+  ],
+  "always_allow_scope": "project",
+  "projects": {
+    "/Users/me/code/app": {
+      "sandbox_directories": [{ "path": "/Users/me/code/shared", "mode": "rw" }],
+      "command_rules": [{ "prefix": "npm install", "action": "allow" }]
+    }
+  }
 }
 ```
+
+- `projects`: settings for one workspace, keyed by its absolute path with
+  symlinks resolved (LynShen Desktop's project path). Its directories and
+  rules add to the top-level ones when an engine starts in that directory.
+- `always_allow_scope`: where a `project` approval saves its rule:
+  `"project"` (the default) or `"global"` (the top-level `command_rules`).
+
+The rules apply in this order: the top-level ones, the project's, then the
+session's; `forbid` wins over any other match, otherwise the longest prefix.
 
 `/sandbox` shows the current sandbox; `/sandbox <mode>` switches the mode for
 the current session.

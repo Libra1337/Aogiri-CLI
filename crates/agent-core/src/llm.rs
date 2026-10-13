@@ -264,6 +264,8 @@ pub struct ApprovalDecision {
     /// Set when no client was watching: the call was recorded as this
     /// deferred action id and must not run now.
     pub deferred: Option<String>,
+    /// With a deny: the user's reason, passed to the model as it is.
+    pub feedback: Option<String>,
 }
 
 impl ApprovalDecision {
@@ -272,6 +274,7 @@ impl ApprovalDecision {
             allow: true,
             approved_hunks: None,
             deferred: None,
+            feedback: None,
         }
     }
 
@@ -280,6 +283,7 @@ impl ApprovalDecision {
             allow: false,
             approved_hunks: None,
             deferred: None,
+            feedback: None,
         }
     }
 
@@ -287,6 +291,7 @@ impl ApprovalDecision {
         Self {
             allow: false,
             approved_hunks: None,
+            feedback: None,
             deferred: Some(id),
         }
     }
@@ -1081,7 +1086,7 @@ impl OpenAiClient {
                     })?;
                     let result = match &decision.deferred {
                         Some(id) => approval_deferred_result(id),
-                        None => approval_denied_result(),
+                        None => approval_denied_result(decision.feedback.as_deref()),
                     };
                     emit_tool_output(&request, &result, &mut emit)?;
                     blocked_results.push(ToolCallResult { request, result });
@@ -2778,7 +2783,9 @@ impl OpenAiClient {
         match sandbox.rule_for(command) {
             Some(RuleAction::Forbid) => SandboxGate::Forbid,
             Some(RuleAction::Ask) => SandboxGate::Ask,
-            Some(RuleAction::Allow) if escalated => SandboxGate::Run,
+            // An allow rule (a default one, or one an approval remembered):
+            // it runs without asking, out of the sandbox when escalated.
+            Some(RuleAction::Allow) => SandboxGate::Run,
             // A worktree agent leaves its sandbox only when a person says so.
             _ if escalated
                 && sandbox.is_sandboxed()
@@ -3823,10 +3830,18 @@ fn approval_deferred_result(id: &str) -> tools::ToolExecutionResult {
     }
 }
 
-fn approval_denied_result() -> tools::ToolExecutionResult {
-    let output = json!({
-        "error": "denied by user: the user declined to run this tool call. Do not retry it; ask how to proceed or try a different approach."
-    })
+/// A declined call's result. With the user's `feedback` the model gets it
+/// as their instruction.
+fn approval_denied_result(feedback: Option<&str>) -> tools::ToolExecutionResult {
+    let output = match feedback {
+        Some(feedback) => json!({
+            "error": "denied by user: the user declined to run this tool call and said what to do instead. Do not retry it as it was.",
+            "user_feedback": feedback,
+        }),
+        None => json!({
+            "error": "denied by user: the user declined to run this tool call. Do not retry it; ask how to proceed or try a different approach."
+        }),
+    }
     .to_string();
     tools::ToolExecutionResult {
         model_output: output.clone(),
@@ -6236,6 +6251,7 @@ mod tests {
                     allow: true,
                     approved_hunks: Some(vec!["f0h1".to_string()]),
                     deferred: None,
+                    feedback: None,
                 })
                 .unwrap();
         });
