@@ -206,6 +206,8 @@ they check paths themselves.
   asking, make the directory writable (`approve` with `add_dir`, or
   `add_directory`). The root, the home directory and the directories
   around it, credentials and LynShen's settings cannot be made writable.
+  `generate_image` names its files itself, so it asks for the directory
+  they go into, and creates new files only, right in it.
 - `apply_patch` changes files inside the workspace only.
 - Checkpoints and `/rewind` cover files inside the workspace only: a file
   written outside it is not restored, and the tool result says so.
