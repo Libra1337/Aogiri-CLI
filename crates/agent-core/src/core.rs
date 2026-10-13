@@ -3049,9 +3049,11 @@ impl AgentCore {
     /// subagents share the channel). Requests are auto-approved when the tool
     /// is allowlisted or the current approval mode no longer gates it (a mode
     /// loosened mid-run applies immediately), unless a person must decide
-    /// (an `ask` command rule, a worktree agent leaving its sandbox); the
-    /// rest surface an ApprovalRequest and park their responder until the
-    /// client decides.
+    /// (an `ask` command rule, the built-in list, a worktree agent leaving
+    /// its sandbox); the rest surface an ApprovalRequest and park their
+    /// responder until the client decides. A call that crosses the sandbox
+    /// or workspace boundary and runs unasked (approved here by the mode, or
+    /// already allowed by the worker: `ran_by`) is reported as `escalated`.
     fn poll_approval_requests(&mut self) -> Vec<AgentEvent> {
         let Some(rx) = self.approval_receiver.take() else {
             return Vec::new();

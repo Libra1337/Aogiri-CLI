@@ -2948,10 +2948,18 @@ impl OpenAiClient {
         let user_request = user_request
             .map(|text| text.chars().take(4_000).collect::<String>())
             .unwrap_or_default();
+        // A write's arguments carry the whole file: its start is enough to
+        // judge it, and keeps the call cheap.
+        let arguments = if request.arguments.len() > 4_000 {
+            let cut: String = request.arguments.chars().take(4_000).collect();
+            format!("{cut}… (cut)")
+        } else {
+            request.arguments.clone()
+        };
         let evidence = json!({
             "action": {
                 "tool": request.name,
-                "arguments": request.arguments,
+                "arguments": arguments,
                 "cwd": cwd,
             },
             "user_request": user_request,

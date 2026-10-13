@@ -107,6 +107,9 @@ Never runs:
 - deleting the root, the home directory, a drive root, or a directory
   that contains the workspace (`rm -rf ~`, `rm -rf /*`, `rmdir ..`).
 
+`--headless` denies every approval request, so it refuses the commands on
+the first list too, in `full-access` as well.
+
 These lists, like the rules, match the command's text. They catch a
 model's mistake, not a command written to get past them: an alias, a
 script, a variable (`rm -rf "$DIR"`), an encoded or generated command
