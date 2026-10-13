@@ -4,7 +4,7 @@
 //!
 //! The workspace, temp and the test's HOME are all inside the boundary, so
 //! the outside directory is one every user may write that is not temp:
-//! `/Users/Shared` on macOS, `/dev/shm` on Linux. Tests skip without one.
+//! `/Users/Shared` on macOS, `/dev/shm` on Linux.
 
 #[path = "support/fake_model.rs"]
 mod fake_model;
@@ -66,15 +66,15 @@ fn tool_output(events: &[AgentEvent]) -> String {
 struct Outside(PathBuf);
 
 impl Outside {
-    fn new(label: &str) -> Option<Self> {
+    fn new(label: &str) -> Self {
         let root = if cfg!(target_os = "macos") {
             Path::new("/Users/Shared")
         } else {
             Path::new("/dev/shm")
         };
         let dir = root.join(format!("lynshen-outside-{}-{label}", std::process::id()));
-        fs::create_dir_all(&dir).ok()?;
-        Some(Self(dir.canonicalize().ok()?))
+        fs::create_dir_all(&dir).expect("a writable directory outside temp");
+        Self(dir.canonicalize().unwrap())
     }
 }
 
@@ -120,9 +120,7 @@ fn call(core: &mut AgentCore, tool: &str, arguments: serde_json::Value) -> Vec<A
 fn a_write_outside_the_workspace_asks_and_runs_once_approved() {
     let _guard = setup();
     let _write = WriteTool::on();
-    let Some(outside) = Outside::new("ask") else {
-        return;
-    };
+    let outside = Outside::new("ask");
     let dir = temp_dir("outside-ask");
     let mut core = open(&dir, ApprovalMode::AutoEdit);
     fs::write(outside.0.join("notes.txt"), "outside notes").unwrap();
@@ -161,9 +159,7 @@ fn a_write_outside_the_workspace_asks_and_runs_once_approved() {
 fn full_access_writes_outside_the_workspace_and_reports_it() {
     let _guard = setup();
     let _write = WriteTool::on();
-    let Some(outside) = Outside::new("full") else {
-        return;
-    };
+    let outside = Outside::new("full");
     let dir = temp_dir("outside-full");
     let mut core = open(&dir, ApprovalMode::FullAccess);
     let target = outside.0.join("chart.svg");
@@ -220,9 +216,7 @@ fn config() -> serde_json::Value {
 fn an_approval_can_make_the_directory_writable() {
     let _guard = setup();
     let _write = WriteTool::on();
-    let Some(outside) = Outside::new("add-dir") else {
-        return;
-    };
+    let outside = Outside::new("add-dir");
     let dir = temp_dir("outside-add-dir");
     let mut core = open(&dir, ApprovalMode::AutoEdit);
     let path = outside.0.display().to_string();
@@ -274,9 +268,7 @@ fn an_approval_can_make_the_directory_writable() {
 fn directories_are_saved_for_the_project_or_every_project() {
     let _guard = setup();
     let _write = WriteTool::on();
-    let Some(outside) = Outside::new("persist") else {
-        return;
-    };
+    let outside = Outside::new("persist");
     let dir = temp_dir("outside-persist");
     let mut core = open(&dir, ApprovalMode::AutoEdit);
     let path = outside.0.display().to_string();
