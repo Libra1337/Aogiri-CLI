@@ -65,12 +65,30 @@ pub fn program_name(word: &str) -> String {
 /// shell (`bash -c "…"`).
 pub fn segments(command: &str) -> Vec<Segment> {
     let mut out = Vec::new();
-    collect_segments(command, false, 0, &mut out);
+    collect_segments(command, false, 0, false, &mut out);
+    // A backslash is an escape to a POSIX shell and a path separator to
+    // PowerShell (`Remove-Item "C:\Users\me\" -Recurse`). Read it both ways:
+    // neither reading may hide a part from the lists.
+    if command.contains('\\') {
+        let mut windows = Vec::new();
+        collect_segments(command, false, 0, true, &mut windows);
+        for part in windows {
+            if !out.contains(&part) {
+                out.push(part);
+            }
+        }
+    }
     out
 }
 
-fn collect_segments(command: &str, elevated: bool, depth: usize, out: &mut Vec<Segment>) {
-    for tokens in lex(command) {
+fn collect_segments(
+    command: &str,
+    elevated: bool,
+    depth: usize,
+    windows: bool,
+    out: &mut Vec<Segment>,
+) {
+    for tokens in lex(command, windows) {
         let mut raw = Vec::new();
         let mut redirects = Vec::new();
         let mut tokens = tokens.into_iter();
@@ -109,7 +127,7 @@ fn collect_segments(command: &str, elevated: bool, depth: usize, out: &mut Vec<S
                 // Pushed after its own segment, so callers see the shell first.
                 let mut inner = Vec::new();
                 if let Inline::Code(code) = code {
-                    collect_segments(code, nested_elevated, depth + 1, &mut inner);
+                    collect_segments(code, nested_elevated, depth + 1, windows, &mut inner);
                 }
                 out.push(segment);
                 out.extend(inner);
@@ -119,7 +137,7 @@ fn collect_segments(command: &str, elevated: bool, depth: usize, out: &mut Vec<S
         if let Some(code) = stripped.inner {
             out.push(segment);
             if depth < 4 {
-                collect_segments(&code, true, depth + 1, out);
+                collect_segments(&code, true, depth + 1, windows, out);
             }
             continue;
         }
@@ -131,7 +149,13 @@ fn collect_segments(command: &str, elevated: bool, depth: usize, out: &mut Vec<S
         if depth < 4 {
             for words in executed {
                 let mut inner = Vec::new();
-                collect_segments(&join_words(&words), nested_elevated, depth + 1, &mut inner);
+                collect_segments(
+                    &join_words(&words),
+                    nested_elevated,
+                    depth + 1,
+                    windows,
+                    &mut inner,
+                );
                 if inner.first().is_some_and(|first| !is_delete(first)) {
                     out.extend(inner);
                 }
@@ -205,8 +229,10 @@ enum Token {
     Redirect(String),
 }
 
-/// Splits a command line into the tokens of each simple command.
-fn lex(command: &str) -> Vec<Vec<Token>> {
+/// Splits a command line into the tokens of each simple command. With
+/// `windows`, a backslash in a word that is a Windows path is the path's,
+/// not an escape (see `segments`).
+fn lex(command: &str, windows: bool) -> Vec<Vec<Token>> {
     let chars: Vec<char> = command.chars().collect();
     let mut segments: Vec<Vec<Token>> = Vec::new();
     let mut current: Vec<Token> = Vec::new();
@@ -246,7 +272,7 @@ fn lex(command: &str) -> Vec<Vec<Token>> {
                 while i < chars.len() && chars[i] != '"' {
                     if chars[i] == '\\'
                         && matches!(at(i + 1), Some('"' | '\\' | '$' | '`'))
-                        && !is_windows_path(&word)
+                        && !(windows && is_windows_path(&word))
                     {
                         word.push(chars[i + 1]);
                         i += 2;
@@ -258,13 +284,13 @@ fn lex(command: &str) -> Vec<Vec<Token>> {
                 i += 1;
             }
             // A backslash escapes the shell's own characters; before any
-            // other character it is kept, so a Windows path stays whole. In
-            // a word that is a Windows path it is the path's (`C:\ -Recurse`
-            // in PowerShell, where `\` escapes nothing).
+            // other character it is kept, so a Windows path stays whole.
+            // Read the PowerShell way (`windows`), in a word that is a
+            // Windows path it is the path's (`C:\ -Recurse`).
             '\\' if matches!(
                 at(i + 1),
                 Some(' ' | '"' | '\'' | '\\' | ';' | '&' | '|' | '>' | '<' | '$' | '`' | '(' | ')')
-            ) && !is_windows_path(&word) =>
+            ) && !(windows && is_windows_path(&word)) =>
             {
                 word.push(chars[i + 1]);
                 in_word = true;
@@ -764,10 +790,21 @@ pub fn delete_targets(segment: &Segment) -> Vec<String> {
     let args = segment.args();
     let mut targets = Vec::new();
     if program == "find" {
-        // The starting points, before the first test or action; `.` when
-        // there are none.
+        // The starting points: after the options on symlinks and
+        // optimisation (`-L`, `-H`, `-P`, `-O3`, `-D tree`), before the
+        // first test or action; `.` when there are none.
+        let mut i = 0;
+        while let Some(arg) = args.get(i) {
+            match arg.as_str() {
+                "-H" | "-L" | "-P" => i += 1,
+                "-D" => i += 2,
+                _ if arg.starts_with("-O") => i += 1,
+                _ => break,
+            }
+        }
         targets.extend(
-            args.iter()
+            args[i.min(args.len())..]
+                .iter()
                 .take_while(|arg| !arg.starts_with('-') && *arg != "(" && *arg != "!")
                 .cloned(),
         );
@@ -1337,11 +1374,18 @@ mod tests {
         );
         let del = &segments(r"del /s /q C:\temp\x")[0];
         assert_eq!(delete_targets(del), strings(&[r"C:\temp\x"]));
-        // PowerShell: a backslash before a space ends the path.
-        let root = &segments(r"Remove-Item C:\ -Recurse -Force")[0];
-        assert_eq!(delete_targets(root), strings(&[r"C:\"]));
-        let quoted = &segments(r#"Remove-Item "C:\Users\me\" -Recurse"#)[0];
-        assert_eq!(delete_targets(quoted), strings(&[r"C:\Users\me\"]));
+        // PowerShell: a backslash before a space or a quote ends the path.
+        let targets = |command: &str| -> Vec<String> {
+            segments(command).iter().flat_map(delete_targets).collect()
+        };
+        assert!(targets(r"Remove-Item C:\ -Recurse -Force").contains(&r"C:\".to_string()));
+        assert!(targets(r#"Remove-Item "C:\Users\me\" -Recurse"#)
+            .contains(&r"C:\Users\me\".to_string()));
+        // Read the POSIX way too: an escaped quote does not hide what runs.
+        let parts = segments(r#"echo "C:\" ; echo "; rm -rf ~"#);
+        assert!(parts.iter().any(|part| part.program() == "rm"), "{parts:?}");
+        let parts = segments(r#"ls C:\" ; rm -rf ~"#);
+        assert!(parts.iter().any(|part| part.program() == "rm"), "{parts:?}");
         assert_eq!(
             write_targets(&segments("cp -r src ~/Desktop/out")[0]),
             strings(&["~/Desktop/out"])
@@ -1533,6 +1577,8 @@ mod tests {
         let delete = &segments("find ~ -name '*.log' -delete")[0];
         assert!(is_delete(delete));
         assert_eq!(delete_targets(delete), strings(&["~"]));
+        let follow = &segments("find -L -O2 ~ /srv -delete")[0];
+        assert_eq!(delete_targets(follow), strings(&["~", "/srv"]));
         let exec = segments("find /srv build -exec rm -rf {} +");
         assert!(is_delete(&exec[0]));
         assert_eq!(delete_targets(&exec[0]), strings(&["/srv", "build"]));
