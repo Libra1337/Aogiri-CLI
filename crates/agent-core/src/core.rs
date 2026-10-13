@@ -64,6 +64,9 @@ struct PendingApproval {
     arguments: String,
     cwd: PathBuf,
     subagent_id: Option<String>,
+    /// A person must decide (see `ApprovalRequest::must_ask`): a switch to
+    /// a looser mode does not approve it.
+    must_ask: bool,
 }
 
 /// What an engine holds of its session only in memory (see
@@ -2975,8 +2978,10 @@ impl AgentCore {
     /// Drain pending tool-approval requests from the worker (main agent and
     /// subagents share the channel). Requests are auto-approved when the tool
     /// is allowlisted or the current approval mode no longer gates it (a mode
-    /// loosened mid-run applies immediately); the rest surface an
-    /// ApprovalRequest and park their responder until the client decides.
+    /// loosened mid-run applies immediately), unless a person must decide
+    /// (an `ask` command rule, a worktree agent leaving its sandbox); the
+    /// rest surface an ApprovalRequest and park their responder until the
+    /// client decides.
     fn poll_approval_requests(&mut self) -> Vec<AgentEvent> {
         let Some(rx) = self.approval_receiver.take() else {
             return Vec::new();
@@ -3000,13 +3005,14 @@ impl AgentCore {
             let allowlisted = gate != Some(crate::host::HostGate::Ask)
                 && self.approved_tools.contains(&request.name)
                 && !crate::tools::is_forced_restore(&request.name, &request.arguments);
-            if allowlisted
-                || !requires_approval(
-                    self.approval_mode.get(),
-                    gate,
-                    &request.name,
-                    &request.arguments,
-                )
+            if !request.must_ask
+                && (allowlisted
+                    || !requires_approval(
+                        self.approval_mode.get(),
+                        gate,
+                        &request.name,
+                        &request.arguments,
+                    ))
             {
                 let _ = request.response_tx.send(ApprovalDecision::allow_all());
                 continue;
@@ -3046,6 +3052,7 @@ impl AgentCore {
                     arguments: request.arguments,
                     cwd: request.cwd,
                     subagent_id: request.subagent_id,
+                    must_ask: request.must_ask,
                 },
             );
         }
@@ -3371,14 +3378,16 @@ impl AgentCore {
     /// `set_approval_mode` op and the `--approval-mode` flag).
     pub fn set_approval_mode(&mut self, mode: ApprovalMode) -> Vec<AgentEvent> {
         self.approval_mode.set(mode);
-        // Calls parked for a decision the new mode no longer needs run now.
+        // Calls parked for a decision the new mode no longer needs run now;
+        // one a person must decide keeps waiting.
         let host = self.host.as_ref();
         let freed: Vec<String> = self
             .pending_approvals
             .iter()
             .filter(|(_, pending)| {
                 let gate = host.and_then(|host| host.gate_of(&pending.name));
-                !requires_approval(mode, gate, &pending.name, &pending.arguments)
+                !pending.must_ask
+                    && !requires_approval(mode, gate, &pending.name, &pending.arguments)
             })
             .map(|(call, _)| call.clone())
             .collect();
@@ -6040,6 +6049,7 @@ mod approval_decision_tests {
                 arguments: String::new(),
                 cwd: PathBuf::new(),
                 subagent_id: None,
+                must_ask: false,
             },
         );
         (map, response_rx)
