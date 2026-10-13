@@ -2936,12 +2936,18 @@ impl ToolState {
         }
     }
 
-    /// Whether this call may write `path` outside the workspace.
+    /// Whether this call may write `path` outside the workspace: an
+    /// approved file, or a new file right in an approved directory (where
+    /// `generate_image` saves the images it names itself).
     fn may_write_outside(&self, path: &Path) -> bool {
         let path = normalize_for_policy(path);
-        self.outside_writes
-            .as_ref()
-            .is_some_and(|paths| paths.contains(&path))
+        self.outside_writes.as_ref().is_some_and(|paths| {
+            paths.contains(&path)
+                || path
+                    .parent()
+                    .is_some_and(|parent| paths.iter().any(|dir| dir == parent && dir.is_dir()))
+                    && !path.exists()
+        })
     }
 
     pub fn set_web(&self, web: Option<crate::web::WebTools>) {
@@ -4615,7 +4621,12 @@ pub(crate) fn outside_write_target(
     }
     let args = serde_json::from_str::<Value>(arguments).ok()?;
     let path = args.get("path").and_then(Value::as_str)?;
-    let resolved = resolve_path(cwd, path);
+    let mut resolved = resolve_path(cwd, path);
+    // generate_image names its files (`fox.png`, `fox-2.png`, a timestamp
+    // in a directory): what it asks for is the directory they go into.
+    if name == crate::images::TOOL_NAME && !(path.ends_with(['/', '\\']) || resolved.is_dir()) {
+        resolved = resolved.parent()?.to_path_buf();
+    }
     let inside = ensure_in_workspace(cwd, &resolved).is_ok()
         || sandbox.is_some_and(|sandbox| sandbox.within_boundary(cwd, &resolved));
     (!inside || is_guarded_write(&resolved)).then(|| normalize_for_policy(&resolved))
@@ -6943,6 +6954,63 @@ mod tests {
         // `..` inside a not-yet-existing prefix must not escape either.
         assert!(workspace_path(&dir, "missing/../../escape.txt").is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn an_approved_image_directory_takes_the_images_named_in_it() {
+        let pid = std::process::id();
+        let workspace = env::temp_dir().join(format!("lynshen-image-out-ws-{pid}"));
+        let outside = PathBuf::from(if cfg!(target_os = "macos") {
+            "/Users/Shared"
+        } else {
+            "/dev/shm"
+        })
+        .join(format!("lynshen-image-out-{pid}"));
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let outside = outside.canonicalize().unwrap();
+        // The approval names the directory the images go into.
+        let base = outside.join("fox").display().to_string();
+        let args = json!({ "prompt": "a fox", "path": base }).to_string();
+        let target =
+            outside_write_target(crate::images::TOOL_NAME, &args, &workspace, None).unwrap();
+        assert_eq!(target, outside);
+        let state = test_state().allowing_writes(vec![target]);
+        for name in ["fox.png", "fox-2.png"] {
+            assert!(write_target(
+                &workspace,
+                &outside.join(name).display().to_string(),
+                &state
+            )
+            .is_ok());
+        }
+        // Not an existing file there, nor anything deeper or elsewhere.
+        fs::write(outside.join("old.png"), "x").unwrap();
+        assert!(write_target(
+            &workspace,
+            &outside.join("old.png").display().to_string(),
+            &state
+        )
+        .is_err());
+        assert!(write_target(
+            &workspace,
+            &outside.join("sub/x.png").display().to_string(),
+            &state
+        )
+        .is_err());
+        // A file tool's approval is for its file only.
+        let notes = outside.join("notes.md");
+        let state = test_state().allowing_writes(vec![notes.clone()]);
+        assert!(write_target(&workspace, &notes.display().to_string(), &state).is_ok());
+        assert!(write_target(
+            &workspace,
+            &outside.join("other.md").display().to_string(),
+            &state
+        )
+        .is_err());
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&workspace);
     }
 
     #[cfg(not(windows))]
