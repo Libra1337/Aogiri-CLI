@@ -213,7 +213,9 @@ Structured answer to an `approval_request` event; equivalent to the
 - `call_id` (required): the `call_id` from the request.
 - `decision` (required): `"allow"` or `"deny"`.
 - `always` (optional, default `false`): on allow, add the tool to the
-  per-session allowlist so it stops asking.
+  per-session allowlist so it stops asking. A call that an `ask` command
+  rule stops, or a worktree agent leaving its sandbox, still asks every
+  time (`docs/sandbox.md`).
 - `hunks` (optional): for edit-tool requests that carried a `hunks` list,
   apply only these hunk ids. Omit or `null` for the whole call. Cannot be
   combined with `always`.
@@ -229,7 +231,10 @@ can retry with a corrected op.
 
 `mode` is `manual`, `plan`, `auto-edit`, `auto`, or `full-access`. Emits
 `status:"approval mode: ..."` and an `approval_mode` event. The change
-applies to new turns; an in-flight turn's gating can only loosen.
+applies to new turns; an in-flight turn's gating can only loosen. A call
+waiting for approval that the new mode does not gate runs at once, except
+one that an `ask` command rule stops or a worktree agent leaving its
+sandbox: that one still waits for `approve`.
 
 `plan` is plan mode: only read-only tools run (reads, listing, search,
 web search/fetch, read-only shell commands, MCP tools marked

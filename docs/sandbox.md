@@ -35,7 +35,9 @@ model, `manual` and `auto-edit` ask you, `full-access` runs it.
 Command rules are checked first, by how the command starts:
 
 - `forbid`: never runs;
-- `ask`: always asks you;
+- `ask`: always asks you, in every approval mode (`full-access` too). "Always
+  allow" for the session does not cover it, and a switch to a looser mode
+  does not approve a call that waits;
 - `allow`: may leave the sandbox without asking.
 
 `forbid` wins over other matches, otherwise the longest prefix applies. The
@@ -56,8 +58,8 @@ A subagent that works in its own git worktree (`isolation: "worktree"`, the
   read-write directories are read-only for it, even where they lie in temp.
   The worktree's `.git` file and its real git directory stay read-only.
 - Leaving the sandbox (`escalate: true`) always asks you, whatever the
-  approval mode, unless an `allow` command rule matches (`git commit` by
-  default).
+  approval mode or "always allow", unless an `allow` command rule matches
+  (`git commit` by default).
 - Its file tools write only inside the worktree.
 
 With the sandbox off (`full-access`, Windows) only the first and last points

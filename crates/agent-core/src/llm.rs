@@ -220,7 +220,9 @@ pub struct GoalToolRequest {
 enum SandboxGate {
     /// Runs without approval (inside the sandbox, or an allowed escalation).
     Run,
-    /// Always asks a person.
+    /// Always asks a person, whatever the approval mode or the session's
+    /// "always allow": an `ask` command rule, or a worktree agent leaving
+    /// its sandbox.
     Ask,
     /// Never runs.
     Forbid,
@@ -244,6 +246,10 @@ pub struct ApprovalRequest {
     /// Hunk breakdown for edit tools, computed before anything is applied so
     /// the client can approve a subset. None means whole-call decisions only.
     pub hunks: Option<Vec<HunkView>>,
+    /// A person must decide (`SandboxGate::Ask`): the core never approves
+    /// it by the approval mode, the session's "always allow" or a switch
+    /// to a looser mode.
+    pub must_ask: bool,
     pub response_tx: Sender<ApprovalDecision>,
 }
 
@@ -1064,7 +1070,7 @@ impl OpenAiClient {
                 let decision = if classified_allow {
                     ApprovalDecision::allow_all()
                 } else {
-                    self.request_approval(&request, cwd)
+                    self.request_approval(&request, cwd, gate == SandboxGate::Ask)
                 };
                 if !decision.allow {
                     emit(StreamEvent::ToolStart {
@@ -2779,10 +2785,11 @@ impl OpenAiClient {
                 SandboxGate::Ask
             }
             // Inside the sandbox a command needs no approval; only the
-            // strictest mode still asks for every command.
+            // strictest mode still asks for every command, as a mode does:
+            // a switch to a looser mode or "always allow" lets it run.
             _ if sandbox.is_sandboxed() && !escalated => {
                 if self.approval_mode.get() == ApprovalMode::Manual {
-                    SandboxGate::Ask
+                    SandboxGate::Mode
                 } else {
                     SandboxGate::Run
                 }
@@ -2940,8 +2947,13 @@ impl OpenAiClient {
     /// Blocks until the core forwards the user's decision. A dropped channel
     /// (interrupt / no handler) is treated as a denial so the worker unblocks.
     /// Edit tool calls carry their hunk breakdown so the decision may approve
-    /// only a subset of the change.
-    fn request_approval(&self, request: &ToolCallRequest, cwd: &Path) -> ApprovalDecision {
+    /// only a subset of the change. `must_ask`: see `ApprovalRequest`.
+    fn request_approval(
+        &self,
+        request: &ToolCallRequest,
+        cwd: &Path,
+        must_ask: bool,
+    ) -> ApprovalDecision {
         let Some(tx) = &self.approval_tx else {
             return ApprovalDecision::allow_all();
         };
@@ -2972,6 +2984,7 @@ impl OpenAiClient {
                 cwd: cwd.to_path_buf(),
                 subagent_id: (self.agent_depth > 0).then(|| self.agent_path.clone()),
                 hunks: hunks::plan_edit_hunks(&request.name, &request.arguments, cwd),
+                must_ask,
                 response_tx,
             })
             .is_err()
@@ -5594,6 +5607,53 @@ mod tests {
     }
 
     #[test]
+    fn an_ask_rule_asks_in_every_mode_and_manual_asks_as_a_mode() {
+        let (tx, _rx) = mpsc::channel();
+        let client = approval_test_client(ApprovalMode::FullAccess, Some(tx));
+        client
+            .tool_state
+            .set_sandbox(Some(crate::sandbox::SandboxPolicy {
+                mode: crate::sandbox::SandboxMode::WorkspaceWrite,
+                ..crate::sandbox::SandboxPolicy::default_for_platform()
+            }));
+        let bash = |command: &str| ToolCallRequest {
+            call_id: "c".to_string(),
+            name: "bash".to_string(),
+            arguments: json!({ "command": command }).to_string(),
+        };
+        // The default rules ask before git push, escalated or not.
+        let escalated_push = ToolCallRequest {
+            arguments: json!({ "command": "git push", "escalate": true }).to_string(),
+            ..bash("git push")
+        };
+        for mode in [
+            ApprovalMode::Manual,
+            ApprovalMode::AutoEdit,
+            ApprovalMode::Auto,
+            ApprovalMode::FullAccess,
+        ] {
+            client.approval_mode.set(mode);
+            assert_eq!(
+                client.sandbox_gate(&bash("git push origin main")),
+                SandboxGate::Ask,
+                "{mode:?}"
+            );
+            assert_eq!(
+                client.sandbox_gate(&escalated_push),
+                SandboxGate::Ask,
+                "{mode:?}"
+            );
+        }
+        // Manual mode asks for a command inside the sandbox by the mode, so
+        // the session's "always allow" and a mode switch still cover it.
+        client.approval_mode.set(ApprovalMode::Manual);
+        assert_eq!(client.sandbox_gate(&bash("cargo test")), SandboxGate::Mode);
+        assert!(client.call_needs_approval(&bash("cargo test")));
+        client.approval_mode.set(ApprovalMode::AutoEdit);
+        assert_eq!(client.sandbox_gate(&bash("cargo test")), SandboxGate::Run);
+    }
+
+    #[test]
     fn a_stopped_agents_conversation_drops_calls_without_results() {
         let items = vec![
             json!({ "role": "user", "content": "task" }),
@@ -5931,6 +5991,7 @@ mod tests {
                 arguments: json!({ "command": "rm -rf build" }).to_string(),
             },
             Path::new("."),
+            false,
         );
         assert!(decision.allow);
         assert!(decision.approved_hunks.is_none());
@@ -5956,6 +6017,7 @@ mod tests {
                 arguments: json!({ "path": "a.txt" }).to_string(),
             },
             Path::new("."),
+            false,
         );
         assert!(!decision.allow);
         responder.join().unwrap();
@@ -5997,6 +6059,7 @@ mod tests {
                 arguments: json!({ "path": "a.txt", "content": "new\n" }).to_string(),
             },
             &dir,
+            false,
         );
         assert!(decision.allow);
         assert_eq!(decision.approved_hunks, Some(vec!["f0h1".to_string()]));
