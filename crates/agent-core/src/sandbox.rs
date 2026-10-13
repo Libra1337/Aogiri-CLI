@@ -633,37 +633,38 @@ impl SandboxPolicy {
         } else {
             format!(" Read-only: {}.", list(&self.readable_dirs))
         };
-        let escalate = "The approval mode decides whether it runs at once or after the user approves; either way the user sees it.";
+        let escalate =
+            "with `escalate: true` and a one-line `justification`; it may need approval.";
         let (tag, shell) = if !self.is_sandboxed() {
             (
                 format!("<sandbox mode=\"{}\">", self.mode.as_str()),
-                "There is no sandbox: shell commands run with the user's permissions and can write anywhere. The approval mode decides whether a command runs at once or after the user approves.".to_string(),
+                "No sandbox: commands run with the user's permissions.".to_string(),
             )
         } else if !self.enforced() {
             (
                 format!("<sandbox mode=\"{}\" enforced=\"false\">", self.mode.as_str()),
                 format!(
-                    "This platform has no OS sandbox: shell commands run with the user's permissions. Treat the working directory{extra}, temp and package-cache directories as your boundary.{read_only} A command that writes outside it, installs software or changes system settings must be run with `escalate: true` and a one-line `justification`. {escalate}"
+                    "No OS sandbox on this platform: commands run with the user's permissions. Your boundary is the working directory{extra}, temp and package caches.{read_only} Run a command that writes outside it, installs software or changes settings {escalate}"
                 ),
             )
         } else {
             let writable = match self.mode {
                 SandboxMode::ReadOnly => "Nothing is writable.".to_string(),
                 _ => format!(
-                    "Writable: the working directory{extra}, temp and package-cache directories; .git, .lynshen and .agents inside them are read-only."
+                    "Writable: the working directory{extra}, temp and package caches; .git, .lynshen and .agents in them are read-only."
                 ),
             };
             (
                 format!("<sandbox mode=\"{}\">", self.mode.as_str()),
                 format!(
-                    "Shell commands run in an OS sandbox. {writable}{read_only} Network is {}. Credentials such as ~/.ssh are unreadable. A command that needs more (committing to git, installing software, writing elsewhere{}) runs outside the sandbox with `escalate: true` and a one-line `justification`. {escalate} A command that fails with \"Operation not permitted\" or \"Read-only file system\" was probably stopped by the sandbox: run it again with escalate.",
+                    "Commands run in an OS sandbox. {writable}{read_only} Network is {}; credentials such as ~/.ssh are unreadable. For more (git commit, installing software, writing elsewhere{}), run the command {escalate}",
                     if self.network { "on" } else { "off" },
-                    if self.network { "" } else { ", network access" },
+                    if self.network { "" } else { ", network" },
                 ),
             )
         };
         format!(
-            "{tag}\n{shell}\nFile tools read anywhere except credentials. Writing a file outside the working directory and the writable directories needs the user's approval (in full-access approval mode it runs at once and the user sees it); checkpoints do not cover such a file. These always ask the user, in every mode: sudo and other elevation, git push, deleting files outside the workspace, changing system settings (services, registry, firewall), touching credentials. Deleting the root, the home directory or a parent of the workspace never runs.\n</sandbox>"
+            "{tag}\n{shell}\nFile tools read anywhere but credentials; writing outside the writable directories may need approval. Always asked, in every mode: sudo, git push, deleting outside the workspace, system settings, credentials.\n</sandbox>"
         )
     }
 }
@@ -1098,10 +1099,9 @@ mod tests {
             );
             assert!(prompt.contains("/srv/shared"), "{prompt}");
             assert!(prompt.contains("escalate: true"), "{prompt}");
-            assert!(prompt.contains("Operation not permitted"), "{prompt}");
         } else {
             assert!(prompt.contains("enforced=\"false\""), "{prompt}");
-            assert!(prompt.contains("no OS sandbox"), "{prompt}");
+            assert!(prompt.contains("No OS sandbox"), "{prompt}");
         }
         let full = SandboxPolicy {
             mode: SandboxMode::FullAccess,
@@ -1109,11 +1109,11 @@ mod tests {
         }
         .prompt();
         assert!(full.starts_with("<sandbox mode=\"full-access\">"), "{full}");
-        assert!(full.contains("There is no sandbox"), "{full}");
+        assert!(full.contains("No sandbox"), "{full}");
         // Every mode says what file tools may do and what always asks.
         for prompt in [&prompt, &full] {
-            assert!(prompt.contains("File tools read anywhere except credentials"));
-            assert!(prompt.contains("sudo and other elevation, git push"));
+            assert!(prompt.contains("File tools read anywhere but credentials"));
+            assert!(prompt.contains("Always asked, in every mode: sudo, git push"));
             assert!(prompt.ends_with("</sandbox>"));
         }
     }
