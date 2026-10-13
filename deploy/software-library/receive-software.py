@@ -25,10 +25,13 @@ import tempfile
 
 # Same key as MANIFEST_PUBLIC_KEY in crates/agent-core/src/update.rs.
 PUBLIC_KEY = 'rNaDD3lDFhpKdEGDOZdTHGBW9uEoQJ5jaQeTYrhz0tQ='
-PRODUCTS = ('cli',)
+# `skills` is the skills mirror (deploy/skills-mirror): a catalog and one
+# archive per skill, so a release may hold many files.
+PRODUCTS = ('cli', 'skills')
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
 VERSION = re.compile(r'\d+\.\d+\.\d+')
 MAX_BYTES = 1024**3
+MAX_ENTRIES = 1024
 
 
 def verify(manifest):
@@ -60,7 +63,7 @@ def receive(stream, root, product):
                 parts = PurePosixPath(name).parts
                 if (not parts or len(parts) > 2 or PurePosixPath(name).is_absolute()
                         or any(not NAME.fullmatch(part) for part in parts)
-                        or name in names or len(names) >= 64):
+                        or name in names or len(names) >= MAX_ENTRIES):
                     raise ValueError('Invalid archive path or entry count')
                 names.add(name)
                 if member.isdir():

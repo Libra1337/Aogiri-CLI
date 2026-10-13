@@ -1,13 +1,17 @@
 //! Skills for the desktop: the marketplace (github.com/anthropics/skills and
 //! community skill repositories in one catalog, installed into the personal
-//! skills directory of the session's engine) and the skills on this computer
+//! skills directory of the session's engine; see `skill_market` for how the
+//! community sources are cached and read) and the skills on this computer
 //! (listed with their switches and load problems, switched, created and
 //! deleted).
 
-use crate::engines;
-use lynshen_agent_core::skills::{self, SkillInventory, SkillScope};
+use crate::{engines, skill_market};
+use lynshen_agent_core::skills::{self, mirror, SkillInventory, SkillScope};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 pub fn handle(name: &str, op: &Value) -> Result<Value, String> {
     let backend = op["backend"].as_str().unwrap_or("lynshen");
@@ -23,7 +27,7 @@ pub fn handle(name: &str, op: &Value) -> Result<Value, String> {
         .map(Path::new)
         .filter(|cwd| cwd.is_absolute());
     match name {
-        "skills_catalog" => catalog(install_dir(backend)?),
+        "skills_catalog" => catalog(install_dir(backend)?, op),
         "skill_install" => install(install_dir(backend)?, text("source")?, text("skill")?)
             .map(|path| json!({ "type": "skill_installed", "path": path })),
         "skills_list" => list(backend, cwd),
@@ -188,64 +192,40 @@ fn uninstall(backend: &str, cwd: Option<&Path>, dir: &Path) -> Result<(), String
     skills::delete_skill(personal, dir).map_err(|error| error.to_string())
 }
 
-/// The community repositories, fetched at most once an hour: listing one
-/// reads every SKILL.md it has.
-fn community_sources() -> Vec<(String, Result<skills::SkillSource, String>)> {
-    use std::sync::Mutex;
-    use std::time::{Duration, Instant};
-    type Cached = (Instant, Result<skills::SkillSource, String>);
-    static CACHE: Mutex<Vec<(String, Cached)>> = Mutex::new(Vec::new());
-    const FRESH: Duration = Duration::from_secs(3600);
-    // `LYNSHEN_SKILL_SOURCES="Name=https://github.com/o/r;…"` replaces the
-    // list (empty: none, as the tests run offline).
-    let configured: Vec<(String, String)> = match std::env::var("LYNSHEN_SKILL_SOURCES") {
-        Ok(list) => list
-            .split(';')
-            .filter_map(|item| item.split_once('='))
-            .map(|(name, repository)| (name.trim().to_string(), repository.trim().to_string()))
-            .collect(),
-        Err(_) => skills::COMMUNITY_SKILL_SOURCES
-            .iter()
-            .map(|(name, repository)| (name.to_string(), repository.to_string()))
-            .collect(),
-    };
-    configured
-        .iter()
-        .map(|(name, repository)| {
-            let cached = CACHE.lock().ok().and_then(|cache| {
-                cache
-                    .iter()
-                    .find(|(repo, (at, result))| {
-                        repo == repository && (result.is_ok() && at.elapsed() < FRESH)
-                    })
-                    .map(|(_, (_, result))| result.clone())
-            });
-            let result = cached.unwrap_or_else(|| {
-                let result = skills::fetch_github_source(name, repository);
-                if let Ok(mut cache) = CACHE.lock() {
-                    cache.retain(|(repo, _)| repo != repository);
-                    cache.push((repository.clone(), (Instant::now(), result.clone())));
-                }
-                result
-            });
-            (name.clone(), result)
-        })
-        .collect()
-}
-
 /// A catalog entry's `source`: `anthropic`, or a community repository's
 /// `owner/repo`.
 fn source_key(repository: &str) -> String {
     repository
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
         .trim_start_matches("https://github.com/")
         .to_string()
 }
 
-/// Anthropic's catalog is bundled; a community repository that cannot be read
-/// is only a warning.
-fn catalog(dir: PathBuf) -> Result<Value, String> {
+/// How long `wait: true` waits for a refresh: the mirror's short timeouts
+/// plus GitHub's tree and SKILL.md reads.
+const WAIT_LIMIT: Duration = Duration::from_secs(60);
+
+/// Anthropic's bundled index and the community sources as cached, at once.
+/// A source that is missing or old is read again in the background
+/// (`refreshing`); `refresh: true` reads every source again now, and
+/// `wait: true` answers once that refresh has ended. A source that cannot be
+/// read is a warning of its own, beside the skills it had.
+fn catalog(dir: PathBuf, op: &Value) -> Result<Value, String> {
+    let configured = skill_market::configured();
+    let mut cached = skill_market::read();
+    let all = op["refresh"] == true;
+    if !configured.is_empty()
+        && (all || skill_market::due(&cached, &configured, skill_market::now_ms()))
+    {
+        skill_market::start_refresh(configured.clone(), all);
+    }
+    if op["wait"] == true {
+        skill_market::wait_refresh(WAIT_LIMIT);
+        cached = skill_market::read();
+    }
     let mut entries = Vec::new();
-    let mut warnings = Vec::new();
     let mut add = |source: &skills::SkillSource, key: &str, shown: &str| {
         entries.extend(source.skills.iter().map(|skill| {
             json!({
@@ -264,11 +244,30 @@ fn catalog(dir: PathBuf) -> Result<Value, String> {
         }))
     };
     add(&skills::anthropic_source()?, "anthropic", "Anthropic");
-    for (name, result) in community_sources() {
-        match result {
-            Ok(source) => add(&source, &source_key(&source.repository), &source.name),
-            Err(error) => warnings.push(format!("{name}: {error}")),
+    let mut sources = vec![json!({
+        "key": "anthropic",
+        "name": "Anthropic",
+        "origin": "bundled",
+        "fetchedAt": null,
+        "error": null,
+    })];
+    let mut warnings = Vec::new();
+    for (name, repository) in &configured {
+        let key = source_key(repository);
+        let entry = skill_market::find(&cached, repository);
+        if let Some(entry) = entry {
+            add(&entry.source, &key, name);
+            if let Some(error) = &entry.error {
+                warnings.push(format!("{name}: {error}"));
+            }
         }
+        sources.push(json!({
+            "key": key,
+            "name": name,
+            "origin": entry.and_then(|entry| entry.origin.clone()),
+            "fetchedAt": entry.and_then(|entry| entry.fetched_at),
+            "error": entry.and_then(|entry| entry.error.clone()),
+        }));
     }
     let key = |entry: &Value| {
         (
@@ -282,21 +281,42 @@ fn catalog(dir: PathBuf) -> Result<Value, String> {
         "type": "skills_catalog",
         "skills": entries,
         "warnings": warnings,
+        "sources": sources,
+        "refreshing": skill_market::refreshing(),
         "installDir": dir,
     }))
 }
 
 /// The skill is looked up again here rather than trusting anything the
-/// client sent beyond its source and id. Anthropic's source-available skills
-/// are listed but not installed, as in the TUI's `/skills`.
+/// client sent beyond its source and id: in the bundled index, or in a
+/// configured community source as cached (read first when the cache has
+/// none). Anthropic's source-available skills are listed but not installed,
+/// as in the TUI's `/skills`. The LynShen mirror's checked archive comes
+/// first; GitHub is the fallback.
 fn install(dir: PathBuf, source: &str, id: &str) -> Result<PathBuf, String> {
     let found = if source == "anthropic" {
         skills::anthropic_source()?
     } else {
-        community_sources()
-            .into_iter()
-            .find_map(|(_, result)| result.ok().filter(|s| source_key(&s.repository) == source))
-            .ok_or_else(|| format!("unknown skill source: {source}"))?
+        let configured = skill_market::configured();
+        let repository = configured
+            .iter()
+            .map(|(_, repository)| repository.clone())
+            .find(|repository| source_key(repository) == source)
+            .ok_or_else(|| format!("unknown skill source: {source}"))?;
+        let cached_source = || {
+            let cached = skill_market::read();
+            skill_market::find(&cached, &repository)
+                .filter(|entry| !entry.source.skills.is_empty())
+                .map(|entry| entry.source.clone())
+        };
+        match cached_source() {
+            Some(found) => found,
+            None => {
+                skill_market::start_refresh(configured, false);
+                skill_market::wait_refresh(WAIT_LIMIT);
+                cached_source().ok_or_else(|| format!("cannot read skill source {source}"))?
+            }
+        }
     };
     let skill = found
         .skills
@@ -309,5 +329,19 @@ fn install(dir: PathBuf, source: &str, id: &str) -> Result<PathBuf, String> {
             skill.license
         ));
     }
-    skills::install_source_skill(&dir, &found, skill).map_err(|error| error.to_string())
+    let mut mirror_error = None;
+    if let Some(url) = mirror::mirror_url() {
+        let installed = mirror::fetch_mirror(&url).and_then(|published| {
+            mirror::install_from_mirror(&published, &dir, &found.repository, id)
+                .map_err(|error| error.to_string())
+        });
+        match installed {
+            Ok(path) => return Ok(path),
+            Err(error) => mirror_error = Some(error),
+        }
+    }
+    skills::install_source_skill(&dir, &found, skill).map_err(|error| match mirror_error {
+        Some(mirror_failed) => format!("{error} (LynShen mirror: {mirror_failed})"),
+        None => error.to_string(),
+    })
 }

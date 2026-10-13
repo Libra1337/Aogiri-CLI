@@ -2651,8 +2651,10 @@ fn only_the_desktop_starts_acp_agents_which_run_like_any_session() {
 #[test]
 fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
     let _guard = setup();
-    // No community repositories: the catalog is Anthropic's bundled index, offline.
+    // No community repositories and no mirror: the catalog is Anthropic's
+    // bundled index, offline.
     std::env::set_var("LYNSHEN_SKILL_SOURCES", "");
+    std::env::set_var("LYNSHEN_SKILLS_MIRROR", "");
     let home = PathBuf::from(std::env::var_os("HOME").unwrap());
     let daemon = start_daemon();
     let mut desktop = Client::connect(&daemon);
@@ -2673,6 +2675,9 @@ fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
     assert_eq!(catalog["type"], "skills_catalog", "{catalog}");
     // The LynShen marketplace is gone: nothing asks for it, nothing warns.
     assert_eq!(catalog["warnings"], json!([]));
+    assert_eq!(catalog["refreshing"], false);
+    assert_eq!(catalog["sources"][0]["key"], "anthropic");
+    assert_eq!(catalog["sources"].as_array().unwrap().len(), 1);
     assert!(catalog["skills"]
         .as_array()
         .unwrap()
@@ -2724,6 +2729,184 @@ fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
         );
         assert_eq!(refused["type"], "error", "{refused}");
     }
+}
+
+/// Restores environment variables when a test ends, however it ends.
+struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl EnvRestore {
+    fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect();
+        for (name, value) in vars {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        for (name, value) in &self.0 {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+#[test]
+fn the_skill_catalog_answers_from_its_cache_while_unreachable_sources_refresh() {
+    let _guard = setup();
+    // GitHub through a proxy that hangs up on every request after a moment:
+    // each fails soon, offline, and only if the proxy is used at all.
+    let refused = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(400));
+                    drop(stream);
+                });
+            }
+        });
+        address
+    };
+    let _env = EnvRestore::set(&[
+        (
+            "LYNSHEN_SKILL_SOURCES",
+            Some(
+                "Cached=https://github.com/example/cached;Broken=https://github.com/example/broken",
+            ),
+        ),
+        ("LYNSHEN_SKILLS_MIRROR", Some("")),
+        ("https_proxy", Some(&refused)),
+        ("HTTPS_PROXY", Some(&refused)),
+        ("no_proxy", None),
+        ("NO_PROXY", None),
+    ]);
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let cache = home.join(".lynshen/cache/skills-catalog.json");
+    fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    fs::write(
+        &cache,
+        json!({ "version": 1, "sources": [{
+            "name": "Cached", "repository": "https://github.com/example/cached",
+            "revision": "", "dir": "skills", "origin": "mirror",
+            "fetchedAt": now - 1000, "checkedAt": now - 1000, "error": null,
+            "skills": [{ "id": "demo", "name": "Demo", "description": "From the cache",
+                         "tags": [], "license": "MIT", "redistributable": true }]
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    let daemon = start_daemon();
+    let mut desktop = Client::connect(&daemon);
+    let source = |catalog: &Value, key: &str| {
+        catalog["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["key"] == key)
+            .unwrap_or_else(|| panic!("{key} in {catalog}"))
+            .clone()
+    };
+    let has = |catalog: &Value, key: &str, id: &str| {
+        catalog["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|skill| skill["source"] == key && skill["id"] == id)
+    };
+
+    // At once: Anthropic and the cached source, while the missing one is read.
+    let started = Instant::now();
+    let catalog = request(
+        &mut desktop,
+        json!({ "op": "skills_catalog", "backend": "lynshen" }),
+    );
+    assert!(started.elapsed() < Duration::from_secs(2), "{catalog}");
+    assert!(has(&catalog, "anthropic", "frontend-design"), "{catalog}");
+    assert!(has(&catalog, "example/cached", "demo"), "{catalog}");
+    assert_eq!(source(&catalog, "example/cached")["origin"], "mirror");
+    assert_eq!(source(&catalog, "example/cached")["fetchedAt"], now - 1000);
+    assert_eq!(source(&catalog, "example/broken")["fetchedAt"], Value::Null);
+    assert_eq!(catalog["refreshing"], true, "{catalog}");
+
+    // The refresh ends with a warning of the broken source's own.
+    let catalog = request(
+        &mut desktop,
+        json!({ "op": "skills_catalog", "backend": "lynshen", "wait": true }),
+    );
+    assert_eq!(catalog["refreshing"], false, "{catalog}");
+    let broken = source(&catalog, "example/broken");
+    assert!(
+        broken["error"].as_str().unwrap().contains("api.github.com"),
+        "{catalog}"
+    );
+    assert_eq!(source(&catalog, "example/cached")["error"], Value::Null);
+    assert_eq!(
+        catalog["warnings"].as_array().unwrap().len(),
+        1,
+        "{catalog}"
+    );
+    assert!(catalog["warnings"][0]
+        .as_str()
+        .unwrap()
+        .starts_with("Broken: "));
+    assert!(has(&catalog, "example/cached", "demo"));
+
+    // A failure is not tried again on every open.
+    let catalog = request(
+        &mut desktop,
+        json!({ "op": "skills_catalog", "backend": "lynshen" }),
+    );
+    assert_eq!(catalog["refreshing"], false, "{catalog}");
+
+    // Refreshing reads every source again; one that fails keeps its skills.
+    let catalog = request(
+        &mut desktop,
+        json!({ "op": "skills_catalog", "backend": "lynshen", "refresh": true, "wait": true }),
+    );
+    let cached = source(&catalog, "example/cached");
+    assert!(cached["error"].as_str().is_some(), "{catalog}");
+    assert_eq!(cached["fetchedAt"], now - 1000);
+    assert!(has(&catalog, "example/cached", "demo"), "{catalog}");
+    assert_eq!(
+        catalog["warnings"].as_array().unwrap().len(),
+        2,
+        "{catalog}"
+    );
+
+    // Installing from it fails quickly with a reason, and installs nothing.
+    let started = Instant::now();
+    let failed = request(
+        &mut desktop,
+        json!({ "op": "skill_install", "source": "example/cached", "skill": "demo" }),
+    );
+    assert_eq!(failed["type"], "error", "{failed}");
+    assert!(started.elapsed() < Duration::from_secs(30), "{failed}");
+    assert!(!home.join(".lynshen/skills/demo").exists());
+    let unknown = request(
+        &mut desktop,
+        json!({ "op": "skill_install", "source": "example/cached", "skill": "other" }),
+    );
+    assert!(
+        unknown["message"].as_str().unwrap().contains("not found"),
+        "{unknown}"
+    );
+    let _ = fs::remove_file(&cache);
 }
 
 /// The skill commands a new LynShen session in `cwd` offers. Its engine may

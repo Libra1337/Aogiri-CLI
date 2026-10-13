@@ -89,11 +89,17 @@ classification and the upstream changes since the previous commit, then run the 
 
 ## Desktop marketplace
 
-LynShen Desktop shows the LynShen marketplace and the Anthropic index in one catalog through the
-daemon's `skills_catalog` and `skill_install` ops (see `docs/daemon-protocol.md`), which use the
-same install code as `/skills`. The session's engine picks the directory: Claude Code sessions
-install into `~/.claude/skills`, all others into `~/.lynshen/skills`. A marketplace failure only
-adds a warning; the Anthropic catalog stays installable.
+Aogiri (the desktop) shows the Anthropic index and community skill
+repositories (`COMMUNITY_SKILL_SOURCES` in `crates/agent-core/src/skills.rs`)
+in one catalog through the daemon's `skills_catalog` and `skill_install` ops
+(see `docs/daemon-protocol.md`). The catalog opens at once from the bundled
+index and a cache of the community sources; the daemon reads them again in the
+background. It reads the LynShen mirror first (`deploy/skills-mirror`, served
+from software.lynshen.org, so computers in China need no GitHub), and GitHub
+for what the mirror does not have. A source that cannot be read is a warning
+of its own and keeps its cached skills. The session's engine picks the
+directory: Claude Code sessions install into `~/.claude/skills`, all others
+into `~/.lynshen/skills`.
 
 Desktop lists the source-available Anthropic document skills the same way: shown with their
 license and repository link, not installed (the daemon's `skill_install` refuses them).

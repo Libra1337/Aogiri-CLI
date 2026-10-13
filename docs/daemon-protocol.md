@@ -181,8 +181,8 @@ every connected client.
 | `item_reopen` | `kind`, `item` | `item_reopened` with `item`; puts a closed item back among the open ones and takes its session out of the archive |
 | `report_list` | optional `limit` (50) | `reports`, newest first, with `read` |
 | `report_read` | `report` | `report_read` |
-| `skills_catalog` | optional `backend` (`lynshen`, default, or `claude`) | `skills_catalog` with `skills: [{id, name, description, tags, source, isDefault, installed, license, redistributable, homepage}]`, `warnings` and `installDir` (local clients only). See "Skills" |
-| `skill_install` | `source` (`lynshen` or `anthropic`), `skill` (its `id` in the catalog), optional `backend` | `skill_installed` with `path` (local clients only) |
+| `skills_catalog` | optional `backend` (`lynshen`, default, or `claude`), optional `refresh` and `wait` (booleans) | `skills_catalog` with `skills: [{id, name, description, tags, source, sourceName, isDefault, installed, license, redistributable, homepage}]`, `sources: [{key, name, origin, fetchedAt, error}]`, `refreshing`, `warnings` and `installDir` (local clients only). See "Skills" |
+| `skill_install` | `source` (`anthropic` or a community source's `owner/repo`), `skill` (its `id` in the catalog), optional `backend` | `skill_installed` with `path` (local clients only) |
 | `skills_list` | optional `backend` (`lynshen`, default, or `claude`), optional `cwd` (an absolute project folder) | `skills_list` with `skills: [{name, description, path, scope, enabled, toggleable, removable}]`, `problems: [{level, kind, path, message}]`, `dirs: [{scope, path}]` and `projectTrusted` (local clients only). See "Skills" |
 | `skill_set_enabled` | `path` (a listed skill's folder), `enabled`, optional `cwd` | the new `skills_list` (local clients only, `lynshen` only) |
 | `skill_uninstall` | `path` (a listed skill's folder) or `skill` (a catalog `id`), optional `backend` | `skill_uninstalled` with `path` (local clients only) |
@@ -209,22 +209,42 @@ followed) before the check.
 
 ## Skills
 
-`skills_catalog` lists the LynShen marketplace (`/v1/skills/marketplace` on
-the configured LynShen API, with the LynShen login's token when there is one)
-and the bundled index of github.com/anthropics/skills. When the marketplace
-cannot be reached its error is one of `warnings` and only the Anthropic
-skills are listed. `source` is `lynshen` or `anthropic`; `redistributable` is
-false for Anthropic's source-available document skills, which `skill_install`
-refuses.
+`skills_catalog` answers at once with the bundled index of
+github.com/anthropics/skills and the community repositories as last read.
+`source` is `anthropic` or a community repository's `owner/repo`;
+`redistributable` is false for Anthropic's source-available document skills,
+which `skill_install` refuses.
+
+The community sources are cached in `~/.lynshen/cache/skills-catalog.json`.
+`sources` has one entry per source, Anthropic first: `origin` is `bundled`,
+`mirror` (the LynShen mirror on software.lynshen.org) or `github`;
+`fetchedAt` is when its skills were read (ms since the epoch, null when never)
+and `error` why the last read failed (null when it worked). A source that
+fails keeps the skills it had. When a source was never read, was read over an
+hour ago, or failed over ten minutes ago, the daemon reads it again in the
+background and `refreshing` is true. `refresh: true` reads every source again;
+`wait: true` answers once the refresh has ended (at most a minute later).
+`warnings` repeats each source's error as `<name>: <error>` for older
+desktops.
+
+A refresh reads the mirror's signed catalog first (5 s to connect, 10 s in
+all) and GitHub (8 s to connect, 20 s per request) only for the sources the
+mirror does not have. Requests go through the proxy that `HTTPS_PROXY`,
+`HTTP_PROXY` or `ALL_PROXY` names (not SOCKS), as web_fetch does;
+`NO_PROXY` applies. `LYNSHEN_SKILLS_MIRROR` replaces the mirror's
+`latest.json` URL (empty: no mirror) and `LYNSHEN_SKILL_SOURCES`
+(`Name=https://github.com/o/r;…`) the community list.
 
 `backend` picks the directory: `claude` installs into `~/.claude/skills`,
 anything else into `~/.lynshen/skills`. `installed` means
 `<installDir>/<id>/SKILL.md` exists. `skill_install` looks the skill up again
-in its source, then downloads it: a LynShen skill's inline content or
-checksummed package, or an Anthropic skill's whole directory at the index's
-pinned commit. The new install replaces an old one only once complete. Both
-ops are refused for paired devices: an installed skill is instructions and
-scripts that later sessions run.
+in its source (the bundled index or the cache), then installs the mirror's
+archive of it, checked against the sha256 in the mirror's signed manifest.
+Without one (or without the mirror) it downloads the skill's whole directory
+from GitHub, at the source's pinned commit when it has one. The new install
+replaces an old one only once complete. Both ops are refused for paired
+devices: an installed skill is instructions and scripts that later sessions
+run.
 
 `skills_list` lists the skills an engine finds, switched on or off. For
 `lynshen` they come from `~/.lynshen/skills` (`scope: "user"`),

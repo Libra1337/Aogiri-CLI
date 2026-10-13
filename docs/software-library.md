@@ -6,6 +6,8 @@ CLI updates from it; nothing else is needed on the server.
 ```
 /cli/latest.json            signed manifest of the newest release (never cached)
 /cli/<version>/<file>       release files (immutable)
+/skills/latest.json         the skills mirror's signed manifest (see below)
+/skills/<version>/<file>    catalog.json and one archive per skill
 ```
 
 ## Manifest
@@ -77,3 +79,47 @@ than the published one. Published versions cannot change. Then it switches
    `restrict,command="/usr/bin/python3 /usr/local/lib/lynshen/receive-software.py /srv/software" ssh-ed25519 …`
 6. Add `deploy/software-library/Caddyfile` to Caddy and reload it. Caddy gets
    the certificate itself once DNS points at the server.
+
+## Skills mirror
+
+The `skills` product mirrors the desktop marketplace's skills
+(`skills_catalog` in docs/daemon-protocol.md), so computers that cannot reach
+GitHub list and install them from here. The engine reads
+`/skills/latest.json` first (5 s to connect, 10 s in all), checks its
+signature with the same built-in key as CLI updates and the sha256 of every
+file it uses, and falls back to GitHub when the mirror fails or lacks a skill.
+
+`deploy/skills-mirror/build.py build <dir>` writes:
+
+- `catalog.json`: `{"format": 1, "sources": [...]}`, one source per
+  marketplace repository (`name`, `repository`, `revision` (the commit it was
+  read at), `dir`, `skills`), each skill with `id`, `name`, `description`,
+  `tags`, `license`, `redistributable` and, when the mirror carries it,
+  `archive`.
+- `<owner>_<repo>__<id>.tar.gz` (`anthropic__<id>.tar.gz` for Anthropic):
+  `<id>/` with the skill's files, plus the repository's top-level LICENSE and
+  NOTICE files when the skill folder has none of its own. The same commit
+  packs to the same bytes.
+
+Anthropic's skills are read at the commit the bundled index pins, and only
+the ones it marks redistributable are packed. A community skill is packed
+only with a license (its own or its repository's); without one it is listed
+and the engine installs it from GitHub. The community list is
+`deploy/skills-mirror/sources.json`, which a test keeps equal to
+`COMMUNITY_SKILL_SOURCES`.
+
+`deploy/skills-mirror/publish.sh` builds the mirror, compares every file's
+sha256 with the published manifest, and publishes only when something
+changed, as version `<UTC date>.<UTC hour and minute>.0` through
+`deploy/software-library/publish.sh skills …`. Run it where the signing key
+lives (the release machine), never on the server:
+
+```sh
+SOFTWARE_SIGNING_KEY=~/.lynshen-release/software-signing.key \
+SOFTWARE_SSH=software@40.160.141.21 \
+deploy/skills-mirror/publish.sh
+```
+
+The server's `receive-software.py` accepts the `skills` product and up to
+1024 entries per release. Old versions stay until removed by hand; keep the
+newest few.

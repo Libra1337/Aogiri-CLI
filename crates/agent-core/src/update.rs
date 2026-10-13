@@ -20,8 +20,9 @@ const SOFTWARE_URL: &str = "https://software.lynshen.org/cli/latest.json";
 /// Where people download the CLI by hand.
 const DOWNLOAD_PAGE: &str = "https://www.lynshen.org/download";
 /// Ed25519 key that signs `latest.json`. Its private half signs releases
-/// offline; a manifest under any other key is refused.
-const MANIFEST_PUBLIC_KEY: &str = "rNaDD3lDFhpKdEGDOZdTHGBW9uEoQJ5jaQeTYrhz0tQ=";
+/// offline; a manifest under any other key is refused. The skills mirror
+/// (`skills::mirror`) is a product of the same library, under the same key.
+pub(crate) const MANIFEST_PUBLIC_KEY: &str = "rNaDD3lDFhpKdEGDOZdTHGBW9uEoQJ5jaQeTYrhz0tQ=";
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
@@ -157,6 +158,17 @@ fn parse_signed_release(
     manifest_url: &str,
     public_key: &str,
 ) -> Result<Release, String> {
+    let release = verified_release(manifest, public_key, "cli")?;
+    parse_release(&release, manifest_dir(manifest_url))
+}
+
+/// The release a library manifest signs, once its signature verifies under
+/// `public_key` and it names `product`.
+pub(crate) fn verified_release(
+    manifest: &str,
+    public_key: &str,
+    product: &str,
+) -> Result<Value, String> {
     let envelope: Value = serde_json::from_str(manifest).map_err(|error| error.to_string())?;
     let signed = envelope["release"]
         .as_str()
@@ -175,13 +187,17 @@ fn parse_signed_release(
     key.verify(signed.as_bytes(), &signature)
         .map_err(|_| "manifest signature does not verify".to_string())?;
     let release: Value = serde_json::from_str(signed).map_err(|error| error.to_string())?;
-    if release["product"] != "cli" {
-        return Err("manifest is not for the CLI".to_string());
+    if release["product"] != product {
+        return Err(format!("manifest is not for {product}"));
     }
-    let base = manifest_url
+    Ok(release)
+}
+
+/// The directory a manifest's files are named relative to.
+pub(crate) fn manifest_dir(manifest_url: &str) -> &str {
+    manifest_url
         .rsplit_once('/')
-        .map_or(manifest_url, |(dir, _)| dir);
-    parse_release(&release, base)
+        .map_or(manifest_url, |(dir, _)| dir)
 }
 
 fn text(value: &Value) -> &str {
@@ -190,7 +206,7 @@ fn text(value: &Value) -> &str {
 
 /// The signed release: a version and one entry per platform binary, each
 /// with its sha256. Files live in `<base>/<version>/`; names cannot leave it.
-fn parse_release(value: &Value, base: &str) -> Result<Release, String> {
+pub(crate) fn parse_release(value: &Value, base: &str) -> Result<Release, String> {
     let version = text(&value["version"]).to_string();
     if Version::parse(&version).is_err() {
         return Err("manifest has no valid version".to_string());

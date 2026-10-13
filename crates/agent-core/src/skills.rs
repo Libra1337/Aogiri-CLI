@@ -10,6 +10,8 @@ use std::{
 use tar::Archive;
 use zip::ZipArchive;
 
+pub mod mirror;
+
 /// Limit for one download: a package, a single skill file.
 const MAX_PACKAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_TREE_BYTES: usize = 4 * 1024 * 1024;
@@ -21,7 +23,8 @@ const ANTHROPIC_SKILLS_INDEX: &str = include_str!("anthropic-skills.json");
 
 /// Public GitHub repositories of skills the desktop marketplace lists beside
 /// Anthropic's: (shown name, repository). Their skills sit in `skills/<id>/`
-/// or at the top level (`<id>/SKILL.md`); see [`fetch_github_source`].
+/// or at the top level (`<id>/SKILL.md`); see [`fetch_github_source`]. The
+/// skills mirror builds the same list (deploy/skills-mirror/sources.json).
 pub const COMMUNITY_SKILL_SOURCES: [(&str, &str); 3] = [
     ("Ikaleio", "https://github.com/Ikaleio/skills"),
     ("Superpowers", "https://github.com/obra/superpowers"),
@@ -30,6 +33,26 @@ pub const COMMUNITY_SKILL_SOURCES: [(&str, &str); 3] = [
         "https://github.com/ComposioHQ/awesome-claude-skills",
     ),
 ];
+
+/// How long one marketplace request may wait for its connection, and for
+/// the whole response. From China GitHub is often slow or blocked, so a
+/// request gives up rather than hold the catalog for minutes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    pub connect: Duration,
+    pub total: Duration,
+}
+
+/// Listing a source: a repository's tree and its SKILL.md files.
+pub const CATALOG_TIMEOUTS: Timeouts = Timeouts {
+    connect: Duration::from_secs(8),
+    total: Duration::from_secs(20),
+};
+/// One file or package of a skill being installed.
+pub const INSTALL_TIMEOUTS: Timeouts = Timeouts {
+    connect: Duration::from_secs(8),
+    total: Duration::from_secs(60),
+};
 
 /// A skill in a GitHub repository's `<dir>/<id>/` directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,8 +192,18 @@ pub fn fetch_extra_skill_source(spec: &str) -> Result<Option<SkillSource>, Strin
 /// from the directory holding the most. Names and descriptions come from each
 /// SKILL.md's frontmatter, read in parallel.
 pub fn fetch_github_source(name: &str, repository: &str) -> Result<SkillSource, String> {
+    read_github_source(name, repository, &|url, limit| {
+        fetch(url, limit, CATALOG_TIMEOUTS)
+    })
+}
+
+fn read_github_source(
+    name: &str,
+    repository: &str,
+    fetch: &(dyn Fn(&str, usize) -> io::Result<Vec<u8>> + Sync),
+) -> Result<SkillSource, String> {
     let (owner, repo) = github_repository_parts(repository)?;
-    let tree = download(
+    let tree = fetch(
         &format!("https://api.github.com/repos/{owner}/{repo}/git/trees/HEAD?recursive=1"),
         MAX_TREE_BYTES,
     )
@@ -203,32 +236,42 @@ pub fn fetch_github_source(name: &str, repository: &str) -> Result<SkillSource, 
         // folder (a vendored collection) only when there are none there.
         .max_by_key(|(dir, ids)| (dir == "skills" || dir.is_empty(), ids.len()))
         .ok_or_else(|| format!("no SKILL.md found in {repository}"))?;
-    let read = |id: &str| -> (String, String) {
+    let read = |id: &str| -> Result<(String, String), String> {
         let path = if dir.is_empty() {
             format!("{id}/SKILL.md")
         } else {
             format!("{dir}/{id}/SKILL.md")
         };
-        let text = download(
+        let bytes = fetch(
             &format!(
                 "https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{}",
                 encode_url_path(&path)
             ),
             256 * 1024,
         )
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default();
+        .map_err(|error| error.to_string())?;
+        let text = String::from_utf8_lossy(&bytes);
         let field = |key| crate::prompt::read_frontmatter_field(&text, key).unwrap_or_default();
-        (field("name"), field("description"))
+        Ok((field("name"), field("description")))
     };
-    let metas: Vec<(String, String)> = std::thread::scope(|scope| {
+    let reads: Vec<Result<(String, String), String>> = std::thread::scope(|scope| {
         let read = &read;
         let handles: Vec<_> = ids.iter().map(|id| scope.spawn(move || read(id))).collect();
         handles
             .into_iter()
-            .map(|handle| handle.join().unwrap_or_default())
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err("SKILL.md read failed".to_string()))
+            })
             .collect()
     });
+    // raw.githubusercontent.com blocked while the API answers: a list of bare
+    // ids is no catalog, and must not replace a cached one.
+    if let Some(Err(error)) = reads.first().filter(|_| reads.iter().all(Result::is_err)) {
+        return Err(error.clone());
+    }
+    let metas = reads.into_iter().map(Result::unwrap_or_default);
     let mut skills: Vec<SourceSkill> = ids
         .iter()
         .zip(metas)
@@ -253,6 +296,86 @@ pub fn fetch_github_source(name: &str, repository: &str) -> Result<SkillSource, 
         dir,
         skills,
     })
+}
+
+/// A source as the marketplace cache and the mirror's catalog store it: the
+/// bundled index's fields, plus `dir`.
+pub fn source_json(source: &SkillSource) -> Value {
+    serde_json::json!({
+        "name": source.name,
+        "repository": source.repository,
+        "revision": source.revision,
+        "dir": source.dir,
+        "skills": source.skills.iter().map(|skill| serde_json::json!({
+            "id": skill.id,
+            "name": skill.name,
+            "description": skill.description,
+            "tags": skill.tags,
+            "license": skill.license,
+            "redistributable": skill.redistributable,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Reads [`source_json`] back. Everything that later names a path or a URL
+/// (the repository, revision, folder and ids) is checked; a missing name,
+/// description or license is empty, a missing `redistributable` false.
+pub fn parse_source(value: &Value) -> Result<SkillSource, String> {
+    let name = read_string(value, "name").ok_or("source missing name")?;
+    let repository = read_string(value, "repository").ok_or("source missing repository")?;
+    github_repository_parts(&repository)?;
+    let revision = read_string(value, "revision").unwrap_or_default();
+    if !revision.is_empty() {
+        validate_revision(&revision).map_err(|error| error.to_string())?;
+    }
+    let dir = read_string(value, "dir").unwrap_or_default();
+    if !dir.is_empty()
+        && !dir
+            .split('/')
+            .all(|part| validate_folder_name(part).is_ok())
+    {
+        return Err(format!("unsafe source folder: {dir}"));
+    }
+    let mut skills: Vec<SourceSkill> = Vec::new();
+    for item in value["skills"].as_array().ok_or("source missing skills")? {
+        let id = read_string(item, "id").ok_or("source skill missing id")?;
+        validate_skill_id(&id).map_err(|error| error.to_string())?;
+        if skills.iter().any(|skill| skill.id == id) {
+            return Err(format!("duplicate source skill id: {id}"));
+        }
+        skills.push(SourceSkill {
+            name: read_string(item, "name").unwrap_or_else(|| id.clone()),
+            description: read_string(item, "description").unwrap_or_default(),
+            tags: read_strings(item, "tags"),
+            license: read_string(item, "license").unwrap_or_default(),
+            redistributable: item["redistributable"].as_bool().unwrap_or(false),
+            id,
+        });
+    }
+    Ok(SkillSource {
+        name,
+        repository: normalize_repository_url(&repository),
+        revision,
+        dir,
+        skills,
+    })
+}
+
+/// One folder name of a repository path: no `.`/`..`, no separators.
+fn validate_folder_name(name: &str) -> io::Result<()> {
+    let safe = !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if safe {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsafe folder name: {name}"),
+        ))
+    }
 }
 
 fn parse_source_index(value: &Value) -> Result<SkillSource, String> {
@@ -894,17 +1017,24 @@ fn install_skill_package(dir: &Path, skill: &MarketplaceSkill, url: &str) -> io:
     })?;
     let bytes = download(url, MAX_PACKAGE_BYTES)?;
     verify_sha256(&bytes, expected)?;
-    let temp_dir = staging_dir(dir, "extract");
-    recreate_dir(&temp_dir)?;
     let package_type = skill
         .package_type
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| infer_package_type(url));
+    install_package_bytes(dir, &bytes, package_type)
+}
+
+/// Unpacks a checked `zip` or `tar.gz` package and installs the folder in it
+/// that holds SKILL.md as `dir`, replacing an earlier install only once the
+/// package is unpacked.
+fn install_package_bytes(dir: &Path, bytes: &[u8], package_type: &str) -> io::Result<()> {
+    let temp_dir = staging_dir(dir, "extract");
+    recreate_dir(&temp_dir)?;
     let extract_result = match package_type {
-        "zip" => extract_zip(&bytes, &temp_dir),
-        "tar.gz" | "tgz" => extract_tar_gz(&bytes, &temp_dir),
+        "zip" => extract_zip(bytes, &temp_dir),
+        "tar.gz" | "tgz" => extract_tar_gz(bytes, &temp_dir),
         other => {
             let _ = fs::remove_dir_all(&temp_dir);
             return Err(io::Error::new(
@@ -941,18 +1071,73 @@ fn install_skill_package(dir: &Path, skill: &MarketplaceSkill, url: &str) -> io:
 }
 
 fn download(url: &str, limit: usize) -> io::Result<Vec<u8>> {
+    fetch(url, limit, INSTALL_TIMEOUTS)
+}
+
+/// GETs `url` (or reads a `file://` URL or a path), at most `limit` bytes,
+/// through the proxy the environment names (HTTPS_PROXY and the like, as
+/// web_fetch does; a SOCKS proxy is not supported, so it connects directly).
+pub(crate) fn fetch(url: &str, limit: usize, timeouts: Timeouts) -> io::Result<Vec<u8>> {
     if let Some(path) = url.strip_prefix("file://") {
         return read_bounded(fs::File::open(path)?, limit);
     }
     if !url.contains("://") {
         return read_bounded(fs::File::open(url)?, limit);
     }
-    let response = ureq::get(url)
+    fetch_through(url, limit, timeouts, crate::web_fetch::env_proxy(url))
+}
+
+fn fetch_through(
+    url: &str,
+    limit: usize,
+    timeouts: Timeouts,
+    proxy: Option<String>,
+) -> io::Result<Vec<u8>> {
+    let builder = ureq::AgentBuilder::new()
+        .timeout_connect(timeouts.connect)
+        .timeout(timeouts.total);
+    let proxy = proxy
+        .filter(|proxy| !proxy.to_ascii_lowercase().starts_with("socks"))
+        .and_then(|proxy| ureq::Proxy::new(proxy).ok());
+    let agent = match proxy {
+        Some(proxy) => builder.proxy(proxy).build(),
+        None => builder.build(),
+    };
+    let response = agent
+        .get(url)
         .set("User-Agent", "lynshen")
-        .timeout(Duration::from_secs(60))
         .call()
-        .map_err(|error| io::Error::other(error.to_string()))?;
+        .map_err(|error| io::Error::other(request_error(url, error)))?;
     read_bounded(response.into_reader(), limit)
+}
+
+/// `raw.githubusercontent.com: connection failed (…)`: the host, not the
+/// whole URL, so a source's warning stays one short line.
+fn request_error(url: &str, error: ureq::Error) -> String {
+    let host = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or_default();
+    match error {
+        ureq::Error::Status(code, _) => format!("{host} answered HTTP {code}"),
+        ureq::Error::Transport(transport) => {
+            let what = match transport.kind() {
+                ureq::ErrorKind::Dns => "DNS lookup failed",
+                ureq::ErrorKind::ConnectionFailed => "connection failed",
+                ureq::ErrorKind::Io => "timed out or the connection broke",
+                ureq::ErrorKind::ProxyConnect | ureq::ErrorKind::ProxyUnauthorized => {
+                    "the proxy refused the connection"
+                }
+                _ => "request failed",
+            };
+            match transport.message() {
+                Some(message) => format!("{host}: {what} ({message})"),
+                None => format!("{host}: {what}"),
+            }
+        }
+    }
 }
 
 fn read_bounded(reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
@@ -996,6 +1181,10 @@ fn infer_package_type(url: &str) -> &str {
 }
 
 fn extract_zip(bytes: &[u8], dest: &Path) -> io::Result<()> {
+    extract_zip_within(bytes, dest, MAX_EXTRACTED_BYTES)
+}
+
+fn extract_zip_within(bytes: &[u8], dest: &Path, max_bytes: u64) -> io::Result<()> {
     let cursor = Cursor::new(bytes);
     let mut archive = ZipArchive::new(cursor).map_err(zip_err)?;
     if archive.len() > MAX_PACKAGE_FILES {
@@ -1017,10 +1206,10 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> io::Result<()> {
             }
         }
         extracted_bytes = extracted_bytes.saturating_add(file.size());
-        if extracted_bytes > MAX_EXTRACTED_BYTES {
+        if extracted_bytes > max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("extracted skill exceeds {MAX_EXTRACTED_BYTES} byte limit"),
+                format!("extracted skill exceeds {max_bytes} byte limit"),
             ));
         }
         let path = safe_path_components(Path::new(file.name())).ok_or_else(|| {
@@ -1037,8 +1226,22 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> io::Result<()> {
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent)?;
         }
+        // The size counted above is the one the archive declares; a deflated
+        // entry can hold far more. Write no more than declared, then the
+        // entry must end (reading to its end also checks its CRC).
+        let declared = file.size();
         let mut output = fs::File::create(&out)?;
-        io::copy(&mut file, &mut output)?;
+        let written = io::copy(&mut (&mut file).take(declared), &mut output)?;
+        let mut rest = [0_u8; 1];
+        if written != declared || file.read(&mut rest)? != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "skill package entry is not its declared size: {}",
+                    file.name()
+                ),
+            ));
+        }
         set_mode(&out, file.unix_mode())?;
     }
     Ok(())
@@ -1048,8 +1251,9 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> io::Result<()> {
 fn set_mode(path: &Path, mode: Option<u32>) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
+    // Permission bits only: no setuid, setgid or sticky bit from a package.
     if let Some(mode) = mode {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))?;
     }
     Ok(())
 }
@@ -1060,6 +1264,10 @@ fn set_mode(_path: &Path, _mode: Option<u32>) -> io::Result<()> {
 }
 
 fn extract_tar_gz(bytes: &[u8], dest: &Path) -> io::Result<()> {
+    extract_tar_gz_within(bytes, dest, MAX_EXTRACTED_BYTES)
+}
+
+fn extract_tar_gz_within(bytes: &[u8], dest: &Path, max_bytes: u64) -> io::Result<()> {
     let gz = GzDecoder::new(Cursor::new(bytes));
     let mut archive = Archive::new(gz);
     let mut extracted_bytes = 0_u64;
@@ -1085,11 +1293,13 @@ fn extract_tar_gz(bytes: &[u8], dest: &Path) -> io::Result<()> {
                 "skill package links and special files are not allowed",
             ));
         }
-        extracted_bytes = extracted_bytes.saturating_add(entry.header().size()?);
-        if extracted_bytes > MAX_EXTRACTED_BYTES {
+        // The size the entry's data is read with: a pax `size` record
+        // overrides the header's, which may say 0.
+        extracted_bytes = extracted_bytes.saturating_add(entry.size());
+        if extracted_bytes > max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("extracted skill exceeds {MAX_EXTRACTED_BYTES} byte limit"),
+                format!("extracted skill exceeds {max_bytes} byte limit"),
             ));
         }
         let out = dest.join(safe);
@@ -1770,6 +1980,138 @@ mod tests {
         assert!(error.to_string().contains("byte limit"));
     }
 
+    /// A tar.gz of `(header, data)` pairs, written as given: the data need
+    /// not match the header's size, and paths are not checked.
+    fn raw_tar_gz(entries: Vec<(tar::Header, Vec<u8>)>) -> Vec<u8> {
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for (header, data) in entries {
+            tar.append(&header, data.as_slice()).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn tar_header(path: &str, kind: tar::EntryType, size: u64) -> tar::Header {
+        let mut header = tar::Header::new_ustar();
+        let name = &mut header.as_ustar_mut().unwrap().name;
+        name[..path.len()].copy_from_slice(path.as_bytes());
+        header.set_entry_type(kind);
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_cksum();
+        header
+    }
+
+    #[test]
+    fn a_tar_package_is_held_to_its_real_size_and_carries_no_links() {
+        let root = test_dir("lynshen-tar-limits-test");
+        let skill = || {
+            let text = b"---\nname: demo\ndescription: Demo\n---\n".to_vec();
+            (
+                tar_header("demo/SKILL.md", tar::EntryType::Regular, text.len() as u64),
+                text,
+            )
+        };
+        let unpack = |entries, limit| {
+            let dest = root.join(format!("out-{}", entries_id()));
+            fs::create_dir_all(&dest).unwrap();
+            extract_tar_gz_within(&raw_tar_gz(entries), &dest, limit).map(|()| dest)
+        };
+        assert!(unpack(vec![skill()], 1024).is_ok());
+
+        // A pax `size` record says 4096 while the header says 0: the limit
+        // counts the 4096 bytes that would be written.
+        let record = b"13 size=4096\n".to_vec();
+        let pax = tar_header("pax", tar::EntryType::XHeader, record.len() as u64);
+        let big = tar_header("demo/big.bin", tar::EntryType::Regular, 0);
+        let error = unpack(vec![skill(), (pax, record), (big, vec![0; 4096])], 1024).unwrap_err();
+        assert!(error.to_string().contains("byte limit"), "{error}");
+
+        for (path, kind) in [
+            ("demo/link", tar::EntryType::Symlink),
+            ("demo/hard", tar::EntryType::Link),
+            ("demo/fifo", tar::EntryType::Fifo),
+        ] {
+            let mut link = tar_header(path, kind, 0);
+            link.set_link_name("../../outside").unwrap();
+            link.set_cksum();
+            let error = unpack(vec![skill(), (link, Vec::new())], 1024).unwrap_err();
+            assert!(error.to_string().contains("links"), "{path}: {error}");
+        }
+        for path in ["../escape.sh", "/abs/escape.sh", "demo/../../escape.sh"] {
+            let entry = (
+                tar_header(path, tar::EntryType::Regular, 3),
+                b"bad".to_vec(),
+            );
+            let error = unpack(vec![skill(), entry], 1024).unwrap_err();
+            assert!(error.to_string().contains("unsafe path"), "{path}: {error}");
+        }
+        assert!(!root.join("escape.sh").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn entries_id() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
+
+    #[test]
+    fn a_zip_package_is_held_to_its_real_size() {
+        let root = test_dir("lynshen-zip-limits-test");
+        fs::create_dir_all(&root).unwrap();
+        let package = root.join("skill.zip");
+        {
+            let mut zip = zip::ZipWriter::new(fs::File::create(&package).unwrap());
+            let stored = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .unix_permissions(0o755);
+            zip.start_file("demo/SKILL.md", stored).unwrap();
+            zip.write_all(b"---\nname: demo\ndescription: Demo\n---\n")
+                .unwrap();
+            zip.start_file("demo/big.bin", stored).unwrap();
+            zip.write_all(&[0; 4096]).unwrap();
+            zip.finish().unwrap();
+        }
+        let mut honest = fs::read(&package).unwrap();
+        // big.bin's central directory record.
+        let entry = honest
+            .windows(4)
+            .enumerate()
+            .filter(|(_, window)| *window == b"PK\x01\x02")
+            .map(|(at, _)| at)
+            .find(|&at| honest[at + 46..].starts_with(b"demo/big.bin"))
+            .unwrap();
+        // A setuid file: the bit is dropped.
+        honest[entry + 38..entry + 42].copy_from_slice(&(0o104755_u32 << 16).to_le_bytes());
+        let dest = root.join("honest");
+        fs::create_dir_all(&dest).unwrap();
+        extract_zip_within(&honest, &dest, 1 << 20).unwrap();
+        assert_eq!(fs::read(dest.join("demo/big.bin")).unwrap().len(), 4096);
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(dest.join("demo/big.bin"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+
+        // The central directory says big.bin holds 1 byte: it holds 4096.
+        let mut lying = honest.clone();
+        lying[entry + 24..entry + 28].copy_from_slice(&1_u32.to_le_bytes());
+        let dest = root.join("lying");
+        fs::create_dir_all(&dest).unwrap();
+        let error = extract_zip_within(&lying, &dest, 1 << 20).unwrap_err();
+        assert!(error.to_string().contains("declared size"), "{error}");
+        assert!(fs::metadata(dest.join("demo/big.bin")).unwrap().len() <= 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn github_source() -> SkillSource {
         SkillSource {
             name: "example".to_string(),
@@ -1811,6 +2153,150 @@ mod tests {
             zip.write_all(content.as_bytes()).unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    #[test]
+    fn a_repository_whose_skill_files_cannot_be_read_is_an_error_not_a_bare_list() {
+        let tree = json!({ "tree": [
+            { "path": "skills/one/SKILL.md", "type": "blob" },
+            { "path": "skills/two/SKILL.md", "type": "blob" },
+            { "path": "README.md", "type": "blob" }
+        ]})
+        .to_string();
+        let blocked = |url: &str, _: usize| -> io::Result<Vec<u8>> {
+            if url.starts_with("https://api.github.com/") {
+                Ok(tree.clone().into_bytes())
+            } else {
+                Err(io::Error::other(
+                    "raw.githubusercontent.com: connection failed",
+                ))
+            }
+        };
+        let error = read_github_source("Example", "https://github.com/example/skills", &blocked)
+            .unwrap_err();
+        assert!(error.contains("raw.githubusercontent.com"), "{error}");
+
+        // One file read: the source lists both, the other without a description.
+        let partly = |url: &str, _: usize| -> io::Result<Vec<u8>> {
+            if url.starts_with("https://api.github.com/") {
+                Ok(tree.clone().into_bytes())
+            } else if url.ends_with("/skills/one/SKILL.md") {
+                Ok(b"---\nname: One\ndescription: The first\n---\n".to_vec())
+            } else {
+                Err(io::Error::other("timed out"))
+            }
+        };
+        let source =
+            read_github_source("Example", "https://github.com/example/skills", &partly).unwrap();
+        assert_eq!(source.dir, "skills");
+        assert_eq!(source.skills.len(), 2);
+        assert_eq!(source.skills[0].name, "One");
+        assert_eq!(source.skills[0].description, "The first");
+        assert_eq!(source.skills[1].name, "two");
+        assert!(source.skills[1].redistributable);
+    }
+
+    #[test]
+    fn a_source_survives_the_cache_format() {
+        let mut source = github_source();
+        source.dir = String::new();
+        let parsed = parse_source(&source_json(&source)).unwrap();
+        assert_eq!(parsed, source);
+        let mut unsafe_dir = source_json(&source);
+        unsafe_dir["dir"] = json!("skills/../..");
+        assert!(parse_source(&unsafe_dir).is_err());
+        let mut unsafe_id = source_json(&source);
+        unsafe_id["skills"][0]["id"] = json!("../x");
+        assert!(parse_source(&unsafe_id).is_err());
+        let mut branch = source_json(&source);
+        branch["revision"] = json!("main");
+        assert!(parse_source(&branch).is_err());
+    }
+
+    /// Accepts connections on a loopback port; `answer` writes the reply to
+    /// each request line it reads (or nothing, to stall).
+    fn listen(answer: fn(&str) -> Option<String>) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (seen, requests) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                let _ = reader.read_line(&mut request);
+                let _ = seen.send(request.trim_end().to_string());
+                match answer(&request) {
+                    Some(reply) => {
+                        let _ = stream.write_all(reply.as_bytes());
+                    }
+                    None => std::thread::sleep(Duration::from_secs(30)),
+                }
+            }
+        });
+        (address, requests)
+    }
+
+    #[test]
+    fn a_silent_server_times_out_instead_of_holding_the_catalog() {
+        let (address, _) = listen(|_| None);
+        let short = Timeouts {
+            connect: Duration::from_secs(1),
+            total: Duration::from_secs(1),
+        };
+        let started = std::time::Instant::now();
+        let error = fetch(&format!("http://{address}/tree"), 1024, short).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "{error}");
+        assert!(error.to_string().starts_with("127.0.0.1:"), "{error}");
+    }
+
+    #[test]
+    fn requests_go_through_the_proxy_the_environment_names() {
+        let (proxy, requests) = listen(|_| {
+            Some("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string())
+        });
+        let bytes = fetch_through(
+            "http://skills.example.invalid/catalog.json",
+            1024,
+            CATALOG_TIMEOUTS,
+            Some(format!("http://{proxy}")),
+        )
+        .unwrap();
+        assert_eq!(bytes, b"ok");
+        assert_eq!(
+            requests.recv().unwrap(),
+            "GET http://skills.example.invalid/catalog.json HTTP/1.1"
+        );
+        // ureq cannot speak SOCKS: such a proxy is passed over, not a failure
+        // of every request.
+        let error = fetch_through(
+            "http://127.0.0.1:9/x",
+            1024,
+            CATALOG_TIMEOUTS,
+            Some("socks5://127.0.0.1:1080".to_string()),
+        )
+        .unwrap_err();
+        assert!(!error.to_string().contains("proxy"), "{error}");
+    }
+
+    #[test]
+    fn the_mirror_builds_the_community_sources_the_engine_lists() {
+        let built: Value =
+            serde_json::from_str(include_str!("../../../deploy/skills-mirror/sources.json"))
+                .unwrap();
+        let built: Vec<(&str, &str)> = built
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|source| {
+                (
+                    source["name"].as_str().unwrap(),
+                    source["repository"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(built, COMMUNITY_SKILL_SOURCES);
     }
 
     /// Network: the community repositories list their skills with metadata.
