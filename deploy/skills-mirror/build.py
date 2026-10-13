@@ -50,6 +50,10 @@ MAX_ARCHIVE_BYTES = 20 * 1024 * 1024
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_SKILL_BYTES = 100 * 1024 * 1024
 MAX_SKILL_FILES = 4096
+# A repository's tarball, and its files on disk: a repository larger than
+# this is not mirrored (the build fails), rather than fill the disk.
+MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
+MAX_REPOSITORY_BYTES = 1024 * 1024 * 1024
 
 SKILL_ID = re.compile(r'[a-z0-9](?:[a-z0-9-]*[a-z0-9])?')
 FOLDER = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9._-]*')
@@ -64,7 +68,7 @@ def log(message: str) -> None:
 
 # ---------- GitHub ----------
 
-def get(url: str, accept: str | None = None) -> bytes:
+def get(url: str, accept: str | None = None, limit: int = MAX_DOWNLOAD_BYTES) -> bytes:
     request = urllib.request.Request(url, headers={'User-Agent': 'lynshen-skills-mirror'})
     if accept:
         request.add_header('Accept', accept)
@@ -72,7 +76,10 @@ def get(url: str, accept: str | None = None) -> bytes:
     if token and url.startswith('https://api.github.com/'):
         request.add_header('Authorization', f'Bearer {token}')
     with urllib.request.urlopen(request, timeout=120) as response:
-        return response.read()
+        data = response.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f'{url}: more than {limit} bytes')
+    return data
 
 
 def commit(owner: str, repo: str, ref: str) -> tuple[str, int]:
@@ -89,7 +96,8 @@ def commit(owner: str, repo: str, ref: str) -> tuple[str, int]:
 class Tree:
     """A repository's files at one commit: `files` maps each regular file's
     path to whether it is executable; `links` holds every other entry
-    (symbolic links), which the engine does not install."""
+    (symbolic links, and files too big for the engine), which the engine
+    does not install."""
 
     def __init__(self, root: Path):
         self.root = root
@@ -98,19 +106,30 @@ class Tree:
 
     @classmethod
     def download(cls, owner: str, repo: str, sha: str, dest: Path) -> 'Tree':
-        tree = cls(dest)
         data = get(f'https://codeload.github.com/{owner}/{repo}/tar.gz/{sha}')
+        return cls.from_tarball(data, dest, f'{owner}/{repo}')
+
+    @classmethod
+    def from_tarball(cls, data: bytes, dest: Path, label: str) -> 'Tree':
+        """GitHub's tarball (`<repo>-<sha>/<files>`) unpacked into `dest`:
+        regular files only, none outside `dest`, none over the engine's file
+        limit, and no more than MAX_REPOSITORY_BYTES in all."""
+        tree = cls(dest)
+        total = 0
         with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
             for member in archive:
                 parts = PurePosixPath(member.name).parts[1:]
                 if not parts or member.isdir():
                     continue
                 if any(part in ('', '.', '..') for part in parts) or PurePosixPath(member.name).is_absolute():
-                    raise ValueError(f'{owner}/{repo}: unsafe path {member.name}')
+                    raise ValueError(f'{label}: unsafe path {member.name}')
                 path = '/'.join(parts)
-                if not member.isfile():
+                if not member.isfile() or member.size > MAX_FILE_BYTES:
                     tree.links.add(path)
                     continue
+                total += member.size
+                if total > MAX_REPOSITORY_BYTES:
+                    raise ValueError(f'{label}: more than {MAX_REPOSITORY_BYTES} bytes of files')
                 target = dest.joinpath(*parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with archive.extractfile(member) as source, target.open('wb') as output:
@@ -277,7 +296,7 @@ def add_archive(entry: dict, tree: Tree, prefix: str, key: str, mtime: int, out:
         log(f'  {key} {skill}: no SKILL.md, listed only')
         return None
     if links:
-        log(f'  {key} {skill}: has links ({links[0]}), listed only')
+        log(f'  {key} {skill}: has links or oversized files ({links[0]}), listed only')
         return None
     extra, license_text = legal_files(tree, files, prefix)
     if license_text is None:

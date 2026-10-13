@@ -138,6 +138,51 @@ class BuildTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             build.check_sources([{'name': 'x', 'repository': 'https://example.com/a/b'}])
 
+    def tarball(self, entries) -> bytes:
+        """GitHub's layout: every path under `repo-sha/`."""
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode='w:gz', format=tarfile.PAX_FORMAT) as archive:
+            for name, data, kind in entries:
+                info = tarfile.TarInfo(f'repo-{SHA}/{name}')
+                info.type = kind
+                if kind == tarfile.SYMTYPE:
+                    info.linkname = '../../outside'
+                    archive.addfile(info)
+                else:
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
+        return buffer.getvalue()
+
+    def test_a_repository_tarball_unpacks_regular_files_only_within_limits(self):
+        old = build.MAX_FILE_BYTES, build.MAX_REPOSITORY_BYTES
+        self.addCleanup(lambda: (setattr(build, 'MAX_FILE_BYTES', old[0]),
+                                 setattr(build, 'MAX_REPOSITORY_BYTES', old[1])))
+        build.MAX_FILE_BYTES, build.MAX_REPOSITORY_BYTES = 100, 250
+        data = self.tarball([
+            ('skills/a/SKILL.md', b'---\nname: a\n---\n', tarfile.REGTYPE),
+            ('skills/a/big.bin', b'x' * 101, tarfile.REGTYPE),
+            ('skills/a/link.md', b'', tarfile.SYMTYPE),
+        ])
+        dest = self.root / 'tree'
+        tree = build.Tree.from_tarball(data, dest, 'example/skills')
+        self.assertEqual(sorted(tree.files), ['skills/a/SKILL.md'])
+        self.assertEqual(sorted(tree.links), ['skills/a/big.bin', 'skills/a/link.md'])
+        self.assertFalse((dest / 'skills/a/big.bin').exists())
+        self.assertFalse((dest / 'skills/a/link.md').exists())
+        # A skill with a file the engine would refuse is listed only.
+        write(dest, 'LICENSE', MIT)
+        tree.files['LICENSE'] = False
+        entry = {'id': 'a'}
+        self.assertIsNone(build.add_archive(entry, tree, 'skills/a', 'example/skills', 0, self.out))
+        self.assertNotIn('archive', entry)
+
+        with self.assertRaisesRegex(ValueError, 'unsafe path'):
+            build.Tree.from_tarball(self.tarball([('skills/../../x', b'x', tarfile.REGTYPE)]),
+                                    self.root / 'unsafe', 'example/skills')
+        with self.assertRaisesRegex(ValueError, 'more than 250 bytes'):
+            build.Tree.from_tarball(self.tarball([(f'f{n}', b'x' * 100, tarfile.REGTYPE) for n in range(3)]),
+                                    self.root / 'large', 'example/skills')
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1181,6 +1181,10 @@ fn infer_package_type(url: &str) -> &str {
 }
 
 fn extract_zip(bytes: &[u8], dest: &Path) -> io::Result<()> {
+    extract_zip_within(bytes, dest, MAX_EXTRACTED_BYTES)
+}
+
+fn extract_zip_within(bytes: &[u8], dest: &Path, max_bytes: u64) -> io::Result<()> {
     let cursor = Cursor::new(bytes);
     let mut archive = ZipArchive::new(cursor).map_err(zip_err)?;
     if archive.len() > MAX_PACKAGE_FILES {
@@ -1202,10 +1206,10 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> io::Result<()> {
             }
         }
         extracted_bytes = extracted_bytes.saturating_add(file.size());
-        if extracted_bytes > MAX_EXTRACTED_BYTES {
+        if extracted_bytes > max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("extracted skill exceeds {MAX_EXTRACTED_BYTES} byte limit"),
+                format!("extracted skill exceeds {max_bytes} byte limit"),
             ));
         }
         let path = safe_path_components(Path::new(file.name())).ok_or_else(|| {
@@ -1222,8 +1226,22 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> io::Result<()> {
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent)?;
         }
+        // The size counted above is the one the archive declares; a deflated
+        // entry can hold far more. Write no more than declared, then the
+        // entry must end (reading to its end also checks its CRC).
+        let declared = file.size();
         let mut output = fs::File::create(&out)?;
-        io::copy(&mut file, &mut output)?;
+        let written = io::copy(&mut (&mut file).take(declared), &mut output)?;
+        let mut rest = [0_u8; 1];
+        if written != declared || file.read(&mut rest)? != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "skill package entry is not its declared size: {}",
+                    file.name()
+                ),
+            ));
+        }
         set_mode(&out, file.unix_mode())?;
     }
     Ok(())
@@ -1233,8 +1251,9 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> io::Result<()> {
 fn set_mode(path: &Path, mode: Option<u32>) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
+    // Permission bits only: no setuid, setgid or sticky bit from a package.
     if let Some(mode) = mode {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))?;
     }
     Ok(())
 }
@@ -1245,6 +1264,10 @@ fn set_mode(_path: &Path, _mode: Option<u32>) -> io::Result<()> {
 }
 
 fn extract_tar_gz(bytes: &[u8], dest: &Path) -> io::Result<()> {
+    extract_tar_gz_within(bytes, dest, MAX_EXTRACTED_BYTES)
+}
+
+fn extract_tar_gz_within(bytes: &[u8], dest: &Path, max_bytes: u64) -> io::Result<()> {
     let gz = GzDecoder::new(Cursor::new(bytes));
     let mut archive = Archive::new(gz);
     let mut extracted_bytes = 0_u64;
@@ -1270,11 +1293,13 @@ fn extract_tar_gz(bytes: &[u8], dest: &Path) -> io::Result<()> {
                 "skill package links and special files are not allowed",
             ));
         }
-        extracted_bytes = extracted_bytes.saturating_add(entry.header().size()?);
-        if extracted_bytes > MAX_EXTRACTED_BYTES {
+        // The size the entry's data is read with: a pax `size` record
+        // overrides the header's, which may say 0.
+        extracted_bytes = extracted_bytes.saturating_add(entry.size());
+        if extracted_bytes > max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("extracted skill exceeds {MAX_EXTRACTED_BYTES} byte limit"),
+                format!("extracted skill exceeds {max_bytes} byte limit"),
             ));
         }
         let out = dest.join(safe);
@@ -1953,6 +1978,138 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("byte limit"));
+    }
+
+    /// A tar.gz of `(header, data)` pairs, written as given: the data need
+    /// not match the header's size, and paths are not checked.
+    fn raw_tar_gz(entries: Vec<(tar::Header, Vec<u8>)>) -> Vec<u8> {
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for (header, data) in entries {
+            tar.append(&header, data.as_slice()).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn tar_header(path: &str, kind: tar::EntryType, size: u64) -> tar::Header {
+        let mut header = tar::Header::new_ustar();
+        let name = &mut header.as_ustar_mut().unwrap().name;
+        name[..path.len()].copy_from_slice(path.as_bytes());
+        header.set_entry_type(kind);
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_cksum();
+        header
+    }
+
+    #[test]
+    fn a_tar_package_is_held_to_its_real_size_and_carries_no_links() {
+        let root = test_dir("lynshen-tar-limits-test");
+        let skill = || {
+            let text = b"---\nname: demo\ndescription: Demo\n---\n".to_vec();
+            (
+                tar_header("demo/SKILL.md", tar::EntryType::Regular, text.len() as u64),
+                text,
+            )
+        };
+        let unpack = |entries, limit| {
+            let dest = root.join(format!("out-{}", entries_id()));
+            fs::create_dir_all(&dest).unwrap();
+            extract_tar_gz_within(&raw_tar_gz(entries), &dest, limit).map(|()| dest)
+        };
+        assert!(unpack(vec![skill()], 1024).is_ok());
+
+        // A pax `size` record says 4096 while the header says 0: the limit
+        // counts the 4096 bytes that would be written.
+        let record = b"13 size=4096\n".to_vec();
+        let pax = tar_header("pax", tar::EntryType::XHeader, record.len() as u64);
+        let big = tar_header("demo/big.bin", tar::EntryType::Regular, 0);
+        let error = unpack(vec![skill(), (pax, record), (big, vec![0; 4096])], 1024).unwrap_err();
+        assert!(error.to_string().contains("byte limit"), "{error}");
+
+        for (path, kind) in [
+            ("demo/link", tar::EntryType::Symlink),
+            ("demo/hard", tar::EntryType::Link),
+            ("demo/fifo", tar::EntryType::Fifo),
+        ] {
+            let mut link = tar_header(path, kind, 0);
+            link.set_link_name("../../outside").unwrap();
+            link.set_cksum();
+            let error = unpack(vec![skill(), (link, Vec::new())], 1024).unwrap_err();
+            assert!(error.to_string().contains("links"), "{path}: {error}");
+        }
+        for path in ["../escape.sh", "/abs/escape.sh", "demo/../../escape.sh"] {
+            let entry = (
+                tar_header(path, tar::EntryType::Regular, 3),
+                b"bad".to_vec(),
+            );
+            let error = unpack(vec![skill(), entry], 1024).unwrap_err();
+            assert!(error.to_string().contains("unsafe path"), "{path}: {error}");
+        }
+        assert!(!root.join("escape.sh").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn entries_id() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
+
+    #[test]
+    fn a_zip_package_is_held_to_its_real_size() {
+        let root = test_dir("lynshen-zip-limits-test");
+        fs::create_dir_all(&root).unwrap();
+        let package = root.join("skill.zip");
+        {
+            let mut zip = zip::ZipWriter::new(fs::File::create(&package).unwrap());
+            let stored = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .unix_permissions(0o755);
+            zip.start_file("demo/SKILL.md", stored).unwrap();
+            zip.write_all(b"---\nname: demo\ndescription: Demo\n---\n")
+                .unwrap();
+            zip.start_file("demo/big.bin", stored).unwrap();
+            zip.write_all(&[0; 4096]).unwrap();
+            zip.finish().unwrap();
+        }
+        let mut honest = fs::read(&package).unwrap();
+        // big.bin's central directory record.
+        let entry = honest
+            .windows(4)
+            .enumerate()
+            .filter(|(_, window)| *window == b"PK\x01\x02")
+            .map(|(at, _)| at)
+            .find(|&at| honest[at + 46..].starts_with(b"demo/big.bin"))
+            .unwrap();
+        // A setuid file: the bit is dropped.
+        honest[entry + 38..entry + 42].copy_from_slice(&(0o104755_u32 << 16).to_le_bytes());
+        let dest = root.join("honest");
+        fs::create_dir_all(&dest).unwrap();
+        extract_zip_within(&honest, &dest, 1 << 20).unwrap();
+        assert_eq!(fs::read(dest.join("demo/big.bin")).unwrap().len(), 4096);
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(dest.join("demo/big.bin"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+
+        // The central directory says big.bin holds 1 byte: it holds 4096.
+        let mut lying = honest.clone();
+        lying[entry + 24..entry + 28].copy_from_slice(&1_u32.to_le_bytes());
+        let dest = root.join("lying");
+        fs::create_dir_all(&dest).unwrap();
+        let error = extract_zip_within(&lying, &dest, 1 << 20).unwrap_err();
+        assert!(error.to_string().contains("declared size"), "{error}");
+        assert!(fs::metadata(dest.join("demo/big.bin")).unwrap().len() <= 1);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn github_source() -> SkillSource {
