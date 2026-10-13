@@ -24,6 +24,11 @@ use std::{
 const CLIENT_ID: &str = "lynshen-cli";
 /// How a revoke may hold up a logout or a new login: it is only tidying.
 const REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The longest one token, account or model request may take. ureq's agent
+/// has no read timeout of its own: a refresh sent as a turn starts (on the
+/// engine's thread, which the daemon also stops turns on) would otherwise
+/// wait for good on a connection that went quiet.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 /// Text the browser shows after landing on the CLI callback.
 const CALLBACK_LOGIN_COMPLETE: &str = "LynShen CLI login complete. You can close this tab.";
@@ -155,6 +160,7 @@ fn exchange_code(
     #[allow(clippy::result_large_err)]
     let response = send_with_retry(|| {
         ureq::post(&url)
+            .timeout(REQUEST_TIMEOUT)
             .set("Content-Type", "application/json")
             .send_json(json!({
                 "grant_type": "authorization_code",
@@ -180,6 +186,7 @@ pub fn refresh(api_url: &str, refresh_token: &str) -> Result<Tokens, String> {
     #[allow(clippy::result_large_err)]
     let response = send_with_retry(|| {
         ureq::post(&url)
+            .timeout(REQUEST_TIMEOUT)
             .set("Content-Type", "application/json")
             .send_json(json!({
                 "grant_type": "refresh_token",
@@ -343,6 +350,7 @@ pub fn get_json(api_url: &str, path: &str, access_token: &str) -> Result<Value, 
     let url = format!("{}{}", api_url.trim_end_matches('/'), path);
     json_response(
         ureq::get(&url)
+            .timeout(REQUEST_TIMEOUT)
             .set("Authorization", &format!("Bearer {access_token}"))
             .call(),
     )
@@ -354,6 +362,7 @@ fn fetch_models(base_url: &str, access_token: &str) -> Result<Vec<OAuthModel>, S
     #[allow(clippy::result_large_err)]
     let value = json_response(send_with_retry(|| {
         ureq::get(&url)
+            .timeout(REQUEST_TIMEOUT)
             .set("Authorization", &format!("Bearer {access_token}"))
             .call()
     }))?;
