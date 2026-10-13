@@ -341,10 +341,12 @@ fn script(request: &Value) -> String {
                 .find(|message| message["role"] == "system")
                 .and_then(|message| message["content"].as_str())
                 .unwrap_or_default();
+            // The end of the system prompt: the session's own parts (chat or
+            // agent prompt, sandbox note) come last.
             let tail: String = system
                 .chars()
                 .rev()
-                .take(2000)
+                .take(4000)
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
