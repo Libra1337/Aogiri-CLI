@@ -884,6 +884,7 @@ mod tests {
                 summary: "rm -rf".to_string(),
                 subagent_id: None,
                 hunks: None,
+                info: Default::default(),
             },
             &mut pending,
         );

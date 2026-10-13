@@ -22,6 +22,11 @@ pub struct DeferredAction {
     /// reused instead of asking again for an identical call.
     pub digest: String,
     pub created_at: u64,
+    /// The approval's kind (`approval::ApprovalKind`); None in a record
+    /// saved before it was kept.
+    pub kind: Option<String>,
+    /// The model's reason for the call, when it gave one.
+    pub justification: Option<String>,
 }
 
 impl DeferredAction {
@@ -37,6 +42,8 @@ impl DeferredAction {
             "subagent_id": self.subagent_id,
             "digest": self.digest,
             "created_at": self.created_at,
+            "kind": self.kind,
+            "justification": self.justification,
         })
     }
 
@@ -54,6 +61,8 @@ impl DeferredAction {
             subagent_id: text("subagent_id"),
             digest: text("digest")?,
             created_at: value.get("created_at").and_then(Value::as_u64)?,
+            kind: text("kind"),
+            justification: text("justification"),
         })
     }
 }
@@ -114,6 +123,8 @@ mod tests {
             subagent_id: None,
             digest: action_digest("bash", r#"{"command":"make"}"#, Path::new("/work")),
             created_at: 42,
+            kind: Some("escalation".to_string()),
+            justification: Some("build it".to_string()),
         };
         assert_eq!(DeferredAction::from_json(&action.to_json()), Some(action));
         assert_eq!(DeferredAction::from_json(&json!({ "id": "x" })), None);
@@ -132,6 +143,8 @@ mod tests {
             subagent_id: None,
             digest: String::new(),
             created_at: 0,
+            kind: None,
+            justification: None,
         };
         assert_eq!(
             decision_message(&action, Some(("{}", true))),

@@ -334,6 +334,8 @@ pub enum AgentEvent {
         /// with a subset of these ids to apply only part of the change. None
         /// for non-edit tools (or when planning failed): whole-call only.
         hunks: Option<Vec<HunkView>>,
+        /// Kind, reason, paths and how far an approval may reach.
+        info: crate::approval::ApprovalInfo,
     },
     /// A gated call made while no client was watching: recorded instead of
     /// blocking the turn. Decide it later with `AgentCore::decide_action`.

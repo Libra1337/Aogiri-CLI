@@ -1402,6 +1402,8 @@ mod tests {
             subagent_id: None,
             digest: id.to_string(),
             created_at: 1,
+            kind: None,
+            justification: None,
         };
         store.record_deferred(&action("one")).unwrap();
         store.record_deferred(&action("two")).unwrap();

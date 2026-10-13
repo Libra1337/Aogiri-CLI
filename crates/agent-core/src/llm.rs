@@ -1,5 +1,6 @@
 use crate::providers::CLIENT_NAME;
 use crate::{
+    approval::{ApprovalInfo, ApprovalKind, ApprovalScope},
     config::{is_shell_tool, ApprovalMode, Fanout, LiveApprovalMode, ModelConfig, SubagentModel},
     hooks::Hooks,
     host::HostGate,
@@ -246,10 +247,10 @@ pub struct ApprovalRequest {
     /// Hunk breakdown for edit tools, computed before anything is applied so
     /// the client can approve a subset. None means whole-call decisions only.
     pub hunks: Option<Vec<HunkView>>,
-    /// A person must decide (`SandboxGate::Ask`): the core never approves
-    /// it by the approval mode, the session's "always allow" or a switch
-    /// to a looser mode.
-    pub must_ask: bool,
+    /// Kind, reason and reach of the decision. With `info.must_ask` (from
+    /// `SandboxGate::Ask`) the core never approves it by the approval mode,
+    /// the session's "always allow" or a switch to a looser mode.
+    pub info: ApprovalInfo,
     pub response_tx: Sender<ApprovalDecision>,
 }
 
@@ -1070,7 +1071,8 @@ impl OpenAiClient {
                 let decision = if classified_allow {
                     ApprovalDecision::allow_all()
                 } else {
-                    self.request_approval(&request, cwd, gate == SandboxGate::Ask)
+                    let info = self.approval_info(&request, cwd, gate);
+                    self.request_approval(&request, cwd, info)
                 };
                 if !decision.allow {
                     emit(StreamEvent::ToolStart {
@@ -2944,15 +2946,125 @@ impl OpenAiClient {
         }
     }
 
+    /// What the approval request for `request` tells the client: its kind,
+    /// the model's reason, and how far an approval may reach (see
+    /// `approval::ApprovalInfo`). `gate` is the call's `sandbox_gate`.
+    fn approval_info(
+        &self,
+        request: &ToolCallRequest,
+        cwd: &Path,
+        gate: SandboxGate,
+    ) -> ApprovalInfo {
+        let must_ask = gate == SandboxGate::Ask;
+        let mut info = ApprovalInfo {
+            must_ask,
+            cwd: cwd.to_path_buf(),
+            scopes: vec![ApprovalScope::Once],
+            ..ApprovalInfo::default()
+        };
+        let args = serde_json::from_str::<Value>(&request.arguments).unwrap_or(Value::Null);
+        let text = |key: &str| {
+            args.get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        };
+        if request.name == "write_stdin" {
+            info.kind = ApprovalKind::Command;
+            info.command = text("chars").or_else(|| text("text"));
+            return info;
+        }
+        if is_shell_tool(&request.name) {
+            let command = text("command").or_else(|| text("cmd")).unwrap_or_default();
+            let workdir = text("workdir")
+                .map(|dir| tools::resolve_path(cwd, &dir))
+                .unwrap_or_else(|| cwd.to_path_buf());
+            let escalated = args.get("escalate").and_then(Value::as_bool) == Some(true);
+            let sandbox = self.tool_state.sandbox();
+            let check = sandbox
+                .as_ref()
+                .map(|sandbox| sandbox.check_command(&command, Some((&workdir, cwd))))
+                .unwrap_or_default();
+            let rule_asks = sandbox
+                .as_ref()
+                .and_then(|sandbox| sandbox.rule_for(&command))
+                == Some(RuleAction::Ask);
+            let crossing = escalated
+                && sandbox
+                    .as_ref()
+                    .is_some_and(|sandbox| sandbox.is_sandboxed());
+            let outside: Vec<PathBuf> = match &sandbox {
+                Some(sandbox) if crossing => check
+                    .writes
+                    .iter()
+                    .filter(|path| !sandbox.within_boundary(cwd, path))
+                    .cloned()
+                    .collect(),
+                _ => Vec::new(),
+            };
+            info.kind = if check.elevation {
+                ApprovalKind::Elevation
+            } else if must_ask && rule_asks {
+                ApprovalKind::Rule
+            } else if crossing && !outside.is_empty() {
+                ApprovalKind::OutsideWrite
+            } else if crossing {
+                ApprovalKind::Escalation
+            } else {
+                ApprovalKind::Command
+            };
+            info.justification = text("justification");
+            info.cwd = workdir;
+            info.command = Some(command);
+            info.dir_suggestion = outside.first().and_then(|path| {
+                crate::approval::dir_suggestion(
+                    path,
+                    crate::sandbox::home().as_deref(),
+                    &crate::sandbox::denied_reads(),
+                )
+            });
+            info.paths = outside;
+            info.elevation = check.elevation.then(crate::approval::elevation_prompt);
+            if !must_ask && !check.once_only {
+                if let Some(prefix) = check.prefix {
+                    info.scopes = vec![
+                        ApprovalScope::Once,
+                        ApprovalScope::Session,
+                        ApprovalScope::Project,
+                    ];
+                    info.prefix = Some(prefix);
+                }
+            }
+            return info;
+        }
+        let edit = crate::config::canonical_edit_tool_name(&request.name).is_some()
+            || request.name == crate::images::TOOL_NAME;
+        info.kind = if edit {
+            ApprovalKind::Edit
+        } else {
+            ApprovalKind::Tool
+        };
+        // "This session": the tool stops asking, as "always allow" did; not
+        // a host tool that always asks, nor a forced restore.
+        if !must_ask
+            && self.host_gate(&request.name) != Some(HostGate::Ask)
+            && !tools::is_forced_restore(&request.name, &request.arguments)
+        {
+            info.scopes.push(ApprovalScope::Session);
+        }
+        info
+    }
+
     /// Blocks until the core forwards the user's decision. A dropped channel
     /// (interrupt / no handler) is treated as a denial so the worker unblocks.
     /// Edit tool calls carry their hunk breakdown so the decision may approve
-    /// only a subset of the change. `must_ask`: see `ApprovalRequest`.
+    /// only a subset of the change.
     fn request_approval(
         &self,
         request: &ToolCallRequest,
         cwd: &Path,
-        must_ask: bool,
+        info: ApprovalInfo,
     ) -> ApprovalDecision {
         let Some(tx) = &self.approval_tx else {
             return ApprovalDecision::allow_all();
@@ -2984,7 +3096,7 @@ impl OpenAiClient {
                 cwd: cwd.to_path_buf(),
                 subagent_id: (self.agent_depth > 0).then(|| self.agent_path.clone()),
                 hunks: hunks::plan_edit_hunks(&request.name, &request.arguments, cwd),
-                must_ask,
+                info,
                 response_tx,
             })
             .is_err()
@@ -5673,6 +5785,82 @@ mod tests {
         assert_eq!(step["files"]["items"]["type"], "string");
     }
 
+    #[test]
+    fn an_approval_request_names_its_kind_reason_and_reach() {
+        use ApprovalScope::{Once, Project, Session};
+        let client = approval_test_client(ApprovalMode::Manual, None);
+        client
+            .tool_state
+            .set_sandbox(Some(crate::sandbox::SandboxPolicy {
+                mode: crate::sandbox::SandboxMode::WorkspaceWrite,
+                ..crate::sandbox::SandboxPolicy::default_for_platform()
+            }));
+        let cwd = std::env::temp_dir();
+        let info = |name: &str, arguments: Value| {
+            let request = ToolCallRequest {
+                call_id: "c".to_string(),
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            };
+            client.approval_info(&request, &cwd, client.sandbox_gate(&request))
+        };
+
+        let npm = info(
+            "bash",
+            json!({ "command": "npm install lodash", "escalate": true, "justification": "fetch deps" }),
+        );
+        assert_eq!(npm.kind, ApprovalKind::Escalation);
+        assert_eq!(npm.justification.as_deref(), Some("fetch deps"));
+        assert_eq!(npm.command.as_deref(), Some("npm install lodash"));
+        assert_eq!(npm.prefix.as_deref(), Some("npm install"));
+        assert_eq!(npm.scopes, vec![Once, Session, Project]);
+        assert!(!npm.must_ask && npm.paths.is_empty() && npm.elevation.is_none());
+
+        // Manual mode asks inside the sandbox too: a plain command.
+        let test = info("bash", json!({ "command": "cargo test" }));
+        assert_eq!(test.kind, ApprovalKind::Command);
+        assert_eq!(test.prefix.as_deref(), Some("cargo test"));
+
+        // A write the text shows lands outside: its path and a directory.
+        if let Some(home) = crate::sandbox::home() {
+            let copy = info(
+                "bash",
+                json!({ "command": "cp shot.png ~/Desktop/shot.png", "escalate": true }),
+            );
+            assert_eq!(copy.kind, ApprovalKind::OutsideWrite);
+            assert_eq!(copy.paths, vec![home.join("Desktop/shot.png")]);
+            assert_eq!(copy.dir_suggestion, Some(home.join("Desktop")));
+        }
+
+        // Interpreters, deletes, elevation and git push: once at most.
+        for command in [
+            "python3 build.py",
+            "rm -rf build",
+            "git push --force",
+            "bash -c 'make all'",
+        ] {
+            let once = info("bash", json!({ "command": command, "escalate": true }));
+            assert_eq!(once.scopes, vec![Once], "{command}");
+            assert_eq!(once.prefix, None, "{command}");
+        }
+        let sudo = info(
+            "bash",
+            json!({ "command": "sudo apt install jq", "escalate": true }),
+        );
+        assert_eq!(sudo.kind, ApprovalKind::Elevation);
+        assert_eq!(sudo.elevation, Some(crate::approval::elevation_prompt()));
+        let push = info("bash", json!({ "command": "git push origin main" }));
+        assert_eq!(push.kind, ApprovalKind::Rule);
+        assert!(push.must_ask);
+
+        let edit = info("write", json!({ "path": "a.txt", "content": "x" }));
+        assert_eq!(edit.kind, ApprovalKind::Edit);
+        assert_eq!(edit.scopes, vec![Once, Session]);
+        let tool = info("mcp__srv__lookup", json!({}));
+        assert_eq!(tool.kind, ApprovalKind::Tool);
+        assert_eq!(tool.scopes, vec![Once, Session]);
+    }
+
     fn approval_test_client(
         mode: ApprovalMode,
         approval_tx: Option<Sender<ApprovalRequest>>,
@@ -5991,7 +6179,7 @@ mod tests {
                 arguments: json!({ "command": "rm -rf build" }).to_string(),
             },
             Path::new("."),
-            false,
+            ApprovalInfo::default(),
         );
         assert!(decision.allow);
         assert!(decision.approved_hunks.is_none());
@@ -6017,7 +6205,7 @@ mod tests {
                 arguments: json!({ "path": "a.txt" }).to_string(),
             },
             Path::new("."),
-            false,
+            ApprovalInfo::default(),
         );
         assert!(!decision.allow);
         responder.join().unwrap();
@@ -6059,7 +6247,7 @@ mod tests {
                 arguments: json!({ "path": "a.txt", "content": "new\n" }).to_string(),
             },
             &dir,
-            false,
+            ApprovalInfo::default(),
         );
         assert!(decision.allow);
         assert_eq!(decision.approved_hunks, Some(vec!["f0h1".to_string()]));

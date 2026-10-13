@@ -64,9 +64,9 @@ struct PendingApproval {
     arguments: String,
     cwd: PathBuf,
     subagent_id: Option<String>,
-    /// A person must decide (see `ApprovalRequest::must_ask`): a switch to
-    /// a looser mode does not approve it.
-    must_ask: bool,
+    /// Kind, reason and reach (see `ApprovalRequest::info`). With
+    /// `must_ask` a switch to a looser mode does not approve it.
+    info: crate::approval::ApprovalInfo,
 }
 
 /// What an engine holds of its session only in memory (see
@@ -3005,7 +3005,7 @@ impl AgentCore {
             let allowlisted = gate != Some(crate::host::HostGate::Ask)
                 && self.approved_tools.contains(&request.name)
                 && !crate::tools::is_forced_restore(&request.name, &request.arguments);
-            if !request.must_ask
+            if !request.info.must_ask
                 && (allowlisted
                     || !requires_approval(
                         self.approval_mode.get(),
@@ -3025,6 +3025,7 @@ impl AgentCore {
                     request.arguments,
                     request.cwd,
                     request.subagent_id,
+                    &request.info,
                 );
                 let _ = request.response_tx.send(decision);
                 events.extend(event);
@@ -3041,6 +3042,7 @@ impl AgentCore {
                 summary: request.summary.clone(),
                 subagent_id: request.subagent_id.clone(),
                 hunks: request.hunks,
+                info: request.info.clone(),
             });
             self.pending_approvals.insert(
                 request.call_id,
@@ -3052,7 +3054,7 @@ impl AgentCore {
                     arguments: request.arguments,
                     cwd: request.cwd,
                     subagent_id: request.subagent_id,
-                    must_ask: request.must_ask,
+                    info: request.info,
                 },
             );
         }
@@ -3062,6 +3064,7 @@ impl AgentCore {
 
     /// Records a gated call as a deferred action, or reuses the decision (or
     /// the still-open action) of an identical call made earlier.
+    #[allow(clippy::too_many_arguments)]
     fn defer_call(
         &mut self,
         call_id: String,
@@ -3070,6 +3073,7 @@ impl AgentCore {
         arguments: String,
         cwd: PathBuf,
         subagent_id: Option<String>,
+        info: &crate::approval::ApprovalInfo,
     ) -> (ApprovalDecision, Option<AgentEvent>) {
         let digest = action_digest(&name, &arguments, &cwd);
         match self.action_decisions.get(&digest) {
@@ -3099,6 +3103,8 @@ impl AgentCore {
             subagent_id,
             digest,
             created_at,
+            kind: Some(info.kind.as_str().to_string()),
+            justification: info.justification.clone(),
         };
         self.deferred_actions
             .insert(action.id.clone(), action.clone());
@@ -3207,6 +3213,7 @@ impl AgentCore {
                     pending.arguments,
                     pending.cwd,
                     pending.subagent_id,
+                    &pending.info,
                 );
                 let _ = pending.response_tx.send(decision);
                 events.extend(event);
@@ -3386,7 +3393,7 @@ impl AgentCore {
             .iter()
             .filter(|(_, pending)| {
                 let gate = host.and_then(|host| host.gate_of(&pending.name));
-                !pending.must_ask
+                !pending.info.must_ask
                     && !requires_approval(mode, gate, &pending.name, &pending.arguments)
             })
             .map(|(call, _)| call.clone())
@@ -6049,7 +6056,7 @@ mod approval_decision_tests {
                 arguments: String::new(),
                 cwd: PathBuf::new(),
                 subagent_id: None,
-                must_ask: false,
+                info: crate::approval::ApprovalInfo::default(),
             },
         );
         (map, response_rx)

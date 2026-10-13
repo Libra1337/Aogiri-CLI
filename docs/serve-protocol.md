@@ -223,6 +223,58 @@ Structured answer to an `approval_request` event; equivalent to the
 Validation errors emit `error` and leave the request pending, so the client
 can retry with a corrected op.
 
+### Approval requests
+
+An `approval_request` event carries, besides the call:
+
+- `kind`: what the user decides.
+  - `edit`: a file edit inside the workspace (manual mode).
+  - `command`: a command inside the sandbox (manual mode), or any command
+    where there is no sandbox to leave.
+  - `escalation`: a command that leaves the sandbox (`escalate: true`).
+  - `outside_write`: a write outside the working directory and the
+    writable directories, by a file tool or by a command whose target the
+    command text shows (`cp a ~/Desktop/`, `> ~/notes.txt`).
+  - `elevation`: `sudo`, `su`, `doas`, `pkexec`, `gsudo`, `runas`,
+    `Start-Process -Verb RunAs`.
+  - `rule`: an `ask` command rule, or the built-in list that always asks
+    (`docs/sandbox.md`).
+  - `tool`: any other tool (MCP tools, `merge_agent`, a checkpoint restore,
+    ...).
+- `must_ask`: a person must decide. The approval mode, "always allow" and
+  a switch to a looser mode never approve it.
+- `justification`: the model's reason (a shell call's `justification`), or
+  `null`.
+- `cwd`: where the call runs (a command's `workdir`, else the agent's
+  directory).
+- `command`: the shell command as the model wrote it, or `null`.
+- `paths`: the paths outside the working directory and the writable
+  directories that the call writes (absolute). Empty when there are none,
+  or when the command text does not show them.
+- `dir_suggestion`: a directory the client can offer to make writable
+  (`approve` with `add_dir`): under the home directory its first directory
+  (`~/Desktop` for `~/Desktop/a/b.txt`), elsewhere the file's directory.
+  `null` without `paths`, and never the home directory, a root or a
+  credentials directory.
+- `prefix`: the command prefix a `session` or `project` approval
+  remembers (the first two words of the command, without wrappers such as
+  `sudo` or `env`), or `null`.
+- `scopes`: how far the engine lets an approval reach, a subset of
+  `["once", "session", "project"]`.
+  - `["once"]` for a request that must be asked, an interpreter (`python`,
+    `node`, `bash -c`, `powershell -Command`, ...), a delete (`rm`,
+    `Remove-Item`, ...), an elevation, `git push --force`, a command whose
+    parts start differently (`make && npm test`), a file tool's write
+    outside the workspace (offer `add_dir` instead) and a forced
+    checkpoint restore.
+  - `["once", "session"]` for `edit` and `tool`: `session` stops asking
+    for that tool in this session.
+  - `["once", "session", "project"]` for other commands, with `prefix`.
+- `elevation`: `null`, or for `kind: "elevation"` how the user completes
+  it: `"terminal"` (macOS and Linux: the user runs the command in their own
+  terminal, where they can type a password) or `"uac"` (Windows: once
+  approved, Windows asks through UAC).
+
 ### `set_approval_mode`
 
 ```json
@@ -423,8 +475,8 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `tool_start` | `call_id`, `name` | Tool call begins. |
 | `tool_update` | `call_id`, `name`, `output` | Intermediate tool progress (e.g. long-running bash). |
 | `tool_output` | `call_id`, `name`, `output`, `is_error` | Tool call finished. |
-| `approval_request` | `call_id`, `name`, `summary`, `subagent_id`, `hunks` | A gated tool call waits for an `approve` op. `hunks` is a list of `{id, file, header, lines}` for partial approval, `null` otherwise. `subagent_id` is set when a subagent issued the call. |
-| `action_deferred` | `id`, `session_id`, `cwd`, `call_id`, `name`, `arguments`, `summary`, `subagent_id`, `digest`, `created_at` | An unattended session recorded a gated call instead of prompting; decide it with `decide_action`. |
+| `approval_request` | `call_id`, `name`, `summary`, `subagent_id`, `hunks`, `kind`, `must_ask`, `justification`, `cwd`, `command`, `paths`, `dir_suggestion`, `prefix`, `scopes`, `elevation` | A gated tool call waits for an `approve` op. `hunks` is a list of `{id, file, header, lines}` for partial approval, `null` otherwise. `subagent_id` is set when a subagent issued the call. The other fields are described in "Approval requests". |
+| `action_deferred` | `id`, `session_id`, `cwd`, `call_id`, `name`, `arguments`, `summary`, `subagent_id`, `digest`, `created_at`, `kind`, `justification` | An unattended session recorded a gated call instead of prompting; decide it with `decide_action`. `kind` and `justification` are as in `approval_request` (`null` in a record saved by an older version). |
 | `action_decided` | `id`, `decision`, `output`, `is_error` | A deferred action was decided; `output` is the tool result when it ran, `null` when declined. |
 | `attended` | `attended` | Current attended state, after `set_attended`. |
 | `subagent_lifecycle` | `path`, `status`, `message`, `label`, `model`, `tool_use_id`, `role`, `plan_step`, `background`, `attempt_group`, `attempt` | Subagent spawn/progress/finish notices. `status` is a state of `agent_runs` or `message` (a message was queued for it); `pending` with message `resumed` when `resume_agent` runs it again. `role`, `plan_step` and `attempt_group` are strings or `null`, `attempt` a number or `null`, `background` a boolean (as in `agent_runs`). |
@@ -749,7 +801,7 @@ A normal turn looks like:
 Approval round-trip:
 
 ```jsonl
-< {"type":"approval_request","call_id":"call_2","name":"bash","summary":"rm -rf build","subagent_id":null,"hunks":null}
+< {"type":"approval_request","call_id":"call_2","name":"bash","summary":"rm -rf build","subagent_id":null,"hunks":null,"kind":"command","must_ask":false,"justification":null,"cwd":"/work/app","command":"rm -rf build","paths":[],"dir_suggestion":null,"prefix":null,"scopes":["once"],"elevation":null}
 > {"op":"approve","call_id":"call_2","decision":"deny"}
 ```
 

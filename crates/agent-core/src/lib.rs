@@ -1,6 +1,8 @@
 pub mod actions;
+pub mod approval;
 mod board;
 pub mod chat;
+pub mod command_text;
 mod commands;
 mod config;
 mod core;

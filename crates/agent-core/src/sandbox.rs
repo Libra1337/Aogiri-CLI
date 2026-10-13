@@ -77,6 +77,28 @@ pub struct CommandRule {
     pub action: RuleAction,
 }
 
+/// What the command rules and the built-in lists say about a command (see
+/// `SandboxPolicy::check_command`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandCheck {
+    /// `Forbid`: a part never runs. `Ask`: a person must decide, in every
+    /// approval mode. `Allow`: a rule allows every part. None: the approval
+    /// mode decides.
+    pub action: Option<RuleAction>,
+    /// Why it is forbidden or must be asked.
+    pub reason: Option<String>,
+    /// A part runs with elevated privileges (sudo, su, doas, runas, ...).
+    pub elevation: bool,
+    /// No approval may reach beyond this call: an interpreter, a delete, an
+    /// elevation, a forced push.
+    pub once_only: bool,
+    /// The prefix a session or project approval would remember; None when
+    /// its parts start differently.
+    pub prefix: Option<String>,
+    /// The paths its text shows it writes.
+    pub writes: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SandboxPolicy {
     pub mode: SandboxMode,
@@ -114,6 +136,182 @@ impl SandboxPolicy {
             .into_iter()
             .max_by_key(|rule| rule.prefix.split_whitespace().count())
             .map(|rule| rule.action)
+    }
+
+    /// What the command rules and the built-in lists say about `command`,
+    /// run from `dirs` = (its directory, the agent's workspace).
+    ///
+    /// The command is split into its parts (`&&`, `||`, `;`, `|`, ...; see
+    /// `command_text`), wrappers such as `sudo` or `env` come off, and each
+    /// part is matched on its own: `forbid` (a rule or the built-in list)
+    /// wins, then the built-in list that always asks, then the longest
+    /// matching rule. The command is forbidden when a part is, must be asked
+    /// when a part must, and allowed when every part but the neutral ones
+    /// (`cd`, `echo`, `grep`, ...) is.
+    pub fn check_command(&self, command: &str, dirs: Option<(&Path, &Path)>) -> CommandCheck {
+        use crate::command_text as text;
+        let home = home().map(|home| real(&home));
+        let credentials = denied_reads();
+        let roots = dirs.map(|(_, workspace)| self.boundary_roots(workspace));
+        let workspace = dirs.map(|(_, workspace)| real(workspace));
+        let mut check = CommandCheck::default();
+        let mut forbid: Option<String> = None;
+        let mut ask: Option<String> = None;
+        let mut all_allowed = true;
+        let mut counted = 0;
+        let mut prefixes: Vec<String> = Vec::new();
+        let parts = text::segments(command);
+        for part in &parts {
+            let user = self.user_rule(part);
+            let mut part_forbid = (user == Some(RuleAction::Forbid))
+                .then(|| "it matches a forbid command rule".to_string());
+            let mut part_ask = (user == Some(RuleAction::Ask))
+                .then(|| "it matches an ask command rule".to_string());
+            let elevated = part.elevated
+                || matches!(
+                    part.program().as_str(),
+                    "sudo" | "su" | "doas" | "pkexec" | "gsudo" | "runas"
+                );
+            if elevated {
+                check.elevation = true;
+                part_ask.get_or_insert_with(|| "it runs with elevated privileges".to_string());
+            }
+            if let Some(force) = text::git_push(part) {
+                check.once_only |= force;
+                part_ask.get_or_insert_with(|| "it pushes to a git remote".to_string());
+            }
+            if let Some(setting) = text::system_setting(part) {
+                part_ask.get_or_insert_with(|| format!("it {setting}"));
+            }
+            if let Some((cwd, _)) = dirs {
+                let resolve = |word: &str| text::resolve_word(word, cwd, home.as_deref());
+                for target in text::delete_targets(part).iter().filter_map(|w| resolve(w)) {
+                    let real_target = real_or_parent(&target);
+                    let protected = target.parent().is_none()
+                        || home
+                            .as_ref()
+                            .is_some_and(|home| real_target == *home || target == *home)
+                        || workspace.as_ref().is_some_and(|workspace| {
+                            workspace != &real_target && workspace.starts_with(&real_target)
+                        });
+                    if protected {
+                        part_forbid.get_or_insert_with(|| {
+                            format!(
+                                "it deletes {}: the root, the home directory or a parent of the workspace",
+                                target.display()
+                            )
+                        });
+                    } else if !roots
+                        .iter()
+                        .flatten()
+                        .any(|root| real_target.starts_with(root))
+                    {
+                        part_ask.get_or_insert_with(|| {
+                            format!("it deletes {}, outside the workspace", target.display())
+                        });
+                    }
+                }
+                let mentioned = part
+                    .raw
+                    .iter()
+                    .chain(&part.redirects)
+                    .filter(|word| text::looks_like_path(word))
+                    .filter_map(|word| resolve(word));
+                for path in mentioned {
+                    let real_path = real_or_parent(&path);
+                    if credentials
+                        .iter()
+                        .any(|secret| real_path.starts_with(secret) || path.starts_with(secret))
+                    {
+                        part_ask.get_or_insert_with(|| {
+                            format!("it touches credentials ({})", path.display())
+                        });
+                    }
+                }
+                for target in text::write_targets(part).iter().filter_map(|w| resolve(w)) {
+                    if !check.writes.contains(&target) {
+                        check.writes.push(target);
+                    }
+                }
+            }
+            check.once_only |= text::is_interpreter(part) || text::is_delete(part) || elevated;
+            if let Some(reason) = part_forbid {
+                forbid.get_or_insert(reason);
+            } else if let Some(reason) = part_ask {
+                ask.get_or_insert(reason);
+            }
+            if !text::is_neutral(part) {
+                counted += 1;
+                all_allowed &= user == Some(RuleAction::Allow);
+                if let Some(prefix) = text::prefix(part) {
+                    if !prefixes.contains(&prefix) {
+                        prefixes.push(prefix);
+                    }
+                }
+            }
+        }
+        if counted == 0 {
+            prefixes.extend(parts.first().and_then(text::prefix));
+        }
+        check.prefix = (prefixes.len() == 1).then(|| prefixes.remove(0));
+        (check.action, check.reason) = match (forbid, ask) {
+            (Some(reason), _) => (Some(RuleAction::Forbid), Some(reason)),
+            (None, Some(reason)) => (Some(RuleAction::Ask), Some(reason)),
+            _ if counted > 0 && all_allowed => (Some(RuleAction::Allow), None),
+            _ => (None, None),
+        };
+        check
+    }
+
+    /// The command rule for one part of a command line: `forbid` wins over
+    /// any other match, otherwise the longest matching prefix. A rule matches
+    /// the part as written, without its wrappers, or with the program named
+    /// by its file name (`/usr/bin/git push` matches `git push`).
+    fn user_rule(&self, part: &crate::command_text::Segment) -> Option<RuleAction> {
+        let mut named = part.words.clone();
+        if let Some(first) = named.first_mut() {
+            *first = crate::command_text::program_name(first);
+        }
+        let variants = [&part.raw, &part.words, &named];
+        let matches: Vec<&CommandRule> = self
+            .rules
+            .iter()
+            .filter(|rule| {
+                let prefix: Vec<&str> = rule.prefix.split_whitespace().collect();
+                !prefix.is_empty()
+                    && variants.iter().any(|words| {
+                        words.len() >= prefix.len()
+                            && words.iter().zip(&prefix).all(|(word, want)| word == want)
+                    })
+            })
+            .collect();
+        if matches.iter().any(|rule| rule.action == RuleAction::Forbid) {
+            return Some(RuleAction::Forbid);
+        }
+        matches
+            .into_iter()
+            .max_by_key(|rule| rule.prefix.split_whitespace().count())
+            .map(|rule| rule.action)
+    }
+
+    /// Where the agent may write without crossing the boundary, whatever
+    /// the mode: the workspace, the read-write directories, temp and the
+    /// package caches.
+    fn boundary_roots(&self, workspace: &Path) -> Vec<PathBuf> {
+        let mut roots = vec![workspace.to_path_buf()];
+        roots.extend(self.writable_dirs.iter().cloned());
+        roots.extend(temp_dirs());
+        roots.extend(cache_dirs());
+        roots.iter().map(|root| real(root)).collect()
+    }
+
+    /// Whether a write to `path` stays inside the boundary (see
+    /// `boundary_roots`).
+    pub fn within_boundary(&self, workspace: &Path, path: &Path) -> bool {
+        let target = real_or_parent(path);
+        self.boundary_roots(workspace)
+            .iter()
+            .any(|root| target.starts_with(root))
     }
 
     /// Directories a command started in `cwd` may write.
@@ -598,7 +796,7 @@ fn gitdir_target(git_file: &Path) -> Option<PathBuf> {
     })
 }
 
-fn home() -> Option<PathBuf> {
+pub fn home() -> Option<PathBuf> {
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .map(PathBuf::from)

@@ -468,21 +468,26 @@ pub fn event_json(event: AgentEvent) -> Value {
             summary,
             subagent_id,
             hunks,
-        } => json!({
-            "type": "approval_request",
-            "call_id": call_id,
-            "name": name,
-            "summary": summary,
-            "subagent_id": subagent_id,
-            // Edit tools: the selectable hunks of the pending change; answer
-            // with the `approve` op (or /approve --hunks) to apply a subset.
-            "hunks": hunks.map(|hunks| hunks.into_iter().map(|hunk| json!({
-                "id": hunk.id,
-                "file": hunk.file,
-                "header": hunk.header,
-                "lines": hunk.lines,
-            })).collect::<Vec<_>>()),
-        }),
+            info,
+        } => {
+            let mut value = json!({
+                "type": "approval_request",
+                "call_id": call_id,
+                "name": name,
+                "summary": summary,
+                "subagent_id": subagent_id,
+                // Edit tools: the selectable hunks of the pending change; answer
+                // with the `approve` op (or /approve --hunks) to apply a subset.
+                "hunks": hunks.map(|hunks| hunks.into_iter().map(|hunk| json!({
+                    "id": hunk.id,
+                    "file": hunk.file,
+                    "header": hunk.header,
+                    "lines": hunk.lines,
+                })).collect::<Vec<_>>()),
+            });
+            info.wire_fields(&mut value);
+            value
+        }
         AgentEvent::ApprovalMode { mode } => json!({
             "type": "approval_mode",
             "mode": mode,
@@ -772,6 +777,7 @@ mod tests {
             name: "apply_patch".to_string(),
             summary: "src/lib.rs".to_string(),
             subagent_id: None,
+            info: crate::approval::ApprovalInfo::default(),
             hunks: Some(vec![crate::HunkView {
                 id: "f0h1".to_string(),
                 file: "src/lib.rs".to_string(),
@@ -790,10 +796,27 @@ mod tests {
         let plain = AgentEvent::ApprovalRequest {
             call_id: "call_8".to_string(),
             name: "bash".to_string(),
-            summary: "ls".to_string(),
+            summary: "git push".to_string(),
             subagent_id: None,
             hunks: None,
+            info: crate::approval::ApprovalInfo {
+                kind: crate::approval::ApprovalKind::Rule,
+                must_ask: true,
+                cwd: std::path::PathBuf::from("/work"),
+                command: Some("git push".to_string()),
+                scopes: vec![crate::approval::ApprovalScope::Once],
+                ..Default::default()
+            },
         };
-        assert_eq!(event_json(plain)["hunks"], Value::Null);
+        let plain = event_json(plain);
+        assert_eq!(plain["hunks"], Value::Null);
+        assert_eq!(plain["kind"], "rule");
+        assert_eq!(plain["must_ask"], true);
+        assert_eq!(plain["command"], "git push");
+        assert_eq!(plain["cwd"], "/work");
+        assert_eq!(plain["scopes"], json!(["once"]));
+        assert_eq!(plain["paths"], json!([]));
+        assert_eq!(plain["prefix"], Value::Null);
+        assert_eq!(plain["elevation"], Value::Null);
     }
 }

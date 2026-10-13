@@ -476,10 +476,16 @@ impl TuiState {
                     summary,
                     subagent_id,
                     hunks,
+                    info,
                 } => {
                     // Stop the thinking clock here: time spent waiting on the
                     // user's decision is not the model's thinking time.
                     self.collapse_live_thinking();
+                    // Why the model asks to leave the sandbox, when it said.
+                    let summary = match &info.justification {
+                        Some(reason) => format!("{summary} — {reason}"),
+                        None => summary,
+                    };
                     // Show which subagent asked; main-agent requests are unprefixed.
                     let summary = match subagent_id {
                         Some(id) => format!("[agent {id}] {summary}"),
