@@ -801,8 +801,11 @@ impl OpenAiClient {
         })
     }
 
-    /// The flag the turn's owner sets to stop it (see `HostToolRunner`).
+    /// The flag the turn's owner sets to stop it (see `HostToolRunner`). It
+    /// stops the client's requests too, whatever they wait on (see
+    /// `TransportClient::set_interrupt`).
     pub fn set_interrupt_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.transport.set_interrupt(Arc::clone(&flag));
         self.interrupt_flag = flag;
     }
 
@@ -2283,7 +2286,12 @@ impl OpenAiClient {
             manager.register_workspace(&path, workspace, &spec.parent_cwd);
         }
         manager.set_spec(&path, spec.clone());
-        let child = self.child_client(&spec, manager, &path, workspace.as_ref());
+        let mut child = self.child_client(&spec, manager, &path, workspace.as_ref());
+        // Closing the agent stops its request at once. Its own flag, not the
+        // parent turn's: a background agent outlives a stopped turn.
+        child
+            .transport
+            .set_interrupt(Arc::clone(&slot.interrupt_flag));
         let manager = manager.clone();
         let hooks = self.hooks.clone();
         let workdir_text = workdir.clone();
@@ -4064,8 +4072,161 @@ mod tests {
     use llm_provider_kit::response_content_text;
     use std::{
         fs,
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        sync::atomic::{AtomicUsize, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    /// A model server that answers every request with `head` (nothing when
+    /// empty) and then keeps the connection open, saying nothing more: a
+    /// network that went quiet. Closes at once instead when `close`.
+    /// Counts the requests it got.
+    fn quiet_model(head: &'static str, close: bool) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&requests);
+        thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let count = Arc::clone(&count);
+                thread::spawn(move || {
+                    // The request: its head, then Content-Length bytes.
+                    let mut received = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    loop {
+                        let Ok(read) = stream.read(&mut chunk) else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        received.extend_from_slice(&chunk[..read]);
+                        let text = String::from_utf8_lossy(&received).to_lowercase();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let length = text[..end]
+                                .lines()
+                                .find_map(|line| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if received.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.flush();
+                    if !close {
+                        thread::sleep(Duration::from_secs(60));
+                    }
+                });
+            }
+        });
+        (base_url, requests)
+    }
+
+    /// Runs a turn against `base_url` on a thread of its own, with
+    /// `retry_attempts`, and stops it (the interrupt flag, as
+    /// `AgentCore::interrupt` sets it) once `ready` says so, `ready` being
+    /// asked with every event and every 20 ms. Returns the turn's result and
+    /// how long it took to end after the stop.
+    fn stop_turn(
+        base_url: String,
+        retry_attempts: usize,
+        ready: impl Fn(Option<&StreamEvent>) -> bool + Send + Sync + 'static,
+    ) -> (Result<(), String>, Duration) {
+        let mut config = test_client_config();
+        config.protocol = "chat".to_string();
+        config.base_url = base_url;
+        config.retry_attempts = retry_attempts;
+        config.connect_timeout = Duration::from_secs(5);
+        config.read_timeout = Duration::from_secs(60);
+        let mut client = OpenAiClient::from_config(config).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        client.set_interrupt_flag(Arc::clone(&flag));
+        let ready = Arc::new(ready);
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let on_event = Arc::clone(&ready);
+        thread::spawn(move || {
+            let input = vec![
+                json!({ "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }),
+            ];
+            let result = client.run_turn_events(input, &std::env::temp_dir(), |event| {
+                if (*on_event)(Some(&event)) {
+                    let _ = seen_tx.send(());
+                }
+                Ok(())
+            });
+            let _ = done_tx.send((result, Instant::now()));
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen_rx.try_recv().is_err() && !(*ready)(None) {
+            assert!(Instant::now() < deadline, "the turn never got there");
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Waiting for real: in the sleep, on the socket.
+        thread::sleep(Duration::from_millis(200));
+        let stopped = Instant::now();
+        flag.store(true, Ordering::SeqCst);
+        let (result, ended) = done_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the turn ended");
+        (result, ended.saturating_duration_since(stopped))
+    }
+
+    #[test]
+    fn a_stop_ends_the_wait_before_a_retry_and_nothing_is_sent_after_it() {
+        let (base_url, requests) = quiet_model(
+            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 30\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy",
+            true,
+        );
+        let (result, took) = stop_turn(base_url, 3, |event| {
+            matches!(event, Some(StreamEvent::Retrying { .. }))
+        });
+        assert_eq!(result.unwrap_err(), "interrupted");
+        assert!(
+            took < Duration::from_secs(1),
+            "ended {took:?} after the stop"
+        );
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_stop_ends_a_turn_whose_answer_never_comes() {
+        let (base_url, requests) = quiet_model("", false);
+        let asked = Arc::clone(&requests);
+        let (result, took) = stop_turn(base_url, 3, move |_| asked.load(Ordering::SeqCst) > 0);
+        assert_eq!(result.unwrap_err(), "interrupted");
+        assert!(
+            took < Duration::from_secs(1),
+            "ended {took:?} after the stop"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_stop_ends_a_turn_whose_stream_stops_midway() {
+        let (base_url, _) = quiet_model(
+            concat!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+            ),
+            false,
+        );
+        let (result, took) = stop_turn(
+            base_url,
+            3,
+            |event| matches!(event, Some(StreamEvent::Delta(delta)) if delta == "partial"),
+        );
+        assert_eq!(result.unwrap_err(), "interrupted");
+        assert!(
+            took < Duration::from_secs(1),
+            "ended {took:?} after the stop"
+        );
+    }
 
     #[test]
     fn empty_non_tool_response_requests_runtime_reminder() {

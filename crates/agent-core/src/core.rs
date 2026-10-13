@@ -2590,6 +2590,10 @@ impl AgentCore {
         self.interrupt_flag = Arc::new(AtomicBool::new(false));
         let interrupt_flag = Arc::clone(&self.interrupt_flag);
         client.set_interrupt_flag(Arc::clone(&interrupt_flag));
+        let compaction = compaction.map(|(plan, mut summarizer)| {
+            summarizer.set_interrupt_flag(Arc::clone(&interrupt_flag));
+            (plan, summarizer)
+        });
         self.receiver = Some(rx);
         self.running = true;
 
@@ -2738,7 +2742,7 @@ impl AgentCore {
             )?;
             Ok((client, self.compaction_client()?))
         });
-        let (client, summarizer) = match clients {
+        let (mut client, mut summarizer) = match clients {
             Ok(clients) => clients,
             Err(error) => return vec![AgentEvent::Error(error)],
         };
@@ -2749,6 +2753,9 @@ impl AgentCore {
         let current_plan = self.plan.clone();
         let (tx, rx) = mpsc::channel();
         self.interrupt_flag = Arc::new(AtomicBool::new(false));
+        // Stopping the compaction stops its request at once.
+        client.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
+        summarizer.set_interrupt_flag(Arc::clone(&self.interrupt_flag));
         self.receiver = Some(rx);
         self.running = true;
 
