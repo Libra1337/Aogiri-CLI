@@ -38,11 +38,61 @@ Command rules are checked first, by how the command starts:
 - `ask`: always asks you, in every approval mode (`full-access` too). "Always
   allow" for the session does not cover it, and a switch to a looser mode
   does not approve a call that waits;
-- `allow`: may leave the sandbox without asking.
+- `allow`: runs without asking, and may leave the sandbox without asking.
 
 `forbid` wins over other matches, otherwise the longest prefix applies. The
 defaults let `git add` and `git commit` leave the sandbox and always ask
 before `git push`.
+
+A command line is matched part by part. It is split on `&&`, `||`, `;`,
+`|`, `&`, new lines and command substitutions (`$(…)`, backticks); code
+given inline to a shell (`bash -c "…"`, `powershell -Command …`,
+`cmd /c …`) is split the same way. From each part, leading variable
+assignments and wrappers come off (`sudo`, `doas`, `env`, `command`,
+`time`, `nohup`, `nice`, `timeout`, `xargs`), and a rule matches the part
+as written, without its wrappers, or with the program named by its file
+name (`/usr/bin/git push` matches `git push`). Then:
+
+- a part that is forbidden makes the whole command forbidden;
+- a part that must ask makes the whole command ask;
+- the command is allowed only when every part is, except parts that only
+  move around, print or filter (`cd`, `echo`, `grep`, `head`, `tail`, ...,
+  without a redirection).
+
+### Built-in lists
+
+Two lists live in the engine, not in the settings, and you cannot remove
+them. They apply in every approval mode and every sandbox mode, Windows
+included. A rule of yours does not override them; you can add your own
+`ask` and `forbid` rules.
+
+Always asks (`must_ask`, approved once at most):
+
+- elevation: `sudo`, `su`, `doas`, `pkexec`, `gsudo`, `runas`,
+  `Start-Process -Verb RunAs`;
+- `git push`, forced or not;
+- deleting files outside the workspace, the read-write directories, temp
+  and the package caches (`rm`, `rmdir`, `unlink`, `del`, `rd`,
+  `Remove-Item`, ...);
+- changing system settings: services and startup items (`launchctl`,
+  `systemctl enable|start|stop|…`, `service … start`, `sc create|config|…`,
+  `New-Service`, `schtasks /create`, `crontab`), the registry under HKLM,
+  the firewall and antivirus (`netsh advfirewall`, `ufw`, `iptables`,
+  `pfctl`, `Set-MpPreference`, ...), `spctl`, `csrutil`,
+  `Set-ExecutionPolicy`;
+- reading or writing credentials (`~/.ssh`, `~/.gnupg`, `~/.aws`,
+  `~/.lynshen/auth.json`, `~/.lynshen/daemon`).
+
+Never runs:
+
+- deleting the root, the home directory, a drive root, or a directory
+  that contains the workspace (`rm -rf ~`, `rm -rf /*`, `rmdir ..`).
+
+These lists, like the rules, match the command's text. They catch a
+model's mistake, not a command written to get past them: an alias, a
+script, a variable (`rm -rf "$DIR"`), an encoded or generated command
+line are not seen through. What is enforced is the OS sandbox on macOS and
+Linux (what a command can write) and the file tools' own checks.
 
 ### How far an approval reaches
 

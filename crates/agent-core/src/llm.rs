@@ -1042,14 +1042,17 @@ impl OpenAiClient {
             let mut partial_approvals: BTreeMap<String, (Vec<String>, Vec<String>)> =
                 BTreeMap::new();
             for mut request in allowed_requests {
-                let gate = self.sandbox_gate(&request);
+                let (gate, check) = self.gate(&request, cwd);
                 if gate == SandboxGate::Forbid {
                     emit(StreamEvent::ToolStart {
                         call_id: request.call_id.clone(),
                         name: request.name.clone(),
                     })?;
+                    let reason = check
+                        .and_then(|check| check.reason)
+                        .unwrap_or_else(|| "forbidden by the agent's command rules".to_string());
                     let result = json_tool_result(
-                        json!({ "error": "this command is forbidden by the agent's command rules; do not retry it" }),
+                        json!({ "error": format!("this command is {reason}; do not retry it") }),
                         true,
                     );
                     emit_tool_output(&request, &result, &mut emit)?;
@@ -1076,7 +1079,7 @@ impl OpenAiClient {
                 let decision = if classified_allow {
                     ApprovalDecision::allow_all()
                 } else {
-                    let info = self.approval_info(&request, cwd, gate);
+                    let info = self.approval_info(&request, cwd, gate, check.as_ref());
                     self.request_approval(&request, cwd, info)
                 };
                 if !decision.allow {
@@ -2755,23 +2758,35 @@ impl OpenAiClient {
     /// wired (interactive serve / TUI); the class-per-mode policy lives in
     /// `ApprovalMode::requires_approval`. Requests that do go out may still be
     /// auto-approved core-side by the session allowlist or a looser live mode.
-    /// How the sandbox and the command rules treat a shell call; `Mode`
-    /// defers to the approval mode as without a sandbox.
+    /// `gate` from the working directory, for tests.
+    #[cfg(test)]
     fn sandbox_gate(&self, request: &ToolCallRequest) -> SandboxGate {
+        self.gate(request, Path::new(".")).0
+    }
+
+    /// How the sandbox, the command rules and the built-in lists treat a
+    /// call made from `cwd`, with what the rules said about a shell
+    /// command; `Mode` defers to the approval mode as without a sandbox.
+    fn gate(
+        &self,
+        request: &ToolCallRequest,
+        cwd: &Path,
+    ) -> (SandboxGate, Option<crate::sandbox::CommandCheck>) {
         if request.name == "write_stdin" {
             // Polling writes nothing: it only reads a shell this engine
             // already started through its own gate.
-            return if approval_summary(&request.name, &request.arguments).is_empty() {
+            let gate = if approval_summary(&request.name, &request.arguments).is_empty() {
                 SandboxGate::Run
             } else {
                 SandboxGate::Mode
             };
+            return (gate, None);
         }
         if !is_shell_tool(&request.name) {
-            return SandboxGate::Mode;
+            return (SandboxGate::Mode, None);
         }
         let Some(sandbox) = self.tool_state.sandbox() else {
-            return SandboxGate::Mode;
+            return (SandboxGate::Mode, None);
         };
         let args = serde_json::from_str::<Value>(&request.arguments).unwrap_or(Value::Null);
         let command = args
@@ -2779,8 +2794,14 @@ impl OpenAiClient {
             .or_else(|| args.get("cmd"))
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let workdir = args
+            .get("workdir")
+            .and_then(Value::as_str)
+            .map(|dir| tools::resolve_path(cwd, dir))
+            .unwrap_or_else(|| cwd.to_path_buf());
         let escalated = args.get("escalate").and_then(Value::as_bool) == Some(true);
-        match sandbox.rule_for(command) {
+        let check = sandbox.check_command(command, Some((&workdir, cwd)));
+        let gate = match check.action {
             Some(RuleAction::Forbid) => SandboxGate::Forbid,
             Some(RuleAction::Ask) => SandboxGate::Ask,
             // An allow rule (a default one, or one an approval remembered):
@@ -2804,7 +2825,8 @@ impl OpenAiClient {
                 }
             }
             _ => SandboxGate::Mode,
-        }
+        };
+        (gate, Some(check))
     }
 
     /// `needs_approval` for one call: merge_agent asks only to apply, since
@@ -2961,6 +2983,7 @@ impl OpenAiClient {
         request: &ToolCallRequest,
         cwd: &Path,
         gate: SandboxGate,
+        check: Option<&crate::sandbox::CommandCheck>,
     ) -> ApprovalInfo {
         let must_ask = gate == SandboxGate::Ask;
         let mut info = ApprovalInfo {
@@ -2989,14 +3012,8 @@ impl OpenAiClient {
                 .unwrap_or_else(|| cwd.to_path_buf());
             let escalated = args.get("escalate").and_then(Value::as_bool) == Some(true);
             let sandbox = self.tool_state.sandbox();
-            let check = sandbox
-                .as_ref()
-                .map(|sandbox| sandbox.check_command(&command, Some((&workdir, cwd))))
-                .unwrap_or_default();
-            let rule_asks = sandbox
-                .as_ref()
-                .and_then(|sandbox| sandbox.rule_for(&command))
-                == Some(RuleAction::Ask);
+            let check = check.cloned().unwrap_or_default();
+            let rule_asks = check.action == Some(RuleAction::Ask);
             let crossing = escalated
                 && sandbox
                     .as_ref()
@@ -5817,7 +5834,8 @@ mod tests {
                 name: name.to_string(),
                 arguments: arguments.to_string(),
             };
-            client.approval_info(&request, &cwd, client.sandbox_gate(&request))
+            let (gate, check) = client.gate(&request, &cwd);
+            client.approval_info(&request, &cwd, gate, check.as_ref())
         };
 
         let npm = info(

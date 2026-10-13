@@ -1,7 +1,9 @@
 //! A command rule that says `ask` always reaches a person: full-access does
 //! not approve it, the session's "always allow" does not cover it, and a
 //! switch to a looser mode does not approve it while it waits. A `forbid`
-//! rule still refuses, and other commands still run as the mode says.
+//! rule still refuses, and other commands still run as the mode says. The
+//! built-in lists (elevation, git push, deletes outside the workspace, ...)
+//! ask the same way, and deleting the home directory never runs.
 //!
 //! Runs against the temporary HOME and fake model of `support/fake_model.rs`
 //! (`RUN: <command>`, `CALL <tool> <arguments>`).
@@ -11,6 +13,7 @@ mod fake_model;
 
 use fake_model::{setup, temp_dir};
 use lynshen_agent_core::{
+    approval::{ApprovalInfo, ApprovalKind, ApprovalScope},
     sandbox::{CommandRule, RuleAction, SandboxPolicy},
     AgentCore, AgentEvent, ApprovalMode,
 };
@@ -62,6 +65,14 @@ fn approval(events: &[AgentEvent]) -> Option<(String, String)> {
         AgentEvent::ApprovalRequest {
             call_id, summary, ..
         } => Some((call_id.clone(), summary.clone())),
+        _ => None,
+    })
+}
+
+/// The call id and what the first approval request in `events` says.
+fn approval_info(events: &[AgentEvent]) -> Option<(String, ApprovalInfo)> {
+    events.iter().find_map(|event| match event {
+        AgentEvent::ApprovalRequest { call_id, info, .. } => Some((call_id.clone(), info.clone())),
         _ => None,
     })
 }
@@ -214,4 +225,56 @@ fn ordinary_commands_run_without_asking_in_full_access() {
     let events = pump(&mut core, |event| is_ready(event) || is_approval(event));
     assert!(approval(&events).is_none(), "{events:#?}");
     assert_eq!(fs::read_to_string(dir.join("out.txt")).unwrap(), "out");
+}
+
+#[test]
+fn the_built_in_list_asks_in_full_access_whatever_the_rules_say() {
+    let _guard = setup();
+    let dir = temp_dir("built-in-ask");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    let mut sandbox = SandboxPolicy::default_for_platform();
+    sandbox.rules = ["sudo", "git push", "rm"]
+        .into_iter()
+        .map(|prefix| CommandRule {
+            prefix: prefix.into(),
+            action: RuleAction::Allow,
+        })
+        .collect();
+    core.set_sandbox(Some(sandbox));
+
+    let mut ask = |command: &str, kind: ApprovalKind| {
+        let events = run(&mut core, command);
+        let (call_id, info) =
+            approval_info(&events).unwrap_or_else(|| panic!("{command} asks: {events:#?}"));
+        assert_eq!(info.kind, kind, "{command}");
+        assert!(info.must_ask, "{command}");
+        assert_eq!(info.scopes, vec![ApprovalScope::Once], "{command}");
+        core.approve(&call_id, false, false, None);
+        let events = pump(&mut core, is_ready);
+        assert!(assistant_text(&events).contains("denied by user"));
+        info
+    };
+    let sudo = ask("sudo -n true", ApprovalKind::Elevation);
+    assert!(sudo.elevation.is_some());
+    ask("git push --force", ApprovalKind::Rule);
+    // Outside the workspace, temp and the package caches.
+    ask(
+        "cd . && rm -f /var/empty/lynshen-test-missing",
+        ApprovalKind::Rule,
+    );
+}
+
+#[test]
+fn deleting_the_home_directory_or_a_parent_never_runs() {
+    let _guard = setup();
+    let dir = temp_dir("built-in-forbid");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+
+    // Harmless if they ran: the paths do not exist.
+    for command in ["rmdir ~/lynshen-missing/..", "rmdir ../lynshen-missing/.."] {
+        let events = run(&mut core, command);
+        assert!(approval(&events).is_none(), "{events:#?}");
+        let text = assistant_text(&events);
+        assert!(text.contains("never run"), "{command}: {text}");
+    }
 }

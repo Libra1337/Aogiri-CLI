@@ -117,25 +117,10 @@ impl SandboxPolicy {
         self.mode != SandboxMode::FullAccess
     }
 
-    /// The rule that applies to `command`: `forbid` wins over any other
-    /// match, otherwise the longest matching prefix.
+    /// What the command rules and the built-in lists say about `command`
+    /// (see `check_command`), without the checks that need its directory.
     pub fn rule_for(&self, command: &str) -> Option<RuleAction> {
-        let words: Vec<&str> = command.split_whitespace().collect();
-        let matches: Vec<&CommandRule> = self
-            .rules
-            .iter()
-            .filter(|rule| {
-                let prefix: Vec<&str> = rule.prefix.split_whitespace().collect();
-                !prefix.is_empty() && words.starts_with(&prefix)
-            })
-            .collect();
-        if matches.iter().any(|rule| rule.action == RuleAction::Forbid) {
-            return Some(RuleAction::Forbid);
-        }
-        matches
-            .into_iter()
-            .max_by_key(|rule| rule.prefix.split_whitespace().count())
-            .map(|rule| rule.action)
+        self.check_command(command, None).action
     }
 
     /// What the command rules and the built-in lists say about `command`,
@@ -164,7 +149,7 @@ impl SandboxPolicy {
         for part in &parts {
             let user = self.user_rule(part);
             let mut part_forbid = (user == Some(RuleAction::Forbid))
-                .then(|| "it matches a forbid command rule".to_string());
+                .then(|| "forbidden by the agent's command rules".to_string());
             let mut part_ask = (user == Some(RuleAction::Ask))
                 .then(|| "it matches an ask command rule".to_string());
             let elevated = part.elevated
@@ -197,7 +182,7 @@ impl SandboxPolicy {
                     if protected {
                         part_forbid.get_or_insert_with(|| {
                             format!(
-                                "it deletes {}: the root, the home directory or a parent of the workspace",
+                                "never run: it deletes {}, the root, the home directory or a parent of the workspace",
                                 target.display()
                             )
                         });
@@ -1006,6 +991,106 @@ mod tests {
         fs::create_dir_all(dir.join(".git")).unwrap();
         fs::create_dir_all(dir.join(".lynshen/agents/sub")).unwrap();
         real(&dir)
+    }
+
+    #[test]
+    fn every_part_of_a_command_line_is_matched_on_its_own() {
+        use RuleAction::{Allow, Ask, Forbid};
+        let policy = policy(SandboxMode::WorkspaceWrite);
+        // Allowed only when every part is; moving around does not count.
+        assert_eq!(policy.rule_for("cd app && git commit -m x"), Some(Allow));
+        assert_eq!(policy.rule_for("git commit -m x && make"), None);
+        // One part that asks or is forbidden decides.
+        assert_eq!(policy.rule_for("make && git status"), Some(Ask));
+        assert_eq!(
+            policy.rule_for("make; git push --force origin | tail"),
+            Some(Forbid)
+        );
+        // Wrappers and the program's path come off.
+        assert_eq!(
+            policy.rule_for("FOO=1 command git commit -m x"),
+            Some(Allow)
+        );
+        assert_eq!(policy.rule_for("/usr/bin/git commit -m x"), Some(Allow));
+        assert_eq!(policy.rule_for("echo $(git status)"), Some(Ask));
+    }
+
+    #[test]
+    fn the_built_in_lists_ask_or_refuse_whatever_the_rules_say() {
+        use RuleAction::{Allow, Ask, Forbid};
+        let dir = work("built-in");
+        let mut policy = policy(SandboxMode::FullAccess);
+        policy.rules = ["sudo", "git push", "rm", "launchctl", "cat", "reg"]
+            .into_iter()
+            .map(|prefix| CommandRule {
+                prefix: prefix.to_string(),
+                action: Allow,
+            })
+            .collect();
+        let check = |command: &str| policy.check_command(command, Some((&dir, &dir)));
+        for command in [
+            "sudo make install",
+            "doas reboot",
+            "Start-Process powershell -Verb RunAs",
+            "git push origin main",
+            "launchctl load ~/Library/LaunchAgents/x.plist",
+            r"reg add HKLM\Software\X /v Y /d 1",
+            "Set-ExecutionPolicy Bypass",
+            "rm -f /etc/hosts.bak",
+            "cat ~/.ssh/id_ed25519",
+            "echo key >> ~/.ssh/authorized_keys",
+        ] {
+            let check = check(command);
+            assert_eq!(check.action, Some(Ask), "{command}: {check:?}");
+            assert!(check.reason.is_some(), "{command}");
+        }
+        assert!(check("sudo make install").elevation);
+        let parent = dir.parent().unwrap().display().to_string();
+        for command in [
+            "rm -rf /".to_string(),
+            "rm -rf ~".to_string(),
+            "sudo rm -rf $HOME/*".to_string(),
+            "rmdir ..".to_string(),
+            format!("rm -r {parent}"),
+            "bash -c 'rm -rf /'".to_string(),
+        ] {
+            let check = check(&command);
+            assert_eq!(check.action, Some(Forbid), "{command}: {check:?}");
+            assert!(check.reason.unwrap().starts_with("never run"), "{command}");
+        }
+        // Inside the workspace, temp and the read-write directories a delete
+        // is the rules' to decide.
+        assert_eq!(check("rm -rf build target").action, Some(Allow));
+        assert_eq!(check("rm -f /tmp/x.log").action, Some(Allow));
+        // `cat` is neutral: nothing asks, nothing allows.
+        assert_eq!(check("cat ~/.lynshen/config.json").action, None);
+    }
+
+    #[test]
+    fn a_check_names_what_an_approval_may_remember() {
+        let dir = work("remember");
+        let policy = policy(SandboxMode::WorkspaceWrite);
+        let check = |command: &str| policy.check_command(command, Some((&dir, &dir)));
+        assert_eq!(
+            check("cd web && npm install --save x").prefix.as_deref(),
+            Some("npm install")
+        );
+        assert_eq!(check("make && npm test").prefix, None);
+        assert!(!check("npm install").once_only);
+        for command in [
+            "python3 x.py",
+            "node -e 1",
+            "rm a.txt",
+            "sudo ls",
+            "git push -f",
+            "pwsh -c ls",
+        ] {
+            assert!(check(command).once_only, "{command}");
+        }
+        assert_eq!(
+            check("cp out.png /srv/www/").writes,
+            vec![PathBuf::from("/srv/www")]
+        );
     }
 
     #[test]
