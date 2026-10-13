@@ -190,6 +190,8 @@ fn refresh(configured: &[(String, String)], all: bool) {
 }
 
 type MirrorSources<'a> = dyn Fn() -> Option<Result<Vec<SkillSource>, String>> + 'a;
+/// A source read again, and where from (`mirror` or `github`).
+type Fresh = Result<(SkillSource, &'static str), String>;
 type GithubSource<'a> = dyn Fn(&str, &str) -> Result<SkillSource, String> + Sync + 'a;
 
 /// The cache after reading the stale sources (every one when `all`) again:
@@ -211,7 +213,7 @@ fn read_again(
     if rest.is_empty() {
         return None;
     }
-    let mut fresh: Vec<(usize, Result<(SkillSource, &str), String>)> = Vec::new();
+    let mut fresh: Vec<(usize, Fresh)> = Vec::new();
     let mut mirror_error = None;
     match mirror() {
         Some(Ok(sources)) => rest.retain(|&at| {
