@@ -4025,12 +4025,14 @@ fn inject_input_item(
     Ok(())
 }
 
-/// Retries after the first attempt, overridable for debugging.
+/// Retries after the first attempt, overridable for debugging; never more
+/// than `MAX_RETRY_ATTEMPTS`.
 fn retry_attempts_from_env(configured: usize) -> usize {
     env::var("LYNSHEN_RETRY_ATTEMPTS")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(configured)
+        .min(crate::config::MAX_RETRY_ATTEMPTS)
 }
 
 /// Maps a transport event onto the agent's stream event.
