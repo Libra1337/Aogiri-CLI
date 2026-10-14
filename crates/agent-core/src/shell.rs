@@ -1618,7 +1618,9 @@ mod tests {
             ids,
             [("pwsh", false), ("powershell", true), ("gitbash", true)]
         );
-        assert_eq!(reply["shells"][1]["path"], powershell.display().to_string());
+        // As paths: Windows' separators may differ in the text.
+        let path = PathBuf::from(reply["shells"][1]["path"].as_str().unwrap());
+        assert_eq!(path, powershell);
         assert_eq!(reply["shells"][1]["version"], "5.1.22621.4391");
         // PowerShell 7 is missing: auto's first installed shell runs (Git
         // Bash, or Windows PowerShell with PowerShell 7 first), and says why.
