@@ -1077,7 +1077,7 @@ impl CommandShell {
             ),
             Kind::GitBash => {
                 let mut line = format!(
-                    "Commands run in {label} on Windows: use bash syntax and forward slashes in paths (`C:/Users/me` or `/c/Users/me`)."
+                    "Commands run in {label} on Windows: use bash syntax, and write paths with forward slashes (`C:/Users/me`)."
                 );
                 if let Some((kind, version)) = &self.helper {
                     let program = if *kind == Kind::Pwsh {
