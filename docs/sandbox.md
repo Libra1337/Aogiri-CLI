@@ -283,3 +283,88 @@ Desktop, Downloads and Documents are not writable unless you add them;
 the approval card offers it the first time the model needs one.
 
 Hook commands are written by you and are not sandboxed.
+
+## Shell
+
+The model's commands run in the shell that `shell` in
+`~/.lynshen/config.json` names. The sandbox wraps whichever shell runs.
+
+| `shell` | Commands run in |
+| --- | --- |
+| `"auto"` (default, also when the key is absent) | Windows: the first installed of Git Bash, PowerShell 7, Windows PowerShell 5.1. macOS and Linux: the login shell (`$SHELL`, else the user database's) when it is zsh, bash or sh; else zsh, bash or sh, whichever is installed (zsh first on macOS, bash first on Linux) |
+| `"pwsh"` | PowerShell 7 |
+| `"powershell"` | Windows PowerShell 5.1 |
+| `"gitbash"` | Git for Windows' `bin\bash.exe` (never WSL's `System32\bash.exe`) |
+| `"zsh"`, `"bash"`, `"sh"` | That shell |
+| an absolute path | That program; its file name must say which shell it is (`pwsh`, `powershell`, `bash`, `zsh`, `sh`, `dash`, `ksh`) |
+
+A shell that is not installed here, or a value the engine does not know,
+falls back to `"auto"`; the `shells` op reports why in `commands.notes`.
+The Windows order is `WINDOWS_AUTO_ORDER` in
+`crates/agent-core/src/shell.rs`.
+
+Where the engine looks:
+- PowerShell 7: `pwsh.exe` on `PATH`, `%ProgramFiles%\PowerShell\7`
+  (the installer, winget), `%LOCALAPPDATA%\Microsoft\WindowsApps` (Store and
+  MSIX), `%ProgramFiles%\PowerShell\7-preview`, `%USERPROFILE%\.dotnet\tools`.
+- Windows PowerShell: `%SystemRoot%\System32\WindowsPowerShell\v1.0`, then
+  `PATH`.
+- Git Bash: `%ProgramFiles%\Git`, `%ProgramFiles(x86)%\Git`,
+  `%LOCALAPPDATA%\Programs\Git`, the Git that `git.exe` on `PATH` belongs to,
+  Scoop's.
+- zsh, bash, sh: `PATH`, then `/bin`, `/usr/bin`.
+
+How each shell runs a command:
+- PowerShell 7 and 5.1: `-NoProfile -ExecutionPolicy Bypass -Command`,
+  after a prelude that sets `$OutputEncoding`, `[Console]::OutputEncoding`
+  and `[Console]::InputEncoding` to UTF-8 (without a BOM) and turns off
+  progress bars. Without it, Chinese text is garbled under a GBK code page.
+- Git Bash: `bash.exe -lc`, with `CHERE_INVOKING=1` so that its
+  `/etc/profile` stays in the working directory.
+- zsh and bash: `-c`, in the login environment (below). Without one,
+  `-lc`; when even `-lc` does not start within 5 seconds, `/bin/sh -c`.
+- sh: `sh -lc`, as before this setting.
+
+Every command also gets `NO_COLOR=1`, `TERM=dumb`, `PAGER=cat`,
+`GIT_PAGER=cat`, and `GIT_TERMINAL_PROMPT=0` unless it is set. POSIX shells
+get `LANG=en_US.UTF-8` (macOS) or `C.UTF-8` when none of `LC_ALL`,
+`LC_CTYPE` and `LANG` is set. A terminal gets none of these.
+
+### Login environment
+
+Users add to `PATH` in `~/.zshrc` (nvm, pyenv, conda, Homebrew), which a
+non-interactive shell does not read. So for zsh and bash the engine starts
+the shell once as an interactive login shell, `$SHELL -ilc`, and keeps the
+environment it prints (`command env -0`, written to a temporary file and
+ended by a marker). Each command then runs with `-c` in that environment;
+`-l` again would let macOS' `path_helper` move `/usr/bin` ahead of the
+user's directories. `PWD`, `OLDPWD`, `SHLVL` and `_` are left out.
+
+The snapshot runs with input, output and errors closed, in its own process
+group, and is killed after 5 seconds: an rc file that waits for input gets
+end of file, one that starts a background program cannot hold a pipe open,
+and one that hangs or exits early only costs the snapshot. Aliases and
+functions from rc files are not kept.
+
+An engine takes the snapshot in the background when it starts, once per
+process and setting (the daemon hosts all its sessions in one process).
+A new `shell` value, the `shells` op with `refresh: true`, or a restart
+takes it again.
+
+### What the model is told about the shell
+
+The system prompt's `<env>` block names the shell and its version, for
+example `Commands run in zsh 5.9.` or `Commands run in PowerShell 7.5.2
+(pwsh): …`. Windows PowerShell 5.1 adds that it has no `&&` or `||` (use
+`;` and `if ($?) { … }`). Git Bash adds that Windows-native work can run
+in `pwsh -NoProfile -Command "…"`, with PowerShell's version. When the
+shell changes during a session, the model gets a note on its next turn.
+
+### Terminals
+
+A terminal (the daemon's `term_open`, Desktop's terminal panel) opens
+`terminal_shell`, else `shell`. `terminal_shell` takes the same values,
+and an absolute path to any program (`cmd.exe`, `fish`). `"auto"` is the
+model's shell on Windows, and the login shell, whichever it is, on macOS
+and Linux. zsh, bash, sh and fish start with `-l`, Git Bash with
+`--login -i`, PowerShell with `-NoLogo`.

@@ -1,4 +1,4 @@
-//! Remote terminals: the user's login shell on a pty, in a known directory,
+//! Remote terminals: the user's shell on a pty, in a known directory,
 //! or a session's own TUI (see `open_command`). A terminal belongs to the
 //! client that opened it: only that client may use it or sees its output,
 //! and it is killed when that client goes.
@@ -8,6 +8,7 @@ use crate::{
     hub::{lock, Hub},
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
+use lynshen_agent_core::shell;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
 use std::{
@@ -212,32 +213,18 @@ pub fn tui(command: &std::process::Command, cwd: &Path) -> CommandBuilder {
     builder
 }
 
-/// The user's login shell in `cwd`, with the daemon's environment.
+/// The terminal shell the settings name (`terminal_shell`, else `shell` in
+/// config.json; see `lynshen_agent_core::shell`) in `cwd`, with the daemon's
+/// environment: by default the login shell on macOS and Linux, and what the
+/// model's commands run in on Windows.
 fn shell(cwd: &Path) -> CommandBuilder {
-    #[cfg(unix)]
-    let mut command = {
-        let fallback = if cfg!(target_os = "macos") {
-            "/bin/zsh"
-        } else {
-            "/bin/bash"
-        };
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|shell| !shell.is_empty())
-            .unwrap_or_else(|| {
-                let found = [fallback, "/bin/sh"]
-                    .into_iter()
-                    .find(|shell| Path::new(shell).exists());
-                found.unwrap_or("/bin/sh").to_string()
-            });
-        let mut command = CommandBuilder::new(shell);
-        command.arg("-l");
-        command
-    };
-    #[cfg(windows)]
-    let mut command = CommandBuilder::new(
-        std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string()),
-    );
+    let settings = shell::Settings::read();
+    let shell = shell::Host::current().terminal(settings.terminal());
+    let mut command = CommandBuilder::new(&shell.program);
+    command.args(&shell.args);
+    for (name, value) in &shell.env {
+        command.env(name, value);
+    }
     command.cwd(cwd);
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");

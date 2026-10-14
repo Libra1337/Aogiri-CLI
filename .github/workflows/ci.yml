@@ -42,7 +42,9 @@ jobs:
         run: python3 deploy/skills-mirror/test_build.py
 
   # The release workflow already builds Windows binaries, so keep Windows
-  # compiling on every PR. Tests are only run on Linux for now.
+  # compiling on every PR. Tests are only run on Linux for now, except the
+  # shell tests, which run real commands in PowerShell 7, Windows
+  # PowerShell and Git Bash (all three are on windows-latest).
   build-windows:
     name: Build (Windows)
     runs-on: windows-latest
@@ -56,3 +58,6 @@ jobs:
 
       - name: Build workspace (including tests)
         run: cargo build --workspace --all-targets
+
+      - name: Shell tests
+        run: cargo test -p lynshen-agent-core --lib shell::tests

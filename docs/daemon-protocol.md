@@ -186,6 +186,7 @@ every connected client.
 | `skills_list` | optional `backend` (`lynshen`, default, or `claude`), optional `cwd` (an absolute project folder) | `skills_list` with `skills: [{name, description, path, scope, enabled, toggleable, removable}]`, `problems: [{level, kind, path, message}]`, `dirs: [{scope, path}]` and `projectTrusted` (local clients only). See "Skills" |
 | `skill_set_enabled` | `path` (a listed skill's folder), `enabled`, optional `cwd` | the new `skills_list` (local clients only, `lynshen` only) |
 | `skill_uninstall` | `path` (a listed skill's folder) or `skill` (a catalog `id`), optional `backend` | `skill_uninstalled` with `path` (local clients only) |
+| `shells` | optional `refresh` (detect again: shells, versions and the login environment) | `shells` with `platform`, `shell` and `terminal_shell` (the settings; `terminal_shell` null follows `shell`), `auto` (`{id, path}`: what `"auto"` takes here), `auto_order` (ids in order; `login` is the login shell), `shells: [{id, name, installed, path, version}]` (the shells this platform offers: `pwsh`, `powershell`, `gitbash` on Windows; `zsh`, `bash`, `sh` elsewhere), `commands` (`{id, name, label, path, version, login, snapshot, notes, helper}`: what the model's commands run in now; `notes` say why it is not what `shell` asks; `helper` is the PowerShell named for Windows-native work with Git Bash) and `terminal` (`{program, args, env}`: what a terminal opens). Local clients only. See "Shell" in `docs/sandbox.md` |
 | `skill_create` | `name` (lowercase letters, digits and hyphens), `description` | `skill_created` with `path`, the new `SKILL.md` in `~/.lynshen/skills/<name>/` (local clients only) |
 
 `decide_action` (a session op) also works for a session that is closed or
@@ -632,9 +633,11 @@ Only the client that opened a terminal receives its events:
 A client may have 4 terminals open; a fifth `term_open` is an error. Ops on
 another client's terminal or an unknown one are errors. A terminal belongs to
 its connection: when the client disconnects its shells are killed (SIGHUP,
-then SIGKILL), and there is no reattaching. The shell is `$SHELL -l` (else
-`/bin/zsh` on macOS, `/bin/bash`, then `/bin/sh`), `%COMSPEC%` or
-PowerShell on Windows, with the daemon's environment plus
+then SIGKILL), and there is no reattaching. The shell is the one
+`terminal_shell`, else `shell`, in config.json names (see "Shell" in
+`docs/sandbox.md`): by default `$SHELL -l` (else `/bin/zsh` on macOS,
+`/bin/bash`, then `/bin/sh`), and on Windows Git Bash, PowerShell 7 or
+Windows PowerShell, else `%COMSPEC%`. It has the daemon's environment plus
 `TERM=xterm-256color`, `COLORTERM=truecolor` and `LANG=en_US.UTF-8` when
 `LANG` is unset.
 

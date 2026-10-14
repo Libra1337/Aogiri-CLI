@@ -57,6 +57,11 @@ After `hello`, before any command, the engine emits its startup batch:
 `startup.version` is the CLI version; front-ends should record it for
 compatibility checks.
 
+The model's commands run in the shell `shell` in config.json names, read
+again each turn (see "Shell" in `docs/sandbox.md`). There is no op for it
+here: a client changes config.json, and the daemon's `shells` op lists the
+shells this computer has.
+
 After startup the loop polls every ~30 ms. `model_status` is deduplicated:
 it is re-emitted only when its content changes. All other events are emitted
 as they occur — command responses first, then background worker events
