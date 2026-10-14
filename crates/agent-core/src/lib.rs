@@ -31,6 +31,7 @@ pub mod sandbox;
 mod search;
 mod secrets;
 mod session;
+pub mod shell;
 pub mod skills;
 mod subagent_trace;
 mod subagents;

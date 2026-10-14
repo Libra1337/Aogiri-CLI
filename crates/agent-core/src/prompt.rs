@@ -46,6 +46,8 @@ pub struct PromptContext {
     pub chat: bool,
     /// The shell sandbox's note; empty without a sandbox.
     pub sandbox: String,
+    /// What the shell is (`CommandShell::prompt`); empty in a chat.
+    pub shell: String,
     /// The host's text (a daemon agent's brief and peers); empty without a
     /// host. When it changes the kept prompt is built again; the host's
     /// state (the dispatcher's tasks) is a note instead.
@@ -148,8 +150,8 @@ pub fn skills_section(skills: &[SkillPromptItem]) -> String {
     section
 }
 
-/// What follows the skills: the sandbox note, the working directory and the
-/// date, and the host's text.
+/// What follows the skills: the sandbox note, the working directory, the
+/// shell and the date, and the host's text.
 pub fn tail_section(context: &PromptContext) -> String {
     let mut tail = String::new();
     if !context.sandbox.trim().is_empty() {
@@ -157,10 +159,14 @@ pub fn tail_section(context: &PromptContext) -> String {
         tail.push_str(context.sandbox.trim_end());
     }
     tail.push_str(&format!(
-        "{ENV_START}Working directory: {}\nDate: {}\n</env>",
-        context.cwd.display(),
-        context.date
+        "{ENV_START}Working directory: {}\n",
+        context.cwd.display()
     ));
+    if !context.shell.trim().is_empty() {
+        tail.push_str(context.shell.trim());
+        tail.push('\n');
+    }
+    tail.push_str(&format!("Date: {}\n</env>", context.date));
     if !context.host.trim().is_empty() {
         tail.push_str("\n\n");
         tail.push_str(context.host.trim_end());
@@ -186,6 +192,9 @@ pub struct SessionPrompt {
     pub date: String,
     /// The sandbox note `tail` gives; empty without a sandbox.
     pub sandbox: String,
+    /// The shell `tail` names; empty in a chat, or in a prompt kept before
+    /// the shell was named.
+    pub shell: String,
     /// The host's text `tail` ends with; empty without a host.
     pub host: String,
 }
@@ -202,8 +211,8 @@ impl SessionPrompt {
     /// skills section lists only the skills that load) or host text (a
     /// daemon agent's brief, handoffs and peers: the model saw them current
     /// every turn before the prompt was kept).
-    /// The rest of the tail is left out: its date and sandbox note reach the
-    /// model as notes, and the working directory is the session's.
+    /// The rest of the tail is left out: its date, sandbox note and shell
+    /// reach the model as notes, and the working directory is the session's.
     pub fn outdated_by(&self, now: &SessionPrompt) -> bool {
         self.head != now.head
             || self.project != now.project
@@ -219,6 +228,7 @@ impl SessionPrompt {
             "tail": self.tail,
             "date": self.date,
             "sandbox": self.sandbox,
+            "shell": self.shell,
             "host": self.host,
         })
     }
@@ -232,6 +242,8 @@ impl SessionPrompt {
             tail: field("tail")?,
             date: field("date")?,
             sandbox: field("sandbox")?,
+            // Kept before the shell was named: a note names it.
+            shell: field("shell").unwrap_or_default(),
             // Saved before it was kept: a host's session builds its prompt
             // again once.
             host: field("host").unwrap_or_default(),
@@ -251,16 +263,19 @@ pub enum Note {
     Date,
     /// The shell sandbox (`SandboxPolicy::prompt`).
     Sandbox,
+    /// The shell commands run in (`CommandShell::prompt`).
+    Shell,
     /// The host's current state (`HostExtensions::context`).
     Host,
 }
 
 impl Note {
-    const ALL: [Note; 5] = [
+    const ALL: [Note; 6] = [
         Note::PlanMode,
         Note::PlanReminder,
         Note::Date,
         Note::Sandbox,
+        Note::Shell,
         Note::Host,
     ];
 
@@ -270,6 +285,7 @@ impl Note {
             Note::PlanReminder => "plan_reminder",
             Note::Date => "date",
             Note::Sandbox => "sandbox",
+            Note::Shell => "shell",
             Note::Host => "host",
         }
     }
@@ -304,7 +320,7 @@ const SANDBOX_OFF_NOTE: &str =
     "The shell sandbox is off now: commands run without one (full access), as the approval mode allows.";
 
 /// What the notes describe now: the approval mode's plan mode, today's date,
-/// the shell sandbox and the host's state.
+/// the shell sandbox, the shell and the host's state.
 pub struct NoteState {
     pub plan_mode: bool,
     /// The turn starts with a user's message: in plan mode it gets a short
@@ -313,6 +329,8 @@ pub struct NoteState {
     pub date: String,
     /// The sandbox note (`SandboxPolicy::prompt`); empty without a sandbox.
     pub sandbox: String,
+    /// The shell (`CommandShell::prompt`); empty in a chat.
+    pub shell: String,
     pub host: String,
 }
 
@@ -354,6 +372,17 @@ pub fn notes_due<'a>(
         told != sandbox
     }) {
         due.push((Note::Sandbox, sandbox));
+    }
+    // Another shell since the prompt (the setting changed, or the prompt was
+    // kept before it named one).
+    if !now.shell.trim().is_empty() {
+        let prompt_shell = prompt.map_or(now.shell.as_str(), |prompt| prompt.shell.as_str());
+        let shell = note(&now.shell);
+        if last(Note::Shell).map_or(now.shell.trim() != prompt_shell.trim(), |told| {
+            told != shell
+        }) {
+            due.push((Note::Shell, shell));
+        }
     }
     let host = note(if now.host.trim().is_empty() {
         HOST_EMPTY_NOTE
@@ -1467,6 +1496,7 @@ mod tests {
             tail: "\n\n<env>\nDate: 2026-10-12\n</env>".to_string(),
             date: "2026-10-12".to_string(),
             sandbox: String::new(),
+            shell: "Commands run in zsh 5.9.".to_string(),
             host: "<agent id=\"ops\">".to_string(),
         };
         assert_eq!(
@@ -1489,6 +1519,7 @@ mod tests {
             tail: tail_section(context),
             date: context.date.clone(),
             sandbox: context.sandbox.clone(),
+            shell: context.shell.clone(),
             host: context.host.clone(),
         }
     }
@@ -1512,6 +1543,7 @@ mod tests {
         let later = PromptContext {
             date: "2026-10-13".to_string(),
             sandbox: "<sandbox mode=\"read-only\">\nnote\n</sandbox>".to_string(),
+            shell: "Commands run in bash 5.2.37.".to_string(),
             ..context.clone()
         };
         assert!(!kept.outdated_by(&session_prompt("Base.", &later)));
@@ -1558,6 +1590,7 @@ mod tests {
             user_turn: false,
             date: date.to_string(),
             sandbox: String::new(),
+            shell: String::new(),
             host: host.to_string(),
         }
     }
@@ -1656,6 +1689,52 @@ mod tests {
         let off = notes_due(&now(""), Some(&prompt), told(&notes));
         assert_eq!(kinds(&off), [Note::Sandbox]);
         assert!(off[0].1.contains(SANDBOX_OFF_NOTE));
+    }
+
+    #[test]
+    fn the_env_block_names_the_shell() {
+        let shell = "Commands run in Windows PowerShell 5.1.22621.4391. It has no `&&` or `||`: separate commands with `;`.";
+        let prompt = build_system_prompt(
+            "Base prompt",
+            &PromptContext {
+                shell: shell.to_string(),
+                ..coding_context(crate::config::default_edit_tools())
+            },
+        );
+        assert!(prompt.ends_with(&format!(
+            "<env>\nWorking directory: /repo\n{shell}\nDate: 2026-05-27\n</env>"
+        )));
+        // The shell is per machine: it stays out of the cached prefix.
+        assert!(stable_prefix_len(&prompt).unwrap() < prompt.find(shell).unwrap());
+    }
+
+    #[test]
+    fn a_shell_change_is_a_note() {
+        let zsh = "Commands run in zsh 5.9.";
+        let bash = "Commands run in bash 5.2.37.";
+        let prompt = SessionPrompt {
+            shell: zsh.to_string(),
+            ..prompt_of("2026-10-12", "")
+        };
+        let now = |shell: &str| NoteState {
+            shell: shell.to_string(),
+            ..state(false, "2026-10-12", "")
+        };
+        assert!(notes_due(&now(zsh), Some(&prompt), |_| None).is_empty());
+        let notes = notes_due(&now(bash), Some(&prompt), |_| None);
+        assert_eq!(kinds(&notes), [Note::Shell]);
+        assert_eq!(
+            notes[0].1,
+            format!("<system-reminder>\n{bash}\n</system-reminder>")
+        );
+        assert!(notes_due(&now(bash), Some(&prompt), told(&notes)).is_empty());
+        // A prompt kept before the shell was named: told once.
+        let older = prompt_of("2026-10-12", "");
+        assert_eq!(
+            kinds(&notes_due(&now(zsh), Some(&older), |_| None)),
+            [Note::Shell]
+        );
+        assert_eq!(Note::parse(Note::Shell.as_str()), Some(Note::Shell));
     }
 
     #[test]

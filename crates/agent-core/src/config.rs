@@ -361,6 +361,10 @@ pub struct Config {
     pub web_fetch_engine: String,
     /// Install new CLI releases in the background (release binaries only).
     pub auto_update: bool,
+    /// The shell the model's commands run in (`shell` in config.json, see
+    /// `crate::shell`): "auto", a shell's id or an absolute path. Desktop
+    /// sets it; it is read again each turn and never written back.
+    pub shell: String,
     /// Subagent limits and policy (`agents` in config.json).
     pub agents: AgentsConfig,
     path: PathBuf,
@@ -616,6 +620,7 @@ impl Config {
                 web_search_model: crate::web::DEFAULT_SEARCH_MODEL.to_string(),
                 web_fetch_engine: crate::web::DEFAULT_FETCH_ENGINE.to_string(),
                 auto_update: true,
+                shell: "auto".to_string(),
                 agents: AgentsConfig::default(),
                 path,
             };
@@ -771,6 +776,7 @@ impl Config {
                 crate::web::FETCH_ENGINES,
             )?,
             auto_update: read_bool(&value, "auto_update", true),
+            shell: crate::shell::Settings::from_config(&value).shell,
             agents: read_agents(&value)?,
             path,
         };
@@ -867,8 +873,8 @@ impl Config {
 
     /// Re-reads, in one read of config.json, the settings Desktop changes
     /// while engines run: the image model, the subagent models, the hand-set
-    /// context windows and the LynShen group per model (the window follows
-    /// the group). An unreadable file keeps the current values.
+    /// context windows, the LynShen group per model (the window follows the
+    /// group) and the shell. An unreadable file keeps the current values.
     pub(crate) fn reload_live_settings(&mut self) -> io::Result<()> {
         let content = fs::read_to_string(&self.path)?;
         let value = serde_json::from_str::<Value>(&content)
@@ -877,6 +883,7 @@ impl Config {
         self.subagent_models = read_subagent_models(&value);
         self.context_window_overrides = read_context_window_overrides(&value);
         self.lynshen_groups = read_lynshen_groups(&value);
+        self.shell = crate::shell::Settings::from_config(&value).shell;
         if let Ok(agents) = read_agents(&value) {
             self.agents = agents;
         }
@@ -2683,6 +2690,7 @@ mod tests {
             web_search_model: crate::web::DEFAULT_SEARCH_MODEL.to_string(),
             web_fetch_engine: crate::web::DEFAULT_FETCH_ENGINE.to_string(),
             auto_update: true,
+            shell: "auto".to_string(),
             agents: AgentsConfig::default(),
             lynshen_models: Vec::new(),
             lynshen_groups: BTreeMap::new(),

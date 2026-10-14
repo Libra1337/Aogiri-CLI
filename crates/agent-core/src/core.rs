@@ -373,6 +373,11 @@ impl AgentCore {
             session: Default::default(),
         };
         tool_state.set_sandbox(sandbox.merged());
+        // The shell's version and login environment take a moment: ready by
+        // the first command (see `refresh_shell`).
+        if !cfg!(test) && !chat {
+            crate::shell::prewarm(&config.shell);
+        }
         // Subagent worktrees left behind by earlier sessions, past their keep
         // time; git may take a moment, so off the startup path.
         let keep_days = config.agents.keep_worktrees_days;
@@ -2471,6 +2476,7 @@ impl AgentCore {
                 .sandbox()
                 .map(|sandbox| sandbox.prompt())
                 .unwrap_or_default(),
+            shell: self.refresh_shell(),
             host: self
                 .host
                 .as_ref()
@@ -2490,6 +2496,7 @@ impl AgentCore {
                 tail: crate::prompt::tail_section(&context),
                 date: context.date,
                 sandbox: context.sandbox,
+                shell: context.shell,
                 host: context.host,
             },
             project_files,
@@ -2514,6 +2521,23 @@ impl AgentCore {
         built
     }
 
+    /// Sets the shell commands run in from `shell` in config.json, read
+    /// again here (Desktop changes it while engines run), and returns what
+    /// the prompt says about it; empty in a chat. Unit tests keep the shell
+    /// of before (`CommandShell::legacy`): they must not run this machine's
+    /// shells and rc files.
+    fn refresh_shell(&mut self) -> String {
+        if self.chat {
+            return String::new();
+        }
+        if !cfg!(test) {
+            self.config.shell = crate::shell::Settings::read().shell;
+            let shell = crate::shell::for_commands(&self.config.shell);
+            self.tool_state.set_shell(Some(shell));
+        }
+        self.tool_state.shell().prompt()
+    }
+
     /// Plan mode applies: the approval mode is plan, in a coding session.
     fn in_plan_mode(&self) -> bool {
         !self.chat && self.approval_mode.get() == ApprovalMode::Plan
@@ -2534,6 +2558,7 @@ impl AgentCore {
                 .sandbox()
                 .map(|sandbox| sandbox.prompt())
                 .unwrap_or_default(),
+            shell: self.refresh_shell(),
             host: self
                 .host
                 .as_ref()

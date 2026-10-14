@@ -362,6 +362,20 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         });
         return;
     }
+    // The shells this computer has, for the settings page: asking each for
+    // its version, and the login shell for its environment, takes a moment.
+    if name == "shells" {
+        if !hub.is_local(client) {
+            reply(json!({ "type": "error", "message": "only the desktop can list shells" }));
+            return;
+        }
+        let hub = Arc::clone(hub);
+        thread::spawn(move || {
+            let shells = lynshen_agent_core::shell::shells_json(op["refresh"] == true);
+            respond(&hub, client, &request, Ok(shells));
+        });
+        return;
+    }
     if name == "gateway_catalog" {
         let hub = Arc::clone(hub);
         thread::spawn(move || respond(&hub, client, &request, Ok(gateway::catalog_json())));

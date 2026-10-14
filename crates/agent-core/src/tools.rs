@@ -321,7 +321,8 @@ fn run_tool_inner(
                 .confine
                 .as_ref()
                 .map(|confine| (confine.0.as_path(), confine.1.as_path()));
-            let value = bash(&args, cwd, sandbox.as_ref(), confine, &mut emit);
+            let shell = state.shell();
+            let value = bash(&args, cwd, &shell, sandbox.as_ref(), confine, &mut emit);
             if let Some(session_id) = value.get("session_id").and_then(Value::as_u64) {
                 state.own_shell(session_id);
             }
@@ -1451,6 +1452,7 @@ fn post_edit_anchor_block(content: &str, first: usize, last: usize) -> Option<St
 fn bash(
     args: &Value,
     cwd: &Path,
+    shell: &crate::shell::CommandShell,
     sandbox: Option<&crate::sandbox::SandboxPolicy>,
     confine: Option<(&Path, &Path)>,
     emit: &mut impl FnMut(ToolExecutionEvent) -> Result<(), String>,
@@ -1483,7 +1485,9 @@ fn bash(
         Err(error) => return json!({ "command": command, "error": error }),
     };
 
-    let (program, shell_args) = shell_command(command);
+    let invocation = shell.invocation(command);
+    let program = invocation.program.as_str();
+    let shell_args: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
     let escalated = args.get("escalate").and_then(Value::as_bool) == Some(true);
     let wrapped = sandbox.filter(|_| !escalated).map(|sandbox| match confine {
         Some((root, project)) => {
@@ -1494,17 +1498,16 @@ fn bash(
     let (program, shell_args) = match wrapped {
         Some(Ok(wrapped)) => wrapped,
         Some(Err(error)) => return json!({ "command": command, "error": error }),
-        None => (
-            program.to_string(),
-            shell_args.iter().map(|arg| arg.to_string()).collect(),
-        ),
+        None => (program.to_string(), invocation.args.clone()),
     };
     let program = program.as_str();
     let shell_args: Vec<&str> = shell_args.iter().map(String::as_str).collect();
+    let env = &invocation.env;
     let result = if let Some(yield_time) = yield_time {
         run_command_session(
             program,
             &shell_args,
+            env,
             command,
             &workdir,
             timeout,
@@ -1512,7 +1515,7 @@ fn bash(
             emit,
         )
     } else {
-        run_command_events(program, &shell_args, None, &workdir, timeout, emit)
+        run_command_events(program, &shell_args, env, None, &workdir, timeout, emit)
             .map(|result| command_result_json(command, Ok(result)))
     };
     let sandboxed = !escalated && sandbox.is_some_and(|sandbox| sandbox.enforced());
@@ -1596,9 +1599,11 @@ fn write_stdin(args: &Value, state: &ToolState) -> Value {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_command_session(
     program: &str,
     args: &[&str],
+    env: &crate::shell::Vars,
     display_command: &str,
     cwd: &Path,
     timeout: Duration,
@@ -1613,6 +1618,7 @@ fn run_command_session(
     let mut command = Command::new(program);
     command
         .args(args)
+        .envs(env.iter().cloned())
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout_file))
@@ -2404,6 +2410,7 @@ fn apply_patch(
     let check = run_command_events(
         "git",
         &["apply", "--check", "--whitespace=nowarn", "-"],
+        &[],
         Some(patch),
         cwd,
         Duration::from_secs(30),
@@ -2422,6 +2429,7 @@ fn apply_patch(
             let result = run_command_events(
                 "git",
                 &["apply", "--whitespace=nowarn", "-"],
+                &[],
                 Some(patch),
                 cwd,
                 Duration::from_secs(30),
@@ -2858,6 +2866,9 @@ struct ToolStateInner {
     /// When set, shell commands run in this OS sandbox and file writes are
     /// checked against it.
     sandbox: Option<crate::sandbox::SandboxPolicy>,
+    /// The shell commands run in (`shell` in config.json); None runs them
+    /// as before the setting (`CommandShell::legacy`).
+    shell: Option<Arc<crate::shell::CommandShell>>,
     /// Gateway settings for the web tools; None fetches locally and leaves
     /// web_search unavailable.
     web: Option<crate::web::WebTools>,
@@ -2897,6 +2908,24 @@ impl ToolState {
         if let Ok(mut inner) = self.inner.lock() {
             inner.sandbox = sandbox;
         }
+    }
+
+    pub fn set_shell(&self, shell: Option<Arc<crate::shell::CommandShell>>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.shell = shell;
+        }
+    }
+
+    /// The shell this agent's commands run in.
+    pub fn shell(&self) -> Arc<crate::shell::CommandShell> {
+        static LEGACY: OnceLock<Arc<crate::shell::CommandShell>> = OnceLock::new();
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.shell.clone())
+            .unwrap_or_else(|| {
+                Arc::clone(LEGACY.get_or_init(|| Arc::new(crate::shell::CommandShell::legacy())))
+            })
     }
 
     /// The sandbox this agent runs in. A confined agent's has no extra
@@ -3969,12 +3998,14 @@ fn run_command(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<CommandResult, String> {
-    run_command_events(program, args, None, cwd, timeout, &mut |_| Ok(()))
+    run_command_events(program, args, &[], None, cwd, timeout, &mut |_| Ok(()))
 }
 
+/// Runs `program` with `env` added to this process's environment.
 fn run_command_events(
     program: &str,
     args: &[&str],
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
     stdin: Option<&str>,
     cwd: &Path,
     timeout: Duration,
@@ -3988,6 +4019,7 @@ fn run_command_events(
     let mut command = Command::new(program);
     command
         .args(args)
+        .envs(env.iter().cloned())
         .current_dir(cwd)
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -4497,14 +4529,6 @@ fn truncate_command_output(text: &str) -> (String, bool) {
         ),
         true,
     )
-}
-
-fn shell_command(command: &str) -> (&'static str, Vec<&str>) {
-    if cfg!(windows) {
-        ("powershell", vec!["-NoProfile", "-Command", command])
-    } else {
-        ("sh", vec!["-lc", command])
-    }
 }
 
 fn temp_output_path(label: &str) -> PathBuf {
