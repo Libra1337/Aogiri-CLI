@@ -198,7 +198,27 @@ fn the_restricted_token_sandbox_runs_the_engine_s_commands() {
 
     // The engine's shells, as its shell tool starts them.
     let host = Host::current();
-    for setting in ["pwsh", "powershell", "gitbash"] {
+    // Git Bash is refused in plain words (see `windows_shell_supported`).
+    let bash = CommandShell::detect(&host, "gitbash");
+    if bash.notes.is_empty() {
+        let invocation = bash.invocation("echo 1");
+        let args: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
+        let refused = policy.wrap(&invocation.program, &args, &ws);
+        report.check(
+            "shell gitbash: refused with a reason",
+            refused
+                .as_ref()
+                .is_err_and(|error| error.contains("Git Bash cannot run")),
+            format!("{refused:?}"),
+        );
+    } else {
+        report.check(
+            "shell gitbash",
+            !ci,
+            format!("not available: {:?}", bash.notes),
+        );
+    }
+    for setting in ["pwsh", "powershell"] {
         let shell = CommandShell::detect(&host, setting);
         if !shell.notes.is_empty() {
             report.check(

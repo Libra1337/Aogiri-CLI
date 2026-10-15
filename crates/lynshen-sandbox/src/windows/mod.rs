@@ -34,6 +34,8 @@ pub use process::{spawn, Sandboxed};
 pub use session::{cleanup, last_prepare_stats, root_sid, Grant, PrepareStats};
 pub use sid::Sid;
 pub use token::sandbox_token;
+#[cfg(test)]
+use token::Variant;
 
 use std::{
     ffi::OsString,

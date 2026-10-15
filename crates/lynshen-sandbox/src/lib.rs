@@ -164,16 +164,7 @@ pub(crate) fn within(path: &Path, root: &Path) -> bool {
 }
 
 /// Whether one of `a` and `b` contains the other.
-#[cfg_attr(
-    not(any(
-        windows,
-        all(
-            target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        )
-    )),
-    allow(dead_code)
-)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn overlaps(a: &Path, b: &Path) -> bool {
     within(a, b) || within(b, a)
 }

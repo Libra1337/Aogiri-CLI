@@ -684,6 +684,7 @@ impl SandboxPolicy {
         denied: &[PathBuf],
     ) -> Result<(String, Vec<String>), String> {
         use lynshen_sandbox::Backend;
+        windows_shell_supported(program)?;
         windows_backend()?.wrap(
             &self.windows_spec(root, denied),
             &sandbox_runner()?,
@@ -1332,6 +1333,18 @@ fn os_sandbox() -> bool {
     OS_SANDBOX || windows_restricted()
 }
 
+/// Git Bash (MSYS2) cannot start under the Windows sandbox's token: its
+/// runtime opens pipes whose ACL names only the user, which a
+/// write-restricted token cannot write. Said plainly instead of failing in
+/// MSYS2's own words on every command.
+pub fn windows_shell_supported(program: &str) -> Result<(), String> {
+    use crate::shell::{Kind, Platform};
+    if Kind::of_program(Path::new(program), Platform::Windows) == Some(Kind::GitBash) {
+        return Err("Git Bash cannot run in the Windows sandbox (sandbox_windows = restricted-token). Run this command with escalate: true, or ask the user to choose PowerShell as the shell or turn sandbox_windows off".to_string());
+    }
+    Ok(())
+}
+
 /// The Windows backend, keeping its state (the ledgers of what it changed)
 /// in `~/.lynshen/sandbox`.
 #[cfg(windows)]
@@ -1451,6 +1464,14 @@ mod tests {
         // Nothing in this test process turns it on.
         assert_eq!(windows_sandbox(), WindowsSandbox::Off);
         assert!(!windows_restricted());
+    }
+
+    #[test]
+    fn git_bash_is_refused_by_the_windows_sandbox_in_plain_words() {
+        let error = windows_shell_supported(r"C:\Program Files\Git\bin\bash.exe").unwrap_err();
+        assert!(error.contains("Git Bash cannot run"), "{error}");
+        assert!(windows_shell_supported(r"C:\Program Files\PowerShell\7\pwsh.exe").is_ok());
+        assert!(windows_shell_supported("cmd.exe").is_ok());
     }
 
     #[test]

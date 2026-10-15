@@ -41,6 +41,29 @@ use super::sid::{last_error, Sid};
 /// A primary token for `CreateProcessAsUserW`, restricted as the module
 /// says, with `capabilities` among its restricting SIDs.
 pub fn sandbox_token(capabilities: &[Sid], low: bool) -> Result<OwnedHandle, String> {
+    token_with(capabilities, low, Variant::WriteRestricted)
+}
+
+/// How restricted a token is: what the sandbox uses, and two variants the
+/// tests compare tools against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Variant {
+    /// The sandbox's token.
+    WriteRestricted,
+    /// Write-restricted, with the user's own SID among the restricting
+    /// SIDs: writes are then checked as the user's (no protection by ACL).
+    #[cfg_attr(not(test), allow(dead_code))]
+    WithUser,
+    /// Not write-restricted: only the integrity level limits writes.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Unrestricted,
+}
+
+pub(crate) fn token_with(
+    capabilities: &[Sid],
+    low: bool,
+    variant: Variant,
+) -> Result<OwnedHandle, String> {
     // SAFETY: handles are owned as soon as Windows returns them; buffers
     // outlive the calls that read them.
     unsafe {
@@ -63,24 +86,40 @@ pub fn sandbox_token(capabilities: &[Sid], low: bool) -> Result<OwnedHandle, Str
         })?;
         let user = token_user(raw)?;
         let everyone = Sid::well_known(WinWorldSid)?;
-        let restricting: Vec<SID_AND_ATTRIBUTES> = capabilities
-            .iter()
-            .chain([&logon, &everyone])
+        let extra: Vec<&Sid> = match variant {
+            Variant::WriteRestricted => vec![&logon, &everyone],
+            Variant::WithUser => vec![&logon, &everyone, &user],
+            Variant::Unrestricted => Vec::new(),
+        };
+        let chosen: Vec<&Sid> = match variant {
+            Variant::Unrestricted => Vec::new(),
+            _ => capabilities.iter().chain(extra).collect(),
+        };
+        let restricting: Vec<SID_AND_ATTRIBUTES> = chosen
+            .into_iter()
             .map(|sid| SID_AND_ATTRIBUTES {
                 Sid: sid.as_psid(),
                 Attributes: 0,
             })
             .collect();
+        let flags = match variant {
+            Variant::Unrestricted => DISABLE_MAX_PRIVILEGE | LUA_TOKEN,
+            _ => DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED,
+        };
         let mut restricted: HANDLE = ptr::null_mut();
         if CreateRestrictedToken(
             base.as_raw_handle(),
-            DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED,
+            flags,
             0,
             ptr::null(),
             0,
             ptr::null(),
             restricting.len() as u32,
-            restricting.as_ptr(),
+            if restricting.is_empty() {
+                ptr::null()
+            } else {
+                restricting.as_ptr()
+            },
             &mut restricted,
         ) == 0
         {

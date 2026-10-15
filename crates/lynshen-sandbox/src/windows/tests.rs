@@ -80,7 +80,28 @@ fn run_with(
     args: &[&str],
     timeout: Duration,
 ) -> Result<Run, String> {
-    let token = sandbox_token(caps, low)?;
+    run_variant(
+        caps,
+        low,
+        Variant::WriteRestricted,
+        cwd,
+        program,
+        args,
+        timeout,
+    )
+}
+
+/// `run_with` with a token of `variant`.
+fn run_variant(
+    caps: &[Sid],
+    low: bool,
+    variant: Variant,
+    cwd: &Path,
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Run, String> {
+    let token = token::token_with(caps, low, variant)?;
     let outputs = base().join("outputs");
     fs::create_dir_all(&outputs).map_err(|e| e.to_string())?;
     let n = OUTPUTS.fetch_add(1, Ordering::Relaxed);
@@ -617,6 +638,33 @@ fn the_restricted_token_sandbox_enforces_the_policy() {
             }
         }
     }
+    // Git Bash (MSYS2) against the token's parts: which one stops it.
+    if let Some(bash) = git_bash() {
+        let program = bash.display().to_string();
+        for (name, low, variant) in [
+            ("low, not write-restricted", true, Variant::Unrestricted),
+            ("medium, not write-restricted", false, Variant::Unrestricted),
+            (
+                "low, write-restricted with the user SID",
+                true,
+                Variant::WithUser,
+            ),
+        ] {
+            match run_variant(
+                &compat_caps,
+                low,
+                variant,
+                &ws,
+                &program,
+                &["-lc", "echo ok; touch bash-variant.txt; uname -s"],
+                Duration::from_secs(90),
+            ) {
+                Ok(result) => report.info(&format!("Git Bash, {name}"), result.describe()),
+                Err(error) => report.info(&format!("Git Bash, {name}"), error),
+            }
+        }
+    }
+
     // Under Medium the same credential is readable: the label is what
     // stops it.
     let medium_read = run_with(

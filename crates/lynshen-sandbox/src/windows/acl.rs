@@ -13,10 +13,10 @@ use windows_sys::Win32::{
         AddMandatoryAce,
         Authorization::{
             GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, ACCESS_MODE,
-            DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS,
-            SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+            DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT,
+            TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
         },
-        GetAce, InitializeAcl, ACE_HEADER, ACL, ACL_REVISION, DACL_SECURITY_INFORMATION,
+        DeleteAce, GetAce, InitializeAcl, ACE_HEADER, ACL, ACL_REVISION, DACL_SECURITY_INFORMATION,
         INHERITED_ACE, LABEL_SECURITY_INFORMATION, OBJECT_SECURITY_INFORMATION,
         PSECURITY_DESCRIPTOR, PSID, SUB_CONTAINERS_AND_OBJECTS_INHERIT, SYSTEM_MANDATORY_LABEL_ACE,
     },
@@ -116,47 +116,55 @@ pub fn add_ace(
     }
 }
 
-/// Removes every explicit ACE for `sid` from `path`, and from what below it
-/// inherited them. Nothing to remove is not an error, and a path that is
-/// gone neither.
+/// Removes every explicit ACE for `sid` from `path`, allow and deny, and
+/// from what below it inherited them. Nothing to remove is not an error,
+/// and a path that is gone neither. (`REVOKE_ACCESS` in `SetEntriesInAclW`
+/// would leave the deny ACEs.)
 pub fn revoke(path: &Path, sid: &Sid) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
-    let entry = explicit_access(sid, REVOKE_ACCESS, 0);
-    // SAFETY: as in `add_ace`.
+    // SAFETY: the DACL is copied, AclSize bytes, into a buffer this
+    // function owns (u32 for alignment); ACEs are read and deleted inside it.
     unsafe {
         let current = Dacl::read(path)?;
         if current.dacl.is_null() {
             return Ok(());
         }
-        let mut updated: *mut ACL = ptr::null_mut();
-        let code = SetEntriesInAclW(1, &entry, current.dacl, &mut updated);
-        if code != ERROR_SUCCESS {
-            return Err(format!(
-                "SetEntriesInAclW failed for {}: {code}",
-                path.display()
-            ));
+        let size = usize::from((*current.dacl).AclSize);
+        let mut copy = vec![0u32; size.div_ceil(4)];
+        ptr::copy_nonoverlapping(
+            current.dacl.cast::<u8>(),
+            copy.as_mut_ptr().cast::<u8>(),
+            size,
+        );
+        let acl = copy.as_mut_ptr().cast::<ACL>();
+        let mut removed = false;
+        for index in (0..u32::from((*acl).AceCount)).rev() {
+            let mut ace: *mut core::ffi::c_void = ptr::null_mut();
+            if GetAce(acl, index, &mut ace) != 0 && explicit_for(ace, sid).is_some() {
+                if DeleteAce(acl, index) == 0 {
+                    return Err(format!(
+                        "DeleteAce failed for {}: {}",
+                        path.display(),
+                        super::sid::last_error()
+                    ));
+                }
+                removed = true;
+            }
         }
-        let updated = Local(updated.cast());
         // An unchanged ACL needs no walk below the path.
-        if (*updated.0.cast::<ACL>()).AceCount == (*current.dacl).AceCount {
+        if !removed {
             return Ok(());
         }
-        set(
-            path,
-            DACL_SECURITY_INFORMATION,
-            updated.0.cast(),
-            ptr::null(),
-        )
+        set(path, DACL_SECURITY_INFORMATION, acl, ptr::null())
     }
 }
 
 /// Whether `path` carries an ACE for `sid` that it did not inherit:
 /// `Some(true)` an allow, `Some(false)` a deny.
 pub fn explicit_ace(path: &Path, sid: &Sid) -> Result<Option<bool>, String> {
-    // SAFETY: the ACEs are read inside the descriptor the guard keeps alive;
-    // an allowed or denied ACE's SID starts after its header and mask.
+    // SAFETY: the ACEs are read inside the descriptor the guard keeps alive.
     unsafe {
         let current = Dacl::read(path)?;
         if current.dacl.is_null() {
@@ -167,20 +175,31 @@ pub fn explicit_ace(path: &Path, sid: &Sid) -> Result<Option<bool>, String> {
             if GetAce(current.dacl, index, &mut ace) == 0 {
                 continue;
             }
-            let header = &*(ace as *const ACE_HEADER);
-            let kind = u32::from(header.AceType);
-            if u32::from(header.AceFlags) & INHERITED_ACE != 0
-                || !(kind == ACCESS_ALLOWED_ACE_TYPE || kind == ACCESS_DENIED_ACE_TYPE)
-            {
-                continue;
-            }
-            let ace_sid = (ace as *mut u8).add(8) as PSID;
-            if sid.equals(ace_sid) {
-                return Ok(Some(kind == ACCESS_ALLOWED_ACE_TYPE));
+            if let Some(allow) = explicit_for(ace, sid) {
+                return Ok(Some(allow));
             }
         }
         Ok(None)
     }
+}
+
+/// For an explicit (not inherited) allow or deny ACE naming `sid`: whether
+/// it allows.
+///
+/// # Safety
+/// `ace` must point at an ACE inside a valid ACL.
+unsafe fn explicit_for(ace: *mut core::ffi::c_void, sid: &Sid) -> Option<bool> {
+    let header = &*(ace as *const ACE_HEADER);
+    let kind = u32::from(header.AceType);
+    if u32::from(header.AceFlags) & INHERITED_ACE != 0
+        || !(kind == ACCESS_ALLOWED_ACE_TYPE || kind == ACCESS_DENIED_ACE_TYPE)
+    {
+        return None;
+    }
+    // An allowed or denied ACE's SID starts after its header and mask.
+    let ace_sid = (ace as *mut u8).add(8) as PSID;
+    sid.equals(ace_sid)
+        .then_some(kind == ACCESS_ALLOWED_ACE_TYPE)
 }
 
 /// The label `path` carries itself (not one it inherited).
