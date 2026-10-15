@@ -63,10 +63,13 @@ pub struct Style {
     pub truncated: bool,
 }
 
-/// A file in a styles folder that does not load, and why.
+/// A file in a styles folder that does not load, and why. `kind` is
+/// `reserved` (`default.md`), `bad_name`, `empty` (no instructions) or
+/// `unreadable` (the file or the folder).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StyleProblem {
     pub path: PathBuf,
+    pub kind: &'static str,
     pub message: String,
 }
 
@@ -245,6 +248,7 @@ fn read_dir(dir: &Path, source: StyleSource, problems: &mut Vec<StyleProblem>) -
         Err(error) => {
             problems.push(StyleProblem {
                 path: dir.to_path_buf(),
+                kind: "unreadable",
                 message: format!("cannot read the folder: {error}"),
             });
             return Vec::new();
@@ -266,31 +270,40 @@ fn read_dir(dir: &Path, source: StyleSource, problems: &mut Vec<StyleProblem>) -
     for path in files {
         match read_file(&path, source) {
             Ok(style) => styles.push(style),
-            Err(message) => problems.push(StyleProblem { path, message }),
+            Err((kind, message)) => problems.push(StyleProblem {
+                path,
+                kind,
+                message,
+            }),
         }
     }
     styles
 }
 
-/// One style file, or why it does not load.
-fn read_file(path: &Path, source: StyleSource) -> Result<Style, String> {
+/// One style file, or why it does not load (a `StyleProblem` kind and
+/// message).
+fn read_file(path: &Path, source: StyleSource) -> Result<Style, (&'static str, String)> {
     let id = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or_default()
         .to_string();
     if id == DEFAULT_ID {
-        return Err("\"default\" is reserved for no style; rename the file".to_string());
+        return Err((
+            "reserved",
+            "\"default\" is reserved for no style; rename the file".to_string(),
+        ));
     }
     if !valid_id(&id) {
-        return Err("the file name cannot be a style id: use no spaces or / \\ : * ? \" < > |, and do not start it with . or -".to_string());
+        return Err(("bad_name", "the file name cannot be a style id: use no spaces or / \\ : * ? \" < > |, and do not start it with . or -".to_string()));
     }
-    let content = fs::read_to_string(path).map_err(|error| format!("cannot read it: {error}"))?;
+    let content = fs::read_to_string(path)
+        .map_err(|error| ("unreadable", format!("cannot read it: {error}")))?;
     let content = content.replace("\r\n", "\n");
     let field = |key| crate::prompt::read_frontmatter_field(&content, key).unwrap_or_default();
     let body = frontmatter_body(&content).trim();
     if body.is_empty() {
-        return Err("no instructions after the frontmatter".to_string());
+        return Err(("empty", "no instructions after the frontmatter".to_string()));
     }
     let (instructions, truncated) = cut(body, MAX_BYTES);
     let name = field("name");
@@ -601,6 +614,7 @@ fn list_value(
         "projectTrusted": trusted,
         "problems": inventory.problems.iter().map(|problem| json!({
             "path": problem.path,
+            "kind": problem.kind,
             "message": problem.message,
         })).collect::<Vec<_>>(),
     })
@@ -783,6 +797,13 @@ mod tests {
             .collect::<Vec<_>>();
         problems.sort();
         assert_eq!(problems, ["default.md", "empty.md", "two words.md"]);
+        let mut kinds = inventory
+            .problems
+            .iter()
+            .map(|problem| problem.kind)
+            .collect::<Vec<_>>();
+        kinds.sort();
+        assert_eq!(kinds, ["bad_name", "empty", "reserved"]);
         assert_eq!(&ids(&inventory)[5..], ["中文风格"]);
         assert_eq!(
             inventory.get("default").unwrap().source,
@@ -956,6 +977,7 @@ mod tests {
         assert_eq!(value["dirs"][1]["scope"], "project");
         assert_eq!(value["projectTrusted"], false);
         assert_eq!(value["problems"].as_array().unwrap().len(), 1);
+        assert_eq!(value["problems"][0]["kind"], "bad_name");
         let _ = fs::remove_dir_all(profile);
         let _ = fs::remove_dir_all(project);
     }
