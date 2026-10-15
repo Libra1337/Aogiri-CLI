@@ -420,7 +420,7 @@ impl Hub {
                     Some(engines::Kind::Codex) => engines::codex::saved(&cwd)
                         .iter()
                         .any(|(saved, _, _)| saved == id),
-                    // ACP agents keep no conversations to reopen.
+                    // The daemon cannot list an ACP agent's conversations.
                     Some(engines::Kind::Acp) => false,
                 };
                 if !saved {
@@ -439,6 +439,7 @@ impl Hub {
                     engine: engine.map(|kind| kind.name().to_string()),
                     gateway: false,
                     group: None,
+                    conversation: None,
                 }
             }
             (None, None) => return Err(format!("unknown session {id}")),
@@ -461,11 +462,12 @@ impl Hub {
                 // A conversation with no turn yet was never saved: start it
                 // again under the same id instead of resuming it.
                 // Codex resumes through its protocol, which also sends the
-                // history back.
+                // history back. An ACP agent reopens the conversation it
+                // opened (its own session id, kept with the record).
                 let saved = match kind {
                     engines::Kind::Claude => engines::claude::is_saved(&record.cwd, id),
                     engines::Kind::Codex => true,
-                    engines::Kind::Acp => false,
+                    engines::Kind::Acp => record.conversation.is_some(),
                 };
                 let transcript = match kind {
                     engines::Kind::Claude => engines::claude::transcript(&record.cwd, id),
@@ -473,13 +475,19 @@ impl Hub {
                 };
                 // A client that does not say (a phone) keeps how it last ran.
                 let options = engines::Options {
-                    resume: saved.then(|| id.to_string()),
+                    resume: match kind {
+                        engines::Kind::Acp => record.conversation.clone(),
+                        _ => saved.then(|| id.to_string()),
+                    },
                     gateway: Some(options.gateway.unwrap_or(record.gateway)),
                     ..options
                 };
                 gateway = options.gateway == Some(true);
-                // A new start keeps the recorded id; a resume opens it.
-                let fresh = options.resume.is_none().then(|| id.to_string());
+                // A new start keeps the recorded id; a resume opens it. An
+                // ACP session keeps the daemon's id either way (`resume` is
+                // the agent's).
+                let fresh = (kind == engines::Kind::Acp || options.resume.is_none())
+                    .then(|| id.to_string());
                 let (_, ops, generation) = engines::spawn(
                     Arc::clone(self),
                     kind,
@@ -1906,6 +1914,7 @@ mod tests {
             engine: None,
             gateway: false,
             group: None,
+            conversation: None,
         };
         assert_eq!(
             shown_title(&record, Some(&scheduled)).as_deref(),

@@ -203,7 +203,7 @@ fn adapter(kind: Kind, cwd: &Path, options: &Options) -> Box<dyn Adapter> {
     match kind {
         Kind::Claude => Box::new(claude::Claude::new(options).at(cwd)),
         Kind::Codex => Box::new(codex::Codex::new(cwd, options)),
-        Kind::Acp => Box::new(acp::Acp::new(cwd)),
+        Kind::Acp => Box::new(acp::Acp::new(cwd, options.resume.clone())),
     }
 }
 
@@ -558,6 +558,8 @@ pub fn spawn(
     let (ops_tx, ops) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let generation = hub.next_generation();
+    // An ACP agent reopening its conversation keeps it under the same id.
+    let conversation = options.resume.clone().filter(|_| kind == Kind::Acp);
     thread::spawn(move || {
         let mut session = Session {
             hub: &hub,
@@ -573,6 +575,7 @@ pub fn spawn(
             pending_mode: None,
             gateway_key,
             tui_request: None,
+            conversation,
         };
         session.snapshot.seed(transcript);
         // A resumed conversation is ready once the engine has opened it.
@@ -625,6 +628,8 @@ struct Session<'a> {
     gateway_key: Option<String>,
     /// A client asked for the conversation in the engine's own TUI.
     tui_request: Option<Value>,
+    /// ACP: the agent's own session id, as recorded for the session.
+    conversation: Option<String>,
 }
 
 impl Drop for Session<'_> {
@@ -709,6 +714,9 @@ impl Session<'_> {
                             if let Some(id) = adapter.conversation() {
                                 self.named(id);
                             }
+                        }
+                        if self.kind == Kind::Acp {
+                            self.note_conversation(adapter.as_ref());
                         }
                         let events =
                             self.allow_while_opening(&mut process, adapter.as_mut(), output.events);
@@ -1058,6 +1066,23 @@ impl Session<'_> {
     fn tagged(&self, mut event: Value) -> Value {
         event["session"] = json!(self.id);
         event
+    }
+
+    /// An ACP agent opened a conversation of its own (its session id): it is
+    /// kept with the session, so reopening the session asks the agent for
+    /// the same conversation.
+    fn note_conversation(&mut self, adapter: &dyn Adapter) {
+        let (Some(id), Some(conversation)) = (self.id.clone(), adapter.conversation()) else {
+            return;
+        };
+        if self.conversation.as_deref() == Some(conversation.as_str()) {
+            return;
+        }
+        let _ = self
+            .hub
+            .store
+            .record_session_meta(&id, &json!({ "conversation": conversation }));
+        self.conversation = Some(conversation);
     }
 
     /// The conversation is open under `id`: the session starts answering to

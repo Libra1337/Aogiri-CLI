@@ -300,9 +300,13 @@ clients need nothing engine-specific. `options`:
 `gemini --experimental-acp`, ...) from `options.command`. Only local
 clients may start or reopen one, or pass `bin` or `env` for any engine,
 since that names a program to run; paired devices watch and drive such
-sessions like any other. ACP agents keep no
-conversation the daemon can resume, so reopening an ACP session starts a
-new conversation under the same session id.
+sessions like any other. The daemon names an ACP session itself and keeps
+the agent's own session id with it; reopening the session (with the same
+`command`) asks the agent for that conversation: `session/load` when the
+agent offers it (its replay becomes the session's `transcript`), else
+`session/resume`. An agent that offers neither, or no longer has the
+conversation, starts a new one under the same session id, and clients get
+an `info` event saying so.
 
 The session id is the engine's conversation id (Claude Code's session id,
 Codex's thread id), so reopening a closed session resumes the same
