@@ -382,6 +382,34 @@ fn the_task_board_is_in_the_snapshot_and_team_ops_reach_the_session() {
 }
 
 #[test]
+fn the_session_list_says_what_a_session_saved() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-entries");
+    let mut client = Client::connect(&daemon);
+    let session = client.create_session(&dir);
+    let entries = |client: &mut Client| {
+        let listed = request(client, json!({ "op": "session_list" }));
+        listed["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["session"] == session.as_str())
+            .unwrap()["entries"]
+            .clone()
+    };
+    // Opened without a first message: saved, with nothing in it.
+    assert_eq!(entries(&mut client), json!(0));
+    client.send(json!({ "op": "user_message", "session": session, "content": "hello" }));
+    client.until(ready(&session));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while entries(&mut client).as_u64().unwrap_or(0) == 0 {
+        assert!(Instant::now() < deadline, "the list never counted the turn");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
 fn the_title_model_names_a_session_and_leaves_a_hand_set_title_alone() {
     let _guard = setup();
     let daemon = start_daemon();
