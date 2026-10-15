@@ -3184,14 +3184,37 @@ fn the_desktop_lists_saves_and_deletes_reply_styles() {
         (terse["source"].clone(), terse["instructions"].clone()),
         (json!("user"), json!("Answer in one line."))
     );
-    for op in [
-        json!({ "op": "style_save", "style": "default", "name": "x", "instructions": "x" }),
-        json!({ "op": "style_save", "style": "../escape", "name": "x", "instructions": "x" }),
-        json!({ "op": "style_save", "name": "No instructions" }),
-        json!({ "op": "style_delete", "style": "concise" }),
-        json!({ "op": "style_delete" }),
+    // Each refusal names its reason with a stable code, for the desktop to word.
+    for (op, code) in [
+        (
+            json!({ "op": "style_save", "style": "default", "name": "x", "instructions": "x" }),
+            "reserved_id",
+        ),
+        (
+            json!({ "op": "style_save", "style": "../escape", "name": "x", "instructions": "x" }),
+            "invalid_id",
+        ),
+        (
+            json!({ "op": "style_save", "name": "No instructions" }),
+            "instructions_missing",
+        ),
+        (
+            json!({ "op": "style_save", "instructions": "x" }),
+            "name_missing",
+        ),
+        (
+            json!({ "op": "style_delete", "style": "concise" }),
+            "not_found",
+        ),
+        (json!({ "op": "style_delete" }), "invalid_id"),
     ] {
-        assert_eq!(request(&mut desktop, op)["type"], "error");
+        let refused = request(&mut desktop, op);
+        assert_eq!(
+            (refused["type"].clone(), refused["code"].clone()),
+            (json!("error"), json!(code)),
+            "{refused}"
+        );
+        assert!(refused["message"].as_str().is_some_and(|m| !m.is_empty()));
     }
 
     // A session takes it with set_style.

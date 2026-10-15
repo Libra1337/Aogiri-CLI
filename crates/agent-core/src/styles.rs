@@ -63,14 +63,52 @@ pub struct Style {
     pub truncated: bool,
 }
 
-/// A file in a styles folder that does not load, and why. `kind` is
-/// `reserved` (`default.md`), `bad_name`, `empty` (no instructions) or
-/// `unreadable` (the file or the folder).
+/// Why a style file does not load, or why saving, deleting or listing
+/// styles failed: a stable `code` that clients word in their own language,
+/// and the English `detail` for logs.
+///
+/// - Loading a file: `reserved_id` (`default.md`), `invalid_id` (the file
+///   name), `no_instructions`, `read_failed` (the file or its folder).
+/// - Saving: `name_missing`, `name_too_long` (also more than one line),
+///   `description_too_long` (also more than one line),
+///   `instructions_missing`, `instructions_too_long`, `reserved_id`,
+///   `invalid_id`, `write_failed`.
+/// - Deleting: `reserved_id`, `invalid_id`, `not_found`, `delete_failed`,
+///   `config_failed` (the file is gone, but config.json's `reply_style`
+///   still names it).
+/// - Listing: `read_failed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyleError {
+    pub code: &'static str,
+    pub detail: String,
+}
+
+impl StyleError {
+    fn new(code: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            detail: detail.into(),
+        }
+    }
+
+    /// The daemon's error reply: the code, and the detail as `message`.
+    pub fn reply(&self) -> Value {
+        json!({ "type": "error", "code": self.code, "message": self.detail })
+    }
+}
+
+impl std::fmt::Display for StyleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+/// A file in a styles folder that does not load, and why (`StyleError`'s
+/// loading codes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StyleProblem {
     pub path: PathBuf,
-    pub kind: &'static str,
-    pub message: String,
+    pub error: StyleError,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -248,8 +286,7 @@ fn read_dir(dir: &Path, source: StyleSource, problems: &mut Vec<StyleProblem>) -
         Err(error) => {
             problems.push(StyleProblem {
                 path: dir.to_path_buf(),
-                kind: "unreadable",
-                message: format!("cannot read the folder: {error}"),
+                error: StyleError::new("read_failed", format!("cannot read the folder: {error}")),
             });
             return Vec::new();
         }
@@ -270,40 +307,38 @@ fn read_dir(dir: &Path, source: StyleSource, problems: &mut Vec<StyleProblem>) -
     for path in files {
         match read_file(&path, source) {
             Ok(style) => styles.push(style),
-            Err((kind, message)) => problems.push(StyleProblem {
-                path,
-                kind,
-                message,
-            }),
+            Err(error) => problems.push(StyleProblem { path, error }),
         }
     }
     styles
 }
 
-/// One style file, or why it does not load (a `StyleProblem` kind and
-/// message).
-fn read_file(path: &Path, source: StyleSource) -> Result<Style, (&'static str, String)> {
+/// One style file, or why it does not load.
+fn read_file(path: &Path, source: StyleSource) -> Result<Style, StyleError> {
     let id = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or_default()
         .to_string();
     if id == DEFAULT_ID {
-        return Err((
-            "reserved",
-            "\"default\" is reserved for no style; rename the file".to_string(),
+        return Err(StyleError::new(
+            "reserved_id",
+            "\"default\" is reserved for no style; rename the file",
         ));
     }
     if !valid_id(&id) {
-        return Err(("bad_name", "the file name cannot be a style id: use no spaces or / \\ : * ? \" < > |, and do not start it with . or -".to_string()));
+        return Err(StyleError::new("invalid_id", "the file name cannot be a style id: use no spaces or / \\ : * ? \" < > |, and do not start it with . or -"));
     }
     let content = fs::read_to_string(path)
-        .map_err(|error| ("unreadable", format!("cannot read it: {error}")))?;
+        .map_err(|error| StyleError::new("read_failed", format!("cannot read it: {error}")))?;
     let content = content.replace("\r\n", "\n");
     let field = |key| crate::prompt::read_frontmatter_field(&content, key).unwrap_or_default();
     let body = frontmatter_body(&content).trim();
     if body.is_empty() {
-        return Err(("empty", "no instructions after the frontmatter".to_string()));
+        return Err(StyleError::new(
+            "no_instructions",
+            "no instructions after the frontmatter",
+        ));
     }
     let (instructions, truncated) = cut(body, MAX_BYTES);
     let name = field("name");
@@ -485,61 +520,101 @@ pub fn save(
     name: &str,
     description: &str,
     instructions: &str,
-) -> Result<(String, PathBuf), String> {
+) -> Result<(String, PathBuf), StyleError> {
     let name = name.trim();
     let description = description.trim();
     let instructions = instructions.trim();
     if name.is_empty() {
-        return Err("a reply style needs a name".to_string());
+        return Err(StyleError::new(
+            "name_missing",
+            "a reply style needs a name",
+        ));
     }
     if name.chars().count() > MAX_NAME_CHARS || name.contains('\n') {
-        return Err(format!(
-            "a style name is one line of at most {MAX_NAME_CHARS} characters"
+        return Err(StyleError::new(
+            "name_too_long",
+            format!("a style name is one line of at most {MAX_NAME_CHARS} characters"),
         ));
     }
     if description.chars().count() > MAX_DESCRIPTION_CHARS || description.contains('\n') {
-        return Err(format!(
-            "a style description is one line of at most {MAX_DESCRIPTION_CHARS} characters"
+        return Err(StyleError::new(
+            "description_too_long",
+            format!(
+                "a style description is one line of at most {MAX_DESCRIPTION_CHARS} characters"
+            ),
         ));
     }
     if instructions.is_empty() {
-        return Err("a reply style needs instructions".to_string());
+        return Err(StyleError::new(
+            "instructions_missing",
+            "a reply style needs instructions",
+        ));
     }
     if instructions.len() > MAX_BYTES {
-        return Err(format!(
-            "the instructions are longer than {} KB",
-            MAX_BYTES / 1024
+        return Err(StyleError::new(
+            "instructions_too_long",
+            format!("the instructions are longer than {} KB", MAX_BYTES / 1024),
         ));
     }
     let id = match id.map(str::trim) {
-        Some(DEFAULT_ID) => return Err("\"default\" is reserved for no style".to_string()),
-        Some(id) if !valid_id(id) => return Err(format!("not a valid style id: {id}")),
+        Some(DEFAULT_ID) => {
+            return Err(StyleError::new(
+                "reserved_id",
+                "\"default\" is reserved for no style",
+            ))
+        }
+        Some(id) if !valid_id(id) => {
+            return Err(StyleError::new(
+                "invalid_id",
+                format!("not a valid style id: {id}"),
+            ))
+        }
         Some(id) => id.to_string(),
         None => id_for_name(name, &inventory(profile_dir, None)),
     };
     let dir = user_dir(profile_dir);
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    let written = |error: io::Error, path: &Path| {
+        StyleError::new(
+            "write_failed",
+            format!("cannot write {}: {error}", path.display()),
+        )
+    };
+    fs::create_dir_all(&dir).map_err(|error| written(error, &dir))?;
     let path = dir.join(format!("{id}.md"));
     crate::config::write_atomically(&path, &file_text(name, description, instructions), None)
-        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        .map_err(|error| written(error, &path))?;
     Ok((id, path))
 }
 
 /// Deletes a personal style file. When config.json's `reply_style` names it,
 /// new conversations go back to `default`.
-pub fn delete(profile_dir: &Path, id: &str) -> Result<(), String> {
+pub fn delete(profile_dir: &Path, id: &str) -> Result<(), StyleError> {
     let id = id.trim();
-    if id == DEFAULT_ID || !valid_id(id) {
-        return Err(format!("not a personal style: {id}"));
+    if id == DEFAULT_ID {
+        return Err(StyleError::new(
+            "reserved_id",
+            "\"default\" is no style file",
+        ));
+    }
+    if !valid_id(id) {
+        return Err(StyleError::new(
+            "invalid_id",
+            format!("not a valid style id: {id}"),
+        ));
     }
     let path = user_dir(profile_dir).join(format!("{id}.md"));
     fs::remove_file(&path).map_err(|error| match error.kind() {
-        io::ErrorKind::NotFound => format!(
-            "no personal style {id} in {}",
-            user_dir(profile_dir).display()
+        io::ErrorKind::NotFound => StyleError::new(
+            "not_found",
+            format!(
+                "no personal style {id} in {}",
+                user_dir(profile_dir).display()
+            ),
         ),
-        _ => format!("cannot delete {}: {error}", path.display()),
+        _ => StyleError::new(
+            "delete_failed",
+            format!("cannot delete {}: {error}", path.display()),
+        ),
     })?;
     let config = profile_dir.join("config.json");
     if !config.exists() {
@@ -551,6 +626,7 @@ pub fn delete(profile_dir: &Path, id: &str) -> Result<(), String> {
         }
         Ok(())
     })
+    .map_err(|error| StyleError::new("config_failed", error))
 }
 
 /// config.json's `reply_style` in `profile_dir`, `default` when unset or
@@ -578,13 +654,15 @@ pub fn style_json(style: &Style) -> Value {
 
 /// The daemon's `styles_list` reply for this profile: every style in effect
 /// (with `cwd`'s project styles once it is trusted), the default for new
-/// conversations, the folders and what does not load.
-pub fn list_json(cwd: Option<&Path>) -> Result<Value, String> {
-    let profile = crate::config::profile_dir().map_err(|error| error.to_string())?;
+/// conversations, the folders and what does not load (each also logged,
+/// with its English detail).
+pub fn list_json(cwd: Option<&Path>) -> Result<Value, StyleError> {
+    let unreadable = |error: io::Error| StyleError::new("read_failed", error.to_string());
+    let profile = crate::config::profile_dir().map_err(unreadable)?;
     let trusted = match cwd {
         Some(cwd) if crate::trust::project_has_local_resources(cwd) => Some(
             crate::trust::TrustStore::load_or_create()
-                .map_err(|error| error.to_string())?
+                .map_err(unreadable)?
                 .decision_for(cwd)
                 .unwrap_or(false),
         ),
@@ -602,6 +680,15 @@ fn list_value(
     trusted: Option<bool>,
 ) -> Value {
     let inventory = inventory(profile, project);
+    for problem in &inventory.problems {
+        crate::log_warn!(
+            "styles",
+            "a reply style does not load",
+            path = problem.path.display().to_string(),
+            code = problem.error.code,
+            detail = problem.error.detail.as_str()
+        );
+    }
     let mut dirs = vec![json!({ "scope": "user", "path": user_dir(profile) })];
     if let Some(cwd) = cwd {
         dirs.push(json!({ "scope": "project", "path": project_dir(cwd) }));
@@ -614,8 +701,8 @@ fn list_value(
         "projectTrusted": trusted,
         "problems": inventory.problems.iter().map(|problem| json!({
             "path": problem.path,
-            "kind": problem.kind,
-            "message": problem.message,
+            "code": problem.error.code,
+            "message": problem.error.detail,
         })).collect::<Vec<_>>(),
     })
 }
@@ -797,13 +884,13 @@ mod tests {
             .collect::<Vec<_>>();
         problems.sort();
         assert_eq!(problems, ["default.md", "empty.md", "two words.md"]);
-        let mut kinds = inventory
+        let mut codes = inventory
             .problems
             .iter()
-            .map(|problem| problem.kind)
+            .map(|problem| problem.error.code)
             .collect::<Vec<_>>();
-        kinds.sort();
-        assert_eq!(kinds, ["bad_name", "empty", "reserved"]);
+        codes.sort();
+        assert_eq!(codes, ["invalid_id", "no_instructions", "reserved_id"]);
         assert_eq!(&ids(&inventory)[5..], ["中文风格"]);
         assert_eq!(
             inventory.get("default").unwrap().source,
@@ -951,15 +1038,48 @@ mod tests {
     }
 
     #[test]
-    fn save_refuses_what_would_not_load() {
+    fn save_and_delete_refuse_with_a_code_for_each_reason() {
         let profile = temp("refuse");
-        assert!(save(&profile, None, "", "", "x").is_err());
-        assert!(save(&profile, None, "Name", "", "  ").is_err());
-        assert!(save(&profile, Some("default"), "Name", "", "x").is_err());
-        assert!(save(&profile, Some("a/b"), "Name", "", "x").is_err());
-        assert!(save(&profile, None, "Name", "", &"x".repeat(MAX_BYTES + 1)).is_err());
-        assert!(save(&profile, None, "Name", "two\nlines", "x").is_err());
-        assert!(delete(&profile, "concise").is_err());
+        let code = |result: Result<(String, PathBuf), StyleError>| result.unwrap_err().code;
+        let long = "x".repeat(MAX_BYTES + 1);
+        assert_eq!(code(save(&profile, None, "", "", "x")), "name_missing");
+        assert_eq!(
+            code(save(&profile, None, &"名".repeat(41), "", "x")),
+            "name_too_long"
+        );
+        assert_eq!(
+            code(save(&profile, None, "Name", "two\nlines", "x")),
+            "description_too_long"
+        );
+        assert_eq!(
+            code(save(&profile, None, "Name", "", "  ")),
+            "instructions_missing"
+        );
+        assert_eq!(
+            code(save(&profile, None, "Name", "", &long)),
+            "instructions_too_long"
+        );
+        assert_eq!(
+            code(save(&profile, Some("default"), "Name", "", "x")),
+            "reserved_id"
+        );
+        assert_eq!(
+            code(save(&profile, Some("a/b"), "Name", "", "x")),
+            "invalid_id"
+        );
+        // The styles folder cannot be made: a file stands in its place.
+        fs::write(user_dir(&profile), "not a folder").unwrap();
+        let error = save(&profile, None, "Name", "", "x").unwrap_err();
+        assert_eq!(error.code, "write_failed");
+        assert!(error.detail.contains("cannot write"), "{error}");
+        assert_eq!(delete(&profile, "default").unwrap_err().code, "reserved_id");
+        assert_eq!(delete(&profile, "a/b").unwrap_err().code, "invalid_id");
+        fs::remove_file(user_dir(&profile)).unwrap();
+        assert_eq!(delete(&profile, "concise").unwrap_err().code, "not_found");
+        assert_eq!(
+            StyleError::new("not_found", "gone").reply(),
+            json!({ "type": "error", "code": "not_found", "message": "gone" })
+        );
         let _ = fs::remove_dir_all(profile);
     }
 
@@ -977,7 +1097,7 @@ mod tests {
         assert_eq!(value["dirs"][1]["scope"], "project");
         assert_eq!(value["projectTrusted"], false);
         assert_eq!(value["problems"].as_array().unwrap().len(), 1);
-        assert_eq!(value["problems"][0]["kind"], "bad_name");
+        assert_eq!(value["problems"][0]["code"], "invalid_id");
         let _ = fs::remove_dir_all(profile);
         let _ = fs::remove_dir_all(project);
     }

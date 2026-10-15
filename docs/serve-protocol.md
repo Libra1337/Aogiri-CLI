@@ -659,8 +659,9 @@ Files load from `~/.lynshen/styles/` and, in a trusted project, from
 for trust, as project skills do; a chat loads no project styles). For one
 id a project file wins over a personal file, which wins over a built-in.
 `default` cannot be replaced: a `default.md` does not load. A file that
-cannot load (a bad name, no instructions, unreadable) is listed with the
-reason by the daemon's `styles_list`.
+cannot load (a bad name, no instructions, unreadable) is listed by the
+daemon's `styles_list` with a stable `code` for clients to word, and the
+English detail, which the daemon also logs.
 
 Which style a conversation uses: its own choice (`set_style`, `/style
 <id>`, `--style <id>` at start), else `reply_style` in config.json (the
