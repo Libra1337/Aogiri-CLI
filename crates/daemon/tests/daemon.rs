@@ -3163,6 +3163,139 @@ fn the_desktop_lists_switches_creates_and_deletes_skills() {
     let _ = fs::remove_dir_all(personal.join("blank"));
 }
 
+#[test]
+fn the_desktop_lists_saves_and_deletes_reply_styles() {
+    let _guard = setup();
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let personal = home.join(".lynshen/styles");
+    let project = temp_dir("daemon-styles-project");
+    let daemon = start_daemon();
+    let mut desktop = Client::connect(&daemon);
+    let ids = |list: &Value| {
+        list["styles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|style| style["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let list = request(&mut desktop, json!({ "op": "styles_list", "cwd": project }));
+    assert_eq!(list["type"], "styles_list", "{list}");
+    assert_eq!(
+        ids(&list),
+        ["default", "concise", "explanatory", "learning", "formal"]
+    );
+    assert_eq!(list["default"], "default");
+    assert_eq!(list["projectTrusted"], true);
+    assert_eq!(
+        list["dirs"][0],
+        json!({ "scope": "user", "path": personal })
+    );
+
+    let saved = request(
+        &mut desktop,
+        json!({ "op": "style_save", "name": "Terse", "description": "One line", "instructions": "Answer in one line." }),
+    );
+    assert_eq!(saved["type"], "style_saved", "{saved}");
+    assert_eq!(saved["style"], "terse");
+    assert_eq!(saved["path"], json!(personal.join("terse.md")));
+    let list = request(&mut desktop, json!({ "op": "styles_list" }));
+    let terse = list["styles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|style| style["id"] == "terse")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        (terse["source"].clone(), terse["instructions"].clone()),
+        (json!("user"), json!("Answer in one line."))
+    );
+    // Each refusal names its reason with a stable code, for the desktop to word.
+    for (op, code) in [
+        (
+            json!({ "op": "style_save", "style": "default", "name": "x", "instructions": "x" }),
+            "reserved_id",
+        ),
+        (
+            json!({ "op": "style_save", "style": "../escape", "name": "x", "instructions": "x" }),
+            "invalid_id",
+        ),
+        (
+            json!({ "op": "style_save", "name": "No instructions" }),
+            "instructions_missing",
+        ),
+        (
+            json!({ "op": "style_save", "instructions": "x" }),
+            "name_missing",
+        ),
+        (
+            json!({ "op": "style_delete", "style": "concise" }),
+            "not_found",
+        ),
+        (json!({ "op": "style_delete" }), "invalid_id"),
+    ] {
+        let refused = request(&mut desktop, op);
+        assert_eq!(
+            (refused["type"].clone(), refused["code"].clone()),
+            (json!("error"), json!(code)),
+            "{refused}"
+        );
+        assert!(refused["message"].as_str().is_some_and(|m| !m.is_empty()));
+    }
+
+    // A session takes it with set_style.
+    let session = desktop.create_session(&project);
+    desktop.send(json!({ "op": "set_style", "session": session, "style": "terse" }));
+    // The startup batch told the default first.
+    let told = desktop
+        .until(|f| {
+            f["type"] == "reply_style" && f["session"] == session.as_str() && f["style"] == "terse"
+        })
+        .pop()
+        .unwrap();
+    assert_eq!(
+        (
+            told["style"].clone(),
+            told["chosen"].clone(),
+            told["source"].clone()
+        ),
+        (json!("terse"), json!(true), json!("user"))
+    );
+    desktop.send(json!({ "op": "session_close", "session": session }));
+    desktop.until(|f| f["type"] == "session_closed" && f["session"] == session.as_str());
+
+    // A paired device can do none of it.
+    desktop.send(json!({ "op": "pair_start", "id": 1 }));
+    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, response) = http(&daemon, &pair_request(&code));
+    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let mut phone = Client::connect_with(&daemon, body["token"].as_str().unwrap());
+    for op in ["styles_list", "style_save", "style_delete"] {
+        let refused = request(
+            &mut phone,
+            json!({ "op": op, "style": "terse", "name": "x", "instructions": "x" }),
+        );
+        assert_eq!(refused["type"], "error", "{refused}");
+    }
+    assert!(personal.join("terse.md").exists());
+
+    let deleted = request(
+        &mut desktop,
+        json!({ "op": "style_delete", "style": "terse" }),
+    );
+    assert_eq!(
+        (deleted["type"].clone(), deleted["style"].clone()),
+        (json!("style_deleted"), json!("terse"))
+    );
+    assert!(!personal.join("terse.md").exists());
+    let _ = fs::remove_dir_all(personal);
+}
+
 /// Requirement `id` in a `requirements` frame.
 fn requirement<'a>(frame: &'a Value, id: &str) -> Option<&'a Value> {
     (frame["type"] == "requirements")

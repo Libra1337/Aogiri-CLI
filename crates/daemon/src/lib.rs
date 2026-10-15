@@ -24,6 +24,7 @@ mod session_messages;
 mod skill_market;
 mod skills;
 mod store;
+mod styles;
 mod terminal;
 mod titles;
 mod uploads;
@@ -345,6 +346,23 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         let name = name.to_string();
         thread::spawn(move || {
             let result = skills::handle(&name, &op);
+            respond(&hub, client, &request, result);
+        });
+        return;
+    }
+    // A reply style is an instruction every later session reads, so only
+    // the desktop lists, writes or deletes them.
+    if matches!(name, "styles_list" | "style_save" | "style_delete") {
+        if !hub.is_local(client) {
+            reply(
+                json!({ "type": "error", "message": "only the desktop can manage reply styles" }),
+            );
+            return;
+        }
+        let hub = Arc::clone(hub);
+        let name = name.to_string();
+        thread::spawn(move || {
+            let result = styles::handle(&name, &op);
             respond(&hub, client, &request, result);
         });
         return;

@@ -84,6 +84,7 @@ lynshen
 | `/model [模型] [强度]` | 查看或切换模型和推理强度。`Ctrl+T` 切换当前模型的推理强度 |
 | `/permissions [模式]` | 查看或切换审批模式。`Shift+Tab` 循环切换 |
 | `/sandbox [模式]` | 查看或切换 shell 命令的沙箱 |
+| `/style [风格] [--global]` | 查看或切换回复风格。`--global` 同时设为新对话的默认风格 |
 | `/resume [会话 ID]` | 列出或恢复以前的会话。也可以用 `lynshen --resume <id>` 启动 |
 | `/rewind [回合 ID]` | 把对话和文件退回到之前的某一回合。只退回本会话改过的文件；之后被别的会话、你或命令改过的文件保持不动，并在结果里列出 |
 | `/tree` | 查看对话分支树 |
@@ -155,6 +156,7 @@ lynshen daemon pair              # 打印一次性配对链接，5 分钟内在�
 | `prompt.txt` | 系统提示词，可以自己改。没改过的文件在升级后会换成新的默认提示词，改过的保持不变 |
 | `sessions/` | 保存的会话，按项目分开 |
 | `skills/` | 安装的技能 |
+| `styles/` | 自定义回复风格，一个风格一个 Markdown 文件 |
 | `commands/` | 自定义斜杠命令 |
 | `logs/lynshen.log` | 日志 |
 | `daemon/` | 后台服务的状态、令牌、已配对设备和日志 |
@@ -221,6 +223,8 @@ lynshen daemon pair              # 打印一次性配对链接，5 分钟内在�
 MCP 服务器写在 `config.json` 的 `mcp_servers` 里，支持 stdio 和 HTTP。详见 [docs/mcp.md](docs/mcp.md)。
 
 钩子（hooks）写在 `~/.lynshen/hooks.json` 和已信任项目的 `.lynshen/hooks.json` 里。每个钩子可以用 `timeout` 设超时秒数。不设时，每次工具调用或提问前后跑的钩子（`pre_tool_use`、`post_tool_use`、`user_prompt_submit`）最多跑 60 秒，`session_start`、`stop`、`task_completed`、`agent_idle` 最多跑 600 秒。超时的钩子连同它启动的进程一起被停掉，按失败处理。在桌面端、`serve` 或 ACP 里中断，也会停掉正在跑的 `session_start`、`user_prompt_submit`、`stop` 钩子；TUI 里暂时不能。详见 [docs/serve-protocol.md](docs/serve-protocol.md) 的 "Hooks"。
+
+回复风格决定模型怎么写回复：语气、长短、结构、讲解多少。它不改变智能体做事的规则：安全、工具、审批、沙箱、验证和项目说明都照旧，代码和提交信息也照项目的约定写。内置 `default`（默认，不加风格）、`concise`（简洁）、`explanatory`（详细讲解）、`learning`（教学引导）、`formal`（正式汇报）。自定义风格是 `~/.lynshen/styles/<id>.md`（已信任项目也可以放在 `.lynshen/styles/`）：frontmatter 写 `name` 和 `description`，正文写要求。新对话的默认风格是 `config.json` 的 `reply_style`；单个对话用 `/style <id>` 或启动参数 `--style <id>` 换。对话中途换风格不会重建系统提示词，提示缓存保留。详见 [docs/serve-protocol.md](docs/serve-protocol.md) 的 "Reply styles"。
 
 子智能体可以按角色启动。内置三个角色：`explorer` 只读调研，`worker` 在自己的 git worktree 里写代码、用 `merge_agent` 合并回来，`reviewer` 只读审查 diff。`~/.lynshen/roles/<名字>.md` 和已信任项目的 `.lynshen/roles/<名字>.md` 可以覆盖或新增角色。同时运行的数量、嵌套层数、每轮 token 预算和分派策略写在 `config.json` 的 `agents` 里，见 [docs/serve-protocol.md](docs/serve-protocol.md) 的 "Agent team"。
 

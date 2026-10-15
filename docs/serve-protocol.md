@@ -48,6 +48,7 @@ After `hello`, before any command, the engine emits its startup batch:
 {"type":"command_list","commands":[{"command":"/help","marker":null,"args":"","description":"..."}]}
 {"type":"approval_mode","mode":"manual"}
 {"type":"sandbox","mode":"workspace-write","network":true,"enforced":true,"unavailable":null,"directories":[]}
+{"type":"reply_style","style":"default","name":"默认","source":"builtin","chosen":false,"missing":false}
 {"type":"mcp_servers","servers":[...]}
 {"type":"task_board","tasks":[...]}                          // only when the session's task board has tasks
 {"type":"trust_prompt","cwd":"...","repo_root":"..."}        // only when an untrusted project has local resources
@@ -486,6 +487,21 @@ Windows a mode other than `full-access` (`workspace-write` is the default
 there too) is accepted but not enforced (`enforced: false`, see
 `docs/sandbox.md`).
 
+### `set_style`
+
+```json
+{"op":"set_style","style":"concise"}
+{"op":"set_style","style":null}
+```
+
+Sets this conversation's reply style (see "Reply styles"): a style id, or
+`null` (or `""`) to follow the default for new conversations
+(`reply_style` in config.json). It applies from the next user message. The
+choice is saved with the session (once it has a message), so reopening it,
+`/resume` and a daemon's idle close keep it. Emits `reply_style`. An unknown
+id emits `error` and `reply_style` and changes nothing. `/style <id>` does
+the same.
+
 ### `add_directory` / `remove_directory`
 
 ```json
@@ -564,6 +580,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `command_list` | `commands: [{command, marker, args, description}]` | Available slash commands incl. custom and MCP prompt commands. |
 | `approval_mode` | `mode` | Current approval mode; emitted at startup and on change. |
 | `sandbox` | `mode`, `network`, `enforced`, `unavailable`, `directories` | The session's sandbox; emitted at startup (and to a client that attaches) and after every change (`set_sandbox`, `/sandbox <mode>`, `add_directory`, `remove_directory`, `approve` with `add_dir`). `enforced`: an OS sandbox applies the mode; false on Windows and in `full-access`. `unavailable`: why the OS sandbox cannot run here (bubblewrap missing, AppArmor blocking it) with the fix, else `null`. `directories`: `[{path, mode, source}]`, the read-write (`rw`) and read-only (`ro`) directories it adds, by where they come from: `global` (config.json `sandbox_directories`, or a daemon agent's directories), `project` (config.json `projects`, and the directories the daemon adds for the project) or `session`. |
+| `reply_style` | `style`, `name`, `source`, `chosen`, `missing` | The conversation's reply style (see "Reply styles"): at startup (and to a client that attaches), after `set_style` and `/style <id>`, and when a turn starts with another style than last told (the default changed, a file was edited away). `style` is the id in effect (`default` for none); `name` its name; `source` `builtin`, `user` or `project`; `chosen` is true when the conversation picked it, false when it follows `reply_style` in config.json. `missing: true` (with `source` `missing`): `style` names no style now, and the conversation runs with none. |
 | `escalated` | `call_id`, `kind`, `command`, `justification`, `cwd`, `paths`, `by` | A call that leaves the sandbox or writes outside the workspace (`kind` `escalation` or `outside_write`) ran without asking anyone. `by`: `mode` (`full-access`, or a switch to it freed the call), `rule` (an `allow` rule, also one an approval remembered) or `classifier` (the safety model in `auto`). Clients show it as a line in the conversation. |
 | `agent_runs` | `workflows: []`, `agents: [{id, label, model, effort, state, started_at, duration_ms, tokens, tool_calls, prompt, result, error, type: "subagent", tool_use_id, activity, role, plan_step, isolation, workdir, files_changed, background, attempt_group, attempt}]` | Every subagent of the session, oldest first (the 24 most recent finished ones, and every one with a worktree to merge). `id` is its path (`/root/<task_name>`), `state` ∈ `pending`/`running`/`completed`/`errored`/`interrupted`/`closed`/`budget_exhausted`/`conflict`/`merged`/`discarded`, `started_at` epoch ms (reset by `resume_agent`), `tool_use_id` the parent's `spawn_agent` call (empty for a reviewer started by `agents.review_on_complete`), `activity` its latest action in a few words ("Running cargo test"). `role` and `plan_step` are strings or `null`. `isolation` is `worktree` or `none`; a worktree agent has `workdir` (its worktree, else `null`) and `files_changed` (paths relative to the worktree, once finished). `background`: it keeps running after its parent's turn ends. `attempt_group` (the task name given to `spawn_agent`) and `attempt` (1–4) are set for best-of-N attempts, else `null`. See "Agent team". |
 | `plan_draft` | `id`, `title`, `append` | Plan mode: the plan while the model writes its `propose_plan` call. `append` is the Markdown added since the previous `plan_draft` of the same `id`; `title` is the title so far. The finished plan follows as `proposed_plan` with the same `id`. Not replayed. |
@@ -608,6 +625,71 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `info` | `message` | Informational line (hook output, notices, update available, loop guard warnings; see "Loop guard"). |
 | `error` | `message` | Error line. Also used for malformed commands and unknown ops, and for a turn the loop guard stopped (message starts with `loop guard:`). |
 | `status` | `message` | Turn status string: `ready`, `streaming`, `queued: N`, `steering`, `interrupted`, `compacting`, `approval mode: ...`, `trusted ...`, etc. `ready` marks the end of a turn. |
+
+## Reply styles
+
+A reply style sets how the model writes to the user: tone, length,
+structure, how much it explains. It changes nothing the engine does: the
+rules on safety, tools, approvals, the sandbox and verifying work, and the
+project's instructions (AGENTS.md, CLAUDE.md), stay as they are. Code,
+comments, commit messages and files follow the project, not the style. A
+request in a user message wins over the style for that message.
+
+Built-in styles: `default` (默认: no style text; the prompt of before),
+`concise` (简洁), `explanatory` (详细讲解), `learning` (教学引导), `formal`
+(正式汇报). Their instructions are Chinese; the model replies in the user's
+language.
+
+A style file is Markdown: a frontmatter `name` and `description` (both
+optional: the name defaults to the id), then the instructions. The file
+name without `.md` is the id: no white space or `/ \ : * ? " < > |`, not
+starting with `.` or `-`, at most 64 characters. At most 8 KiB of
+instructions are used.
+
+```markdown
+---
+name: 代码评审
+description: 指出行号，按严重程度排序
+---
+评审时先列出问题，按严重程度从高到低排列，每条写出文件和行号。
+```
+
+Files load from `~/.lynshen/styles/` and, in a trusted project, from
+`<cwd>/.lynshen/styles/` (a `.lynshen/styles` folder makes the engine ask
+for trust, as project skills do; a chat loads no project styles). For one
+id a project file wins over a personal file, which wins over a built-in.
+`default` cannot be replaced: a `default.md` does not load. A file that
+cannot load (a bad name, no instructions, unreadable) is listed by the
+daemon's `styles_list` with a stable `code` for clients to word, and the
+English detail, which the daemon also logs.
+
+Which style a conversation uses: its own choice (`set_style`, `/style
+<id>`, `--style <id>` at start), else `reply_style` in config.json (the
+default for new conversations, `/style <id> --global`), else `default`.
+Both are read again at each turn. A style whose file is gone runs as
+`default` and `reply_style` says `missing: true`.
+
+In the system prompt the style is the last section, after the host text:
+
+```text
+<reply_style id="concise" name="简洁">
+Reply style: the user chose how your messages to them should read. …
+<the style's instructions>
+</reply_style>
+```
+
+Everything before `<env>`, which providers cache across sessions, is the
+same with any style, and `default` adds nothing. A session keeps the
+system prompt its first turn built: a style chosen or changed later, an
+edited style file or a new default reaches the model as a note before the
+next user message (`<system-reminder>The reply style changed. From now
+on: …`, or that no reply style applies any more), so the provider still
+serves the earlier conversation from its cache. Subagents get the prompt
+without the style: they report to the main agent, not to the user.
+
+`/style` lists the styles and marks the current one. `/style <id>` sets
+this conversation's; `/style <id> --global` saves it as `reply_style` and
+the conversation follows it.
 
 ## Agent team
 

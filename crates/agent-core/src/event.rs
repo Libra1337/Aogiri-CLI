@@ -28,6 +28,21 @@ pub struct SandboxView {
     pub directories: Vec<SandboxDirectoryView>,
 }
 
+/// The reply style a session uses (see `crate::styles`): `style` is the id
+/// in effect, or the one asked for when it is `missing`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyStyleView {
+    pub style: String,
+    pub name: String,
+    /// `builtin`, `user`, `project`, or `missing`.
+    pub source: &'static str,
+    /// The conversation chose it; false when it follows the default for new
+    /// conversations (`reply_style` in config.json).
+    pub chosen: bool,
+    /// No style of that id exists now: the session runs with none.
+    pub missing: bool,
+}
+
 /// A directory the session's sandbox adds: its path, `rw` or `ro`, and
 /// where it comes from (`global`, `project` or `session`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,6 +383,9 @@ pub enum AgentEvent {
     ActionDeferred(crate::actions::DeferredAction),
     /// The session's sandbox: at startup and after every change.
     Sandbox(SandboxView),
+    /// The session's reply style: at startup, after every change, and when
+    /// a turn starts with another one than last told.
+    ReplyStyle(ReplyStyleView),
     /// A call that crosses the sandbox or the workspace boundary ran
     /// without asking anyone: `by` is `mode` (full-access), `rule` (an
     /// allow rule) or `classifier` (the safety model).

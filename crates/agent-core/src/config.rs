@@ -1296,7 +1296,7 @@ pub(crate) fn always_allow_global(path: &Path) -> bool {
 /// truncated file behind. The temp name carries the pid so concurrent saves
 /// do not collide. `mode` (Unix) is set on the temp file before any content
 /// is written, so a credentials file is never readable by others.
-fn write_atomically(path: &Path, contents: &str, mode: Option<u32>) -> io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, contents: &str, mode: Option<u32>) -> io::Result<()> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())

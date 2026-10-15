@@ -625,7 +625,9 @@ impl TuiState {
                     self.mark_history_dirty();
                     true
                 }
-                AgentEvent::Attended(_) | AgentEvent::Sandbox(_) => false,
+                AgentEvent::Attended(_) | AgentEvent::Sandbox(_) | AgentEvent::ReplyStyle(_) => {
+                    false
+                }
                 AgentEvent::Escalated { info, .. } => {
                     let what = match (&info.command, info.paths.first()) {
                         (Some(command), _) => command.clone(),
