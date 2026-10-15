@@ -8,3 +8,12 @@ crates/agent-core/src/anthropic-skills.json indexes the skills in
 https://github.com/anthropics/skills (names, descriptions and license fields).
 Skills are downloaded from that repository when installed and remain under
 their own licenses.
+
+crates/lynshen-sandbox/src/windows (sid.rs, token.rs, acl.rs, process.rs)
+contains code adapted from OpenAI Codex (codex-rs/windows-sandbox-rs),
+https://github.com/openai/codex, licensed under the Apache License 2.0:
+
+    OpenAI Codex
+    Copyright 2025 OpenAI
+
+The adapted files say so at the top and were changed for LynShen.
