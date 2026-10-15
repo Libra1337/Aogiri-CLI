@@ -10,7 +10,7 @@ name = "lynshen"
 path = "src/main.rs"
 
 [workspace]
-members = [".", "crates/agent-core", "crates/daemon", "crates/llm-provider-kit", "crates/software-release", "crates/tui"]
+members = [".", "crates/agent-core", "crates/daemon", "crates/llm-provider-kit", "crates/lynshen-sandbox", "crates/software-release", "crates/tui"]
 resolver = "2"
 
 [workspace.package]
@@ -21,6 +21,7 @@ authors = ["LynShen Innovations INC."]
 [dependencies]
 lynshen-agent-core = { path = "crates/agent-core" }
 lynshen-daemon = { path = "crates/daemon" }
+lynshen-sandbox = { path = "crates/lynshen-sandbox" }
 lynshen-tui = { path = "crates/tui" }
 serde_json = "1"
 tungstenite = "0.30"

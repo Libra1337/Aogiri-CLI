@@ -89,6 +89,16 @@ fn end_tool_processes_on_signal() {
 }
 
 fn main() -> io::Result<()> {
+    // The sandbox runner (`lynshen __sandbox-exec …`, Windows): it sets up
+    // the sandbox, runs one command in it and exits with the command's code.
+    // Nothing else starts, not even logging.
+    let raw_args: Vec<std::ffi::OsString> = env::args_os().skip(1).collect();
+    if raw_args
+        .first()
+        .is_some_and(|arg| arg == lynshen_sandbox::RUNNER_ARG)
+    {
+        std::process::exit(lynshen_sandbox::runner_main(&raw_args[1..]));
+    }
     lynshen_agent_core::logging::init_global();
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     // Before anything that may touch the terminal: `--version` must work in
@@ -147,6 +157,7 @@ fn main() -> io::Result<()> {
     }
     let exit = |code: io::Result<i32>| -> io::Result<()> {
         lynshen_agent_core::terminate_tool_processes();
+        lynshen_agent_core::sandbox::release_os_sandbox();
         std::process::exit(code?);
     };
     if args.first().map(String::as_str) == Some("--headless") {
@@ -229,7 +240,7 @@ fn main() -> io::Result<()> {
     }
     core.start_update_check();
     let app = TuiApp::new(Runtime(core));
-    match args.iter().position(|arg| arg == "--resume") {
+    let result = match args.iter().position(|arg| arg == "--resume") {
         Some(index) => match args.get(index + 1) {
             Some(id) => app.with_command(&format!("/resume {id}")).run(),
             None => {
@@ -238,7 +249,9 @@ fn main() -> io::Result<()> {
             }
         },
         None => app.run(),
-    }
+    };
+    lynshen_agent_core::sandbox::release_os_sandbox();
+    result
 }
 
 fn help_text() -> String {

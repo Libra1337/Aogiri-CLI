@@ -729,6 +729,7 @@ impl Hub {
                 // the next daemon cannot reopen them where it cannot tell this
                 // one is gone (Windows).
                 lynshen_agent_core::release_session_locks();
+                lynshen_agent_core::sandbox::release_os_sandbox();
                 std::process::exit(0);
             }
             thread::sleep(std::time::Duration::from_secs(1));

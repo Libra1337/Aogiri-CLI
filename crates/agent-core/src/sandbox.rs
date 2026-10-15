@@ -10,16 +10,109 @@
 //!
 //! Credentials (`~/.ssh`, `~/.gnupg`, `~/.aws`, LynShen's own auth and daemon
 //! state) are unreadable in every sandboxed mode. macOS uses Seatbelt
-//! (`sandbox-exec`), Linux `bwrap`. Windows has no OS sandbox: a mode other
-//! than `full-access` is a boundary the model is told about and declares
-//! crossing (`escalate`), not one that is enforced (`enforced`). File tools
-//! run in-process and check writes against the same rules.
+//! (`sandbox-exec`), Linux `bwrap`. Windows has no OS sandbox by default: a
+//! mode other than `full-access` is a boundary the model is told about and
+//! declares crossing (`escalate`), not one that is enforced (`enforced`).
+//! With `sandbox_windows = "restricted-token"` (a prototype, see
+//! `WindowsSandbox`) LynShen sandboxes commands there itself. File tools run
+//! in-process and check writes against the same rules.
 
 use serde_json::{json, Value};
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
 };
+
+/// How shell commands are sandboxed on Windows (`sandbox_windows` in
+/// config.json). Elsewhere the setting has no effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsSandbox {
+    /// No OS sandbox (the default): the mode is not enforced.
+    Off,
+    /// A restricted, low-integrity token in a job object, set up by LynShen
+    /// itself without administrator rights (`lynshen_sandbox::windows`).
+    RestrictedToken,
+}
+
+impl WindowsSandbox {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "off" => Ok(Self::Off),
+            "restricted-token" => Ok(Self::RestrictedToken),
+            other => Err(format!(
+                "unknown sandbox_windows '{other}': use off or restricted-token"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::RestrictedToken => "restricted-token",
+        }
+    }
+}
+
+/// This process's Windows sandbox: a machine setting, so one value for every
+/// session and agent the process runs.
+static WINDOWS_RESTRICTED_TOKEN: AtomicBool = AtomicBool::new(false);
+
+/// Sets this process's Windows sandbox (config.json `sandbox_windows`, read
+/// with the config).
+pub fn set_windows_sandbox(choice: WindowsSandbox) {
+    WINDOWS_RESTRICTED_TOKEN.store(choice == WindowsSandbox::RestrictedToken, Ordering::Relaxed);
+}
+
+pub fn windows_sandbox() -> WindowsSandbox {
+    if WINDOWS_RESTRICTED_TOKEN.load(Ordering::Relaxed) {
+        WindowsSandbox::RestrictedToken
+    } else {
+        WindowsSandbox::Off
+    }
+}
+
+/// Whether the Windows sandbox runs commands here.
+fn windows_restricted() -> bool {
+    cfg!(windows) && windows_sandbox() == WindowsSandbox::RestrictedToken
+}
+
+static RUNNER: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// The program that starts a command in the Windows sandbox
+/// (`lynshen __sandbox-exec …`, see `lynshen_sandbox::RUNNER_ARG`): this
+/// executable unless set here (tests set the `lynshen` binary).
+pub fn set_sandbox_runner(path: PathBuf) {
+    if let Ok(mut runner) = RUNNER.lock() {
+        *runner = Some(path);
+    }
+}
+
+#[cfg(windows)]
+fn sandbox_runner() -> Result<PathBuf, String> {
+    if let Some(runner) = RUNNER.lock().ok().and_then(|runner| runner.clone()) {
+        return Ok(runner);
+    }
+    env::current_exe().map_err(|error| format!("cannot find the lynshen executable: {error}"))
+}
+
+/// Takes off what the Windows sandbox changed on disk for this process
+/// (ACL entries, integrity labels) and removes its temp directory. Call
+/// when the engine exits; what a crashed engine left is taken off by the
+/// next one that sandboxes a command. Nothing to do elsewhere.
+pub fn release_os_sandbox() {
+    #[cfg(windows)]
+    if let Err(error) = lynshen_sandbox::windows::cleanup() {
+        crate::log_warn!(
+            "sandbox",
+            "the Windows sandbox could not undo every change; the next engine retries",
+            error = error
+        );
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxMode {
@@ -129,10 +222,11 @@ impl SandboxPolicy {
         self.mode != SandboxMode::FullAccess
     }
 
-    /// Whether an OS sandbox enforces the mode: macOS and Linux, in a mode
-    /// other than `full-access`. Elsewhere commands run unconfined.
+    /// Whether an OS sandbox enforces the mode: macOS and Linux, and
+    /// Windows with `sandbox_windows = "restricted-token"`, in a mode other
+    /// than `full-access`. Elsewhere commands run unconfined.
     pub fn enforced(&self) -> bool {
-        self.is_sandboxed() && OS_SANDBOX
+        self.is_sandboxed() && os_sandbox()
     }
 
     /// Why the OS sandbox cannot run here (bubblewrap missing, or blocked by
@@ -547,10 +641,66 @@ impl SandboxPolicy {
             wrapped.push(program.to_string());
             wrapped.extend(args.iter().map(|arg| arg.to_string()));
             Ok((bwrap.display().to_string(), wrapped))
+        } else if windows_restricted() {
+            self.windows_wrap(program, args, root, denied)
         } else {
-            // No OS sandbox (Windows): the command runs unconfined.
+            // No OS sandbox (Windows by default): the command runs unconfined.
             Ok(plain())
         }
+    }
+
+    /// What a command started in `root` may touch in the Windows sandbox:
+    /// `root` and the read-write directories (none in `read-only`) with
+    /// their protected paths read-only, and a private temp directory. The
+    /// user's temp directory and the package caches are not granted:
+    /// granting a directory walks everything in it and opens it to every
+    /// low-integrity process for the session. `denied` stay read-only (a
+    /// confined agent's project).
+    pub fn windows_spec(&self, root: &Path, denied: &[PathBuf]) -> lynshen_sandbox::Spec {
+        let writable = self.mode != SandboxMode::ReadOnly;
+        let mut roots = Vec::new();
+        if writable {
+            roots.push(real(root));
+            roots.extend(self.writable_dirs.iter().map(|dir| real(dir)));
+            roots.sort();
+            roots.dedup();
+        }
+        lynshen_sandbox::Spec {
+            writable_roots: roots,
+            read_only: self.protected_paths(root),
+            deny_write: denied.iter().map(|dir| real(dir)).collect(),
+            deny_read: denied_reads(),
+            network: self.network,
+            private_temp: writable,
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_wrap(
+        &self,
+        program: &str,
+        args: &[&str],
+        root: &Path,
+        denied: &[PathBuf],
+    ) -> Result<(String, Vec<String>), String> {
+        use lynshen_sandbox::Backend;
+        windows_backend()?.wrap(
+            &self.windows_spec(root, denied),
+            &sandbox_runner()?,
+            program,
+            args,
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn windows_wrap(
+        &self,
+        _program: &str,
+        _args: &[&str],
+        _root: &Path,
+        _denied: &[PathBuf],
+    ) -> Result<(String, Vec<String>), String> {
+        Err("the Windows sandbox runs on Windows only".to_string())
     }
 
     /// Errors when this platform cannot run the OS sandbox, so a host can
@@ -568,6 +718,8 @@ impl SandboxPolicy {
         } else if cfg!(target_os = "linux") {
             let bwrap = find_bwrap().ok_or_else(bwrap_missing)?;
             bwrap_runs(&bwrap)
+        } else if windows_restricted() {
+            windows_check()
         } else {
             Ok(())
         }
@@ -733,18 +885,28 @@ impl SandboxPolicy {
                 ),
             )
         } else {
+            // The Windows sandbox grants a private temp directory, not the
+            // package caches, and cannot turn the network off.
+            let windows = windows_restricted();
             let writable = match self.mode {
                 SandboxMode::ReadOnly => "Nothing is writable.".to_string(),
+                _ if windows => format!(
+                    "Writable: the working directory{extra} and a private temp directory (TEMP); package caches are not; .git, .lynshen and .agents in them are read-only."
+                ),
                 _ => format!(
                     "Writable: the working directory{extra}, temp and package caches; .git, .lynshen and .agents in them are read-only."
                 ),
             };
+            let network = if windows {
+                "Network is not restricted".to_string()
+            } else {
+                format!("Network is {}", if self.network { "on" } else { "off" })
+            };
             (
                 format!("<sandbox mode=\"{}\">", self.mode.as_str()),
                 format!(
-                    "Commands run in an OS sandbox. {writable}{read_only} Network is {}; credentials such as ~/.ssh are unreadable. For more (git commit, installing software, writing elsewhere{}), run the command {escalate}",
-                    if self.network { "on" } else { "off" },
-                    if self.network { "" } else { ", network" },
+                    "Commands run in an OS sandbox. {writable}{read_only} {network}; credentials such as ~/.ssh are unreadable. For more (git commit, installing software, writing elsewhere{}), run the command {escalate}",
+                    if self.network || windows { "" } else { ", network" },
                 ),
             )
         };
@@ -1161,8 +1323,45 @@ fn find_bwrap() -> Option<PathBuf> {
     })
 }
 
-/// Whether this platform has an OS sandbox LynShen drives.
+/// Whether this platform has an OS sandbox LynShen drives by default.
 const OS_SANDBOX: bool = cfg!(any(target_os = "macos", target_os = "linux"));
+
+/// Whether an OS sandbox runs commands here: `OS_SANDBOX`, or the Windows
+/// sandbox when `sandbox_windows` turns it on.
+fn os_sandbox() -> bool {
+    OS_SANDBOX || windows_restricted()
+}
+
+/// The Windows backend, keeping its state (the ledgers of what it changed)
+/// in `~/.lynshen/sandbox`.
+#[cfg(windows)]
+fn windows_backend() -> Result<lynshen_sandbox::windows::RestrictedToken, String> {
+    let home = home().ok_or("the Windows sandbox needs a home directory (USERPROFILE)")?;
+    Ok(lynshen_sandbox::windows::RestrictedToken::new(
+        home.join(".lynshen").join("sandbox"),
+    ))
+}
+
+/// Whether the Windows sandbox can run here: a restricted token can be
+/// made (an interactive logon), and the runner exists.
+#[cfg(windows)]
+fn windows_check() -> Result<(), String> {
+    use lynshen_sandbox::Backend;
+    windows_backend()?.check()?;
+    let runner = sandbox_runner()?;
+    if !runner.is_file() {
+        return Err(format!(
+            "the Windows sandbox runner {} is missing",
+            runner.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn windows_check() -> Result<(), String> {
+    Ok(())
+}
 
 /// Starts `bwrap` once per process with the binds every command gets: on
 /// Ubuntu 24.04 and later AppArmor stops it from creating the user
@@ -1242,6 +1441,56 @@ mod tests {
     }
 
     #[test]
+    fn the_windows_sandbox_is_off_unless_chosen() {
+        assert_eq!(WindowsSandbox::parse("off"), Ok(WindowsSandbox::Off));
+        assert_eq!(
+            WindowsSandbox::parse("restricted-token"),
+            Ok(WindowsSandbox::RestrictedToken)
+        );
+        assert!(WindowsSandbox::parse("on").is_err());
+        // Nothing in this test process turns it on.
+        assert_eq!(windows_sandbox(), WindowsSandbox::Off);
+        assert!(!windows_restricted());
+    }
+
+    #[test]
+    fn the_windows_sandbox_grants_the_workspace_and_a_private_temp_only() {
+        let dir = work("windows-spec");
+        let extra = dir.join("extra");
+        fs::create_dir_all(&extra).unwrap();
+        let mut policy = policy(SandboxMode::WorkspaceWrite);
+        policy.writable_dirs = vec![extra.clone()];
+        let spec = policy.windows_spec(&dir, &[]);
+        assert_eq!(spec.writable_roots, vec![dir.clone(), extra.clone()]);
+        assert!(spec.private_temp);
+        // Neither the user's temp directory nor the package caches.
+        for root in temp_dirs().iter().chain(cache_dirs().iter()) {
+            assert!(!spec.writable_roots.contains(&real(root)), "{root:?}");
+        }
+        assert!(spec.read_only.contains(&dir.join(".git")));
+        assert!(spec.read_only.contains(&dir.join(".lynshen")));
+        assert_eq!(spec.deny_read, denied_reads());
+        assert!(spec.network);
+        // A confined agent: its worktree only, the project around it denied.
+        let worktree = dir.join(".lynshen/agents/sub");
+        let confined = SandboxPolicy {
+            writable_dirs: Vec::new(),
+            ..policy.clone()
+        }
+        .windows_spec(&worktree, std::slice::from_ref(&dir));
+        assert_eq!(confined.writable_roots, vec![worktree.clone()]);
+        assert_eq!(confined.deny_write, vec![dir.clone()]);
+        // Read-only: nothing writable, not even temp.
+        let read_only = SandboxPolicy {
+            mode: SandboxMode::ReadOnly,
+            ..policy
+        }
+        .windows_spec(&dir, &[]);
+        assert!(read_only.writable_roots.is_empty());
+        assert!(!read_only.private_temp);
+    }
+
+    #[test]
     fn the_key_to_desktop_s_secrets_is_a_credential() {
         let denied = denied_reads();
         let home = real(&home().unwrap());
@@ -1253,7 +1502,7 @@ mod tests {
     fn every_platform_starts_with_the_workspace_boundary() {
         let default = SandboxPolicy::default_for_platform();
         assert_eq!(default.mode, SandboxMode::WorkspaceWrite);
-        assert_eq!(default.enforced(), OS_SANDBOX);
+        assert_eq!(default.enforced(), os_sandbox());
         assert!(default.prompt().contains("escalate: true"));
     }
 
@@ -1262,7 +1511,7 @@ mod tests {
         let mut policy = policy(SandboxMode::WorkspaceWrite);
         policy.writable_dirs = vec![PathBuf::from("/srv/shared")];
         let prompt = policy.prompt();
-        if OS_SANDBOX {
+        if os_sandbox() {
             assert!(
                 prompt.starts_with("<sandbox mode=\"workspace-write\">"),
                 "{prompt}"

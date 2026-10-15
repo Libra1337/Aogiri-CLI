@@ -733,6 +733,9 @@ impl Config {
         };
         let default_base_url = default_base_url_for_provider(&provider)
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        // A machine setting, not part of a session's policy: how this process
+        // sandboxes commands on Windows. Only read, never written back.
+        crate::sandbox::set_windows_sandbox(read_windows_sandbox(&value)?);
         let config = Self {
             protocol: read_string(&value, "protocol", ""),
             model,
@@ -1447,6 +1450,26 @@ fn read_sandbox(value: &Value) -> io::Result<crate::sandbox::SandboxPolicy> {
         policy.rules = rules_from_json(rules).map_err(invalid)?;
     }
     Ok(policy)
+}
+
+/// `sandbox_windows`: absent or empty is `off`; an unknown value is a hard
+/// load error, like an unknown `sandbox`.
+fn read_windows_sandbox(value: &Value) -> io::Result<crate::sandbox::WindowsSandbox> {
+    use crate::sandbox::WindowsSandbox;
+    match value
+        .get("sandbox_windows")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|choice| !choice.is_empty())
+    {
+        None => Ok(WindowsSandbox::Off),
+        Some(choice) => WindowsSandbox::parse(choice).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid sandbox settings in config.json: {error}"),
+            )
+        }),
+    }
 }
 
 /// A web engine name from config.json. Absent or empty takes the default;
@@ -3387,6 +3410,17 @@ mod tests {
         assert!(custom.rules.is_empty());
 
         assert!(read_sandbox(&json!({ "sandbox": "wide-open" })).is_err());
+
+        use crate::sandbox::WindowsSandbox;
+        assert_eq!(
+            read_windows_sandbox(&json!({})).unwrap(),
+            WindowsSandbox::Off
+        );
+        assert_eq!(
+            read_windows_sandbox(&json!({ "sandbox_windows": "restricted-token" })).unwrap(),
+            WindowsSandbox::RestrictedToken
+        );
+        assert!(read_windows_sandbox(&json!({ "sandbox_windows": "on" })).is_err());
         assert!(
             read_sandbox(&json!({ "command_rules": [{ "prefix": "", "action": "allow" }] }))
                 .is_err()
