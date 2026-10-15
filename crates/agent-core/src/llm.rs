@@ -82,6 +82,8 @@ pub struct OpenAiClient {
     /// Reasoning-effort tiers `model` supports (low→high). A subagent on this
     /// model must pick one of them and defaults to the first.
     reasoning_efforts: Vec<String>,
+    /// Whether `model` reasons and takes images (its config entry).
+    caps: ModelCaps,
     /// Models `spawn_agent` may choose besides `model` (config
     /// `subagent_models`), resolved against the configured model list.
     subagent_models: Vec<SubagentModelSpec>,
@@ -150,6 +152,30 @@ pub(crate) struct SubagentModelSpec {
     reasoning_efforts: Vec<String>,
     max_output_tokens: u64,
     protocol: Protocol,
+    caps: ModelCaps,
+}
+
+/// What a model's config entry says about its requests: whether it reasons
+/// (`reasoning`) and takes images (`input_modalities`). A model without an
+/// entry does both, as before these settings existed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModelCaps {
+    thinks: bool,
+    images: bool,
+}
+
+impl ModelCaps {
+    const ALL: Self = Self {
+        thinks: true,
+        images: true,
+    };
+
+    fn of(model: Option<&ModelConfig>) -> Self {
+        model.map_or(Self::ALL, |model| Self {
+            thinks: model.thinks(),
+            images: model.accepts_images(),
+        })
+    }
 }
 
 /// The safety classifier's model spec, resolved from config at client build.
@@ -458,6 +484,7 @@ struct SpawnSettings<'a> {
     plan_step: Option<String>,
     model: String,
     efforts: Vec<String>,
+    caps: ModelCaps,
     protocol: Protocol,
     reasoning_effort: String,
     max_output_tokens: u64,
@@ -474,6 +501,7 @@ pub(crate) struct ChildSpec {
     model: String,
     reasoning_effort: String,
     efforts: Vec<String>,
+    caps: ModelCaps,
     protocol: Protocol,
     max_output_tokens: u64,
     max_tool_calls: Option<u64>,
@@ -516,6 +544,24 @@ struct RequestVariant<'a> {
     /// No tool may be called: `tool_choice` none where the request keeps its
     /// tools (Responses, Anthropic Messages), no tools on Chat Completions.
     tools_off: bool,
+}
+
+/// The conversation for a model that takes no images: each image part
+/// becomes a line of text saying it was left out, so the model knows an
+/// image was there (an attachment, or a file the read tool opened).
+fn without_images(mut input: Vec<Value>, model: &str) -> Vec<Value> {
+    let note = format!("[image omitted: {model} does not accept image input]");
+    for item in &mut input {
+        let Some(parts) = item.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) == Some("input_image") {
+                *part = json!({ "type": "input_text", "text": note });
+            }
+        }
+    }
+    input
 }
 
 /// Sets a request body that keeps its tools to call none of them
@@ -728,6 +774,7 @@ pub(crate) fn subagent_offer(
                 reasoning_efforts: model.reasoning_efforts.clone(),
                 max_output_tokens: model.max_output_tokens,
                 protocol: protocol_for(provider, protocol, &model.name),
+                caps: ModelCaps::of(Some(model)),
             })
         })
         .collect();
@@ -771,9 +818,21 @@ impl OpenAiClient {
             &config.models,
             &config.subagent_models,
         );
+        let entry = |name: &str| config.models.iter().find(|model| model.name == name);
+        let caps = ModelCaps::of(entry(&config.model));
         let safety = config.safety_model.map(|model| SafetySpec {
             protocol: protocol_for(&config.provider, &config.protocol, &model),
-            reasoning_effort: config.safety_reasoning_effort,
+            // Sent as is (one-shot, no client of its own): resolved here.
+            reasoning_effort: entry(&model).map_or(
+                config.safety_reasoning_effort.clone(),
+                |entry| {
+                    crate::config::request_effort(
+                        entry.thinks(),
+                        &entry.reasoning_efforts,
+                        &config.safety_reasoning_effort,
+                    )
+                },
+            ),
             model,
         });
         Ok(Self {
@@ -782,6 +841,7 @@ impl OpenAiClient {
             model: config.model,
             reasoning_effort: config.reasoning_effort,
             reasoning_efforts,
+            caps,
             subagent_models,
             root_system_prompt: config.system_prompt.clone(),
             system_prompt: config.system_prompt,
@@ -1447,6 +1507,12 @@ impl OpenAiClient {
     /// conversation only for requests with the same thinking settings, so a
     /// Messages request keeps the turns' effort; so does a model that does
     /// not reason or offers no "low".
+    /// The effort `effort` puts on the wire for this client's model (see
+    /// `config::request_effort`).
+    fn request_effort(&self, effort: &str) -> String {
+        crate::config::request_effort(self.caps.thinks, &self.reasoning_efforts, effort)
+    }
+
     fn summary_effort(&self) -> &str {
         let effort = self.reasoning_effort.as_str();
         let lower = self.provider_kind != Protocol::AnthropicMessages
@@ -1477,7 +1543,7 @@ impl OpenAiClient {
                 let body = responses::one_shot_body(
                     &self.model,
                     system,
-                    &self.reasoning_effort,
+                    &self.request_effort(&self.reasoning_effort),
                     user,
                     self.max_output_tokens,
                 );
@@ -1568,6 +1634,11 @@ impl OpenAiClient {
         variant: RequestVariant<'_>,
         emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<Vec<Value>, String> {
+        let input = if self.caps.images {
+            input
+        } else {
+            without_images(input, &self.model)
+        };
         match self.provider_kind {
             Protocol::OpenAiResponses
             | Protocol::OpenAiCodexResponses
@@ -1592,11 +1663,12 @@ impl OpenAiClient {
         mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<Vec<Value>, String> {
         let tools = self.tool_definitions();
+        let effort = self.request_effort(variant.effort.unwrap_or(&self.reasoning_effort));
         let mut body = responses::request_body(responses::ResponsesRequest {
             model: &self.model,
             instructions: &self.system_prompt,
             prompt_cache_key: &self.prompt_cache_key,
-            reasoning_effort: variant.effort.unwrap_or(&self.reasoning_effort),
+            reasoning_effort: &effort,
             input,
             tools: &tools,
             max_output_tokens: self.max_output_tokens,
@@ -1621,6 +1693,7 @@ impl OpenAiClient {
         mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<Vec<Value>, String> {
         let tools = anthropic::tool_definitions(&self.tool_definitions());
+        let effort = self.request_effort(variant.effort.unwrap_or(&self.reasoning_effort));
         let mut body = anthropic::request_body(&anthropic::AnthropicRequest {
             model: &self.model,
             system_prompt: &self.system_prompt,
@@ -1628,7 +1701,7 @@ impl OpenAiClient {
             input: &input,
             tools: &tools,
             max_output_tokens: self.max_output_tokens,
-            reasoning_effort: variant.effort.unwrap_or(&self.reasoning_effort),
+            reasoning_effort: &effort,
         });
         // The tools stay: Messages refuses tool_use blocks without them.
         if variant.tools_off {
@@ -1657,13 +1730,14 @@ impl OpenAiClient {
         } else {
             self.tool_definitions()
         };
+        let effort = self.request_effort(variant.effort.unwrap_or(&self.reasoning_effort));
         let body = chat::request_body(&chat::ChatRequest {
             model: &self.model,
             system_prompt: &self.system_prompt,
             input: &input,
             tools: &tools,
             max_output_tokens: self.max_output_tokens,
-            reasoning_effort: variant.effort.unwrap_or(&self.reasoning_effort),
+            reasoning_effort: &effort,
         });
         let url = chat::completions_url(&self.base_url);
         self.transport.stream(
@@ -1961,16 +2035,18 @@ impl OpenAiClient {
         }
         let requested_model = text("model").or_else(|| role.and_then(|role| role.model.as_deref()));
         // The child's model: our own, or one of the configured subagent models.
-        let (model, efforts, model_max_output_tokens, protocol) = match requested_model {
+        let (model, efforts, caps, model_max_output_tokens, protocol) = match requested_model {
             None => (
                 self.model.clone(),
                 self.reasoning_efforts.clone(),
+                self.caps,
                 self.max_output_tokens,
                 self.provider_kind,
             ),
             Some(name) if name == self.model => (
                 self.model.clone(),
                 self.reasoning_efforts.clone(),
+                self.caps,
                 self.max_output_tokens,
                 self.provider_kind,
             ),
@@ -1994,6 +2070,7 @@ impl OpenAiClient {
                 (
                     spec.name.clone(),
                     spec.reasoning_efforts.clone(),
+                    spec.caps,
                     spec.max_output_tokens,
                     spec.protocol,
                 )
@@ -2058,6 +2135,7 @@ impl OpenAiClient {
             plan_step,
             model,
             efforts,
+            caps,
             protocol,
             reasoning_effort,
             max_output_tokens,
@@ -2228,6 +2306,7 @@ impl OpenAiClient {
             model: settings.model.clone(),
             reasoning_effort: settings.reasoning_effort.clone(),
             efforts: settings.efforts.clone(),
+            caps: settings.caps,
             protocol: settings.protocol,
             max_output_tokens: settings.max_output_tokens,
             max_tool_calls: settings.max_tool_calls,
@@ -2281,6 +2360,7 @@ impl OpenAiClient {
             model: spec.model.clone(),
             reasoning_effort: spec.reasoning_effort.clone(),
             reasoning_efforts: spec.efforts.clone(),
+            caps: spec.caps,
             subagent_models: self.subagent_models.clone(),
             system_prompt,
             root_system_prompt: self.root_system_prompt.clone(),
@@ -4828,6 +4908,8 @@ mod tests {
             output_cost: 0.0,
             display_name: None,
             group_windows: BTreeMap::new(),
+            reasoning: None,
+            input_modalities: None,
         }
     }
 
@@ -4853,6 +4935,71 @@ mod tests {
         ];
         config.subagent_manager = Some(SubagentManager::default());
         OpenAiClient::from_config(config).unwrap()
+    }
+
+    #[test]
+    fn a_text_only_model_without_reasoning_gets_neither() {
+        let mut config = test_client_config();
+        let mut plain = model("test-model", &[], 4096);
+        plain.reasoning = Some(false);
+        plain.input_modalities = Some(vec!["text".to_string()]);
+        config.models = vec![plain];
+        let client = OpenAiClient::from_config(config).unwrap();
+        assert_eq!(
+            client.caps,
+            ModelCaps {
+                thinks: false,
+                images: false
+            }
+        );
+        assert_eq!(client.request_effort("medium"), "");
+        // A model the config does not list keeps reasoning and images.
+        let unlisted = test_client();
+        assert_eq!(unlisted.caps, ModelCaps::ALL);
+        assert_eq!(unlisted.request_effort("medium"), "medium");
+    }
+
+    #[test]
+    fn images_become_a_note_for_a_model_that_takes_none() {
+        let input = vec![
+            json!({ "role": "user", "content": [
+                { "type": "input_text", "text": "what is this?" },
+                { "type": "input_image", "image_url": "data:image/png;base64,QUJD" }
+            ] }),
+            json!({ "type": "function_call_output", "call_id": "c1", "output": "ok" }),
+        ];
+        let stripped = without_images(input, "plain");
+        assert_eq!(stripped[0]["content"][0]["text"], "what is this?");
+        assert_eq!(
+            stripped[0]["content"][1],
+            json!({ "type": "input_text", "text": "[image omitted: plain does not accept image input]" })
+        );
+        assert_eq!(stripped[1]["output"], "ok");
+    }
+
+    #[test]
+    fn a_subagent_runs_with_its_own_model_settings() {
+        let mut config = test_client_config();
+        config.model = "gpt-main".to_string();
+        let mut plain = model("plain-helper", &[], 4000);
+        plain.reasoning = Some(false);
+        plain.input_modalities = Some(vec!["text".to_string()]);
+        config.models = vec![model("gpt-main", &["low", "max", "ultra"], 8000), plain];
+        config.subagent_models = vec![SubagentModel {
+            name: "plain-helper".to_string(),
+            description: String::new(),
+        }];
+        config.subagent_manager = Some(SubagentManager::default());
+        let client = OpenAiClient::from_config(config).unwrap();
+        assert_eq!(client.request_effort("ultra"), "max");
+        let helper = settings(
+            &client,
+            json!({ "model": "plain-helper", "message": "look" }),
+        )
+        .unwrap();
+        assert!(!helper.caps.thinks && !helper.caps.images);
+        let own = settings(&client, json!({ "message": "look" })).unwrap();
+        assert_eq!(own.caps, ModelCaps::ALL);
     }
 
     #[test]

@@ -288,6 +288,7 @@ impl TuiState {
                     context_limit: _,
                     max_output_tokens,
                     reasoning_efforts,
+                    input_modalities: _,
                     state,
                 } => {
                     let changed = self.provider != provider

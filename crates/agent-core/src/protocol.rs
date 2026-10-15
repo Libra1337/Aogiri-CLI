@@ -323,6 +323,7 @@ pub fn event_json(event: AgentEvent) -> Value {
             context_limit,
             max_output_tokens,
             reasoning_efforts,
+            input_modalities,
             state,
         } => json!({
             "type": "model_status",
@@ -334,6 +335,7 @@ pub fn event_json(event: AgentEvent) -> Value {
             "context_limit": context_limit,
             "max_output_tokens": max_output_tokens,
             "reasoning_efforts": reasoning_efforts,
+            "input_modalities": input_modalities,
             "state": state
         }),
         AgentEvent::PendingMessages(messages) => {
@@ -591,7 +593,8 @@ pub fn event_json(event: AgentEvent) -> Value {
                     "active": model.active,
                     "context_window": model.context_window,
                     "max_output_tokens": model.max_output_tokens,
-                    "reasoning_efforts": model.reasoning_efforts
+                    "reasoning_efforts": model.reasoning_efforts,
+                    "input_modalities": model.input_modalities
                 })
             }).collect::<Vec<_>>()
         }),

@@ -62,6 +62,8 @@ pub struct ModelOptionView {
     pub context_window: u64,
     pub max_output_tokens: u64,
     pub reasoning_efforts: Vec<String>,
+    /// What the model takes as input ("text", "image").
+    pub input_modalities: Vec<String>,
 }
 
 /// One row of the `/login` provider picker.
@@ -179,6 +181,8 @@ pub enum AgentEvent {
         context_limit: u64,
         max_output_tokens: u64,
         reasoning_efforts: Vec<String>,
+        /// What the model takes as input ("text", "image").
+        input_modalities: Vec<String>,
         state: String,
     },
     PendingMessages(Vec<String>),

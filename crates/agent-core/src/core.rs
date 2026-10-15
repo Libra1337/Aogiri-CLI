@@ -635,6 +635,7 @@ impl AgentCore {
             context_window: model_config.context_window,
             context_limit: self.effective_context_limit(),
             max_output_tokens: model_config.max_output_tokens,
+            input_modalities: model_config.effective_input_modalities(),
             reasoning_efforts: model_config.reasoning_efforts,
             state,
         }
@@ -5730,6 +5731,7 @@ impl AgentCore {
                     context_window: self.config.model_config(&model_config.name).context_window,
                     max_output_tokens: model_config.max_output_tokens,
                     reasoning_efforts: model_config.reasoning_efforts.clone(),
+                    input_modalities: model_config.effective_input_modalities(),
                 }
             })
             .collect()
@@ -5931,6 +5933,8 @@ fn lynshen_model_config(model: &OAuthModel) -> ModelConfig {
         output_cost: 0.0,
         display_name: model.display_name.clone(),
         group_windows: model.group_windows.clone(),
+        reasoning: None,
+        input_modalities: None,
     }
 }
 
@@ -7071,6 +7075,27 @@ mod model_config_tests {
         );
         // max_output must leave room for the higher tiers' thinking budgets.
         assert!(config.max_output_tokens >= 32_000);
+    }
+
+    #[test]
+    fn a_custom_model_window_sets_the_compaction_point() {
+        let path = std::env::temp_dir().join("lynshen-custom-window/config.json");
+        let config = crate::config::Config::from_value(
+            r#"{ "provider": "my-llm", "model": "small", "models": [
+                { "name": "small", "context_window": 64000, "max_output_tokens": 4096 },
+                { "name": "big", "context_window": 1000000, "max_output_tokens": 128000 }
+            ] }"#,
+            path,
+        )
+        .unwrap();
+        assert_eq!(
+            target_context_budget(&config.current_model_config(), 75),
+            48_000
+        );
+        assert_eq!(
+            target_context_budget(&config.model_config("big"), 75),
+            750_000
+        );
     }
 
     #[test]
