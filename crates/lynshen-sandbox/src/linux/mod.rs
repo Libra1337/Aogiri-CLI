@@ -15,8 +15,10 @@
 //!
 //! What it cannot do, unlike bubblewrap: keep `.git` (or any path) inside
 //! a writable root read-only, hide a credential inside a writable root,
-//! or give the command a private loopback interface (with the network off,
-//! localhost is unreachable too).
+//! hide the names of the files in a credential directory (only their
+//! contents: the directories on the way stay listable, and listing is
+//! granted to everything below them), or give the command a private
+//! loopback interface (with the network off, localhost is unreachable too).
 
 use std::{
     ffi::{CString, OsString},

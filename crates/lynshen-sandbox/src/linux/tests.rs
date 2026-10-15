@@ -105,8 +105,19 @@ fn landlock_hides_credentials() {
     );
     assert!(!read.status.success());
     assert!(!String::from_utf8_lossy(&read.stdout).contains("top-secret"));
-    let listing = sh(&spec, &ws, "/bin/sh", &format!("ls {}", secrets.display()));
-    assert!(!String::from_utf8_lossy(&listing.stdout).contains("id_test"));
+    // A file deeper inside is unreadable too. Its name is not hidden: the
+    // directories on the way to a credential stay listable, and Landlock
+    // grants listing to everything below a directory.
+    fs::create_dir_all(secrets.join("keys")).unwrap();
+    fs::write(secrets.join("keys/deep"), "deep-secret").unwrap();
+    let deep = sh(
+        &spec,
+        &ws,
+        "/bin/sh",
+        &format!("cat {}/keys/deep", secrets.display()),
+    );
+    assert!(!deep.status.success());
+    assert!(!String::from_utf8_lossy(&deep.stdout).contains("deep-secret"));
     // Its neighbours stay readable.
     let read = sh(
         &spec,
