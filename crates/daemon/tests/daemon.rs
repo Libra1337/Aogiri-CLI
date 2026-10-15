@@ -3197,8 +3197,11 @@ fn the_desktop_lists_saves_and_deletes_reply_styles() {
     // A session takes it with set_style.
     let session = desktop.create_session(&project);
     desktop.send(json!({ "op": "set_style", "session": session, "style": "terse" }));
+    // The startup batch told the default first.
     let told = desktop
-        .until(|f| f["type"] == "reply_style" && f["session"] == session.as_str())
+        .until(|f| {
+            f["type"] == "reply_style" && f["session"] == session.as_str() && f["style"] == "terse"
+        })
         .pop()
         .unwrap();
     assert_eq!(
