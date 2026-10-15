@@ -198,18 +198,35 @@ fn the_restricted_token_sandbox_runs_the_engine_s_commands() {
 
     // The engine's shells, as its shell tool starts them.
     let host = Host::current();
-    // Git Bash is refused in plain words (see `windows_shell_supported`).
+    // Git Bash cannot run in the sandbox: the `gitbash` setting (and
+    // `auto`, which picks it first) runs commands in PowerShell instead, and
+    // a Git Bash program is refused with a reason.
     let bash = CommandShell::detect(&host, "gitbash");
     if bash.notes.is_empty() {
         let invocation = bash.invocation("echo 1");
         let args: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
         let refused = policy.wrap(&invocation.program, &args, &ws);
         report.check(
-            "shell gitbash: refused with a reason",
+            "a Git Bash program is refused with a reason",
             refused
                 .as_ref()
                 .is_err_and(|error| error.contains("Git Bash cannot run")),
             format!("{refused:?}"),
+        );
+        let shell = lynshen_agent_core::shell::for_commands("gitbash");
+        let _ = fs::remove_file(ws.join("instead.txt"));
+        let invocation =
+            shell.invocation("Set-Content -Path instead.txt -Value 1; Get-Content instead.txt");
+        let args: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
+        let (ok, stdout, detail) = run(&policy, &ws, &invocation.program, &args, &invocation.env);
+        report.check(
+            "setting gitbash: commands run in PowerShell, which works",
+            shell.shell.kind.powershell()
+                && shell.to_json()["instead_of"] == "gitbash"
+                && ok
+                && stdout.contains('1')
+                && ws.join("instead.txt").exists(),
+            format!("{} {:?}: {detail}", shell.label(), shell.notes),
         );
     } else {
         report.check(

@@ -355,6 +355,9 @@ impl AgentCore {
         let config = Config::load_or_create().inspect_err(|error| {
             crate::log_error!("config", "failed to load config", error = error.to_string());
         })?;
+        // A machine setting: every session of this process follows the
+        // value the newest one read (see `set_sandbox_mode` too).
+        crate::sandbox::set_windows_sandbox(config.sandbox_windows);
         let approval_mode = config.approval_mode;
         // Enabled MCP servers connect on background threads; the agent is
         // usable immediately and their tools appear once connected.
@@ -3611,6 +3614,11 @@ impl AgentCore {
         mode: crate::sandbox::SandboxMode,
         network: Option<bool>,
     ) -> Vec<AgentEvent> {
+        // Desktop changes `sandbox_windows` in config.json, then sends
+        // set_sandbox to the running sessions: read it again here.
+        if let Ok(disk) = Config::load_existing() {
+            crate::sandbox::set_windows_sandbox(disk.sandbox_windows);
+        }
         let mut next = self.sandbox.clone();
         let base = next.base.get_or_insert_with(|| self.config.sandbox.clone());
         base.mode = mode;
@@ -3688,10 +3696,16 @@ impl AgentCore {
             policy.mode.as_str(),
             if policy.is_sandboxed() && !policy.enforced() {
                 " (not enforced: this platform has no OS sandbox)"
+            } else if policy.is_sandboxed() && crate::sandbox::windows_sandbox_on() {
+                " (Windows sandbox, preview)"
             } else {
                 ""
             },
-            if policy.network { "on" } else { "off" },
+            match (policy.network, crate::sandbox::windows_sandbox_on()) {
+                (true, _) => "on",
+                (false, true) => "off (not enforced by the Windows sandbox)",
+                (false, false) => "off",
+            },
             list(&policy.writable_dirs),
             list(&policy.readable_dirs),
             if rules.is_empty() { "none".to_string() } else { rules }

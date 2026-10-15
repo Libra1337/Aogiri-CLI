@@ -75,8 +75,9 @@ pub fn windows_sandbox() -> WindowsSandbox {
     }
 }
 
-/// Whether the Windows sandbox runs commands here.
-fn windows_restricted() -> bool {
+/// Whether the Windows sandbox runs commands here: on Windows, with
+/// `sandbox_windows = "restricted-token"`.
+pub fn windows_sandbox_on() -> bool {
     cfg!(windows) && windows_sandbox() == WindowsSandbox::RestrictedToken
 }
 
@@ -641,7 +642,7 @@ impl SandboxPolicy {
             wrapped.push(program.to_string());
             wrapped.extend(args.iter().map(|arg| arg.to_string()));
             Ok((bwrap.display().to_string(), wrapped))
-        } else if windows_restricted() {
+        } else if windows_sandbox_on() {
             self.windows_wrap(program, args, root, denied)
         } else {
             // No OS sandbox (Windows by default): the command runs unconfined.
@@ -719,7 +720,7 @@ impl SandboxPolicy {
         } else if cfg!(target_os = "linux") {
             let bwrap = find_bwrap().ok_or_else(bwrap_missing)?;
             bwrap_runs(&bwrap)
-        } else if windows_restricted() {
+        } else if windows_sandbox_on() {
             windows_check()
         } else {
             Ok(())
@@ -888,18 +889,19 @@ impl SandboxPolicy {
         } else {
             // The Windows sandbox grants a private temp directory, not the
             // package caches, and cannot turn the network off.
-            let windows = windows_restricted();
+            let windows = windows_sandbox_on();
             let writable = match self.mode {
                 SandboxMode::ReadOnly => "Nothing is writable.".to_string(),
                 _ if windows => format!(
-                    "Writable: the working directory{extra} and a private temp directory (TEMP); package caches are not; .git, .lynshen and .agents in them are read-only."
+                    "Writable: the working directory{extra} and a private temp directory (TEMP); .git, .lynshen and .agents in them are read-only. Package caches are read-only too, so installs (npm install, cargo fetch, pip install) need escalate."
                 ),
                 _ => format!(
                     "Writable: the working directory{extra}, temp and package caches; .git, .lynshen and .agents in them are read-only."
                 ),
             };
             let network = if windows {
-                "Network is not restricted".to_string()
+                // `sandbox_network: false` is not enforced there.
+                "Network is not restricted (the Windows sandbox cannot turn it off)".to_string()
             } else {
                 format!("Network is {}", if self.network { "on" } else { "off" })
             };
@@ -1330,17 +1332,18 @@ const OS_SANDBOX: bool = cfg!(any(target_os = "macos", target_os = "linux"));
 /// Whether an OS sandbox runs commands here: `OS_SANDBOX`, or the Windows
 /// sandbox when `sandbox_windows` turns it on.
 fn os_sandbox() -> bool {
-    OS_SANDBOX || windows_restricted()
+    OS_SANDBOX || windows_sandbox_on()
 }
 
 /// Git Bash (MSYS2) cannot start under the Windows sandbox's token: its
 /// runtime opens pipes whose ACL names only the user, which a
-/// write-restricted token cannot write. Said plainly instead of failing in
-/// MSYS2's own words on every command.
+/// write-restricted token cannot write. Commands then run in PowerShell
+/// (`shell::for_commands`); this refusal is left for a machine with no
+/// PowerShell, said plainly instead of in MSYS2's own words.
 pub fn windows_shell_supported(program: &str) -> Result<(), String> {
     use crate::shell::{Kind, Platform};
     if Kind::of_program(Path::new(program), Platform::Windows) == Some(Kind::GitBash) {
-        return Err("Git Bash cannot run in the Windows sandbox (sandbox_windows = restricted-token). Run this command with escalate: true, or ask the user to choose PowerShell as the shell or turn sandbox_windows off".to_string());
+        return Err("Git Bash cannot run in the Windows sandbox (preview), and no PowerShell was found to run commands in instead. Run this command with escalate: true, or ask the user to install PowerShell 7 or turn the Windows sandbox off".to_string());
     }
     Ok(())
 }
@@ -1463,7 +1466,7 @@ mod tests {
         assert!(WindowsSandbox::parse("on").is_err());
         // Nothing in this test process turns it on.
         assert_eq!(windows_sandbox(), WindowsSandbox::Off);
-        assert!(!windows_restricted());
+        assert!(!windows_sandbox_on());
     }
 
     #[test]
@@ -1509,6 +1512,7 @@ mod tests {
         .windows_spec(&dir, &[]);
         assert!(read_only.writable_roots.is_empty());
         assert!(!read_only.private_temp);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -346,6 +346,10 @@ pub struct Config {
     /// Sandbox for shell commands (`sandbox`, `sandbox_network`,
     /// `sandbox_directories`, `command_rules` in config.json).
     pub sandbox: crate::sandbox::SandboxPolicy,
+    /// How this machine sandboxes commands on Windows (`sandbox_windows`):
+    /// read, never written back. A session applies it when it starts and on
+    /// `set_sandbox` (`sandbox::set_windows_sandbox`).
+    pub sandbox_windows: crate::sandbox::WindowsSandbox,
     /// Per-project sandbox settings (`projects` in config.json), keyed by
     /// the workspace's path (see `project_key`). Read only: changes are
     /// written to the file (`edit_config_json`).
@@ -649,6 +653,7 @@ impl Config {
                 extra_skills_source: None,
                 mcp_servers: Vec::new(),
                 sandbox: crate::sandbox::SandboxPolicy::default_for_platform(),
+                sandbox_windows: crate::sandbox::WindowsSandbox::Off,
                 projects: Value::Null,
                 web_search_engine: crate::web::DEFAULT_SEARCH_ENGINE.to_string(),
                 web_search_model: crate::web::DEFAULT_SEARCH_MODEL.to_string(),
@@ -733,9 +738,6 @@ impl Config {
         };
         let default_base_url = default_base_url_for_provider(&provider)
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        // A machine setting, not part of a session's policy: how this process
-        // sandboxes commands on Windows. Only read, never written back.
-        crate::sandbox::set_windows_sandbox(read_windows_sandbox(&value)?);
         let config = Self {
             protocol: read_string(&value, "protocol", ""),
             model,
@@ -793,6 +795,7 @@ impl Config {
             extra_skills_source: read_optional_string(&value, "extra_skills_source"),
             mcp_servers: read_mcp_servers(&value),
             sandbox: read_sandbox(&value)?,
+            sandbox_windows: read_windows_sandbox(&value)?,
             projects: value.get("projects").cloned().unwrap_or(Value::Null),
             web_search_engine: known_search_engine(read_web_engine(
                 &value,
@@ -2917,6 +2920,7 @@ mod tests {
             extra_skills_source: None,
             mcp_servers: Vec::new(),
             sandbox: crate::sandbox::SandboxPolicy::default_for_platform(),
+            sandbox_windows: crate::sandbox::WindowsSandbox::Off,
             projects: Value::Null,
             web_search_engine: crate::web::DEFAULT_SEARCH_ENGINE.to_string(),
             web_search_model: crate::web::DEFAULT_SEARCH_MODEL.to_string(),
