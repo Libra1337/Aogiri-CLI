@@ -176,6 +176,42 @@ lynshen daemon pair              # 打印一次性配对链接，5 分钟内在�
 }
 ```
 
+### 自己的服务商和模型
+
+`provider`、`base_url`、`protocol`（`responses`、`anthropic` 或 `chat`）和 `models` 描述当前用的服务商。桌面端在 设置 → 提供商 里编辑这些值，切换默认服务商时写进 `config.json`。`models` 里每个模型可以写这些字段：
+
+| 字段 | 含义 | 不写时 |
+| --- | --- | --- |
+| `name` | 发给服务商的模型 ID | 必填 |
+| `display_name` | 界面显示的名字 | 用 `name` |
+| `context_window` | 上下文窗口，单位 token。自动压缩在用量超过它的 `compaction_threshold_percent` 时开始 | 0：不按窗口压缩 |
+| `max_output_tokens` | 一次回复最多输出的 token 数，作为请求的 `max_output_tokens`（Responses）或 `max_tokens`（Chat、Anthropic）发出 | 0：Responses 和 Chat 不发上限，Anthropic 用默认值 |
+| `reasoning` | 模型会不会思考。`false`：请求不带思考参数，客户端不显示思考强度 | 由 `reasoning_efforts` 决定 |
+| `reasoning_efforts` | 模型接受的思考强度，从低到高：`none`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`。客户端只显示这些档位 | `none` 到 `xhigh` |
+| `input_modalities` | 模型接受的输入：`text`、`image`。没有 `image` 时，发给模型的图片换成一行文字说明 | 文本和图片 |
+
+`ultra` 是 GPT 对最高档的叫法，接口不接受这个值。请求里发的是这个模型列出的其他档位中最高的一档；只列了 `none` 和 `ultra` 时发 `max`。
+
+```json
+{
+  "provider": "my-llm",
+  "base_url": "https://llm.example.com/v1",
+  "protocol": "chat",
+  "model": "my-model",
+  "models": [
+    {
+      "name": "my-model",
+      "context_window": 200000,
+      "max_output_tokens": 32000,
+      "reasoning": true,
+      "reasoning_efforts": ["low", "medium", "high"],
+      "input_modalities": ["text", "image"]
+    },
+    { "name": "my-small-model", "context_window": 64000, "max_output_tokens": 8192, "reasoning": false, "input_modalities": ["text"] }
+  ]
+}
+```
+
 ## 工具、技能和 MCP
 
 模型能用的工具不多：`read`、`hashline_edit`（默认唯一开启的编辑工具）、`bash`、`ripgrep`、`ls`、`outline`、`checkpoint`、`web_fetch`、`generate_image`，以及子智能体相关的 `spawn_agent` 等。`str_replace`、`write`、`apply_patch` 默认关闭，用 `config.json` 的 `edit_tools` 打开。编辑工具改一个已有文件前，智能体必须先 `read` 过它，而且读过之后文件没有被别人改过（`apply_patch` 也一样，包括只改名的补丁，新建的文件除外）。编辑只给新写入的行加换行符：用 CRLF 的文件新行用 CRLF，两种换行混用的文件新行用占多数的那种，没改的行保持原样。`web_search` 不管当前对话用的是什么模型，都交给网关上一个能联网的 Claude 模型去搜（`web_search_model`，默认 `claude-haiku-5-5`），拿回摘要和来源；没有这样的模型（不是 LynShen 或 Monoize 网关，或把 `web_search_model` 设成空字符串）或它搜失败时，改从本机搜 Bing/DuckDuckGo 的网页结果。`config.json` 里把 `web_search_engine` 设成 `gateway` 才走 LynShen 网关自己的搜索，那条路要登录。文件工具只访问工作目录，以及技能目录和 `sandbox_directories` 里配置的目录。
@@ -245,6 +281,8 @@ LynShen CLI is a terminal coding agent written in Rust. The command is `lynshen`
 **Install.** Download the binary for your platform from [GitHub Releases](https://github.com/Libra1337/LynShen-CLI/releases) (`lynshen-aarch64-apple-darwin`, `lynshen-x86_64-apple-darwin`, `lynshen-x86_64-unknown-linux-gnu`, `lynshen-x86_64-pc-windows-msvc.exe`), or build it with `cargo build --release` from a clone made with `--recurse-submodules`. LynShen Desktop ships its own copy in `~/.lynshen/bin`. The npm package `@lynshen/cli` is not on npm yet. On Linux, install `bubblewrap`: shell commands run in its sandbox and fail without it.
 
 **First run.** Run `lynshen` in a project. Type `/login` to sign in to LynShen in the browser, or `/login <provider> <key>` to use your own key (`/login list` shows the providers). Settings are in `~/.lynshen/config.json`, credentials in `~/.lynshen/auth.json`.
+
+**Your own provider.** `provider`, `base_url`, `protocol` and `models` in `config.json` describe the provider in use. Each model entry takes `name`, `display_name`, `context_window` (sets the compaction point), `max_output_tokens` (sent as the request's output cap), `reasoning` (`false`: no reasoning settings are sent and clients show no effort), `reasoning_efforts` (the tiers clients offer: `none`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`) and `input_modalities` (`text`, `image`; without `image`, images are replaced by a note). A missing field keeps the earlier behavior. `ultra` is GPT's name for the top tier: requests send the model's highest other listed tier, or `max`.
 
 **Modes.** `lynshen --headless "<task>"` runs one task and prints JSONL events. It denies approvals unless you pass `--approval-mode`. `lynshen serve` speaks newline JSON over stdio for GUIs, `lynshen acp` speaks ACP for editors such as Zed, and `lynshen daemon` hosts many sessions on `ws://127.0.0.1:7788` for Desktop and paired phones.
 

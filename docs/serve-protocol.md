@@ -44,7 +44,7 @@ After `hello`, before any command, the engine emits its startup batch:
 
 ```jsonl
 {"type":"startup","version":"0.2.0","session_id":"...","profile_dir":"...","config_path":"...","cwd":"...","model":"...","context_window":200000}
-{"type":"model_status","provider":"...","model":"...","reasoning_effort":"...","context_window":200000,"context_limit":160000,"max_output_tokens":32000,"reasoning_efforts":["low","medium","high"],"state":"ready"}
+{"type":"model_status","provider":"...","model":"...","reasoning_effort":"...","context_window":200000,"context_limit":160000,"max_output_tokens":32000,"reasoning_efforts":["low","medium","high"],"input_modalities":["text","image"],"state":"ready"}
 {"type":"command_list","commands":[{"command":"/help","marker":null,"args":"","description":"..."}]}
 {"type":"approval_mode","mode":"manual"}
 {"type":"sandbox","mode":"workspace-write","network":true,"enforced":true,"unavailable":null,"directories":[]}
@@ -560,7 +560,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `type` | Fields | Meaning |
 | --- | --- | --- |
 | `startup` | `version`, `session_id`, `profile_dir`, `config_path`, `cwd`, `model`, `context_window` | First event; identifies the session. |
-| `model_status` | `provider`, `model`, `reasoning_effort`, `context_window`, `context_limit`, `max_output_tokens`, `reasoning_efforts`, `state` | Current model selection; deduplicated, re-emitted on change. Claude Code sessions add their own fields (`docs/daemon-protocol.md` → Other engines). |
+| `model_status` | `provider`, `model`, `reasoning_effort`, `context_window`, `context_limit`, `max_output_tokens`, `reasoning_efforts`, `input_modalities`, `state` | Current model selection; deduplicated, re-emitted on change. `reasoning_efforts` is empty for a model configured with `"reasoning": false`; `input_modalities` lists `text` and/or `image` (both unless the model entry says otherwise). Claude Code sessions add their own fields (`docs/daemon-protocol.md` → Other engines). |
 | `command_list` | `commands: [{command, marker, args, description}]` | Available slash commands incl. custom and MCP prompt commands. |
 | `approval_mode` | `mode` | Current approval mode; emitted at startup and on change. |
 | `sandbox` | `mode`, `network`, `enforced`, `unavailable`, `directories` | The session's sandbox; emitted at startup (and to a client that attaches) and after every change (`set_sandbox`, `/sandbox <mode>`, `add_directory`, `remove_directory`, `approve` with `add_dir`). `enforced`: an OS sandbox applies the mode; false on Windows and in `full-access`. `unavailable`: why the OS sandbox cannot run here (bubblewrap missing, AppArmor blocking it) with the fix, else `null`. `directories`: `[{path, mode, source}]`, the read-write (`rw`) and read-only (`ro`) directories it adds, by where they come from: `global` (config.json `sandbox_directories`, or a daemon agent's directories), `project` (config.json `projects`, and the directories the daemon adds for the project) or `session`. |
@@ -598,7 +598,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `compaction_end` | `summary` | Context compaction finished; the older conversation now reads as `summary`. When the session has a plan, `summary` then has a blank line, `Your plan from update_plan, as it stands:`, one `N. [<status>] <step>` line per step and `Keep it current with update_plan.`, so the model keeps its plan; it is part of the summary, which comes before the kept conversation, so the user's latest request stays the last message. When the session's edit tools changed files, `summary` ends with a blank line, `Files changed in this session:` and one `- <path>` line per file (relative to the session's directory when under it; past 100 files, a last line `- and N more`). Other engines send no `summary`. |
 | `compaction_progress` | `output_tokens` | Compaction summary tokens produced so far. |
 | `compaction_failed` | `error` | Compaction failed; the session continues uncompacted. |
-| `model_view` | `models: [{model, active, context_window, max_output_tokens, reasoning_efforts}]`, `active_effort` | Model picker data (`/model`). |
+| `model_view` | `models: [{model, active, context_window, max_output_tokens, reasoning_efforts, input_modalities}]`, `active_effort` | Model picker data (`/model`). |
 | `tree_view` | `nodes: [{id, parent_id, label, active}]` | Session branch tree (`/tree`). |
 | `resume_view` | `items: [{id, label, active}]` | Session picker data (`/resume`). |
 | `checkpoint_view` | `items: [{id, label, detail}]` | Checkpoint picker data. |

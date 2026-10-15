@@ -1523,6 +1523,7 @@ fn model_picker_enter_includes_selected_effort() {
                 context_window: 400_000,
                 max_output_tokens: 128_000,
                 reasoning_efforts: vec!["none".to_string(), "low".to_string()],
+                input_modalities: Vec::new(),
             },
             ModelOptionView {
                 model: "gpt-5.3-codex".to_string(),
@@ -1536,6 +1537,7 @@ fn model_picker_enter_includes_selected_effort() {
                     "high".to_string(),
                     "xhigh".to_string(),
                 ],
+                input_modalities: Vec::new(),
             },
         ],
         "low".to_string(),
@@ -1564,6 +1566,7 @@ fn model_picker_renders_effort_hint() {
             context_window: 400_000,
             max_output_tokens: 128_000,
             reasoning_efforts: vec!["none".to_string(), "low".to_string()],
+            input_modalities: Vec::new(),
         }],
         "none".to_string(),
     );
@@ -1786,6 +1789,7 @@ fn model_picker_tab_cycles_effort() {
             context_window: 200_000,
             max_output_tokens: 32_000,
             reasoning_efforts: vec!["low".to_string(), "medium".to_string()],
+            input_modalities: Vec::new(),
         },
         ModelOptionView {
             model: "gpt-5.4-mini".to_string(),
@@ -1794,6 +1798,7 @@ fn model_picker_tab_cycles_effort() {
             context_window: 200_000,
             max_output_tokens: 32_000,
             reasoning_efforts: vec!["none".to_string(), "low".to_string()],
+            input_modalities: Vec::new(),
         },
     ];
     let mut app = TuiApp::new(TestRuntime::default());

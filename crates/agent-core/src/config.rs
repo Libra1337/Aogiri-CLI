@@ -541,9 +541,43 @@ pub struct ModelConfig {
     /// LynShen: the window range through each group (group id → smallest,
     /// largest), when a group's channel gives the model another window.
     pub group_windows: BTreeMap<String, (u64, u64)>,
+    /// Whether the model reasons (`reasoning` in config.json). None: not
+    /// stated, `reasoning_efforts` alone decides as before. Some(false):
+    /// no effort tiers, and requests carry no reasoning settings.
+    pub reasoning: Option<bool>,
+    /// What the model takes as input (`input_modalities`: "text", "image").
+    /// None: not stated, which accepts images as before.
+    pub input_modalities: Option<Vec<String>>,
 }
 
+/// Input kinds a model entry may list in `input_modalities`.
+pub const INPUT_MODALITIES: [&str; 2] = ["text", "image"];
+
 impl ModelConfig {
+    /// False only for a model configured with `"reasoning": false`.
+    pub fn thinks(&self) -> bool {
+        self.reasoning != Some(false)
+    }
+
+    /// Image parts may go to the model: true unless `input_modalities` is
+    /// set and leaves "image" out.
+    pub fn accepts_images(&self) -> bool {
+        self.input_modalities
+            .as_ref()
+            .is_none_or(|kinds| kinds.iter().any(|kind| kind == "image"))
+    }
+
+    /// `input_modalities` as reported to clients: the configured list, or
+    /// text and image when none is set.
+    pub fn effective_input_modalities(&self) -> Vec<String> {
+        self.input_modalities.clone().unwrap_or_else(|| {
+            INPUT_MODALITIES
+                .iter()
+                .map(|kind| kind.to_string())
+                .collect()
+        })
+    }
+
     /// Cumulative USD cost for a turn's token usage. Returns 0 when no prices are
     /// configured for the model.
     pub fn cost_for(&self, input_tokens: u64, cached_input_tokens: u64, output_tokens: u64) -> f64 {
@@ -1636,6 +1670,7 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
         else {
             continue;
         };
+        let reasoning = model.get("reasoning").and_then(Value::as_bool);
         let reasoning_efforts = model
             .get("reasoning_efforts")
             .and_then(Value::as_array)
@@ -1660,13 +1695,16 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
         // or the budget tiers older versions wrote for a model that now takes
         // adaptive effort: surface the current tiers (and lift the tiny
         // default cap so high-tier budgets fit) without forcing a re-login.
-        let reasoning_efforts =
-            if name.starts_with("claude-") && stale_claude_tiers(name, &reasoning_efforts) {
+        // An entry that states `reasoning` was set by the user: kept as is.
+        let reasoning_efforts = match reasoning {
+            Some(false) => Vec::new(),
+            Some(true) => reasoning_efforts,
+            None if name.starts_with("claude-") && stale_claude_tiers(name, &reasoning_efforts) => {
                 max_output_tokens = max_output_tokens.max(CLAUDE_MIN_MAX_OUTPUT_TOKENS);
                 claude_thinking_tiers(name)
-            } else {
-                reasoning_efforts
-            };
+            }
+            None => reasoning_efforts,
+        };
 
         configs.push(ModelConfig {
             name: name.to_string(),
@@ -1690,6 +1728,8 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
                 .filter(|label| !label.is_empty())
                 .map(str::to_string),
             group_windows: read_group_windows(model.get("group_context_windows")),
+            reasoning,
+            input_modalities: read_input_modalities(model.get("input_modalities")),
         });
     }
 
@@ -1874,7 +1914,36 @@ fn model_config_value(model: &ModelConfig) -> Value {
     if !model.group_windows.is_empty() {
         value["group_context_windows"] = group_windows_value(&model.group_windows);
     }
+    if let Some(reasoning) = model.reasoning {
+        value["reasoning"] = json!(reasoning);
+        // A model that does not reason keeps the "none" list older engines
+        // read as "no thinking".
+        if !reasoning {
+            value["reasoning_efforts"] = json!(["none"]);
+        }
+    }
+    if let Some(kinds) = &model.input_modalities {
+        value["input_modalities"] = json!(kinds);
+    }
     value
+}
+
+/// `input_modalities` as config.json keeps it: the known kinds, in their
+/// order, each once. A list with none of them reads as unset.
+fn read_input_modalities(value: Option<&Value>) -> Option<Vec<String>> {
+    let listed = value?.as_array()?;
+    let kinds = INPUT_MODALITIES
+        .iter()
+        .filter(|kind| {
+            listed.iter().any(|entry| {
+                entry
+                    .as_str()
+                    .is_some_and(|entry| entry.trim().eq_ignore_ascii_case(kind))
+            })
+        })
+        .map(|kind| kind.to_string())
+        .collect::<Vec<_>>();
+    (!kinds.is_empty()).then_some(kinds)
 }
 
 /// `group_context_windows` as /v1/models sends it and config.json keeps it:
@@ -1950,6 +2019,35 @@ fn stale_claude_tiers(model: &str, efforts: &[String]) -> bool {
             && llm_provider_kit::anthropic::uses_adaptive_thinking(model))
 }
 
+/// Effort tiers from lowest to highest, as `request_effort` ranks them.
+const EFFORT_ORDER: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+/// The reasoning effort a request sends for `effort`, on a model that
+/// reasons or not (`thinks`) and offers `tiers`.
+///
+/// - A model that does not reason gets "" (the request carries no
+///   reasoning settings).
+/// - "ultra" is GPT's name for the top setting, not an API value: the
+///   request sends the highest other tier the model lists ("max" when it
+///   lists none), as Codex does.
+/// - Any other effort is sent as it is.
+pub fn request_effort(thinks: bool, tiers: &[String], effort: &str) -> String {
+    if !thinks {
+        return String::new();
+    }
+    if effort != "ultra" {
+        return effort.to_string();
+    }
+    EFFORT_ORDER
+        .iter()
+        .rev()
+        .filter(|tier| !matches!(**tier, "ultra" | "none"))
+        .find(|tier| tiers.iter().any(|offered| offered == *tier))
+        .map_or_else(|| "max".to_string(), |tier| tier.to_string())
+}
+
 /// True when an effort list offers no actual thinking — empty, or only "none".
 /// Such a list hides thinking-strength selection in the model picker.
 pub(crate) fn is_thinking_disabled(efforts: &[String]) -> bool {
@@ -1988,6 +2086,8 @@ fn model_config_from_catalog(model: &llm_provider_kit::omp::CatalogModel) -> Mod
         output_cost: model.output_cost,
         display_name: Some(model.name.clone()).filter(|name| !name.is_empty() && *name != model.id),
         group_windows: BTreeMap::new(),
+        reasoning: None,
+        input_modalities: None,
     }
 }
 
@@ -2007,6 +2107,8 @@ fn model_config_from_template(model: &llm_provider_kit::ModelTemplate) -> ModelC
         output_cost: 0.0,
         display_name: None,
         group_windows: BTreeMap::new(),
+        reasoning: None,
+        input_modalities: None,
     }
 }
 
@@ -2180,6 +2282,8 @@ fn default_model_config(name: &str) -> ModelConfig {
             output_cost: 0.0,
             display_name: None,
             group_windows: BTreeMap::new(),
+            reasoning: None,
+            input_modalities: None,
         })
 }
 
@@ -2341,6 +2445,101 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn a_custom_model_keeps_its_limits_reasoning_and_input_kinds() {
+        let path = std::env::temp_dir().join("lynshen-custom-model/config.json");
+        let config = Config::from_value(
+            r#"{
+                "provider": "my-llm",
+                "base_url": "https://llm.example.com/v1",
+                "model": "plain",
+                "models": [
+                    { "name": "plain", "context_window": 64000, "max_output_tokens": 4096,
+                      "reasoning": false, "reasoning_efforts": ["none"], "input_modalities": ["text"] },
+                    { "name": "claude-sonnet-5", "context_window": 1000000, "max_output_tokens": 64000,
+                      "reasoning": true, "reasoning_efforts": ["low", "high", "ultra"],
+                      "input_modalities": ["text", "image"] },
+                    { "name": "legacy", "context_window": 128000, "max_output_tokens": 8192 }
+                ]
+            }"#,
+            path,
+        )
+        .unwrap();
+        let plain = config.model_config("plain");
+        assert_eq!(
+            (plain.context_window, plain.max_output_tokens),
+            (64_000, 4_096)
+        );
+        assert!(!plain.thinks() && !plain.accepts_images());
+        assert!(plain.reasoning_efforts.is_empty());
+        assert_eq!(plain.effective_input_modalities(), vec!["text"]);
+        // A stated list is the user's: no Claude tier migration.
+        let claude = config.model_config("claude-sonnet-5");
+        assert_eq!(claude.reasoning_efforts, vec!["low", "high", "ultra"]);
+        assert!(claude.thinks() && claude.accepts_images());
+        // Nothing stated: as before (default tiers, images accepted).
+        let legacy = config.model_config("legacy");
+        assert_eq!(
+            (legacy.reasoning, legacy.input_modalities.clone()),
+            (None, None)
+        );
+        assert_eq!(legacy.reasoning_efforts, default_reasoning_efforts());
+        assert!(legacy.thinks() && legacy.accepts_images());
+        assert_eq!(legacy.effective_input_modalities(), vec!["text", "image"]);
+
+        // config.json keeps what was set, and nothing that was not.
+        let written = model_config_value(&plain);
+        assert_eq!(written["reasoning"], false);
+        assert_eq!(written["reasoning_efforts"], json!(["none"]));
+        assert_eq!(written["input_modalities"], json!(["text"]));
+        let legacy_written = model_config_value(&legacy);
+        assert!(legacy_written.get("reasoning").is_none());
+        assert!(legacy_written.get("input_modalities").is_none());
+        let reread = read_model_configs(
+            &json!({ "models": [written, model_config_value(&claude), legacy_written] }),
+            "my-llm",
+        );
+        assert_eq!(reread[0].reasoning, Some(false));
+        assert!(reread[0].reasoning_efforts.is_empty());
+        assert_eq!(reread[0].input_modalities, Some(vec!["text".to_string()]));
+        assert_eq!(reread[1].reasoning_efforts, vec!["low", "high", "ultra"]);
+        assert_eq!(reread[2].reasoning, None);
+        assert_eq!(reread[2].reasoning_efforts, default_reasoning_efforts());
+    }
+
+    #[test]
+    fn input_modalities_keep_the_known_kinds_in_order() {
+        let read = |value: Value| read_input_modalities(Some(&value));
+        assert_eq!(
+            read(json!(["Image", " text ", "audio", "image"])),
+            Some(vec!["text".to_string(), "image".to_string()])
+        );
+        assert_eq!(read(json!(["image"])), Some(vec!["image".to_string()]));
+        assert_eq!(read(json!([])), None);
+        assert_eq!(read(json!(["audio"])), None);
+        assert_eq!(read(json!("text")), None);
+        assert_eq!(read_input_modalities(None), None);
+    }
+
+    #[test]
+    fn request_effort_sends_ultra_as_the_top_listed_tier() {
+        let tiers = |list: &[&str]| list.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        let gpt = tiers(&["low", "medium", "high", "xhigh", "max", "ultra"]);
+        assert_eq!(request_effort(true, &gpt, "ultra"), "max");
+        assert_eq!(request_effort(true, &gpt, "high"), "high");
+        // A model that stops at xhigh rejects max.
+        let no_max = tiers(&["none", "low", "medium", "high", "xhigh", "ultra"]);
+        assert_eq!(request_effort(true, &no_max, "ultra"), "xhigh");
+        // Nothing else listed: the API's top value.
+        assert_eq!(
+            request_effort(true, &tiers(&["none", "ultra"]), "ultra"),
+            "max"
+        );
+        // A model that does not reason sends no effort at all.
+        assert_eq!(request_effort(false, &gpt, "high"), "");
+        assert_eq!(request_effort(false, &[], "ultra"), "");
+    }
+
+    #[test]
     fn a_retry_count_past_the_most_reads_as_the_most() {
         let path = std::env::temp_dir().join("lynshen-retry-cap/config.json");
         let config = Config::from_value(r#"{ "retry_attempts": 1000000 }"#, path.clone()).unwrap();
@@ -2421,6 +2620,8 @@ mod tests {
             output_cost: 0.0,
             display_name: None,
             group_windows: BTreeMap::new(),
+            reasoning: None,
+            input_modalities: None,
         };
         let overrides = BTreeMap::from([("gpt-6-sol".to_string(), 2_000_000)]);
         // Raised toward, but never past, the largest account window.
@@ -2447,6 +2648,8 @@ mod tests {
             output_cost: 0.0,
             display_name: Some("GPT-6 Sol".to_string()),
             group_windows: BTreeMap::from([("g-big".to_string(), (1_050_000, 1_050_000))]),
+            reasoning: None,
+            input_modalities: None,
         };
         // Saved and read back with its label and group windows.
         let read = read_model_configs(
@@ -2497,6 +2700,8 @@ mod tests {
             output_cost: 8.0,
             display_name: None,
             group_windows: BTreeMap::new(),
+            reasoning: None,
+            input_modalities: None,
         };
         // 1M non-cached input @2 + 1M cached @0.5 + 1M output @8 = 10.5
         let cost = model.cost_for(2_000_000, 1_000_000, 1_000_000);
@@ -2656,6 +2861,8 @@ mod tests {
                     output_cost: 0.0,
                     display_name: None,
                     group_windows: BTreeMap::new(),
+                    reasoning: None,
+                    input_modalities: None,
                 },
                 ModelConfig {
                     name: "compact-model".to_string(),
@@ -2668,6 +2875,8 @@ mod tests {
                     output_cost: 0.0,
                     display_name: None,
                     group_windows: BTreeMap::new(),
+                    reasoning: None,
+                    input_modalities: None,
                 },
             ],
             base_url: "https://api.openai.com/v1".to_string(),
