@@ -1018,6 +1018,7 @@ dependencies = [
  "getrandom 0.2.17",
  "libc",
  "llm-provider-kit",
+ "lynshen-sandbox",
  "regex",
  "semver",
  "serde_json",
@@ -1035,6 +1036,7 @@ dependencies = [
  "libc",
  "lynshen-agent-core",
  "lynshen-daemon",
+ "lynshen-sandbox",
  "lynshen-tui",
  "serde_json",
  "tungstenite",
@@ -1056,6 +1058,15 @@ dependencies = [
  "snow",
  "tungstenite",
  "ureq",
+]
+
+[[package]]
+name = "lynshen-sandbox"
+version = "0.6.2"
+dependencies = [
+ "libc",
+ "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

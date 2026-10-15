@@ -19,12 +19,56 @@ In every sandboxed mode `~/.ssh`, `~/.gnupg`, `~/.aws`,
 Desktop's stored secrets (`secret.key`) are unreadable. Network access
 is on unless `sandbox_network` is false.
 
-Windows has no OS sandbox yet. It defaults to `workspace-write` too, which
-is not enforced there: commands run with your permissions, the model is
-told the working directory is its boundary and declares crossing it
-(`escalate`), the file tools keep to it, and clients see `enforced: false`
-in the `sandbox` event. A daemon agent still refuses to start with a
-sandbox Windows cannot enforce (its default stays `full-access`).
+Windows has no OS sandbox by default. It defaults to `workspace-write`
+too, which is not enforced there: commands run with your permissions, the
+model is told the working directory is its boundary and declares crossing
+it (`escalate`), the file tools keep to it, and clients see
+`enforced: false` in the `sandbox` event. A daemon agent still refuses to
+start with a sandbox Windows cannot enforce (its default stays
+`full-access`).
+
+### Windows sandbox (prototype, opt-in)
+
+`"sandbox_windows": "restricted-token"` in config.json turns on a Windows
+sandbox LynShen sets up itself, without administrator rights (Windows 10
+1607 and later). Desktop's switch is Settings → 权限与沙箱 → "Windows 沙箱（预览）".
+The default is `"off"`; the engine never writes the key. It is a machine
+setting: a session reads it when it starts and again on `set_sandbox`
+(Desktop sends that to the running sessions after changing it), and every
+session of the process follows the value read last. With it on, `enforced`
+is true and a daemon agent may run sandboxed.
+
+- Each command starts through `lynshen __sandbox-exec`, which runs it with a
+  restricted, low-integrity token in a job object. When the command ends,
+  times out or is stopped, everything it started ends with the job.
+- Writable: the working directory and the read-write directories, by an
+  ACL entry for a capability SID made for this engine, plus an integrity
+  label of Low. Inside them `.git`, `.lynshen` and `.agents` are denied to
+  that SID. The command gets a private temp directory (`TEMP`, `TMP`).
+  The user's temp directory and the package caches are not writable:
+  granting a directory changes every file in it. Installs (`npm install`,
+  `cargo fetch`, `pip install`) therefore leave the sandbox through the
+  usual approval (`escalate`); the prompt tells the model so.
+- Shell: Git Bash cannot run under this token (its MSYS2 runtime opens
+  pipes only the user's own token may write). With the sandbox on, the
+  `gitbash` setting, and `auto` where it picks Git Bash, run commands in
+  PowerShell 7, else Windows PowerShell; the `shells` reply says so
+  (`commands.instead_of: "gitbash"` and a note). With no PowerShell at all,
+  a command is refused with that reason.
+- Unreadable: the credential paths above get a Medium "no read up" label,
+  which a low-integrity process cannot read through. Your own programs
+  still can.
+- Not restricted: the network. `sandbox_network: false` is not enforced;
+  the prompt and `/sandbox` say so.
+- A drive root, the profile folder or a folder around it cannot be a
+  writable root: open a project folder.
+- Every ACL entry and label is taken off when the engine exits. Each change
+  is logged first under `~/.lynshen/sandbox`, so changes an engine left
+  when it crashed are undone by the next engine that runs a command.
+
+The crate is `crates/lynshen-sandbox` (it also holds a Landlock backend for
+Linux, not used by the engine yet). Parts are adapted from OpenAI Codex's
+`windows-sandbox-rs` (Apache-2.0, see NOTICE).
 
 On Linux without `bwrap`, or where AppArmor blocks it (Ubuntu 24.04 and
 later restrict unprivileged user namespaces), LynShen reports the sandbox as

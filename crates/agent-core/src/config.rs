@@ -346,6 +346,10 @@ pub struct Config {
     /// Sandbox for shell commands (`sandbox`, `sandbox_network`,
     /// `sandbox_directories`, `command_rules` in config.json).
     pub sandbox: crate::sandbox::SandboxPolicy,
+    /// How this machine sandboxes commands on Windows (`sandbox_windows`):
+    /// read, never written back. A session applies it when it starts and on
+    /// `set_sandbox` (`sandbox::set_windows_sandbox`).
+    pub sandbox_windows: crate::sandbox::WindowsSandbox,
     /// Per-project sandbox settings (`projects` in config.json), keyed by
     /// the workspace's path (see `project_key`). Read only: changes are
     /// written to the file (`edit_config_json`).
@@ -649,6 +653,7 @@ impl Config {
                 extra_skills_source: None,
                 mcp_servers: Vec::new(),
                 sandbox: crate::sandbox::SandboxPolicy::default_for_platform(),
+                sandbox_windows: crate::sandbox::WindowsSandbox::Off,
                 projects: Value::Null,
                 web_search_engine: crate::web::DEFAULT_SEARCH_ENGINE.to_string(),
                 web_search_model: crate::web::DEFAULT_SEARCH_MODEL.to_string(),
@@ -790,6 +795,7 @@ impl Config {
             extra_skills_source: read_optional_string(&value, "extra_skills_source"),
             mcp_servers: read_mcp_servers(&value),
             sandbox: read_sandbox(&value)?,
+            sandbox_windows: read_windows_sandbox(&value)?,
             projects: value.get("projects").cloned().unwrap_or(Value::Null),
             web_search_engine: known_search_engine(read_web_engine(
                 &value,
@@ -1447,6 +1453,26 @@ fn read_sandbox(value: &Value) -> io::Result<crate::sandbox::SandboxPolicy> {
         policy.rules = rules_from_json(rules).map_err(invalid)?;
     }
     Ok(policy)
+}
+
+/// `sandbox_windows`: absent or empty is `off`; an unknown value is a hard
+/// load error, like an unknown `sandbox`.
+fn read_windows_sandbox(value: &Value) -> io::Result<crate::sandbox::WindowsSandbox> {
+    use crate::sandbox::WindowsSandbox;
+    match value
+        .get("sandbox_windows")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|choice| !choice.is_empty())
+    {
+        None => Ok(WindowsSandbox::Off),
+        Some(choice) => WindowsSandbox::parse(choice).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid sandbox settings in config.json: {error}"),
+            )
+        }),
+    }
 }
 
 /// A web engine name from config.json. Absent or empty takes the default;
@@ -2894,6 +2920,7 @@ mod tests {
             extra_skills_source: None,
             mcp_servers: Vec::new(),
             sandbox: crate::sandbox::SandboxPolicy::default_for_platform(),
+            sandbox_windows: crate::sandbox::WindowsSandbox::Off,
             projects: Value::Null,
             web_search_engine: crate::web::DEFAULT_SEARCH_ENGINE.to_string(),
             web_search_model: crate::web::DEFAULT_SEARCH_MODEL.to_string(),
@@ -3387,6 +3414,17 @@ mod tests {
         assert!(custom.rules.is_empty());
 
         assert!(read_sandbox(&json!({ "sandbox": "wide-open" })).is_err());
+
+        use crate::sandbox::WindowsSandbox;
+        assert_eq!(
+            read_windows_sandbox(&json!({})).unwrap(),
+            WindowsSandbox::Off
+        );
+        assert_eq!(
+            read_windows_sandbox(&json!({ "sandbox_windows": "restricted-token" })).unwrap(),
+            WindowsSandbox::RestrictedToken
+        );
+        assert!(read_windows_sandbox(&json!({ "sandbox_windows": "on" })).is_err());
         assert!(
             read_sandbox(&json!({ "command_rules": [{ "prefix": "", "action": "allow" }] }))
                 .is_err()

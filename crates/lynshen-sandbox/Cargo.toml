@@ -1,0 +1,27 @@
+[package]
+name = "lynshen-sandbox"
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+edition = "2021"
+description = "OS sandbox backends LynShen drives itself: Windows restricted token + job object, Linux Landlock + seccomp."
+
+[dependencies]
+serde_json = "1"
+
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+]

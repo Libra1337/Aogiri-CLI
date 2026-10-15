@@ -1540,7 +1540,14 @@ fn add_sandbox_hint(value: &mut Value) {
             .and_then(Value::as_i64)
             .is_some_and(|code| code != 0);
     let output = |key: &str| value.get(key).and_then(Value::as_str).unwrap_or_default();
-    let blocked = ["Operation not permitted", "EPERM", "Read-only file system"]
+    // Seatbelt and bwrap; on Windows the restricted-token sandbox, as cmd,
+    // PowerShell and Git Bash report it.
+    let signs: &[&str] = if cfg!(windows) {
+        &["Access is denied", "is denied.", "Permission denied"]
+    } else {
+        &["Operation not permitted", "EPERM", "Read-only file system"]
+    };
+    let blocked = signs
         .iter()
         .any(|sign| output("stderr").contains(sign) || output("stdout").contains(sign));
     if failed && blocked {

@@ -918,6 +918,9 @@ pub struct CommandShell {
     /// With Git Bash: the PowerShell for Windows-native work, and its
     /// version.
     pub helper: Option<(Kind, Option<String>)>,
+    /// The shell the setting picked that cannot run here, when this one runs
+    /// instead: Git Bash under the Windows sandbox (`in_windows_sandbox`).
+    pub instead_of: Option<Kind>,
 }
 
 /// One line of a command: the program, its arguments, and the variables
@@ -952,6 +955,7 @@ impl CommandShell {
             login: true,
             notes: Vec::new(),
             helper: None,
+            instead_of: None,
         }
     }
 
@@ -1008,7 +1012,35 @@ impl CommandShell {
             login,
             notes,
             helper,
+            instead_of: None,
         }
+    }
+
+    /// The shell for commands under the Windows sandbox: Git Bash cannot
+    /// start there (its MSYS2 runtime needs to write pipes only the user's
+    /// own token may), so PowerShell 7, else Windows PowerShell, runs them
+    /// instead. Any other shell is kept, and so is Git Bash on a machine with
+    /// no PowerShell (the sandbox then refuses it with a reason).
+    pub fn in_windows_sandbox(self, host: &Host) -> Self {
+        if self.shell.kind != Kind::GitBash {
+            return self;
+        }
+        let Some(kind) = [Kind::Pwsh, Kind::WindowsPowerShell]
+            .into_iter()
+            .find(|kind| host.find(*kind).is_some())
+        else {
+            return self;
+        };
+        let mut shell = Self::detect(host, kind.id());
+        shell.notes.insert(
+            0,
+            format!(
+                "Git Bash cannot run in the Windows sandbox (preview): commands run in {} instead",
+                kind.name()
+            ),
+        );
+        shell.instead_of = Some(Kind::GitBash);
+        shell
     }
 
     /// The command line that runs `command`, with the model's variables
@@ -1111,6 +1143,8 @@ impl CommandShell {
                 "name": kind.name(),
                 "version": version,
             })),
+            // Set when the Windows sandbox replaced the chosen shell.
+            "instead_of": self.instead_of.map(Kind::id),
         })
     }
 }
@@ -1126,13 +1160,27 @@ fn commands_cache() -> &'static Mutex<HashMap<String, Arc<CommandShell>>> {
 /// config.json). The first call for a setting detects it, which can take a
 /// few seconds (see `prewarm`); later calls return the same.
 pub fn for_commands(setting: &str) -> Arc<CommandShell> {
+    // The Windows sandbox may run another shell than the setting picks
+    // (`CommandShell::in_windows_sandbox`), and Desktop turns it on and off
+    // while engines run: one entry with it and one without.
+    let sandboxed = crate::sandbox::windows_sandbox_on();
+    let key = if sandboxed {
+        format!("{setting}\u{0}windows-sandbox")
+    } else {
+        setting.to_string()
+    };
     let mut cache = commands_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(shell) = cache.get(setting) {
+    if let Some(shell) = cache.get(&key) {
         return Arc::clone(shell);
     }
-    let shell = Arc::new(CommandShell::detect(&Host::current(), setting));
+    let host = Host::current();
+    let mut shell = CommandShell::detect(&host, setting);
+    if sandboxed {
+        shell = shell.in_windows_sandbox(&host);
+    }
+    let shell = Arc::new(shell);
     crate::log_info!(
         "shell",
         "commands' shell",
@@ -1144,7 +1192,7 @@ pub fn for_commands(setting: &str) -> Arc<CommandShell> {
     for note in &shell.notes {
         crate::log_warn!("shell", "shell setting", note = note.as_str());
     }
-    cache.insert(setting.to_string(), Arc::clone(&shell));
+    cache.insert(key, Arc::clone(&shell));
     shell
 }
 
@@ -1536,6 +1584,46 @@ mod tests {
     }
 
     #[test]
+    fn the_windows_sandbox_runs_powershell_instead_of_git_bash() {
+        let dir = Dir::new("windows-sandbox");
+        let program_files = dir.path("Program Files");
+        let system_root = dir.path("Windows");
+        dir.program("Program Files/Git/bin/bash.exe", "");
+        let vars = [
+            ("ProgramFiles", program_files.as_path()),
+            ("SystemRoot", system_root.as_path()),
+        ];
+        let windows = host(Platform::Windows, &vars, None);
+        let bash = CommandShell::detect(&windows, "gitbash");
+        assert_eq!(bash.shell.kind, Kind::GitBash);
+        // No PowerShell at all: Git Bash stays (the sandbox refuses it).
+        let kept = bash.clone().in_windows_sandbox(&windows);
+        assert_eq!((kept.shell.kind, kept.instead_of), (Kind::GitBash, None));
+        // Windows PowerShell, then PowerShell 7 once it is installed.
+        dir.program(
+            "Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+            "5.1.26100.1",
+        );
+        let windows = host(Platform::Windows, &vars, None);
+        let shell = CommandShell::detect(&windows, "gitbash").in_windows_sandbox(&windows);
+        assert_eq!(shell.shell.kind, Kind::WindowsPowerShell);
+        assert_eq!(shell.instead_of, Some(Kind::GitBash));
+        assert!(shell.notes[0].contains("Git Bash cannot run in the Windows sandbox"));
+        assert_eq!(shell.to_json()["instead_of"], "gitbash");
+        dir.program("Program Files/PowerShell/7/pwsh.exe", "PowerShell 7.5.2");
+        let windows = host(Platform::Windows, &vars, None);
+        let shell = CommandShell::detect(&windows, "auto").in_windows_sandbox(&windows);
+        assert_eq!(
+            (shell.shell.kind, shell.instead_of),
+            (Kind::Pwsh, Some(Kind::GitBash))
+        );
+        // Any other shell is kept as it is.
+        let pwsh = CommandShell::detect(&windows, "pwsh");
+        assert_eq!(pwsh.clone().in_windows_sandbox(&windows).instead_of, None);
+        assert_eq!(pwsh.to_json()["instead_of"], Value::Null);
+    }
+
+    #[test]
     fn terminals_on_windows_open_auto_or_any_program_named() {
         let dir = Dir::new("terminal");
         let program_files = dir.path("Program Files");
@@ -1709,6 +1797,7 @@ mod tests {
             login: true,
             notes: Vec::new(),
             helper: None,
+            instead_of: None,
         }
     }
 
@@ -1988,6 +2077,7 @@ mod tests {
             login: false,
             notes: Vec::new(),
             helper: None,
+            instead_of: None,
         };
         let line = shell.invocation("mytool; echo \"$FROM_RC $TERM $PAGER\"");
         let output = Command::new(&line.program)

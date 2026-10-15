@@ -35,8 +35,12 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # LYNSHEN_SANDBOX_CI: the Landlock tests (lynshen-sandbox) fail
+      # instead of skipping when the kernel lacks Landlock.
       - name: Run tests
         run: cargo test --workspace
+        env:
+          LYNSHEN_SANDBOX_CI: "1"
 
       - name: Test the skills mirror builder
         run: python3 deploy/skills-mirror/test_build.py
@@ -61,3 +65,31 @@ jobs:
 
       - name: Shell tests
         run: cargo test -p lynshen-agent-core --lib shell::tests
+
+  # The Windows sandbox (sandbox_windows = "restricted-token", opt-in): the
+  # crate's policy checks, then the engine's path through the real
+  # `lynshen __sandbox-exec` runner and the shells. Both tests print every
+  # check; they use temporary directories only (no secrets, no real
+  # profile data).
+  sandbox-windows:
+    name: Sandbox (Windows)
+    runs-on: windows-latest
+    env:
+      LYNSHEN_SANDBOX_CI: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy (sandbox crate, Windows code)
+        run: cargo clippy -p lynshen-sandbox --all-targets -- -D warnings
+
+      - name: Sandbox crate tests
+        run: cargo test -p lynshen-sandbox -- --nocapture
+
+      - name: Engine sandbox test (restricted-token)
+        run: cargo test -p lynshen-cli --test windows_sandbox -- --nocapture
