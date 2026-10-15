@@ -33,6 +33,7 @@ mod secrets;
 mod session;
 pub mod shell;
 pub mod skills;
+pub mod styles;
 mod subagent_trace;
 mod subagents;
 mod tokens;
@@ -50,8 +51,8 @@ pub use config::{
 pub use core::{title_completion, AgentCore, ApproveOptions, KeptState};
 pub use event::{
     AgentEvent, CommandView, ContextBreakdown, GoalView, LoginProviderView, McpServerView,
-    McpToolView, ModelOptionView, PlanItem, SandboxDirectoryView, SandboxView, SessionListItemView,
-    TranscriptItem, TreeNodeView,
+    McpToolView, ModelOptionView, PlanItem, ReplyStyleView, SandboxDirectoryView, SandboxView,
+    SessionListItemView, TranscriptItem, TreeNodeView,
 };
 pub use hooks::HookStopper;
 pub use hunks::HunkView;
