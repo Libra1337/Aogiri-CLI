@@ -1659,6 +1659,10 @@ impl Hub {
                     "cwd": cwd.display().to_string(),
                     "created_at": record.created_at,
                     "updated_at": summary.map_or(record.created_at, |s| s.updated_at * 1000),
+                    // What the engine saved of it (LynShen sessions): 0 for one
+                    // opened without a first message, which clients leave out
+                    // of their lists.
+                    "entries": summary.map(|s| s.entries),
                     "title": shown_title(&record, summary.map(|s| s.label.as_str())),
                     "archived": record.archived,
                     "group": record.group,
