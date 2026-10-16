@@ -114,6 +114,27 @@ pub fn lynshen_logout() -> Result<(), String> {
     oauth::logout(&config.lynshen_api_url, config.encrypt_secrets)
 }
 
+/// A daemon secret (a chat bot's token) as it is saved: a `jcenc1:` envelope
+/// when config.json's `encrypt_secrets` is on and a secret key exists, else
+/// the plaintext (`docs/secrets.md`).
+pub fn seal_secret(plaintext: &str) -> Result<String, String> {
+    let wanted = config::Config::load_existing()
+        .map(|config| config.encrypt_secrets)
+        .unwrap_or(false);
+    secrets::seal(plaintext, wanted).map_err(|error| error.to_string())
+}
+
+/// The plaintext of a secret saved by `seal_secret`.
+pub fn open_secret(stored: &str) -> Result<String, String> {
+    secrets::open(stored).map_err(|error| error.to_string())
+}
+
+/// The proxy the engine uses for `url`: `HTTPS_PROXY`, `HTTP_PROXY` or
+/// `ALL_PROXY`, with `NO_PROXY` exempting hosts (as web_fetch reads them).
+pub fn env_proxy(url: &str) -> Option<String> {
+    web_fetch::env_proxy(url)
+}
+
 /// Names the app in the device label of the next LynShen login.
 pub fn set_login_client_label(label: &'static str) {
     oauth::set_client_label(label);

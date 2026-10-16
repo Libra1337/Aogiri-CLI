@@ -91,6 +91,46 @@ pub(crate) fn protect_auth(auth: &mut Value, key: &SecretKey) -> io::Result<()> 
     result
 }
 
+/// A secret as the daemon saves it (a chat bot's token): a `jcenc1:`
+/// envelope when `wanted` and a key exists, else the plaintext. Without a
+/// key yet, the secret stays plaintext, as auth.json does.
+pub(crate) fn seal(plaintext: &str, wanted: bool) -> io::Result<String> {
+    if !wanted || plaintext.is_empty() {
+        return Ok(plaintext.to_string());
+    }
+    match find_key()? {
+        Some(key) => encrypt(plaintext, &key),
+        None => Ok(plaintext.to_string()),
+    }
+}
+
+/// A saved secret's plaintext: plaintext stays as it is; an envelope opens
+/// with the first key that decrypts it.
+pub(crate) fn open(stored: &str) -> io::Result<String> {
+    if !stored.starts_with(ENVELOPE_PREFIX) {
+        return Ok(stored.to_string());
+    }
+    let mut errors = Vec::new();
+    for path in key_candidates() {
+        match read_key(&path) {
+            Ok(Some(key)) => match decrypt(stored, &key) {
+                Ok(plaintext) => return Ok(plaintext),
+                Err(error) => errors.push(format!("{}: {error}", path.display())),
+            },
+            Ok(None) => {}
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    let detail = if errors.is_empty() {
+        "no secret key was found".to_string()
+    } else {
+        errors.join("; ")
+    };
+    Err(invalid_data(format!(
+        "failed to decrypt a jcenc1 secret: {detail}"
+    )))
+}
+
 fn contains_envelope(auth: &mut Value) -> bool {
     let mut found = false;
     for_each_secret(auth, |slot| {
@@ -303,6 +343,16 @@ mod tests {
         let error = reveal_with_key(&mut auth, &[2; KEY_LEN]).unwrap_err();
         assert!(error.to_string().contains("authentication failed"));
         assert_eq!(auth, encrypted);
+    }
+
+    #[test]
+    fn a_daemon_secret_stays_plaintext_unless_sealing_is_wanted() {
+        assert_eq!(seal("123:abc", false).unwrap(), "123:abc");
+        assert_eq!(seal("", true).unwrap(), "");
+        assert_eq!(open("123:abc").unwrap(), "123:abc");
+        let key = [0x33; KEY_LEN];
+        let envelope = encrypt("123:abc", &key).unwrap();
+        assert_eq!(decrypt(&envelope, &key).unwrap(), "123:abc");
     }
 
     #[test]

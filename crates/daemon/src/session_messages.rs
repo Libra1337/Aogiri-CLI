@@ -498,7 +498,7 @@ impl Messages {
 
     /// The approval mode a session runs in, or the looser of it and the one
     /// it switches to once its turn ends.
-    fn mode(&self, session: &str) -> Option<String> {
+    pub(crate) fn mode(&self, session: &str) -> Option<String> {
         let state = lock(&self.state);
         let (mode, pending) = state.modes.get(session)?;
         Some(match pending {
@@ -508,7 +508,7 @@ impl Messages {
     }
 
     /// `mode`, waiting a little for a session that has just opened.
-    fn wait_for_mode(&self, session: &str) -> Option<String> {
+    pub(crate) fn wait_for_mode(&self, session: &str) -> Option<String> {
         let deadline = Instant::now() + MODE_WAIT;
         loop {
             let mode = self.mode(session);
@@ -710,7 +710,7 @@ fn broadcast(hub: &Hub, event: &Event) {
 
 /// Approval modes from the strictest; a name no engine uses counts as the
 /// loosest.
-fn rank(mode: &str) -> u8 {
+pub(crate) fn rank(mode: &str) -> u8 {
     match mode {
         "plan" => 0,
         // Claude Code's `default` and Codex's read-only sandbox ask before

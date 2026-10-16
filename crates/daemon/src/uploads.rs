@@ -122,6 +122,29 @@ impl Uploads {
         }))
     }
 
+    /// Saves a whole file that came another way (a chat connector
+    /// downloaded it), as an upload: the same place, name rules and limit.
+    pub fn save(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        id: impl FnOnce() -> String,
+    ) -> Result<PathBuf, String> {
+        if bytes.len() as u64 > MAX_FILE {
+            return Err("a file may be at most 100 MB".to_string());
+        }
+        let name = file_name(name);
+        let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let dir = self.dir.join(day);
+        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let path = dir.join(format!("{}-{name}", id()));
+        let part = part_path(&path);
+        fs::write(&part, bytes)
+            .and_then(|()| fs::rename(&part, &path))
+            .map_err(|error| error.to_string())?;
+        Ok(path)
+    }
+
     /// `path` when it is a finished upload: inside the uploads directory
     /// (after resolving links), a file. Anything else a client names is
     /// refused, so no other file on this computer can be taken in.
