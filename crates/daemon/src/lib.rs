@@ -6,6 +6,7 @@
 
 mod agent_tools;
 mod agents;
+mod connectors;
 mod dispatch;
 mod engines;
 mod files;
@@ -67,11 +68,12 @@ pub fn serve(
     version: &'static str,
     relay: Option<String>,
 ) -> io::Result<()> {
-    if store.claim_machine()? {
+    let copied = store.claim_machine()?;
+    if copied {
         relay::forget_identity(store.dir());
         lynshen_agent_core::log_warn!(
             "daemon",
-            "state copied from another computer: new token, devices unpaired, new relay identity"
+            "state copied from another computer: new token, devices unpaired, new relay identity, chat bots off"
         );
     }
     let token = store.token()?;
@@ -80,6 +82,11 @@ pub fn serve(
         gateway::set_group(&record.id, record.group.as_deref());
     }
     let hub = Hub::new(store, agents, version, relay);
+    // A bot answers one computer: the copy leaves it to the original.
+    if copied {
+        connectors::turn_all_off(&hub);
+    }
+    connectors::start_all(&hub);
     if hub.relay.url().is_some() {
         let relay = Arc::clone(&hub);
         thread::spawn(move || relay::run(&relay));
@@ -286,7 +293,8 @@ fn request_token(request: &Request) -> Option<String> {
 
 /// Handles one client frame. Replies to daemon ops go to this client only
 /// and echo its `id`; session events reach every client through the hub.
-fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
+/// A chat connector's bindings send their ops here too (`connectors`).
+pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     let op: Value = match serde_json::from_str(text) {
         Ok(op) => op,
         Err(error) => {
@@ -306,6 +314,31 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     };
     let session = op["session"].as_str().map(str::to_string);
     let name = op["op"].as_str().unwrap_or_default();
+    // A chat binding may do only what the chat profile allows, checked
+    // before anything else (docs/chat-connectors.md).
+    if hub.is_chat(client) {
+        if let Err(message) = connectors::check_profile(hub, client, name, &op) {
+            reply(json!({ "type": "error", "message": message }));
+            return;
+        }
+    }
+    // Chat connectors hold bot credentials: only the desktop manages them.
+    // Adding one waits on the platform, so these run off this thread.
+    if name.starts_with("connector_") {
+        if !hub.is_local(client) {
+            reply(
+                json!({ "type": "error", "message": "only the desktop can manage chat connectors" }),
+            );
+            return;
+        }
+        let hub = Arc::clone(hub);
+        let name = name.to_string();
+        thread::spawn(move || {
+            let result = connectors::handle(&hub, &name, &op);
+            respond(&hub, client, &request, result);
+        });
+        return;
+    }
     if matches!(
         name,
         "pair_start"

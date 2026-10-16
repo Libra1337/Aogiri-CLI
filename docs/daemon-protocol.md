@@ -47,6 +47,7 @@ State lives in `~/.lynshen/daemon/`:
 | `settings.json` | Daemon settings: `relay` (whether the relay connection is on). |
 | `workspaces.json` | Workspaces and their projects, with a save counter `rev`. |
 | `relay-identity.json` | Relay keys (Ed25519 identity, X25519 Noise static key), mode 0600. |
+| `connectors.json`, `connectors-state.json`, `connectors.jsonl` | Chat connectors: bots and their credentials (mode 0600), update positions and current sessions, audit log. See `docs/chat-connectors.md`. |
 
 ## Plain HTTP
 
@@ -101,6 +102,14 @@ it from anywhere through end-to-end encrypted streams
 
 A relay stream then behaves exactly like a device's local WebSocket.
 
+## Chat connectors
+
+A chat connector (Telegram; Discord and QQ planned) connects a bot that the
+user created to the daemon. An account bound to the bot is a restricted
+device: it drives sessions from private chats, and the daemon checks every
+op it sends against the chat profile (no full access, no "always allow", no
+elevation approvals, no terminals). See `docs/chat-connectors.md`.
+
 ## Connecting
 
 Connect to `ws://<listen>/?token=<token>` (or send
@@ -143,12 +152,13 @@ every connected client.
 | `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` opens a closed session first, as `session_open` does (an error when it cannot), and also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `approval_mode_pending`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
 | `actions_list` | — | `actions`: undecided deferred actions across all sessions, and in `closed` the ones closed lately (as in `questions`) |
 | `pair_start` | — | `pairing` with `code` and `expires_at` (local clients only) |
-| `device_list` | — | `devices`: paired, unrevoked devices (local clients only) |
+| `device_list` | — | `devices`: paired, unrevoked devices with `id`, `name`, `paired_at`, `kind` (`device`, or `chat` for a chat binding, which also has `platform`, `connector` and `last_seen`) (local clients only) |
 | `device_revoke` | `device` | `device_revoked` (local clients only) |
 | `relay_status` | — | `relay_status` with `enabled`, `connected`, `host` (the host id), `url` (null with `--no-relay`) (local clients only) |
 | `relay_set` | `enabled` | `relay_status`; turns the relay connection on or off and remembers it (local clients only) |
 | `mcp_set` / `mcp_remove` / `mcp_toggle` | as the session ops (`server`; `name`; `name`, `enabled`), with no `session` | `mcp_saved`; saves the change to `config.json` and sends the op to every open LynShen session, which answers with `mcp_servers`. Local clients only, with or without `session` |
 | `pair_link` | — | `pair_link` with `link`, `code` and `expires_at`; an error while the relay is off (local clients only) |
+| `connector_list`, `connector_add`, `connector_set`, `connector_remove`, `connector_bind_start` | see `docs/chat-connectors.md` | `connectors`, `connector_added`, `connector_removed`, `connector_bind_code` (local clients only) |
 | `ping` | — | `pong`. Clients behind the relay send it every minute so an idle stream is not closed |
 | `workspaces` | — | `workspaces` with `rev` and `workspaces: [{id, name, is_default?, color?, icon?, projects: [{id, name, path, dirs?, chats?, worktree?, color?, icon?}]}]`. A project's `color` and `icon` are kept as the client sent them (shaped as an agent's, see "Agents"). `dirs`: the project's extra directories (absolute paths, not including `path`); remote clients may read them, and an engine started in `path` may work in those that exist: Claude Code gets one `--add-dir` each, Codex has them as writable roots of its workspace-write sandbox (and `--add-dir` in its TUI), and a LynShen session's file tools and sandbox treat them as writable workspace (ACP agents get nothing) |
 | `workspaces_set` | `rev`, `workspaces` | `workspaces`; replaces the list when `rev` is the current one, else an error (another client changed it). A project's `dirs`, when present, must be a list of absolute paths. Desktop imports its list with `rev: 0` into an empty daemon |

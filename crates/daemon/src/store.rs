@@ -171,8 +171,9 @@ pub struct Report {
     pub read: bool,
 }
 
-/// A paired remote device (a phone's browser). Only a hash of its token is
-/// kept, so the state directory never holds a usable device token.
+/// A paired remote device (a phone's browser), or an account bound to a
+/// chat connector. Only a hash of its token is kept, so the state directory
+/// never holds a usable device token.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Device {
     pub id: String,
@@ -180,6 +181,22 @@ pub struct Device {
     pub token_hash: String,
     pub paired_at: u64,
     pub revoked: bool,
+    /// Set for a chat binding (see `connectors`): never a WebSocket or
+    /// relay device.
+    pub chat: Option<ChatPeer>,
+}
+
+/// The chat account a binding stands for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatPeer {
+    pub connector: String,
+    pub platform: String,
+    /// The platform's immutable id of the bound account.
+    pub peer: String,
+    /// The private chat the bot answers in.
+    pub chat: String,
+    /// `zh` or `en`: the language the bot answers in.
+    pub lang: String,
 }
 
 /// A one-shot timer that wakes an agent with `body` at `fire_at` (ms).
@@ -935,13 +952,19 @@ impl Store {
     }
 
     pub fn record_device(&self, device: &Device) -> io::Result<()> {
-        self.append(
-            DEVICES,
-            json!({
-                "kind": "paired", "id": device.id, "name": device.name,
-                "token_hash": device.token_hash, "at": device.paired_at,
-            }),
-        )
+        let mut entry = json!({
+            "kind": "paired", "id": device.id, "name": device.name,
+            "token_hash": device.token_hash, "at": device.paired_at,
+        });
+        if let Some(chat) = &device.chat {
+            entry["device_kind"] = json!("chat");
+            entry["connector"] = json!(chat.connector);
+            entry["platform"] = json!(chat.platform);
+            entry["peer"] = json!(chat.peer);
+            entry["chat"] = json!(chat.chat);
+            entry["lang"] = json!(chat.lang);
+        }
+        self.append(DEVICES, entry)
     }
 
     pub fn record_device_revoked(&self, id: &str) -> io::Result<()> {
@@ -960,12 +983,21 @@ impl Store {
             .filter(|entry| entry["kind"] == "paired")
             .filter_map(|entry| {
                 let id = entry["id"].as_str()?.to_string();
+                let text = |key: &str| entry[key].as_str().unwrap_or_default().to_string();
+                let chat = (entry["device_kind"] == "chat").then(|| ChatPeer {
+                    connector: text("connector"),
+                    platform: text("platform"),
+                    peer: text("peer"),
+                    chat: text("chat"),
+                    lang: text("lang"),
+                });
                 Some(Device {
                     revoked: revoked.contains(id.as_str()),
                     id,
-                    name: entry["name"].as_str().unwrap_or_default().to_string(),
+                    name: text("name"),
                     token_hash: entry["token_hash"].as_str()?.to_string(),
                     paired_at: entry["at"].as_u64().unwrap_or_default(),
+                    chat,
                 })
             })
             .collect()
@@ -977,11 +1009,18 @@ impl Store {
     }
 
     /// The active device with this token hash. A relay device's hash is of
-    /// its Noise static key.
+    /// its Noise static key. A chat binding never connects this way.
     pub fn device_for_hash(&self, hash: &str) -> Option<Device> {
         self.devices()
             .into_iter()
-            .find(|device| !device.revoked && device.token_hash == hash)
+            .find(|device| !device.revoked && device.chat.is_none() && device.token_hash == hash)
+    }
+
+    /// An active device by id.
+    pub fn device(&self, id: &str) -> Option<Device> {
+        self.devices()
+            .into_iter()
+            .find(|device| !device.revoked && device.id == id)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -1613,6 +1652,7 @@ mod tests {
                 token_hash: token_hash("secret"),
                 paired_at: 1,
                 revoked: false,
+                chat: None,
             })
             .unwrap();
         // First run here: claimed, nothing reset.
@@ -1641,6 +1681,7 @@ mod tests {
                 token_hash: token_hash("secret"),
                 paired_at: 1,
                 revoked: false,
+                chat: None,
             })
             .unwrap();
         assert_eq!(store.device_for_token("secret").unwrap().id, "d1");
@@ -1651,5 +1692,31 @@ mod tests {
         // Only the hash is on disk.
         let log = fs::read_to_string(store.dir.join(DEVICES)).unwrap();
         assert!(!log.contains("\"secret\""));
+    }
+
+    #[test]
+    fn a_chat_binding_is_kept_but_never_authenticates_a_connection() {
+        let store = store("chat-binding");
+        let peer = ChatPeer {
+            connector: "tg-1".to_string(),
+            platform: "telegram".to_string(),
+            peer: "42".to_string(),
+            chat: "42".to_string(),
+            lang: "zh".to_string(),
+        };
+        store
+            .record_device(&Device {
+                id: "d2".to_string(),
+                name: "Alice".to_string(),
+                token_hash: token_hash("chat-secret"),
+                paired_at: 1,
+                revoked: false,
+                chat: Some(peer.clone()),
+            })
+            .unwrap();
+        assert_eq!(store.device("d2").unwrap().chat, Some(peer));
+        assert!(store.device_for_token("chat-secret").is_none());
+        store.record_device_revoked("d2").unwrap();
+        assert!(store.device("d2").is_none());
     }
 }

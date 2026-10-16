@@ -201,7 +201,8 @@ fn check_dirs(dirs: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn projects(hub: &Hub) -> Vec<Value> {
+/// Every project of every workspace, as `workspaces` lists them.
+pub(crate) fn projects(hub: &Hub) -> Vec<Value> {
     hub.store.workspaces()["workspaces"]
         .as_array()
         .into_iter()

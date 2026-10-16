@@ -91,6 +91,10 @@ pub struct Hub {
     pub usage: Usage,
     /// Messages between sessions (see `session_messages`).
     pub(crate) messages: crate::session_messages::Messages,
+    /// Chat bots and what they keep (see `connectors`).
+    pub connectors: crate::connectors::Connectors,
+    /// When each device was last heard from (ms), since the daemon started.
+    seen: Mutex<HashMap<String, u64>>,
 }
 
 struct Client {
@@ -157,6 +161,8 @@ impl Hub {
             requirements,
             uploads,
             push: crate::push::Push::load(store.dir()),
+            connectors: crate::connectors::Connectors::load(store.dir()),
+            seen: Mutex::new(HashMap::new()),
             terminals: Default::default(),
             store,
             agents,
@@ -179,8 +185,23 @@ impl Hub {
 
     pub fn add_client(&self, outbox: Sender<String>, device: Option<String>) -> u64 {
         let id = self.next_client.fetch_add(1, Ordering::SeqCst);
+        if let Some(device) = &device {
+            self.touch_device(device);
+        }
         lock(&self.clients).insert(id, Client { outbox, device });
         id
+    }
+
+    /// Notes that a device was heard from now (`last_seen`).
+    pub fn touch_device(&self, device: &str) {
+        lock(&self.seen).insert(device.to_string(), now());
+    }
+
+    /// Whether the connection is a chat binding's (see `connectors`).
+    pub fn is_chat(&self, client: u64) -> bool {
+        self.device_of(client)
+            .and_then(|device| self.store.device(&device))
+            .is_some_and(|device| device.chat.is_some())
     }
 
     /// The paired device a connection authenticated as (None: local).
@@ -197,12 +218,7 @@ impl Hub {
 
     /// A new single-use pairing code and its expiry (ms).
     pub fn start_pairing(&self) -> Result<(String, u64), String> {
-        let mut bytes = [0u8; 8];
-        getrandom::getrandom(&mut bytes).map_err(|error| error.to_string())?;
-        let code: String = bytes
-            .iter()
-            .map(|byte| PAIRING_ALPHABET[*byte as usize % PAIRING_ALPHABET.len()] as char)
-            .collect();
+        let code = new_code(8)?;
         let expires_at = now() + PAIRING_TTL_MS;
         let mut pairings = lock(&self.pairings);
         pairings.retain(|_, expiry| *expiry > now());
@@ -238,6 +254,7 @@ impl Hub {
             token_hash,
             paired_at: now(),
             revoked: false,
+            chat: None,
         };
         self.store
             .record_device(&device)
@@ -245,34 +262,52 @@ impl Hub {
         Ok(device)
     }
 
-    /// Revokes a device and drops its open connections.
+    /// Revokes a device and drops its open connections (a chat binding's
+    /// client too: its connector stops serving it).
     pub fn revoke_device(&self, id: &str) -> Result<(), String> {
-        if !self
-            .store
-            .devices()
-            .iter()
-            .any(|device| device.id == id && !device.revoked)
-        {
+        let Some(device) = self.store.device(id) else {
             return Err(format!("unknown device {id}"));
-        }
+        };
         self.store
             .record_device_revoked(id)
             .map_err(|error| error.to_string())?;
         // Dropping the outbox ends that connection's loop.
         lock(&self.clients).retain(|_, client| client.device.as_deref() != Some(id));
         self.push.forget_device(id);
+        if let Some(chat) = &device.chat {
+            self.connectors.revoked(&device, chat);
+        }
         Ok(())
     }
 
     pub fn devices_json(&self) -> Value {
+        let seen = lock(&self.seen).clone();
         let list: Vec<Value> = self
             .store
             .devices()
             .iter()
             .filter(|device| !device.revoked)
-            .map(|device| json!({ "id": device.id, "name": device.name, "paired_at": device.paired_at }))
+            .map(|device| {
+                let mut item = json!({
+                    "id": device.id,
+                    "name": device.name,
+                    "paired_at": device.paired_at,
+                    "kind": if device.chat.is_some() { "chat" } else { "device" },
+                    "last_seen": seen.get(&device.id),
+                });
+                if let Some(chat) = &device.chat {
+                    item["platform"] = json!(chat.platform);
+                    item["connector"] = json!(chat.connector);
+                }
+                item
+            })
             .collect();
         json!({ "type": "devices", "devices": list })
+    }
+
+    /// When a device was last heard from, since the daemon started.
+    pub fn last_seen(&self, device: &str) -> Option<u64> {
+        lock(&self.seen).get(device).copied()
     }
 
     /// Drops the client, its watches and its terminals; sessions it was the
@@ -293,6 +328,15 @@ impl Hub {
     pub fn broadcast(&self, frame: &Value) {
         let text = frame.to_string();
         lock(&self.clients).retain(|_, client| client.outbox.send(text.clone()).is_ok());
+    }
+
+    /// Sends `frame` to the local clients only (the desktop), never to a
+    /// paired phone or a chat binding.
+    pub fn broadcast_local(&self, frame: &Value) {
+        let text = frame.to_string();
+        lock(&self.clients).retain(|_, client| {
+            client.device.is_some() || client.outbox.send(text.clone()).is_ok()
+        });
     }
 
     pub fn send_to(&self, client: u64, frame: &Value) {
@@ -663,6 +707,7 @@ impl Hub {
             }
         }
         crate::session_messages::ended(self, id);
+        self.connectors.session_closed(id);
         lock(&self.busy).remove(id);
         lock(&self.claims).remove(id);
         self.usage.close(id);
@@ -817,6 +862,7 @@ impl Hub {
         if let Some(hub) = self.me.upgrade() {
             crate::push::notify(&hub, title, body, tag);
         }
+        self.connectors.notify(title, body, tag);
     }
 
     /// `notify` whose notification opens `url` on the remote page.
@@ -824,6 +870,7 @@ impl Hub {
         if let Some(hub) = self.me.upgrade() {
             crate::push::notify_at(&hub, title, body, tag, url);
         }
+        self.connectors.notify(title, body, tag);
     }
 
     /// A session's conversation as the title model sees it for a note: its
@@ -1394,6 +1441,7 @@ impl Hub {
     /// (see `titles`).
     pub fn observe(&self, session: &str, event: &Value) {
         crate::session_messages::observe(self, session, event);
+        self.connectors.observe(session, event);
         self.usage.observe(session, event, || {
             let record = self
                 .store
@@ -1761,6 +1809,17 @@ impl Hub {
         list.sort_by_key(|item| std::cmp::Reverse(item["updated_at"].as_u64().unwrap_or(0)));
         Ok(json!({ "type": "session_history", "cwd": cwd, "sessions": list }))
     }
+}
+
+/// A random code of `len` characters from `PAIRING_ALPHABET` (pairing and
+/// chat binding codes).
+pub(crate) fn new_code(len: usize) -> Result<String, String> {
+    let mut bytes = vec![0u8; len];
+    getrandom::getrandom(&mut bytes).map_err(|error| error.to_string())?;
+    Ok(bytes
+        .iter()
+        .map(|byte| PAIRING_ALPHABET[*byte as usize % PAIRING_ALPHABET.len()] as char)
+        .collect())
 }
 
 /// Saved-session summaries of the given directories, by session id.
