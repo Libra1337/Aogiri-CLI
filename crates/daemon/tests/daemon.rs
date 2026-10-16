@@ -2677,6 +2677,58 @@ fn only_the_desktop_starts_acp_agents_which_run_like_any_session() {
 }
 
 #[test]
+fn an_acp_session_reopens_the_agents_own_conversation() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-acp-reopen");
+    fs::create_dir_all(&dir).unwrap();
+    let store = temp_dir("fake-acp-store");
+    fs::create_dir_all(&store).unwrap();
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_acp.py");
+    let options = json!({ "command": script, "env": { "FAKE_ACP_STORE": store } });
+    let mut desktop = Client::connect(&daemon);
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": options }),
+    );
+    let session = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    desktop.send(json!({ "op": "watch", "session": session }));
+    desktop.until(|f| f["session"] == session.as_str() && f["type"] == "attended");
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "hi" }));
+    let frames = desktop.until(turn_done(&session));
+    assert_eq!(claude_reply(&frames, &session), "ok: hi #1");
+
+    // Reopened, the session asks the agent for the same conversation: its
+    // replay is the transcript, and the next turn continues it.
+    desktop.send(json!({ "op": "session_close", "session": session }));
+    desktop.until(|f| f["type"] == "session_closed");
+    let opened = request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": session, "engine": "acp", "options": options }),
+    );
+    assert_eq!(opened["type"], "session_opened", "{opened}");
+    desktop.send(json!({ "op": "watch", "session": session }));
+    let frames = desktop.until(|f| {
+        f["session"] == session.as_str()
+            && f["type"] == "transcript"
+            && f["items"].as_array().is_some_and(|items| !items.is_empty())
+    });
+    let items = frames.last().unwrap()["items"].clone();
+    assert_eq!(
+        items[0],
+        json!({ "role": "user", "content": "hi" }),
+        "{items}"
+    );
+    assert_eq!(items[1]["content"], "ok: hi #1", "{items}");
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "again" }));
+    let frames = desktop.until(turn_done(&session));
+    assert_eq!(claude_reply(&frames, &session), "ok: again #2");
+}
+
+#[test]
 fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
     let _guard = setup();
     // No community repositories and no mirror: the catalog is Anthropic's
