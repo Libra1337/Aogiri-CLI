@@ -12,7 +12,7 @@ Platforms:
 | Platform | Transport | State |
 | --- | --- | --- |
 | Telegram | Bot API, `getUpdates` long polling over HTTPS | Implemented |
-| Discord | Gateway WebSocket and REST | Planned (batch 1) |
+| Discord | Gateway WebSocket (direct messages only) and REST | Implemented |
 | QQ official bot | WebSocket gateway and REST | Planned (batch 1) |
 | WeChat ClawBot, WeCom, Feishu | | Later batches |
 
@@ -50,8 +50,12 @@ Rules:
 
 ## Setup
 
-1. The user creates a bot on the platform (Telegram: @BotFather `/newbot`)
-   and copies its token.
+1. The user creates a bot on the platform and copies its token.
+   - Telegram: @BotFather `/newbot`.
+   - Discord: Developer Portal → New Application → Bot → Reset Token. The
+     bot takes direct messages only from people it shares a server with:
+     the user adds it to a server of their own with the connector's `link`
+     (an OAuth2 link with the `bot` scope and no permissions).
 2. A local client (the desktop's 设置 → 聊天连接) sends `connector_add`. The
    daemon checks the token with the platform (Telegram: `getMe`) and saves
    the connector.
@@ -59,7 +63,8 @@ Rules:
    8-character code, valid 5 minutes, single use. For Telegram it also shows
    `link` (`https://t.me/<bot>?start=<code>`) as a link and a QR code.
 4. The user sends the code to the bot in a private chat: open the link
-   (Telegram sends `/start <code>`), or send `/bind <code>` or `绑定 <code>`.
+   (Telegram sends `/start <code>`), or send `/bind <code>` or `绑定 <code>`
+   (Discord: a direct message to the bot).
 5. The daemon records the sender as a binding and answers in the chat.
    Every local client receives `connector_bound` and a new `connectors`
    list.
@@ -95,7 +100,7 @@ binding cannot read or change connectors or credentials.
 | Op | Fields | Reply |
 | --- | --- | --- |
 | `connector_list` | — | `connectors` |
-| `connector_add` | `platform` (`telegram`), `token`, optional `proxy`, `api` | `connector_added` with `connector`; every local client receives `connectors`. The daemon checks the token first; a wrong token or no connection is an error, and nothing is saved |
+| `connector_add` | `platform` (`telegram` or `discord`), `token`, optional `proxy`, `api` | `connector_added` with `connector`; every local client receives `connectors`. The daemon checks the token first; a wrong token or no connection is an error, and nothing is saved |
 | `connector_set` | `connector`, any of `enabled`, `proxy`, `token`, `approvals`, `notify`, `max_mode` | `connectors`. A new `token`, `proxy` or `enabled` restarts the connection |
 | `connector_remove` | `connector` | `connector_removed` with `connector`; its bindings are revoked and its credentials deleted |
 | `connector_bind_start` | `connector` | `connector_bind_code` with `connector`, `code`, `expires_at` and `link` (Telegram; `null` for other platforms) |
@@ -114,6 +119,8 @@ connection's state changes:
   "created_at":0}]}
 ```
 
+- `link`: Telegram, where the bot opens (`https://t.me/<bot>`); Discord,
+  the link that adds the bot to a server.
 - `state`: `stopped` (disabled), `connecting`, `connected` or `error`
   (`error` says why, without credentials).
 - `proxy`: the connector's own setting: `null` (use the environment),
@@ -325,3 +332,31 @@ A path to a credentials file or directory (`.ssh/`, `.aws/`, `.gnupg/`,
   error until the token changes.
 - HTTP 409: another program polls this bot, or the bot has a webhook; the
   connector shows the error and tries again after 60 s.
+
+## Discord
+
+- REST: `https://discord.com/api/v10` with `Authorization: Bot <token>`;
+  `api` replaces it (a test server). `GET /users/@me` checks the token.
+- Receiving: the Gateway from `GET /gateway/bot`, `?v=10&encoding=json`,
+  through the connector's proxy (an HTTP CONNECT tunnel). Identify with
+  `intents: 4096` (direct messages); a bot gets the text of direct messages
+  without the privileged message content intent. Heartbeats at the
+  interval Hello names, the first after a random part of it; a connection
+  with an unanswered heartbeat is dropped. After a drop the connector
+  resumes the session (`resume_gateway_url`, op 6) when it can, else it
+  identifies again.
+- Only messages without `guild_id` count (direct messages). A forward
+  (`message_reference.type` 1, `message_snapshots`) is refused.
+- Sending: `POST /channels/<id>/messages` with Markdown as it is (2000
+  characters; the bot splits at 1900), `allowed_mentions` empty so a reply
+  never pings anyone; buttons as one action row (允许 primary, 拒绝 danger);
+  `PATCH` edits; files as multipart `payload_json` and `files[0]`, at most
+  20 MiB both ways.
+- A button press (`INTERACTION_CREATE`) is answered at once with type 6
+  (the message changes when the bot edits it), as Discord wants within 3
+  seconds; the press then goes to the chat side, which checks the presser.
+- HTTP 429: the bot waits `retry_after` (at most 30 s) and tries once more.
+- Close codes 4004 (token) and 4013, 4014 (intents) stop the connector
+  until its settings change; 4007 and 4009 start a new session.
+- The bot answers in Chinese: Discord does not report the account's
+  language in a message.
