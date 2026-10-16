@@ -102,6 +102,17 @@ pub fn provider_channel_kind(provider: &str) -> &'static str {
     }
 }
 
+/// The model the LynShen engine runs when its provider is the LynShen
+/// gateway, for other engines that run there (None: another provider, or
+/// no config yet).
+pub fn lynshen_default_model() -> Option<String> {
+    config::Config::load_existing()
+        .ok()
+        .filter(|config| config.provider == "lynshen")
+        .map(|config| config.model.trim().to_string())
+        .filter(|model| !model.is_empty())
+}
+
 /// Whether this computer is signed in to LynShen (no network, no refresh).
 pub fn lynshen_signed_in() -> bool {
     config::Config::load_existing()

@@ -119,6 +119,8 @@ pub struct SessionRecord {
     pub group: Option<String>,
     /// ACP: the agent's own session id, which a reopen asks it for.
     pub conversation: Option<String>,
+    /// ACP: the desktop's registry entry for the agent (`{id, name}`).
+    pub acp_agent: Option<Value>,
 }
 
 /// A message for an agent: from the user, another agent or a timer.
@@ -411,7 +413,7 @@ impl Store {
 
     /// Renames, (un)archives, hides or regroups a session from `changes`
     /// (`title`, `archived`, `hidden`, `group`; the daemon also keeps
-    /// `gateway` and an ACP agent's `conversation`); fields left out are
+    /// `gateway`, an ACP agent's `conversation` and `acp_agent`); fields left out are
     /// unchanged, an empty title goes back to the engine's label and an
     /// empty group to automatic routing. False when `changes` names none.
     pub fn record_session_meta(&self, id: &str, changes: &Value) -> io::Result<bool> {
@@ -440,6 +442,10 @@ impl Store {
         }
         if let Some(conversation) = changes["conversation"].as_str() {
             entry["conversation"] = json!(conversation);
+            changed = true;
+        }
+        if changes["acp_agent"].is_object() {
+            entry["acp_agent"] = changes["acp_agent"].clone();
             changed = true;
         }
         if changed {
@@ -507,6 +513,7 @@ impl Store {
                             gateway: false,
                             group: None,
                             conversation: None,
+                            acp_agent: None,
                         }
                     });
                     record.closed = false;
@@ -538,6 +545,9 @@ impl Store {
                         if let Some(conversation) = entry["conversation"].as_str() {
                             record.conversation =
                                 Some(conversation.to_string()).filter(|c| !c.is_empty());
+                        }
+                        if entry["acp_agent"].is_object() {
+                            record.acp_agent = Some(entry["acp_agent"].clone());
                         }
                     }
                 }

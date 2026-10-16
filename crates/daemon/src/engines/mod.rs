@@ -8,6 +8,7 @@
 pub mod acp;
 pub mod claude;
 pub mod codex;
+pub mod opencode;
 
 use crate::hub::Hub;
 use serde_json::{json, Value};
@@ -88,6 +89,15 @@ pub struct Options {
     /// Claude / Codex: directories besides `cwd` the engine may work in (the
     /// project's extra directories; set by `spawn`, never by a client).
     pub dirs: Vec<PathBuf>,
+    /// ACP: a conversation of the agent's to copy into this new session
+    /// (`session/fork`); the original stays as it is.
+    pub fork: Option<String>,
+    /// ACP: the engine restarts under a conversation its clients show: it
+    /// reopens it without a replay (`session/resume`) when the agent can.
+    pub quiet: bool,
+    /// ACP: the desktop's registry entry for the agent (`{id, name}`), kept
+    /// with the session so a client can start it again.
+    pub acp_agent: Option<Value>,
 }
 
 impl Options {
@@ -124,6 +134,10 @@ impl Options {
             fast: value["fast"] == true,
             thinking: value["thinking"].as_bool(),
             dirs: Vec::new(),
+            fork: text("fork"),
+            quiet: false,
+            acp_agent: Some(value["acp_agent"].clone())
+                .filter(|agent| agent["id"].is_string() && agent["name"].is_string()),
         }
     }
 
@@ -203,19 +217,27 @@ fn adapter(kind: Kind, cwd: &Path, options: &Options) -> Box<dyn Adapter> {
     match kind {
         Kind::Claude => Box::new(claude::Claude::new(options).at(cwd)),
         Kind::Codex => Box::new(codex::Codex::new(cwd, options)),
-        Kind::Acp => Box::new(acp::Acp::new(cwd, options.resume.clone())),
+        Kind::Acp => Box::new(acp::Acp::new(cwd, options)),
     }
 }
 
-/// The engine's command, and the local gateway key it holds when it runs
-/// on the LynShen gateway (see crate::gateway).
-fn command(kind: Kind, id: &str, options: &Options) -> Result<(Command, Option<String>), String> {
+/// An engine's start: its command, the local gateway key it holds when it
+/// runs on the LynShen gateway (see crate::gateway), and notices for the
+/// session's clients.
+struct Start {
+    command: Command,
+    key: Option<String>,
+    notices: Vec<String>,
+}
+
+/// How the engine starts in `cwd`.
+fn command(kind: Kind, id: &str, options: &Options, cwd: &Path) -> Result<Start, String> {
     let command = match kind {
         Kind::Claude => claude::command(id, options),
         Kind::Codex => codex::command(options),
         Kind::Acp => acp::command(options),
     };
-    with_gateway(kind, id, options, command)
+    with_gateway(kind, id, options, cwd, command)
 }
 
 /// The engine's own TUI resuming conversation `id` (Claude Code, Codex),
@@ -224,44 +246,72 @@ fn tui_command(
     kind: Kind,
     id: &str,
     options: &Options,
+    cwd: &Path,
     saved: bool,
-) -> Result<(Command, Option<String>), String> {
+) -> Result<Start, String> {
     let command = match kind {
         Kind::Claude => claude::tui(id, options, saved),
         Kind::Codex => codex::tui(saved.then_some(id), options),
         Kind::Acp => return Err("an ACP agent has no TUI here".to_string()),
     };
-    with_gateway(kind, id, options, command)
+    with_gateway(kind, id, options, cwd, command)
 }
 
 /// `command` with the session's environment, and on the LynShen gateway when
-/// it runs there: with the local gateway key it holds.
+/// it runs there: with the local gateway key it holds. OpenCode also gets
+/// the agent its approval modes run on (see `opencode`).
 fn with_gateway(
     kind: Kind,
     id: &str,
     options: &Options,
+    cwd: &Path,
     mut command: Command,
-) -> Result<(Command, Option<String>), String> {
+) -> Result<Start, String> {
     command.envs(options.env.iter().map(|(name, value)| (name, value)));
+    let opencode = kind == Kind::Acp && opencode::is_opencode(options);
     if options.gateway != Some(true) {
-        return Ok((command, None));
+        let notices = if opencode {
+            opencode::configure(&mut command, options, cwd, None)?
+        } else {
+            Vec::new()
+        };
+        return Ok(Start {
+            command,
+            key: None,
+            notices,
+        });
     }
-    if kind == Kind::Acp {
-        return Err("an ACP agent has no LynShen gateway mode".to_string());
+    if kind == Kind::Acp && !opencode {
+        return Err("of the ACP agents only OpenCode has a LynShen gateway mode".to_string());
     }
     // Not signed in fails the start, not the first request.
     lynshen_agent_core::lynshen_gateway_credentials()?;
     let base = crate::gateway::base_url()?;
     let key = crate::gateway::issue(id)?;
     let configured = match kind {
-        Kind::Claude => claude::use_gateway(&mut command, id, &base, &key),
-        _ => codex::use_gateway(&mut command, &base, &key),
+        Kind::Claude => claude::use_gateway(&mut command, id, &base, &key).map(|()| Vec::new()),
+        Kind::Codex => codex::use_gateway(&mut command, &base, &key).map(|()| Vec::new()),
+        Kind::Acp => opencode::configure(&mut command, options, cwd, Some((&base, &key))),
     };
-    if let Err(error) = configured {
-        crate::gateway::revoke(&key);
-        return Err(error);
+    match configured {
+        Ok(notices) => Ok(Start {
+            command,
+            key: Some(key),
+            notices,
+        }),
+        Err(error) => {
+            crate::gateway::revoke(&key);
+            Err(error)
+        }
     }
-    Ok((command, Some(key)))
+}
+
+/// Notices as `info` events.
+fn notices(notices: Vec<String>) -> Vec<Value> {
+    notices
+        .into_iter()
+        .map(|message| json!({ "type": "info", "message": message }))
+        .collect()
 }
 
 /// One window of an official plan's usage for the `plan_usage` event: its
@@ -545,7 +595,11 @@ pub fn spawn(
         },
         ..options
     };
-    let (command, gateway_key) = command(kind, id.as_deref().unwrap_or_default(), &options)?;
+    let Start {
+        command,
+        key: gateway_key,
+        notices: started,
+    } = command(kind, id.as_deref().unwrap_or_default(), &options, &cwd)?;
     let process = match Process::spawn(command, &cwd) {
         Ok(process) => process,
         Err(error) => {
@@ -560,6 +614,7 @@ pub fn spawn(
     let generation = hub.next_generation();
     // An ACP agent reopening its conversation keeps it under the same id.
     let conversation = options.resume.clone().filter(|_| kind == Kind::Acp);
+    let opencode = kind == Kind::Acp && opencode::is_opencode(&options);
     thread::spawn(move || {
         let mut session = Session {
             hub: &hub,
@@ -576,12 +631,14 @@ pub fn spawn(
             gateway_key,
             tui_request: None,
             conversation,
+            opencode,
         };
         session.snapshot.seed(transcript);
         // A resumed conversation is ready once the engine has opened it.
         if let Some(id) = id {
             session.named(id);
         }
+        session.publish(notices(started));
         session.run(process, options, ops);
         match (session.id.clone(), session.ready.take()) {
             (Some(id), _) => hub.session_ended(&id, generation),
@@ -630,6 +687,8 @@ struct Session<'a> {
     tui_request: Option<Value>,
     /// ACP: the agent's own session id, as recorded for the session.
     conversation: Option<String>,
+    /// The ACP agent is OpenCode (approval modes, LynShen gateway).
+    opencode: bool,
 }
 
 impl Drop for Session<'_> {
@@ -751,20 +810,27 @@ impl Session<'_> {
                     next.gateway = next.gateway.or(options.gateway);
                     next.approval_mode = next.approval_mode.or(options.approval_mode.clone());
                     next.dirs = crate::projects::extra_dirs(self.hub, &self.cwd);
+                    // An ACP agent: the same command, reopened without a replay.
+                    next.command = options.command.clone();
+                    next.args = options.args.clone();
+                    next.quiet = true;
                     current = next.clone();
                     process.stop();
                     let id = self.id.clone().unwrap_or_default();
                     if let Some(key) = self.gateway_key.take() {
                         release_key(self.kind, &key);
                     }
-                    match command(self.kind, &id, &next).and_then(|(command, key)| {
-                        self.gateway_key = key;
-                        Process::spawn(command, &self.cwd)
+                    let mut said = Vec::new();
+                    match command(self.kind, &id, &next, &self.cwd).and_then(|start| {
+                        self.gateway_key = start.key;
+                        said = start.notices;
+                        Process::spawn(start.command, &self.cwd)
                     }) {
                         Ok(started) => {
                             process = started;
                             adapter = self::adapter(self.kind, &self.cwd, &next);
                             process.write(adapter.start());
+                            self.publish(notices(said));
                         }
                         Err(error) => {
                             self.publish(vec![json!({ "type": "error", "message": error })]);
@@ -838,8 +904,8 @@ impl Session<'_> {
             self.refuse(request, "the conversation has not started yet".to_string());
             return None;
         };
-        match tui_command(self.kind, &id, options, self.saved(&id)) {
-            Ok((tui, key)) => Some((id, tui, key)),
+        match tui_command(self.kind, &id, options, &self.cwd, self.saved(&id)) {
+            Ok(start) => Some((id, start.command, start.key)),
             Err(error) => {
                 self.refuse(request, error);
                 None
@@ -941,9 +1007,9 @@ impl Session<'_> {
             resume_at: None,
             ..options
         };
-        let started = self::command(self.kind, &id, &next).and_then(|(command, key)| {
-            self.gateway_key = key;
-            Process::spawn(command, &self.cwd)
+        let started = self::command(self.kind, &id, &next, &self.cwd).and_then(|start| {
+            self.gateway_key = start.key;
+            Process::spawn(start.command, &self.cwd)
         });
         match started {
             Ok(started) => {
@@ -1000,8 +1066,8 @@ impl Session<'_> {
                     ]);
                     return false;
                 };
-                if self.kind == Kind::Acp {
-                    self.publish(vec![json!({ "type": "error", "message": "an ACP agent has no LynShen gateway mode" })]);
+                if self.kind == Kind::Acp && !self.opencode {
+                    self.publish(vec![json!({ "type": "error", "message": "of the ACP agents only OpenCode has a LynShen gateway mode" })]);
                     return false;
                 }
                 self.restart = Some(

@@ -1053,6 +1053,7 @@ dependencies = [
  "lynshen-agent-core",
  "portable-pty",
  "rustls",
+ "serde",
  "serde_json",
  "sha2",
  "snow",

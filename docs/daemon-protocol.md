@@ -294,8 +294,10 @@ clients need nothing engine-specific. `options`:
 | `model` | Model to start with |
 | `resume_at` | Claude Code: resume the conversation as it was at this assistant message uuid |
 | `effort`, `ultracode`, `fast`, `thinking` | Claude Code: start with this thinking effort, ultracode on, fast mode on, thinking summaries shown (`false` hides them). A restart (full access, gateway switch) keeps the session's own |
-| `lynshen_gateway` | Claude Code / Codex: `true` runs this session through the LynShen gateway on the user's LynShen login; `false` on the provider in the user's own Claude Code / Codex config. The endpoint and key go to this process only (Claude: `--settings` file; Codex: `-c` overrides and an env var), never to the user's config files. Omitted on `session_open`: as the session last ran |
+| `lynshen_gateway` | Claude Code / Codex / OpenCode: `true` runs this session through the LynShen gateway on the user's LynShen login; `false` on the provider in the user's own Claude Code / Codex / OpenCode config. The endpoint and key go to this process only (Claude: `--settings` file; Codex: `-c` overrides and an env var; OpenCode: `OPENCODE_CONFIG_CONTENT` and an env var), never to the user's config files. Omitted on `session_open`: as the session last ran |
 | `command`, `args` | ACP: the agent's command line |
+| `fork` | ACP, `session_create` only: a conversation of the agent's (its own session id) to copy into the new session with `session/fork`; the original stays as it is |
+| `acp_agent` | ACP: `{id, name}`, the desktop's registry entry for the agent, kept with the session (`session_list` returns it) |
 | `bin` | Claude Code / Codex: the engine binary to run instead of the one found on `PATH` |
 | `env` | Extra environment variables for the engine process (plain names; no `DYLD_*`/`LD_*`) |
 
@@ -318,7 +320,40 @@ and `engine` opens any conversation the engine saved for that directory
 (`~/.claude/projects`, `~/.codex/sessions`). `session_history` lists those
 too, with their `engine`. `session_created` for Codex comes once its thread
 is open.
-Every session in `session_list` carries its `engine`.
+Every session in `session_list` carries its `engine` (and an ACP session
+the `acp_agent` it was created with).
+
+OpenCode (`opencode acp`, 1.x; the command's program is `opencode`) gets
+more from the daemon (`engines/opencode.rs`):
+
+- `approval_mode` works: the modes are OpenCode agents, switched with
+  `session/set_config_option`, or `session/set_mode` when OpenCode has no
+  session config options (OpenCode 1.0 has `session/set_mode`, so every 1.x
+  can switch). `read-only` and `auto-edit` run on `aogiri`, an agent the
+  daemon defines for the process: every tool asks except the reading ones,
+  and the user's own rules (from `opencode debug config`) apply with `allow`
+  turned into `ask`, so their `deny` rules still deny. Subagents (`task`)
+  are denied: OpenCode runs a subagent with its own agent's rules, which ask
+  for nothing. In `auto-edit` the daemon answers edit requests itself.
+  `plan` runs on `aogiri-plan`: the same agent with no file edits at all, so
+  commands and web fetches ask (OpenCode's own `plan` agent runs them
+  unasked); each prompt carries a plan-mode reminder only the model reads
+  (`annotations.audience: ["assistant"]`), left out of replayed transcripts.
+  `full-auto` runs on OpenCode's `build` agent as the user configured it. A
+  switch during a turn applies to the next one (`approval_mode_pending`).
+- A failed switch fails closed: when OpenCode does not switch to the agent
+  of a mode other than `full-auto` (an error, or its `configOptions` name
+  another agent), the waiting message is dropped and later `user_message`s
+  are refused with an `error` event until the mode is picked again and the
+  switch succeeds. A failed switch to `full-auto` only reports the error.
+  One switch is on its way at a time.
+- `lynshen_gateway`: a `lynshen` provider on the local gateway with the
+  LynShen models the user shows, and only that provider. Claude models use
+  the Anthropic Messages API, OpenAI models the Responses API, the others
+  Chat Completions; prices are 0 in OpenCode, since the gateway bills each
+  turn. `set_gateway` restarts the agent on the same conversation
+  (`session/resume`, no replay).
+- OpenCode 2.x is refused with an error.
 
 Differences from a lynshen session:
 
