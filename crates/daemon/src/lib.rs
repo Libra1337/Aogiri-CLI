@@ -67,11 +67,12 @@ pub fn serve(
     version: &'static str,
     relay: Option<String>,
 ) -> io::Result<()> {
-    if store.claim_machine()? {
+    let copied = store.claim_machine()?;
+    if copied {
         relay::forget_identity(store.dir());
         lynshen_agent_core::log_warn!(
             "daemon",
-            "state copied from another computer: new token, devices unpaired, new relay identity"
+            "state copied from another computer: new token, devices unpaired, new relay identity, chat bots off"
         );
     }
     let token = store.token()?;
@@ -80,6 +81,10 @@ pub fn serve(
         gateway::set_group(&record.id, record.group.as_deref());
     }
     let hub = Hub::new(store, agents, version, relay);
+    // A bot answers one computer: the copy leaves it to the original.
+    if copied {
+        connectors::turn_all_off(&hub);
+    }
     connectors::start_all(&hub);
     if hub.relay.url().is_some() {
         let relay = Arc::clone(&hub);

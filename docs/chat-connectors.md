@@ -66,7 +66,8 @@ Rules:
 
 Use one bot for each computer. Telegram answers HTTP 409 when two programs
 poll one bot; the connector then shows the error and does not fight for the
-connection.
+connection. When the daemon finds its state copied from another computer, it
+turns every connector off (and unpairs every device, chat bindings too).
 
 Brute force: after 5 wrong codes from one sender within 10 minutes, the
 daemon ignores that sender's bind attempts for 1 hour.

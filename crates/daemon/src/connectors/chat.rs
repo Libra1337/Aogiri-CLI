@@ -637,6 +637,13 @@ impl Chat {
         let id = format!("chat-{}", self.next_request);
         op["id"] = json!(id);
         let client = self.bindings.get(device).ok_or("not bound")?.client;
+        // Revoked meanwhile: nothing more goes out as this binding.
+        if self.hub.store.device(device).is_none() {
+            if let Some(binding) = self.bindings.get_mut(device) {
+                binding.gone = true;
+            }
+            return Err("this binding was revoked".to_string());
+        }
         crate::handle(&self.hub, client, &op.to_string());
         let deadline = Instant::now() + wait;
         let binding = self.bindings.get_mut(device).ok_or("not bound")?;

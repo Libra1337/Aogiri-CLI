@@ -826,6 +826,18 @@ fn remove(hub: &Arc<Hub>, id: &str) -> Result<Value, String> {
     Ok(json!({ "type": "connector_removed", "connector": id }))
 }
 
+/// Turns every connector off (state copied from another computer, whose
+/// daemon still answers the same bots).
+pub(crate) fn turn_all_off(hub: &Arc<Hub>) {
+    let mut list = lock(&hub.connectors.list);
+    for connector in list.iter_mut() {
+        connector.enabled = false;
+    }
+    if let Err(error) = hub.connectors.save(&list) {
+        lynshen_agent_core::log_warn!("daemon", "connectors not turned off", error = error);
+    }
+}
+
 /// Starts every enabled connector (when the daemon starts).
 pub(crate) fn start_all(hub: &Arc<Hub>) {
     let ids: Vec<String> = lock(&hub.connectors.list)
