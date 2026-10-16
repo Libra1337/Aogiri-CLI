@@ -3419,8 +3419,14 @@ mod tests {
             "env": { "CLAUDE_CONFIG_DIR": "/tmp/c" },
         }));
         assert!(options.runs_programs());
-        let (command, _) =
-            super::super::command(super::super::Kind::Claude, "x", &options).unwrap();
+        let command = super::super::command(
+            super::super::Kind::Claude,
+            "x",
+            &options,
+            std::path::Path::new("/tmp"),
+        )
+        .unwrap()
+        .command;
         assert_eq!(command.get_program(), "/opt/claude/bin/claude");
         assert!(command
             .get_envs()

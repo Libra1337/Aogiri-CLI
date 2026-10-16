@@ -509,9 +509,11 @@ fn first_object(text: &str) -> Option<Ordered> {
 }
 
 type Rules = (Ordered, Ordered);
+/// Rules read, by program and folder, with when they were read.
+type RulesCache = Mutex<HashMap<(OsString, PathBuf), (Instant, Rules)>>;
 
-fn rules_cache() -> &'static Mutex<HashMap<(OsString, PathBuf), (Instant, Rules)>> {
-    static CACHE: OnceLock<Mutex<HashMap<(OsString, PathBuf), (Instant, Rules)>>> = OnceLock::new();
+fn rules_cache() -> &'static RulesCache {
+    static CACHE: OnceLock<RulesCache> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
