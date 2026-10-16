@@ -50,6 +50,8 @@ const EDIT_EVERY: Duration = Duration::from_secs(3);
 const ACTIVE: Duration = Duration::from_secs(30 * 60);
 /// An approval card's buttons work this long.
 const CARD_TTL: Duration = Duration::from_secs(30 * 60);
+/// Where messages cannot be edited, a running turn says so this often.
+const NOTE_EVERY: Duration = Duration::from_secs(10 * 60);
 /// The same notification goes out at most once in this time.
 const NOTICE_EVERY: Duration = Duration::from_secs(60);
 /// Messages of one reply; the rest goes as a file.
@@ -115,6 +117,8 @@ pub(crate) struct Attachment {
     pub id: String,
     pub name: String,
     pub size: Option<u64>,
+    /// Where it downloads from, when the platform gives an address.
+    pub url: Option<String>,
 }
 
 pub(crate) struct Button {
@@ -131,6 +135,9 @@ pub(crate) struct Limits {
     pub file_out: u64,
     /// Whether messages can carry buttons.
     pub buttons: bool,
+    /// Whether a sent message can be changed: without, a turn shows no
+    /// status message, only a line every `NOTE_EVERY` while it runs.
+    pub edits: bool,
 }
 
 /// A platform's API, as the chat side uses it. Text is Markdown; the
@@ -208,6 +215,8 @@ struct Turn {
     /// Something happened since it started (Claude Code reports `ready`
     /// once at the start of a turn).
     active: bool,
+    /// Where messages cannot be edited: running notes sent so far.
+    notes: u32,
 }
 
 enum Ending {
@@ -398,6 +407,9 @@ impl Chat {
     }
 
     fn edit(&self, chat: &str, message: &str, text: &str, buttons: &[Button]) {
+        if !self.api.limits().edits {
+            return;
+        }
         let text = redact::redact(text, &self.hub.connectors.secrets());
         if let Err(error) = self.api.edit(chat, message, &text, buttons) {
             lynshen_agent_core::log_warn!("daemon", "chat message not edited", error = error);
@@ -1931,7 +1943,12 @@ impl Chat {
         // Queued messages run back to back: the one before is done.
         self.finish(device, Ending::Done);
         let step = tr(lang, "思考中", "Thinking");
-        let status = self.post(&chat, &format!("{step}…"), &[]);
+        // Without edits a status message could only grow stale.
+        let status = if self.api.limits().edits {
+            self.post(&chat, &format!("{step}…"), &[])
+        } else {
+            None
+        };
         if let Some(binding) = self.bindings.get_mut(device) {
             binding.turn = Some(Turn {
                 session: session.to_string(),
@@ -1943,6 +1960,7 @@ impl Chat {
                 reply: String::new(),
                 error: None,
                 active: false,
+                notes: 0,
             });
         }
     }
@@ -2182,6 +2200,32 @@ impl Chat {
         );
     }
 
+    /// Where messages cannot be edited: a line every `NOTE_EVERY` while a
+    /// turn of this binding runs.
+    fn note_running(&mut self, device: &str) {
+        let note = {
+            let Some(binding) = self.bindings.get_mut(device) else {
+                return;
+            };
+            let (chat, lang) = (binding.chat.clone(), binding.lang);
+            let Some(turn) = binding.turn.as_mut() else {
+                return;
+            };
+            let due = turn.started.elapsed() >= NOTE_EVERY * (turn.notes + 1);
+            if !due {
+                return;
+            }
+            turn.notes += 1;
+            let minutes = turn.started.elapsed().as_secs() / 60;
+            let text = match lang {
+                Lang::Zh => format!("仍在运行（已 {minutes} 分钟）：{}", turn.step),
+                Lang::En => format!("Still running ({minutes} min): {}", turn.step),
+            };
+            (chat, text)
+        };
+        self.post(&note.0, &note.1, &[]);
+    }
+
     /// Timed work: progress edits, unwatching an idle chat's session,
     /// expiring cards.
     fn tick(&mut self) {
@@ -2205,6 +2249,9 @@ impl Chat {
             };
             if let Some((chat, message, text)) = edit {
                 self.edit(&chat, &message, &text, &[]);
+            }
+            if !self.api.limits().edits {
+                self.note_running(device);
             }
             let idle = self.bindings.get(device).and_then(|binding| {
                 let idle = binding.turn.is_none()

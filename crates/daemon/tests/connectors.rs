@@ -724,3 +724,315 @@ fn a_wrong_token_or_a_remote_client_cannot_add_a_connector() {
         assert_eq!(reply["type"], "error", "{reply}");
     }
 }
+
+const DISCORD_TOKEN: &str = concat!(
+    "MTA5ODc2NTQz",
+    "MjEwOTg3NjU0.",
+    "GaBcDe.",
+    "f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2"
+);
+const DC_OWNER: &str = "4242";
+
+/// A fake Discord: REST on one port, the gateway on another. Every REST call
+/// is kept with its method and path; events queued with `dispatch` go out
+/// on the gateway connection.
+#[derive(Clone)]
+struct Discord {
+    rest: String,
+    calls: Arc<Mutex<Vec<(String, String, Value)>>>,
+    events: Arc<Mutex<Vec<Value>>>,
+    identify: Arc<Mutex<Option<Value>>>,
+}
+
+impl Discord {
+    fn start() -> Self {
+        let gateway = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway_url = format!("ws://{}", gateway.local_addr().unwrap());
+        let rest = TcpListener::bind("127.0.0.1:0").unwrap();
+        let fake = Self {
+            rest: format!("http://{}", rest.local_addr().unwrap()),
+            calls: Arc::default(),
+            events: Arc::default(),
+            identify: Arc::default(),
+        };
+        let served = fake.clone();
+        thread::spawn(move || {
+            for stream in rest.incoming() {
+                let Ok(stream) = stream else { continue };
+                let fake = served.clone();
+                let gateway_url = gateway_url.clone();
+                thread::spawn(move || fake.serve_rest(stream, &gateway_url));
+            }
+        });
+        let served = fake.clone();
+        thread::spawn(move || {
+            for stream in gateway.incoming() {
+                let Ok(stream) = stream else { continue };
+                let fake = served.clone();
+                thread::spawn(move || fake.serve_gateway(stream));
+            }
+        });
+        fake
+    }
+
+    fn serve_rest(&self, stream: TcpStream, gateway: &str) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut stream = stream;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let mut parts = line.split_whitespace();
+            let (method, path) = (
+                parts.next().unwrap_or_default().to_string(),
+                parts.next().unwrap_or_default().to_string(),
+            );
+            let (mut length, mut auth) = (0, String::new());
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                    return;
+                }
+                let header = header.trim_end();
+                if header.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = header.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                    if name.eq_ignore_ascii_case("authorization") {
+                        auth = value.trim().to_string();
+                    }
+                }
+            }
+            let mut body = vec![0u8; length];
+            if reader.read_exact(&mut body).is_err() {
+                return;
+            }
+            if path.starts_with("/cdn/") {
+                respond(&mut stream, "200 OK", b"discord file");
+                continue;
+            }
+            if auth != format!("Bot {DISCORD_TOKEN}") {
+                respond(
+                    &mut stream,
+                    "401 Unauthorized",
+                    br#"{"message":"401: Unauthorized","code":0}"#,
+                );
+                continue;
+            }
+            let json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let answer = match (method.as_str(), path.as_str()) {
+                ("GET", "/users/@me") => json!({ "id": "777", "username": "lyn_dc_bot" }),
+                ("GET", "/gateway/bot") => json!({ "url": gateway }),
+                ("POST", p) if p.starts_with("/channels/") => {
+                    let id = self.calls.lock().unwrap().len() + 1000;
+                    json!({ "id": id.to_string() })
+                }
+                _ => json!({}),
+            };
+            self.calls.lock().unwrap().push((method, path, json));
+            respond(&mut stream, "200 OK", answer.to_string().as_bytes());
+        }
+    }
+
+    fn serve_gateway(&self, stream: TcpStream) {
+        let mut socket = tungstenite::accept(stream).unwrap();
+        let send = |socket: &mut WebSocket<TcpStream>, frame: Value| {
+            socket.send(Message::text(frame.to_string())).is_ok()
+        };
+        send(
+            &mut socket,
+            json!({ "op": 10, "d": { "heartbeat_interval": 45000 } }),
+        );
+        let identify: Value = match socket.read() {
+            Ok(Message::Text(text)) => serde_json::from_str(text.as_str()).unwrap(),
+            _ => return,
+        };
+        *self.identify.lock().unwrap() = Some(identify);
+        send(
+            &mut socket,
+            json!({ "op": 0, "t": "READY", "s": 1, "d": {
+                "session_id": "sess-1", "resume_gateway_url": "ws://127.0.0.1:9", "user": { "id": "777", "username": "lyn_dc_bot" }
+            }}),
+        );
+        socket
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut seq = 1;
+        loop {
+            let queued: Vec<Value> = std::mem::take(&mut *self.events.lock().unwrap());
+            for (kind, data) in queued.iter().map(|e| (e["t"].clone(), e["d"].clone())) {
+                seq += 1;
+                if !send(
+                    &mut socket,
+                    json!({ "op": 0, "t": kind, "s": seq, "d": data }),
+                ) {
+                    return;
+                }
+            }
+            match socket.read() {
+                Ok(Message::Text(text)) => {
+                    let frame: Value = serde_json::from_str(text.as_str()).unwrap_or(Value::Null);
+                    if frame["op"] == 1 && !send(&mut socket, json!({ "op": 11 })) {
+                        return;
+                    }
+                }
+                Ok(Message::Close(_)) => return,
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn dispatch(&self, kind: &str, data: Value) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(json!({ "t": kind, "d": data }));
+    }
+
+    /// A DM (or, with `guild`, a server message) from `from`.
+    fn say(&self, from: &str, text: &str, guild: bool) {
+        let mut data = json!({
+            "id": format!("m-{}", self.calls.lock().unwrap().len()),
+            "channel_id": format!("dm-{from}"),
+            "author": { "id": from, "username": format!("user{from}") },
+            "content": text,
+            "attachments": [],
+        });
+        if guild {
+            data["guild_id"] = json!("g-1");
+        }
+        self.dispatch("MESSAGE_CREATE", data);
+    }
+
+    fn calls(&self) -> Vec<(String, String, Value)> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn wait_for(&self, after: usize, matches: impl Fn(&str, &str, &Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if let Some((_, _, body)) = self
+                .calls()
+                .into_iter()
+                .skip(after)
+                .find(|(method, path, body)| matches(method, path, body))
+            {
+                return body;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no such call; calls: {:#?}", self.calls());
+    }
+}
+
+/// A message the bot sent into `channel` whose text contains `part`.
+fn posted<'a>(channel: &'a str, part: &'a str) -> impl Fn(&str, &str, &Value) -> bool + 'a {
+    move |method, path, body| {
+        method == "POST"
+            && path == format!("/channels/{channel}/messages")
+            && body["content"].as_str().unwrap_or_default().contains(part)
+    }
+}
+
+#[test]
+fn a_discord_dm_binding_drives_a_session_with_buttons() {
+    if cfg!(windows) {
+        return;
+    }
+    let _guard = setup();
+    let discord = Discord::start();
+    let (address, token, _) = start_daemon();
+    let mut desktop = Client::connect(&address, &token);
+    desktop.send(json!({
+        "op": "connector_add", "id": "add", "platform": "discord",
+        "token": DISCORD_TOKEN, "api": discord.rest, "proxy": "direct",
+    }));
+    let added = desktop.until(|frame| frame["id"] == "add");
+    assert_eq!(added["type"], "connector_added", "{added}");
+    assert_eq!(added["connector"]["name"], "@lyn_dc_bot");
+    assert_eq!(
+        added["connector"]["link"],
+        "https://discord.com/oauth2/authorize?client_id=777&scope=bot&permissions=0"
+    );
+    let connector = added["connector"]["id"].as_str().unwrap().to_string();
+    assert!(connector.starts_with("dc-"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        desktop.send(json!({ "op": "connector_list", "id": "list" }));
+        let list = desktop.until(|frame| frame["id"] == "list");
+        if list["connectors"][0]["state"] == "connected" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never connected: {list}");
+        thread::sleep(Duration::from_millis(100));
+    }
+    // Direct messages only.
+    let identify = discord.identify.lock().unwrap().clone().unwrap();
+    assert_eq!(identify["op"], 2);
+    assert_eq!(identify["d"]["intents"], 4096);
+
+    desktop.send(json!({ "op": "connector_bind_start", "id": "code", "connector": connector }));
+    let code = desktop.until(|frame| frame["id"] == "code");
+    assert_eq!(code["link"], Value::Null);
+    let before = discord.calls().len();
+    discord.say(
+        DC_OWNER,
+        &format!("/bind {}", code["code"].as_str().unwrap()),
+        false,
+    );
+    desktop.until(|frame| frame["type"] == "connector_bound");
+    discord.wait_for(before, posted("dm-4242", "绑定成功"));
+
+    // A server message never reaches a model.
+    let asked = requests().len();
+    discord.say(DC_OWNER, "RUN: echo guild", true);
+    thread::sleep(Duration::from_millis(1000));
+    assert_eq!(requests().len(), asked);
+
+    let before = discord.calls().len();
+    discord.say(DC_OWNER, "/chat", false);
+    discord.wait_for(before, posted("dm-4242", "已新建聊天会话"));
+    discord.say(DC_OWNER, "/mode manual", false);
+    discord.wait_for(before, posted("dm-4242", "已切换为「谨慎」"));
+    let before = discord.calls().len();
+    discord.say(DC_OWNER, "RUN: echo dc-ok", false);
+    let card = discord.wait_for(before, |method, _, body| {
+        method == "POST" && body["components"][0]["components"].is_array()
+    });
+    let allow = card["components"][0]["components"][0]["custom_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(allow.ends_with(":y"));
+    discord.dispatch(
+        "INTERACTION_CREATE",
+        json!({ "id": "i-1", "token": "itok", "type": 3, "channel_id": "dm-4242",
+                "user": { "id": DC_OWNER }, "data": { "custom_id": allow } }),
+    );
+    // Answered at once, then the card says how it ended and the reply follows.
+    discord.wait_for(before, |method, path, body| {
+        method == "POST" && path == "/interactions/i-1/itok/callback" && body["type"] == 6
+    });
+    discord.wait_for(before, |method, _, body| {
+        method == "PATCH"
+            && body["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("已允许")
+    });
+    discord.wait_for(before, posted("dm-4242", "tool said"));
+    for (_, _, body) in discord.calls() {
+        assert!(!body.to_string().contains(DISCORD_TOKEN));
+    }
+}

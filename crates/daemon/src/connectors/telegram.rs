@@ -227,6 +227,7 @@ impl chat::Api for Api {
             file_in: MAX_IN,
             file_out: MAX_OUT,
             buttons: true,
+            edits: true,
         }
     }
 
@@ -461,6 +462,7 @@ pub(crate) fn parse(update: &Value) -> Option<Inbound> {
                     id_text(&message["message_id"]).unwrap_or_default()
                 ),
                 size: photo["file_size"].as_u64(),
+                url: None,
             });
         }
         if let Some(document) = message.get("document") {
@@ -468,6 +470,7 @@ pub(crate) fn parse(update: &Value) -> Option<Inbound> {
                 id: document["file_id"].as_str().unwrap_or_default().to_string(),
                 name: document["file_name"].as_str().unwrap_or("file").to_string(),
                 size: document["file_size"].as_u64(),
+                url: None,
             });
         }
         let text = message["text"]

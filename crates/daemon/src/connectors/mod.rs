@@ -11,6 +11,8 @@
 //! chat side.
 
 mod chat;
+mod discord;
+mod net;
 mod profile;
 mod redact;
 mod render;
@@ -157,17 +159,30 @@ impl Connector {
         })
     }
 
-    /// Where the bot is opened in the app, for the desktop's link and QR.
+    /// Where the bot is opened (Telegram), or added to a server (Discord,
+    /// whose bots take DMs only from people they share a server with).
     fn link(&self) -> Option<String> {
-        (self.platform == "telegram" && !self.username.is_empty())
-            .then(|| format!("https://t.me/{}", self.username))
+        match self.platform.as_str() {
+            "telegram" if !self.username.is_empty() => {
+                Some(format!("https://t.me/{}", self.username))
+            }
+            "discord" if !self.bot_id.is_empty() => Some(format!(
+                "https://discord.com/oauth2/authorize?client_id={}&scope=bot&permissions=0",
+                self.bot_id
+            )),
+            _ => None,
+        }
     }
 
     /// The origin requests go to.
     pub(crate) fn api_origin(&self) -> String {
-        self.api
-            .clone()
-            .unwrap_or_else(|| telegram::ORIGIN.to_string())
+        self.api.clone().unwrap_or_else(|| {
+            match self.platform.as_str() {
+                "discord" => discord::ORIGIN,
+                _ => telegram::ORIGIN,
+            }
+            .to_string()
+        })
     }
 }
 
@@ -654,7 +669,10 @@ pub(crate) fn handle(hub: &Arc<Hub>, name: &str, op: &Value) -> Result<Value, St
                 return Err("turn the connector on first".to_string());
             }
             let (code, expires_at) = hub.connectors.new_code(id)?;
-            let link = found.link().map(|link| format!("{link}?start={code}"));
+            // Only Telegram opens a chat with the code already typed.
+            let link = (found.platform == "telegram")
+                .then(|| found.link().map(|link| format!("{link}?start={code}")))
+                .flatten();
             Ok(json!({
                 "type": "connector_bind_code",
                 "connector": id,
@@ -667,17 +685,45 @@ pub(crate) fn handle(hub: &Arc<Hub>, name: &str, op: &Value) -> Result<Value, St
     }
 }
 
+/// The platforms a connector can be for, with the prefix of their ids.
+const PLATFORMS: [(&str, &str); 2] = [("telegram", "tg"), ("discord", "dc")];
+
+/// Checks a token's shape before anything is sent with it.
+fn check_token(platform: &str, token: &str) -> Result<(), String> {
+    match platform {
+        "discord" => discord::check_token(token),
+        _ => telegram::check_token(token),
+    }
+}
+
+/// The bot behind a connector's credentials: its id and user name.
+fn probe(connector: &Connector) -> Result<(String, String), String> {
+    match connector.platform.as_str() {
+        "discord" => discord::Api::new(connector)?
+            .me()
+            .map(|bot| (bot.id, bot.username)),
+        _ => telegram::Api::new(connector)?
+            .me()
+            .map(|bot| (bot.id, bot.username)),
+    }
+}
+
 fn add(hub: &Arc<Hub>, op: &Value) -> Result<Value, String> {
     let platform = op["platform"].as_str().unwrap_or_default();
-    if platform != "telegram" {
-        return Err(format!("unknown platform {platform}: use telegram"));
-    }
+    let Some((_, prefix)) = PLATFORMS.iter().find(|(name, _)| *name == platform) else {
+        return Err(format!(
+            "unknown platform {platform}: use telegram or discord"
+        ));
+    };
     let token = op["token"].as_str().unwrap_or_default().trim().to_string();
-    telegram::check_token(&token)?;
+    check_token(platform, &token)?;
     let proxy = proxy_setting(&op["proxy"])?;
     let api = api_setting(&op["api"])?;
     let mut connector = Connector {
-        id: format!("tg-{}", random_hex(4).map_err(|error| error.to_string())?),
+        id: format!(
+            "{prefix}-{}",
+            random_hex(4).map_err(|error| error.to_string())?
+        ),
         platform: platform.to_string(),
         name: String::new(),
         username: String::new(),
@@ -690,16 +736,16 @@ fn add(hub: &Arc<Hub>, op: &Value) -> Result<Value, String> {
         settings: Settings::default(),
         created_at: now(),
     };
-    let bot = telegram::Api::new(&connector)?.me()?;
+    let (bot_id, username) = probe(&connector)?;
     if lock(&hub.connectors.list)
         .iter()
-        .any(|c| c.platform == platform && c.bot_id == bot.id)
+        .any(|c| c.platform == platform && c.bot_id == bot_id)
     {
         return Err("this bot is already added".to_string());
     }
-    connector.name = format!("@{}", bot.username);
-    connector.username = bot.username;
-    connector.bot_id = bot.id;
+    connector.name = format!("@{username}");
+    connector.username = username;
+    connector.bot_id = bot_id;
     {
         let mut list = lock(&hub.connectors.list);
         list.push(connector.clone());
@@ -726,7 +772,7 @@ fn set(hub: &Arc<Hub>, id: &str, op: &Value) -> Result<Value, String> {
     };
     let token = match op["token"].as_str().map(str::trim) {
         Some(token) => {
-            telegram::check_token(token)?;
+            check_token(&before.platform, token)?;
             Some((token.to_string(), seal(token)?))
         }
         None => None,
@@ -743,13 +789,13 @@ fn set(hub: &Arc<Hub>, id: &str, op: &Value) -> Result<Value, String> {
     };
     if let Some((token, _)) = &token {
         // A new token must be the same bot's.
-        let probe = Connector {
+        let probe_with = Connector {
             token: token.clone(),
             proxy: proxy.clone().unwrap_or_else(|| before.proxy.clone()),
             ..before.clone()
         };
-        let bot = telegram::Api::new(&probe)?.me()?;
-        if bot.id != before.bot_id {
+        let (bot_id, _) = probe(&probe_with)?;
+        if bot_id != before.bot_id {
             return Err("this token belongs to another bot: add it as a new connector".to_string());
         }
     }
@@ -865,13 +911,35 @@ fn start(hub: &Arc<Hub>, id: &str) {
             .set_status(hub, id, "error", Some(error.to_string()));
         return;
     }
-    let api = match telegram::Api::new(&connector) {
-        Ok(api) => api,
-        Err(error) => {
-            hub.connectors.set_status(hub, id, "error", Some(error));
-            return;
-        }
+    let started = match connector.platform.as_str() {
+        "discord" => discord::Api::new(&connector).map(|api| {
+            let receiver = api.clone();
+            let mut resume = discord::Resume::default();
+            spawn(hub, id, api, move |hub, id, stop, events, connected| {
+                discord::receive(hub, id, &receiver, stop, events, connected, &mut resume)
+            })
+        }),
+        _ => telegram::Api::new(&connector).map(|api| {
+            let receiver = api.clone();
+            spawn(hub, id, api, move |hub, id, stop, events, connected| {
+                telegram::receive(hub, id, &receiver, stop, events, connected)
+            })
+        }),
     };
+    if let Err(error) = started {
+        hub.connectors.set_status(hub, id, "error", Some(error));
+    }
+}
+
+/// The threads of one connector: `receive` from the platform (supervised,
+/// with backoff) and the chat side over `api`.
+fn spawn<A, R>(hub: &Arc<Hub>, id: &str, api: A, mut receive: R)
+where
+    A: chat::Api + 'static,
+    R: FnMut(&Hub, &str, &AtomicBool, &Sender<chat::Event>, &dyn Fn()) -> Result<(), Fault>
+        + Send
+        + 'static,
+{
     let stop = Arc::new(AtomicBool::new(false));
     let (events, inbox) = mpsc::channel();
     lock(&hub.connectors.running).insert(
@@ -884,11 +952,10 @@ fn start(hub: &Arc<Hub>, id: &str) {
     {
         let hub = Arc::clone(hub);
         let stop = Arc::clone(&stop);
-        let api = api.clone();
         let id = id.to_string();
         thread::spawn(move || {
             supervise(&hub, &id, &stop, |connected| {
-                telegram::receive(&hub, &id, &api, &stop, &events, connected)
+                receive(&hub, &id, &stop, &events, connected)
             })
         });
     }
