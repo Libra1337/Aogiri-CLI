@@ -82,15 +82,17 @@ pub(crate) fn stable_prefix_len(system_prompt: &str) -> Option<usize> {
     system_prompt.find(ENV_START)
 }
 
-/// The whole prompt, as a turn joins its parts (core::TurnPrompt).
+/// The whole prompt, as a turn joins its parts (core::TurnPrompt), without
+/// a reply style (`SessionPrompt::style`, which comes last).
 ///
 /// The system prompt is ordered for prompt caching: what is the same across
 /// sessions comes first, so providers can reuse the cached prefix. Base
 /// prompt and tool guidance (fixed per config), project instructions and
 /// skills (fixed per project), the sandbox note, the working directory and
-/// the date, then the host's text. A session keeps the prompt its first turn
-/// built (`SessionPrompt`); what changes later (plan mode, the date, the
-/// sandbox, the host's state) reaches the model as a note (`Note`).
+/// the date, then the host's text, then the reply style. A session keeps
+/// the prompt its first turn built (`SessionPrompt`); what changes later
+/// (plan mode, the date, the sandbox, the host's state, the reply style)
+/// reaches the model as a note (`Note`).
 #[cfg(test)]
 pub fn build_system_prompt(base: &str, context: &PromptContext) -> String {
     let mut prompt = runtime_prompt(base, context);
@@ -177,10 +179,10 @@ pub fn tail_section(context: &PromptContext) -> String {
 /// A session's system prompt in its parts, built when its first turn starts
 /// and kept while what it is built from stays the same, across reopening: a
 /// provider reuses its prompt cache only for a byte-identical prefix. The
-/// date and the sandbox change it by a note instead (see `notes_due`); a
-/// change to the base prompt, the edit tools, the project's instructions,
-/// the skills or the host's text makes the session take the prompt built now
-/// (`outdated_by`).
+/// date, the sandbox and the reply style change it by a note instead (see
+/// `notes_due`); a change to the base prompt, the edit tools, the project's
+/// instructions, the skills or the host's text makes the session take the
+/// prompt built now (`outdated_by`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionPrompt {
     /// The base prompt with its tool guidance (`runtime_prompt`).
@@ -197,10 +199,20 @@ pub struct SessionPrompt {
     pub shell: String,
     /// The host's text `tail` ends with; empty without a host.
     pub host: String,
+    /// The reply style's section (`styles::prompt_section`), the prompt's
+    /// last part, after everything providers cache across sessions; empty
+    /// without a style.
+    pub style: String,
 }
 
 impl SessionPrompt {
     pub fn text(&self) -> String {
+        format!("{}{}", self.text_without_style(), self.style)
+    }
+
+    /// The prompt without the reply style: a subagent's. It reports to the
+    /// main agent, not to the user.
+    pub fn text_without_style(&self) -> String {
         format!("{}{}{}{}", self.head, self.project, self.skills, self.tail)
     }
 
@@ -213,6 +225,7 @@ impl SessionPrompt {
     /// every turn before the prompt was kept).
     /// The rest of the tail is left out: its date, sandbox note and shell
     /// reach the model as notes, and the working directory is the session's.
+    /// So is the reply style: a note tells the model when it changes.
     pub fn outdated_by(&self, now: &SessionPrompt) -> bool {
         self.head != now.head
             || self.project != now.project
@@ -230,6 +243,7 @@ impl SessionPrompt {
             "sandbox": self.sandbox,
             "shell": self.shell,
             "host": self.host,
+            "style": self.style,
         })
     }
 
@@ -247,6 +261,8 @@ impl SessionPrompt {
             // Saved before it was kept: a host's session builds its prompt
             // again once.
             host: field("host").unwrap_or_default(),
+            // Kept before reply styles: it carried none.
+            style: field("style").unwrap_or_default(),
         })
     }
 }
@@ -267,16 +283,19 @@ pub enum Note {
     Shell,
     /// The host's current state (`HostExtensions::context`).
     Host,
+    /// The reply style (`styles::prompt_section`).
+    Style,
 }
 
 impl Note {
-    const ALL: [Note; 6] = [
+    const ALL: [Note; 7] = [
         Note::PlanMode,
         Note::PlanReminder,
         Note::Date,
         Note::Sandbox,
         Note::Shell,
         Note::Host,
+        Note::Style,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -287,6 +306,7 @@ impl Note {
             Note::Sandbox => "sandbox",
             Note::Shell => "shell",
             Note::Host => "host",
+            Note::Style => "style",
         }
     }
 
@@ -319,8 +339,12 @@ const HOST_EMPTY_NOTE: &str =
 const SANDBOX_OFF_NOTE: &str =
     "The shell sandbox is off now: commands run without one (full access), as the approval mode allows.";
 
+/// The note when the reply style goes back to the default (none).
+const STYLE_OFF_NOTE: &str =
+    "The reply style is now the default: no reply style applies, and the earlier one no longer does.";
+
 /// What the notes describe now: the approval mode's plan mode, today's date,
-/// the shell sandbox, the shell and the host's state.
+/// the shell sandbox, the shell, the host's state and the reply style.
 pub struct NoteState {
     pub plan_mode: bool,
     /// The turn starts with a user's message: in plan mode it gets a short
@@ -332,6 +356,9 @@ pub struct NoteState {
     /// The shell (`CommandShell::prompt`); empty in a chat.
     pub shell: String,
     pub host: String,
+    /// The reply style's section (`styles::prompt_section`); empty without
+    /// a style.
+    pub style: String,
 }
 
 /// The notes to add before the next request: each kind whose latest note
@@ -391,6 +418,22 @@ pub fn notes_due<'a>(
     });
     if last(Note::Host).map_or(!now.host.trim().is_empty(), |told| told != host) {
         due.push((Note::Host, host));
+    }
+    // Another reply style than the prompt's, or than the last note's (the
+    // user picked one, the default changed, its file was edited or deleted).
+    let prompt_style = prompt.map_or(now.style.as_str(), |prompt| prompt.style.as_str());
+    let style = if now.style.trim().is_empty() {
+        note(STYLE_OFF_NOTE)
+    } else {
+        note(&format!(
+            "The reply style changed. From now on:\n{}",
+            now.style.trim()
+        ))
+    };
+    if last(Note::Style).map_or(now.style.trim() != prompt_style.trim(), |told| {
+        told != style
+    }) {
+        due.push((Note::Style, style));
     }
     // Last, so it is next to the user's message.
     if now.plan_mode && now.user_turn && plan_told {
@@ -822,7 +865,7 @@ fn first_non_empty_body_line(content: &str) -> Option<String> {
         .map(|line| line.trim_start_matches('#').trim().to_string())
 }
 
-fn escape_xml(value: &str) -> String {
+pub(crate) fn escape_xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1498,13 +1541,25 @@ mod tests {
             sandbox: String::new(),
             shell: "Commands run in zsh 5.9.".to_string(),
             host: "<agent id=\"ops\">".to_string(),
+            style: "\n\n<reply_style id=\"concise\">…</reply_style>".to_string(),
         };
         assert_eq!(
             SessionPrompt::from_json(&prompt.to_json()),
             Some(prompt.clone())
         );
+        // A prompt kept before reply styles carried none.
+        let mut older = prompt.to_json();
+        older.as_object_mut().unwrap().remove("style");
+        assert_eq!(
+            SessionPrompt::from_json(&older).map(|prompt| prompt.style),
+            Some(String::new())
+        );
         assert_eq!(
             prompt.text(),
+            "Base.\n\n<project_context>…\n\n<env>\nDate: 2026-10-12\n</env>\n\n<reply_style id=\"concise\">…</reply_style>"
+        );
+        assert_eq!(
+            prompt.text_without_style(),
             "Base.\n\n<project_context>…\n\n<env>\nDate: 2026-10-12\n</env>"
         );
         assert_eq!(SessionPrompt::from_json(&json!({ "head": "x" })), None);
@@ -1521,6 +1576,7 @@ mod tests {
             sandbox: context.sandbox.clone(),
             shell: context.shell.clone(),
             host: context.host.clone(),
+            style: String::new(),
         }
     }
 
@@ -1592,6 +1648,7 @@ mod tests {
             sandbox: String::new(),
             shell: String::new(),
             host: host.to_string(),
+            style: String::new(),
         }
     }
 
@@ -1774,5 +1831,108 @@ mod tests {
             format!("<system-reminder>\n{HOST_EMPTY_NOTE}\n</system-reminder>")
         );
         assert!(notes_due(&state(false, "2026-10-12", ""), Some(&prompt), told(&empty)).is_empty());
+    }
+
+    fn concise() -> String {
+        crate::styles::prompt_section(&crate::styles::builtins()[1])
+    }
+
+    #[test]
+    fn the_reply_style_comes_last_after_the_cached_prefix() {
+        let context = PromptContext {
+            host: "Peers: ops (busy)".to_string(),
+            ..coding_context(crate::config::default_edit_tools())
+        };
+        let plain = session_prompt("Base prompt", &context);
+        let styled = SessionPrompt {
+            style: concise(),
+            ..plain.clone()
+        };
+        let text = styled.text();
+        assert!(text.starts_with(&plain.text()));
+        assert!(text.ends_with("</reply_style>"));
+        assert!(text.find("Peers: ops (busy)").unwrap() < text.find("<reply_style").unwrap());
+        // The prefix providers cache across sessions is the same with or
+        // without a style, and a style changes nothing before it.
+        assert_eq!(stable_prefix_len(&text), stable_prefix_len(&plain.text()));
+        assert_eq!(styled.text_without_style(), plain.text());
+        // The default style adds nothing: the prompt of before.
+        assert_eq!(
+            SessionPrompt {
+                style: crate::styles::prompt_section(&crate::styles::builtins()[0]),
+                ..plain.clone()
+            }
+            .text(),
+            build_system_prompt("Base prompt", &context)
+        );
+    }
+
+    #[test]
+    fn another_reply_style_keeps_the_prompt_and_is_a_note() {
+        let kept = SessionPrompt {
+            style: concise(),
+            ..prompt_of("2026-10-12", "")
+        };
+        // A prompt built now with another style is not a new prompt.
+        assert!(!kept.outdated_by(&SessionPrompt {
+            style: String::new(),
+            ..kept.clone()
+        }));
+        let now = |style: &str| NoteState {
+            style: style.to_string(),
+            ..state(false, "2026-10-12", "")
+        };
+        let formal = crate::styles::prompt_section(&crate::styles::builtins()[4]);
+        assert!(notes_due(&now(&concise()), Some(&kept), |_| None).is_empty());
+        let mut notes = notes_due(&now(&formal), Some(&kept), |_| None);
+        assert_eq!(kinds(&notes), [Note::Style]);
+        assert_eq!(
+            notes[0].1,
+            format!(
+                "<system-reminder>\nThe reply style changed. From now on:\n{}\n</system-reminder>",
+                formal.trim()
+            )
+        );
+        assert!(notes_due(&now(&formal), Some(&kept), told(&notes)).is_empty());
+        // Back to the prompt's style: told again, since a note said otherwise.
+        notes.extend(notes_due(&now(&concise()), Some(&kept), told(&notes)));
+        assert_eq!(kinds(&notes), [Note::Style, Note::Style]);
+        assert!(notes[1].1.contains("name=\"简洁\""));
+        // No style at all.
+        let off = notes_due(&now(""), Some(&kept), told(&notes));
+        assert_eq!(kinds(&off), [Note::Style]);
+        assert!(off[0].1.contains(STYLE_OFF_NOTE));
+        // A session whose prompt has no style yet gets its first one as a note.
+        let unstyled = prompt_of("2026-10-12", "");
+        assert_eq!(
+            kinds(&notes_due(&now(&concise()), Some(&unstyled), |_| None)),
+            [Note::Style]
+        );
+        // Before the first turn, the prompt to come carries it.
+        assert!(notes_due(&now(&concise()), None, |_| None).is_empty());
+        assert!(Note::Style.lasting());
+        assert_eq!(Note::parse(Note::Style.as_str()), Some(Note::Style));
+    }
+
+    #[test]
+    fn the_style_note_comes_before_the_plan_reminder() {
+        let kept = prompt_of("2026-10-12", "");
+        let now = NoteState {
+            user_turn: true,
+            style: concise(),
+            ..state(true, "2026-10-12", "")
+        };
+        let told = notes_due(&now, Some(&kept), |_| None);
+        let again = notes_due(&now, Some(&kept), told_plan_only(&told));
+        assert_eq!(kinds(&again), [Note::Style, Note::PlanReminder]);
+    }
+
+    /// `last` that knows only the plan-mode note of `told`.
+    fn told_plan_only<'a>(told: &'a [(Note, String)]) -> impl Fn(Note) -> Option<&'a str> {
+        move |note| {
+            told.iter()
+                .find(|(kind, _)| *kind == note && note == Note::PlanMode)
+                .map(|(_, text)| text.as_str())
+        }
     }
 }

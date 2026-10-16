@@ -130,6 +130,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         advanced: false,
     },
     CommandSpec {
+        name: "/style",
+        aliases: &[],
+        args: "[<id>] [--global]",
+        description: "Show or switch the reply style",
+        advanced: false,
+    },
+    CommandSpec {
         name: "/context",
         aliases: &[],
         args: "",
