@@ -84,6 +84,7 @@ pub fn project_has_local_resources(cwd: &Path) -> bool {
         || base.join("hooks.json").exists()
         || base.join("commands").exists()
         || base.join("roles").exists()
+        || base.join("styles").exists()
 }
 
 /// The nearest ancestor of `cwd` that holds the `.git` marker, offered as a

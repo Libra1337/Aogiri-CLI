@@ -294,6 +294,9 @@ pub struct AgentCore {
     /// What the last `agent_runs` showed, and when it went out (throttle).
     agent_runs_revision: u64,
     agent_runs_sent_at: Option<Instant>,
+    /// The reply style a `reply_style` event last told clients of, so a turn
+    /// that starts with another one tells them again.
+    reply_style_told: Option<crate::event::ReplyStyleView>,
     trust: TrustStore,
     project_trusted: bool,
     hooks: Hooks,
@@ -440,6 +443,7 @@ impl AgentCore {
             steered_pending: Vec::new(),
             agent_runs_revision: 0,
             agent_runs_sent_at: None,
+            reply_style_told: None,
             trust,
             project_trusted,
             hooks,
@@ -566,6 +570,7 @@ impl AgentCore {
             self.command_list_event(),
             self.approval_mode_event(),
             self.sandbox_event(),
+            AgentEvent::ReplyStyle(self.reply_style().view()),
             // Servers still connecting report state "connecting"; a follow-up
             // event is emitted from poll_events when their state settles.
             self.mcp_servers_event(),
@@ -1073,6 +1078,7 @@ impl AgentCore {
             "/plan" => self.plan_command_events(args.trim()),
             "/permissions" => self.permissions_command_events(args.trim()),
             "/sandbox" => self.sandbox_command_events(args.trim()),
+            "/style" => self.style_command_events(args.trim()),
             "/effort" => self.effort_command_events(args.trim()),
             "/subagents" => self.subagents_command_events(args.trim()),
             "/mcp" => self.mcp_command_events(args.trim()),
@@ -2492,6 +2498,7 @@ impl AgentCore {
             .iter()
             .map(|file| (file.path.display().to_string(), file.content.clone()))
             .collect();
+        let style = self.reply_style();
         Ok(TurnPrompt {
             prompt: SessionPrompt {
                 head: crate::prompt::runtime_prompt(&base_prompt, &context),
@@ -2502,7 +2509,9 @@ impl AgentCore {
                 sandbox: context.sandbox,
                 shell: context.shell,
                 host: context.host,
+                style: style.section(),
             },
+            style: style.view(),
             project_files,
             extra_read_roots,
             model_headers,
@@ -2568,6 +2577,7 @@ impl AgentCore {
                 .as_ref()
                 .map(|host| (host.context)())
                 .unwrap_or_default(),
+            style: self.reply_style().section(),
         };
         let due = crate::prompt::notes_due(&now, self.session.prompt(), |note| {
             self.session.last_note(note)
@@ -2586,6 +2596,7 @@ impl AgentCore {
         self.requeue_unread_steers();
         let TurnPrompt {
             prompt,
+            style,
             extra_read_roots,
             model_headers,
             ..
@@ -2598,8 +2609,9 @@ impl AgentCore {
             }
         };
         // A subagent's conversation does not carry this one's notes: it
-        // starts from the prompt built now (today's date, the sandbox now).
-        let subagent_prompt = prompt.text();
+        // starts from the prompt built now (today's date, the sandbox now),
+        // without the reply style: it reports to this agent, not the user.
+        let subagent_prompt = prompt.text_without_style();
         let prompt = self.session_prompt(prompt);
         let skills_tokens =
             crate::tokens::count_text(&self.config.model, &prompt.skills).tokens as u64;
@@ -2678,6 +2690,12 @@ impl AgentCore {
             }
         };
         let mut events = save_event;
+        // The default changed, or the style's file went away, since clients
+        // were told.
+        if self.reply_style_told.as_ref() != Some(&style) {
+            self.reply_style_told = Some(style.clone());
+            events.push(AgentEvent::ReplyStyle(style));
+        }
         events.push(AgentEvent::ContextUsage {
             tokens: context_tokens as u64,
             tokenizer: context_tokenizer,
@@ -3604,6 +3622,118 @@ impl AgentCore {
             unavailable: policy.as_ref().and_then(|policy| policy.unavailable()),
             directories,
         })
+    }
+
+    /// The reply style this session uses now: its own choice, else
+    /// config.json's `reply_style` (read again here: Desktop changes it while
+    /// engines run). A trusted project's styles count; a chat has none.
+    fn reply_style(&self) -> crate::styles::Resolved {
+        let profile = self.config.profile_dir();
+        crate::styles::resolve(
+            &self.style_inventory(),
+            self.session.style(),
+            &crate::styles::default_id(profile),
+        )
+    }
+
+    fn style_inventory(&self) -> crate::styles::StyleInventory {
+        let project = (self.project_trusted && !self.chat).then_some(self.cwd.as_path());
+        crate::styles::inventory(self.config.profile_dir(), project)
+    }
+
+    /// The `set_style` op: this conversation's reply style, from its next
+    /// message; None (or "") follows the default for new conversations.
+    /// An unknown id changes nothing. Saves the session and emits
+    /// `reply_style`.
+    pub fn set_reply_style(&mut self, style: Option<&str>) -> Vec<AgentEvent> {
+        let style = style.map(str::trim).filter(|id| !id.is_empty());
+        if let Some(id) = style {
+            if id != crate::styles::DEFAULT_ID && self.style_inventory().get(id).is_none() {
+                return vec![
+                    AgentEvent::Error(format!(
+                        "unknown reply style: {id} (/style lists the styles)"
+                    )),
+                    self.reply_style_event(),
+                ];
+            }
+        }
+        self.session.set_style(style.map(str::to_string));
+        // A conversation with no message yet keeps the choice in memory
+        // until its first message saves it.
+        let mut events = if self.session.branch().is_empty() {
+            Vec::new()
+        } else {
+            self.save_session_event()
+        };
+        events.push(self.reply_style_event());
+        events
+    }
+
+    /// `reply_style` for the style in use now, remembered as told.
+    fn reply_style_event(&mut self) -> AgentEvent {
+        let view = self.reply_style().view();
+        self.reply_style_told = Some(view.clone());
+        AgentEvent::ReplyStyle(view)
+    }
+
+    /// `/style [<id> [--global]]`: list the reply styles, or pick one for
+    /// this conversation; `--global` also makes it the default for new
+    /// conversations (`reply_style` in config.json), which this
+    /// conversation then follows.
+    fn style_command_events(&mut self, arg: &str) -> Vec<AgentEvent> {
+        let mut words = arg.split_whitespace().collect::<Vec<_>>();
+        let global = words.contains(&"--global");
+        words.retain(|word| *word != "--global");
+        let Some(&id) = words.first() else {
+            if global {
+                return vec![AgentEvent::Error("usage: /style <id> --global".to_string())];
+            }
+            let inventory = self.style_inventory();
+            let default_id = crate::styles::default_id(self.config.profile_dir());
+            let current = crate::styles::resolve(&inventory, self.session.style(), &default_id);
+            return vec![AgentEvent::Info(crate::styles::listing(
+                &inventory,
+                &current,
+                &default_id,
+            ))];
+        };
+        if words.len() > 1 {
+            return vec![AgentEvent::Error(
+                "usage: /style [<id>] [--global]".to_string(),
+            )];
+        }
+        if !global {
+            let mut events = self.set_reply_style(Some(id));
+            if !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error(_)))
+            {
+                let name = self.reply_style().view().name;
+                events.push(AgentEvent::Info(format!(
+                    "reply style: {name} for this conversation, from your next message"
+                )));
+            }
+            return events;
+        }
+        if id != crate::styles::DEFAULT_ID && self.style_inventory().get(id).is_none() {
+            return vec![AgentEvent::Error(format!(
+                "unknown reply style: {id} (/style lists the styles)"
+            ))];
+        }
+        if let Err(error) = crate::config::edit_config_json(self.config.path(), |config| {
+            config.insert("reply_style".to_string(), json!(id));
+            Ok(())
+        }) {
+            return vec![AgentEvent::Error(format!(
+                "cannot save the default reply style: {error}"
+            ))];
+        }
+        let mut events = self.set_reply_style(None);
+        let name = self.reply_style().view().name;
+        events.push(AgentEvent::Info(format!(
+            "reply style: {name} for new conversations and this one, from your next message"
+        )));
+        events
     }
 
     /// The `set_sandbox` op: this session's sandbox mode and, when given,
@@ -4651,7 +4781,7 @@ impl AgentCore {
         let mut categories = vec![
             ContextCategory {
                 name: "System prompt",
-                tokens: text(&format!("{}{}", prompt.head, prompt.tail)),
+                tokens: text(&format!("{}{}{}", prompt.head, prompt.tail, prompt.style)),
                 kind: "used",
             },
             ContextCategory {
@@ -6002,6 +6132,8 @@ fn overhead_tokens(overhead: &ContextBreakdown) -> u64 {
 /// alongside it.
 struct TurnPrompt {
     prompt: SessionPrompt,
+    /// The reply style `prompt.style` carries, as clients are told it.
+    style: crate::event::ReplyStyleView,
     /// The instruction files `prompt.project` carries now: path and content.
     project_files: Vec<(String, String)>,
     extra_read_roots: Vec<std::path::PathBuf>,

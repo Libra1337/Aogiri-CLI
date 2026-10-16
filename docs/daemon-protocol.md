@@ -121,7 +121,7 @@ Each WebSocket text message is one JSON frame. The daemon first sends:
 
 ```json
 {"type":"hello","protocol":2,"version":"0.3.0"}
-{"type":"sessions","sessions":[{"session":"...","cwd":"...","created_at":0,"updated_at":0,"title":"...","archived":false,"open":true,"watchers":0}]}
+{"type":"sessions","sessions":[{"session":"...","cwd":"...","created_at":0,"updated_at":0,"entries":4,"title":"...","archived":false,"open":true,"watchers":0}]}
 {"type":"workspaces","rev":1,"workspaces":[...]}
 ```
 
@@ -141,7 +141,7 @@ every connected client.
 
 | Op | Fields | Reply |
 | --- | --- | --- |
-| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers`, `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at` |
+| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers`, `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at`, `entries` (how many entries the engine saved for a LynShen session, null for other engines; 0 for one opened without a first message) |
 | `gateway_catalog` | — | `gateway_catalog`: `models` (the LynShen models the user chose to show, `lynshen_models` in config.json) and `groups` (the gateway's groups with their models and multipliers); empty when not signed in or offline. For clients that cannot read this machine's login (the remote page) |
 | `restart_when_idle` | — | none. Desktop only: this daemon exits once no session is running (after a `daemon_restarting` broadcast), so the desktop can start a newer one without cutting off a task |
 | `session_meta` | `session`, and any of `title`, `archived`, `hidden`, `group` | none; every client receives the new `sessions` list. An empty title goes back to the engine's label; a hidden session leaves `session_list` and `session_history` (its conversation stays on disk). A session created here is titled after its first user message (first line, 40 characters) unless a client titled it first. After its 1st and 3rd turns, then every 5th, the title model (`title_model` in config.json, else the main `model`) renames it from the project name, the current title, the first and latest requests and the start of the latest reply. A title a client set with `session_meta` is never replaced |
@@ -198,6 +198,9 @@ every connected client.
 | `skill_uninstall` | `path` (a listed skill's folder) or `skill` (a catalog `id`), optional `backend` | `skill_uninstalled` with `path` (local clients only) |
 | `shells` | optional `refresh` (detect again: shells, versions and the login environment) | `shells` with `platform`, `shell` and `terminal_shell` (the settings; `terminal_shell` null follows `shell`), `auto` (`{id, path}`: what `"auto"` takes here), `auto_order` (ids in order; `login` is the login shell), `shells: [{id, name, installed, path, version}]` (the shells this platform offers: `pwsh`, `powershell`, `gitbash` on Windows; `zsh`, `bash`, `sh` elsewhere), `commands` (`{id, name, label, path, version, login, snapshot, notes, helper}`: what the model's commands run in now; `notes` say why it is not what `shell` asks; `helper` is the PowerShell named for Windows-native work with Git Bash) and `terminal` (`{program, args, env}`: what a terminal opens). Local clients only. See "Shell" in `docs/sandbox.md` |
 | `skill_create` | `name` (lowercase letters, digits and hyphens), `description` | `skill_created` with `path`, the new `SKILL.md` in `~/.lynshen/skills/<name>/` (local clients only) |
+| `styles_list` | optional `cwd` (an absolute project folder); an error reply with `code` `read_failed` when the profile or the trust store cannot be read | `styles_list` with `styles: [{id, name, description, instructions, source, path, truncated}]` (the built-ins first in their order, then the others by name; `source` `builtin`, `user` or `project`; `path` null for a built-in; `truncated`: only the first 8 KiB are used), `default` (config.json's `reply_style`, `default` when unset), `dirs: [{scope, path}]`, `projectTrusted` (null without `cwd`) and `problems: [{path, code, message}]` (files that do not load; `code` is `reserved_id` for a `default.md`, `invalid_id` for a file name that cannot be an id, `no_instructions` or `read_failed`; `message` is the English detail, also logged). Local clients only. See "Reply styles" in `docs/serve-protocol.md` |
+| `style_save` | `name`, `instructions`, optional `description`, optional `style` (the id; `id` is the request's) | `style_saved` with `style` (the id) and `path`: writes `~/.lynshen/styles/<id>.md`. Without `style` the id comes from the name (its ASCII letters and digits, else `style`, then `-2`, `-3`… while taken); with `style` that file is replaced. Refused with an error reply that carries `code`: `reserved_id` (`default`), `invalid_id`, `name_missing`, `name_too_long` (over 40 characters or more than one line), `description_too_long` (over 200 characters or more than one line), `instructions_missing`, `instructions_too_long` (over 8 KiB), `write_failed`. Local clients only |
+| `style_delete` | `style` (the id) | `style_deleted` with `style`: deletes `~/.lynshen/styles/<id>.md` (only a personal style). When config.json's `reply_style` names it, it goes back to `default`. Refused with `code` `reserved_id`, `invalid_id`, `not_found`, `delete_failed`, or `config_failed` (deleted, but `reply_style` still names it). Local clients only |
 
 `decide_action` (a session op) also works for a session that is closed or
 was hosted before a restart: the daemon reopens it first.
@@ -310,9 +313,13 @@ clients need nothing engine-specific. `options`:
 `gemini --experimental-acp`, ...) from `options.command`. Only local
 clients may start or reopen one, or pass `bin` or `env` for any engine,
 since that names a program to run; paired devices watch and drive such
-sessions like any other. ACP agents keep no
-conversation the daemon can resume, so reopening an ACP session starts a
-new conversation under the same session id.
+sessions like any other. The daemon names an ACP session itself and keeps
+the agent's own session id with it; reopening the session (with the same
+`command`) asks the agent for that conversation: `session/load` when the
+agent offers it (its replay becomes the session's `transcript`), else
+`session/resume`. An agent that offers neither, or no longer has the
+conversation, starts a new one under the same session id, and clients get
+an `info` event saying so.
 
 The session id is the engine's conversation id (Claude Code's session id,
 Codex's thread id), so reopening a closed session resumes the same

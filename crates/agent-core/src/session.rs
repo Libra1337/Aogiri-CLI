@@ -225,6 +225,9 @@ pub struct SessionStore {
     team: Option<Value>,
     /// The latest `update_plan` steps.
     plan: Vec<PlanItem>,
+    /// The reply style this conversation chose (`set_style`); None follows
+    /// config.json's `reply_style`.
+    style: Option<String>,
     /// The system prompt, fixed when the first turn starts.
     prompt: Option<SessionPrompt>,
     /// `prompt` is not in the journal yet.
@@ -381,6 +384,17 @@ impl SessionStore {
     /// change, so `updated_at` stays.
     pub fn set_plan(&mut self, plan: Vec<PlanItem>) {
         self.plan = plan;
+    }
+
+    /// The reply style this conversation chose; None follows the default.
+    pub fn style(&self) -> Option<&str> {
+        self.style.as_deref()
+    }
+
+    /// Records the conversation's reply style; written with the next save.
+    /// Not a conversation change, so `updated_at` stays.
+    pub fn set_style(&mut self, style: Option<String>) {
+        self.style = style;
     }
 
     pub fn goal(&self) -> Option<&ThreadGoal> {
@@ -1336,7 +1350,8 @@ impl SessionStore {
             "resume_summary_updated_at": self.resume_summary_updated_at,
             "goal": self.goal.as_ref().map(goal_to_json),
             "team": self.team,
-            "plan": plan_to_json(&self.plan)
+            "plan": plan_to_json(&self.plan),
+            "style": self.style
         })
     }
 
@@ -1436,6 +1451,10 @@ impl SessionStore {
                 .and_then(Value::as_u64),
             team: value.get("team").filter(|team| !team.is_null()).cloned(),
             plan: value.get("plan").map(plan_from_json).unwrap_or_default(),
+            style: value
+                .get("style")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             prompt: value.get("prompt").and_then(SessionPrompt::from_json),
             prompt_unsaved: false,
         };
@@ -1519,6 +1538,10 @@ impl SessionStore {
         }
         if let Some(plan) = value.get("plan") {
             self.plan = plan_from_json(plan);
+        }
+        // A state saved before styles has none: the choice stays as it was.
+        if let Some(style) = value.get("style") {
+            self.style = style.as_str().map(str::to_string);
         }
         self.resume_summary = value
             .get("resume_summary")
@@ -3292,6 +3315,43 @@ mod tests {
         older.apply_state_json(&state);
         assert_eq!(older.plan(), latest.as_slice());
         assert!(SessionStore::new().plan().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_chosen_reply_style_is_saved_and_reloads() {
+        let root = test_dir("session-style");
+        let profile = root.join("profile");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut session = SessionStore::new();
+        let session_id = session.session_id().to_string();
+        session.append(EntryKind::User {
+            content: "hello".to_string(),
+        });
+        session.save_for_cwd(&profile, &cwd).unwrap();
+        let updated_at = session.updated_at();
+        session.set_style(Some("concise".to_string()));
+        assert_eq!(session.updated_at(), updated_at);
+        session.save_for_cwd(&profile, &cwd).unwrap();
+        let loaded = SessionStore::load_for_cwd(&profile, &cwd, &session_id).unwrap();
+        assert_eq!(loaded.style(), Some("concise"));
+        assert_eq!(
+            SessionStore::from_json(&session.to_json()).unwrap().style(),
+            Some("concise")
+        );
+        // Back to the default: saved as such.
+        session.set_style(None);
+        session.save_for_cwd(&profile, &cwd).unwrap();
+        let loaded = SessionStore::load_for_cwd(&profile, &cwd, &session_id).unwrap();
+        assert_eq!(loaded.style(), None);
+        // A state record written before styles leaves the choice alone.
+        let mut older = SessionStore::from_json(&session.to_json()).unwrap();
+        older.set_style(Some("formal".to_string()));
+        let mut state = session.state_json();
+        state.as_object_mut().unwrap().remove("style");
+        older.apply_state_json(&state);
+        assert_eq!(older.style(), Some("formal"));
         let _ = fs::remove_dir_all(root);
     }
 
