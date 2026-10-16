@@ -8,7 +8,7 @@
 //! current session's turns, approval requests, plans, and the daemon's
 //! deferred actions and questions.
 
-use super::{bind, redact, render, Redeemed, MODES};
+use super::{bind, profile, redact, render, Redeemed, MODES};
 use crate::{hub::Hub, session_messages::rank, store::Device};
 use serde_json::{json, Value};
 use std::{
@@ -745,10 +745,21 @@ impl Chat {
         Ok(())
     }
 
-    /// Watches `session` and checks that its approval mode is within what
-    /// this connector lets a chat drive.
+    /// Refused, in the binding's language, unless `session` is a LynShen
+    /// session (the chat profile checks the same for every op).
+    fn lynshen_only(&self, device: &str, session: &str) -> Result<(), String> {
+        if profile::lynshen_session(&self.hub, session) {
+            return Ok(());
+        }
+        self.refused(device, "engine");
+        Err(other_engine(self.lang(device)))
+    }
+
+    /// Watches `session` and checks that it is a LynShen session in an
+    /// approval mode within what this connector lets a chat drive.
     fn drive(&mut self, device: &str, session: &str) -> Result<(), String> {
         let lang = self.lang(device);
+        self.lynshen_only(device, session)?;
         self.watch(device, session)?;
         let cap = self.settings().max_mode;
         let mode = self.hub.messages.wait_for_mode(session).ok_or_else(|| {
@@ -861,13 +872,23 @@ impl Chat {
     fn answer_reply(&mut self, device: &str, reply: Reply, text: &str) {
         let lang = self.lang(device);
         let result = match &reply {
-            Reply::Question(question) => self
-                .call(
-                    device,
-                    json!({ "op": "question_answer", "question": question, "answer": text }),
-                    Duration::from_secs(10),
-                )
-                .map(|_| tr(lang, "已回答。", "Answered.")),
+            Reply::Question(question) => {
+                let asking = self
+                    .hub
+                    .store
+                    .question(question)
+                    .map(|q| q.session)
+                    .unwrap_or_default();
+                self.lynshen_only(device, &asking)
+                    .and_then(|()| {
+                        self.call(
+                            device,
+                            json!({ "op": "question_answer", "question": question, "answer": text }),
+                            Duration::from_secs(10),
+                        )
+                    })
+                    .map(|_| tr(lang, "已回答。", "Answered."))
+            }
             Reply::Plan { session, plan } => self
                 .drive(device, session)
                 .and_then(|()| {
@@ -1053,14 +1074,15 @@ impl Chat {
         })
     }
 
-    /// Sessions, newest first, not archived: (id, title, cwd, open).
+    /// LynShen sessions, newest first, not archived: (id, title, cwd, open).
+    /// Sessions of other engines are left out: a chat cannot drive them.
     fn recent(&self) -> Vec<(String, String, PathBuf, bool)> {
         let mut list: Vec<Value> = self.hub.sessions_json()["sessions"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter(|session| session["archived"] != true)
+            .filter(|session| session["archived"] != true && session["engine"] == "lynshen")
             .collect();
         list.sort_by_key(|session| std::cmp::Reverse(session["updated_at"].as_u64().unwrap_or(0)));
         list.into_iter()
@@ -1166,6 +1188,9 @@ impl Chat {
                 "Send /sessions for the numbers, then /use and a number.",
             );
         };
+        if let Err(error) = self.lynshen_only(device, &session) {
+            return error;
+        }
         self.set_current(device, Some(&session));
         let title = self.title(&session, lang);
         match self.drive(device, &session) {
@@ -1237,6 +1262,9 @@ impl Chat {
         let Some(session) = self.current(device) else {
             return no_session(lang);
         };
+        if let Err(error) = self.lynshen_only(device, &session) {
+            return error;
+        }
         let argument = argument.trim();
         if argument.is_empty() {
             let mode = self
@@ -1483,6 +1511,11 @@ impl Chat {
             return tr(lang, "这不是你的确认请求。", "This request is not yours.");
         }
         let (session, target) = (card.session.clone(), card.target.clone());
+        if !matches!(target, Target::Plan(_)) {
+            if let Err(error) = self.lynshen_only(device, &session) {
+                return error;
+            }
+        }
         let decision = if allow { "allow" } else { "deny" };
         let (op, what) = match &target {
             Target::Call(call) => (
@@ -2026,6 +2059,9 @@ impl Chat {
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
+            if !profile::lynshen_session(&self.hub, &session) {
+                continue;
+            }
             let what = format!(
                 "{} {}",
                 action["name"].as_str().unwrap_or_default(),
@@ -2071,6 +2107,10 @@ impl Chat {
         }
         let lang = self.lang(device);
         for question in fresh {
+            let asking = question["session"].as_str().unwrap_or_default();
+            if !profile::lynshen_session(&self.hub, asking) {
+                continue;
+            }
             let mut text = format!(
                 "{}{}\n{}",
                 tr(lang, "问题：", "Question: "),
@@ -2490,6 +2530,16 @@ fn help(lang: Lang) -> String {
         lang,
         "可用命令：\n/new [编号或项目名]：在项目里新建会话\n/chat：新建聊天会话（不带项目文件）\n/sessions：最近的会话\n/use 编号：切换当前会话\n/stop：停止当前任务\n/status：当前会话状态\n/mode [模式]：查看或切换权限模式\n/diff：当前项目的改动\n/file 路径：发送项目里的文件\n/open：手机远程页地址\n/unbind：解除绑定\n\n直接发文字：交给当前会话。发图片或文件：随下一句话一起交给会话。\n全自动、始终允许、sudo 提权和终端只能在电脑或手机远程页操作。",
         "Commands:\n/new [number or project]: new session in a project\n/chat: new chat session (no project files)\n/sessions: recent sessions\n/use number: switch session\n/stop: stop the current task\n/status: session status\n/mode [mode]: show or set the approval mode\n/diff: changes in the project\n/file path: send a project file\n/open: phone page address\n/unbind: unbind this account\n\nPlain text goes to the current session. Photos and files go with your next message.\nFull auto, always-allow, sudo and terminals are only on the desktop or the phone page.",
+    )
+}
+
+/// A session of another engine (Claude Code, Codex, an ACP agent): its
+/// modes and approvals mean something else, so chat leaves it alone.
+fn other_engine(lang: Lang) -> String {
+    tr(
+        lang,
+        "这个会话不是 LynShen 引擎的会话（例如 Claude Code、Codex 或 OpenCode），聊天里不能操作它：不能发消息、切换模式、批准或回答。请在电脑或手机远程页使用它，或发 /sessions 选一个 LynShen 会话，或用 /new 新建一个。",
+        "This session does not run on the LynShen engine (it is a Claude Code, Codex or OpenCode session), so chat cannot message it, switch its mode, approve or answer in it. Use it on the desktop or the phone page, pick a LynShen session with /sessions, or start one with /new.",
     )
 }
 

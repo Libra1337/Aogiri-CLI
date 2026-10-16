@@ -166,17 +166,27 @@ On a failed connection the connector waits 1 s, doubling to 60 s, plus up to
 Every op of a chat client goes through the same `handle()` as a phone's ops,
 plus these checks. Ops not in this table are refused.
 
+A chat binding drives, switches, approves in and answers **LynShen sessions
+only**: sessions the daemon recorded with the `lynshen` engine. Other engines'
+modes and approvals mean something else (OpenCode's 计划 may run commands;
+Claude Code, Codex and ACP approval requests carry no `kind`, so a `sudo`
+command looks like any tool), so the rules below would not hold for them. Ops
+marked "LynShen only" are refused for a session of Claude Code, Codex or an
+ACP agent (OpenCode and others), and for a session the daemon has no record
+of.
+
 | Op | Allowed from chat |
 | --- | --- |
 | `ping`, `session_list`, `session_history`, `workspaces`, `agent_list`, `question_list`, `actions_list`, `report_list` | Yes |
 | `session_create` | Only a LynShen session in a known project's main directory, or `chat: true`. No `engine`, `agent` or `options` |
 | `session_open`, `watch`, `unwatch` | Yes, by session id only |
-| `user_message`, `steer` | Only to a session whose approval mode is known and no looser than `max_mode`. `images` must be uploads |
-| `interrupt`, `question_answer` | Yes |
-| `approve` | `decision` `allow` or `deny`, for a pending request of that session, while `approvals` is on. Refused: `always`, a `scope` other than `once`, `prefix`, `hunks`, `add_dir`, and any request with `kind: "elevation"` |
-| `decide_action` | An open deferred action, while `approvals` is on. Allowing an action with `kind: "elevation"` is refused |
-| `set_approval_mode` | Only to a mode no looser than `max_mode`; never `full-access` |
-| `approve_plan` | `approve` with a `mode` no looser than `max_mode`, or `revise` |
+| `user_message`, `steer` | LynShen only. Only to a session whose approval mode is known and no looser than `max_mode`. `images` must be uploads |
+| `interrupt` | Yes |
+| `question_answer` | LynShen only: the session that asked |
+| `approve` | LynShen only. `decision` `allow` or `deny`, for a pending request of that session, while `approvals` is on. Refused: `always`, a `scope` other than `once`, `prefix`, `hunks`, `add_dir`, and any request with `kind: "elevation"` |
+| `decide_action` | LynShen only. An open deferred action, while `approvals` is on. Allowing an action with `kind: "elevation"` is refused |
+| `set_approval_mode` | LynShen only. Only to a mode no looser than `max_mode`; never `full-access` |
+| `approve_plan` | LynShen only. `approve` with a `mode` no looser than `max_mode`, or `revise` |
 | `fs_read`, `git_status`, `git_diff` | Yes, with the rules of `fs_*` (known directories, credentials unreadable) |
 | `term_*`, `session_tui` | No: "open a terminal on the desktop or the phone page" |
 | Everything else (`project_*`, `workspaces_set`, `agent_*` writes, schedules, requirements, MCP, skills, devices, relay, connectors, uploads, `command`, `set_sandbox`, `dispatch_*`, `message_send`, `push_*`) | No |
@@ -185,6 +195,9 @@ Thus, from a chat, nobody can:
 
 - switch a session to full access (全自动 or 完全访问), or drive a session
   that runs in it;
+- message, switch, approve in or answer a session of another engine (Claude
+  Code, Codex, OpenCode and other ACP agents): it is used on the desktop or
+  the phone page;
 - allow a call "always" (for the session or the project);
 - approve sudo or another elevation;
 - open a terminal or a session's TUI;
@@ -201,7 +214,7 @@ The bot says so in plain words and points to the desktop or the phone page
 | `/help`, `帮助` | The command list |
 | `/new [n\|name]`, `新建` | A new session in a project. Without an argument it lists the projects with numbers |
 | `/chat`, `聊天` | A new chat session (`chat: true`: no project files) |
-| `/sessions`, `会话` | The 10 most recent sessions, numbered, with their state and a mark when an approval waits |
+| `/sessions`, `会话` | The 10 most recent LynShen sessions, numbered, with their state and a mark when an approval waits. Sessions of other engines are not listed |
 | `/use <n>`, `切换 <n>` | Makes a session from `/sessions` the current one |
 | plain text | Goes to the current session as the user's message. While a turn runs, the engine queues it. With no current session, a new chat session starts |
 | `/stop`, `停止` | `interrupt` |
@@ -216,7 +229,10 @@ The bot says so in plain words and points to the desktop or the phone page
 A binding has one current session, saved in `connectors-state.json`. A
 session started from chat is a LynShen session; when its approval mode is
 looser than `max_mode`, the connector sets it to `max_mode` before the
-first message.
+first message. When the current session is not a LynShen session (a state
+saved by an earlier version), messages, `/mode` and approvals are refused
+with a message that points to `/sessions` and `/new`. Questions and deferred
+actions of other engines' sessions are not posted.
 
 The bot answers in Chinese, or in English when the platform says the
 account's language is not Chinese (Telegram's `language_code`).
