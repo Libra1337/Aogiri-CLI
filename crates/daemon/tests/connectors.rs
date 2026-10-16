@@ -1036,3 +1036,298 @@ fn a_discord_dm_binding_drives_a_session_with_buttons() {
         assert!(!body.to_string().contains(DISCORD_TOKEN));
     }
 }
+
+const QQ_APP_ID: &str = "102030405";
+const QQ_SECRET: &str = "qqSecretABCDEF123456";
+const QQ_OWNER: &str = "OPENID42";
+
+/// A fake QQ open platform: the access token, OpenAPI and the gateway.
+#[derive(Clone)]
+struct Qq {
+    api: String,
+    calls: Arc<Mutex<Vec<(String, String, Value)>>>,
+    events: Arc<Mutex<Vec<Value>>>,
+    identify: Arc<Mutex<Option<Value>>>,
+}
+
+impl Qq {
+    fn start() -> Self {
+        let gateway = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway_url = format!("ws://{}", gateway.local_addr().unwrap());
+        let rest = TcpListener::bind("127.0.0.1:0").unwrap();
+        let fake = Self {
+            api: format!("http://{}", rest.local_addr().unwrap()),
+            calls: Arc::default(),
+            events: Arc::default(),
+            identify: Arc::default(),
+        };
+        let served = fake.clone();
+        thread::spawn(move || {
+            for stream in rest.incoming() {
+                let Ok(stream) = stream else { continue };
+                let fake = served.clone();
+                let gateway_url = gateway_url.clone();
+                thread::spawn(move || fake.serve_rest(stream, &gateway_url));
+            }
+        });
+        let served = fake.clone();
+        thread::spawn(move || {
+            for stream in gateway.incoming() {
+                let Ok(stream) = stream else { continue };
+                let fake = served.clone();
+                thread::spawn(move || fake.serve_gateway(stream));
+            }
+        });
+        fake
+    }
+
+    fn serve_rest(&self, stream: TcpStream, gateway: &str) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut stream = stream;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let mut parts = line.split_whitespace();
+            let (method, path) = (
+                parts.next().unwrap_or_default().to_string(),
+                parts.next().unwrap_or_default().to_string(),
+            );
+            let (mut length, mut auth) = (0, String::new());
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                    return;
+                }
+                let header = header.trim_end();
+                if header.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = header.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                    if name.eq_ignore_ascii_case("authorization") {
+                        auth = value.trim().to_string();
+                    }
+                }
+            }
+            let mut body = vec![0u8; length];
+            if reader.read_exact(&mut body).is_err() {
+                return;
+            }
+            let json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            if path == "/app/getAppAccessToken" {
+                let answer = if json["appId"] == QQ_APP_ID && json["clientSecret"] == QQ_SECRET {
+                    json!({ "access_token": "qq-access-1", "expires_in": "7200" })
+                } else {
+                    json!({ "code": 100016, "message": "invalid appid or secret" })
+                };
+                respond(&mut stream, "200 OK", answer.to_string().as_bytes());
+                continue;
+            }
+            if auth != "QQBot qq-access-1" {
+                respond(
+                    &mut stream,
+                    "401 Unauthorized",
+                    br#"{"code":11241,"message":"token invalid"}"#,
+                );
+                continue;
+            }
+            let answer = match (method.as_str(), path.as_str()) {
+                ("GET", "/users/@me") => json!({ "id": "qqbot-1", "username": "LynShen助手" }),
+                ("GET", "/gateway") => json!({ "url": gateway }),
+                ("POST", p) if p.starts_with("/v2/users/") => {
+                    json!({ "id": format!("sent-{}", self.calls.lock().unwrap().len()), "timestamp": "2026-10-16T10:00:00+08:00" })
+                }
+                _ => json!({}),
+            };
+            self.calls.lock().unwrap().push((method, path, json));
+            respond(&mut stream, "200 OK", answer.to_string().as_bytes());
+        }
+    }
+
+    fn serve_gateway(&self, stream: TcpStream) {
+        let mut socket = tungstenite::accept(stream).unwrap();
+        let send = |socket: &mut WebSocket<TcpStream>, frame: Value| {
+            socket.send(Message::text(frame.to_string())).is_ok()
+        };
+        send(
+            &mut socket,
+            json!({ "op": 10, "d": { "heartbeat_interval": 45000 } }),
+        );
+        let identify: Value = match socket.read() {
+            Ok(Message::Text(text)) => serde_json::from_str(text.as_str()).unwrap(),
+            _ => return,
+        };
+        *self.identify.lock().unwrap() = Some(identify);
+        send(
+            &mut socket,
+            json!({ "op": 0, "t": "READY", "s": 1, "d": {
+                "version": 1, "session_id": "qq-sess-1", "user": { "id": "qqbot-1", "username": "LynShen助手", "bot": true }, "shard": [0, 1]
+            }}),
+        );
+        socket
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut seq = 1;
+        loop {
+            let queued: Vec<Value> = std::mem::take(&mut *self.events.lock().unwrap());
+            for (kind, data) in queued.iter().map(|e| (e["t"].clone(), e["d"].clone())) {
+                seq += 1;
+                if !send(
+                    &mut socket,
+                    json!({ "op": 0, "t": kind, "s": seq, "d": data }),
+                ) {
+                    return;
+                }
+            }
+            match socket.read() {
+                Ok(Message::Text(text)) => {
+                    let frame: Value = serde_json::from_str(text.as_str()).unwrap_or(Value::Null);
+                    if frame["op"] == 1 && !send(&mut socket, json!({ "op": 11 })) {
+                        return;
+                    }
+                }
+                Ok(Message::Close(_)) => return,
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// A single-chat message from `from`, with its message id.
+    fn say(&self, from: &str, id: &str, text: &str) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(json!({ "t": "C2C_MESSAGE_CREATE", "d": {
+                "id": id, "content": text, "author": { "user_openid": from }, "attachments": []
+            }}));
+    }
+
+    fn calls(&self) -> Vec<(String, String, Value)> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    /// A message the bot sent to `user` whose text contains `part`.
+    fn wait_for_text(&self, after: usize, user: &str, part: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let path = format!("/v2/users/{user}/messages");
+        while Instant::now() < deadline {
+            if let Some((_, _, body)) =
+                self.calls()
+                    .into_iter()
+                    .skip(after)
+                    .find(|(method, p, body)| {
+                        let text = body["markdown"]["content"]
+                            .as_str()
+                            .or(body["content"].as_str())
+                            .unwrap_or_default();
+                        method == "POST" && *p == path && text.contains(part)
+                    })
+            {
+                return body;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no message with {part}; calls: {:#?}", self.calls());
+    }
+}
+
+#[test]
+fn a_qq_single_chat_binding_answers_approvals_as_text() {
+    if cfg!(windows) {
+        return;
+    }
+    let _guard = setup();
+    let qq = Qq::start();
+    let (address, token, state) = start_daemon();
+    let mut desktop = Client::connect(&address, &token);
+    // A wrong secret is refused before anything is saved.
+    desktop.send(json!({
+        "op": "connector_add", "id": "bad", "platform": "qq",
+        "app_id": QQ_APP_ID, "secret": "wrongSecret123456", "api": qq.api, "proxy": "direct",
+    }));
+    assert_eq!(desktop.until(|frame| frame["id"] == "bad")["type"], "error");
+    desktop.send(json!({
+        "op": "connector_add", "id": "add", "platform": "qq",
+        "app_id": QQ_APP_ID, "secret": QQ_SECRET, "api": qq.api, "proxy": "direct",
+    }));
+    let added = desktop.until(|frame| frame["id"] == "add");
+    assert_eq!(added["type"], "connector_added", "{added}");
+    assert_eq!(added["connector"]["name"], "@LynShen助手");
+    assert_eq!(added["connector"]["link"], Value::Null);
+    let connector = added["connector"]["id"].as_str().unwrap().to_string();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        desktop.send(json!({ "op": "connector_list", "id": "list" }));
+        let list = desktop.until(|frame| frame["id"] == "list");
+        if list["connectors"][0]["state"] == "connected" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never connected: {list}");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let identify = qq.identify.lock().unwrap().clone().unwrap();
+    assert_eq!(identify["d"]["intents"], 1 << 25);
+    assert_eq!(identify["d"]["token"], "QQBot qq-access-1");
+    assert_eq!(identify["d"]["shard"], json!([0, 1]));
+
+    desktop.send(json!({ "op": "connector_bind_start", "id": "code", "connector": connector }));
+    let code = desktop.until(|frame| frame["id"] == "code");
+    let bind = format!("/bind {}", code["code"].as_str().unwrap());
+    let before = qq.calls().len();
+    // QQ may push one message twice: it binds and answers once.
+    qq.say(QQ_OWNER, "m-1", &bind);
+    qq.say(QQ_OWNER, "m-1", &bind);
+    let welcome = qq.wait_for_text(before, QQ_OWNER, "绑定成功");
+    // A reply to the user's message, as Markdown.
+    assert_eq!(welcome["msg_type"], 2);
+    assert_eq!(welcome["msg_id"], "m-1");
+    thread::sleep(Duration::from_millis(800));
+    let welcomes = qq
+        .calls()
+        .iter()
+        .filter(|(_, _, body)| body.to_string().contains("绑定成功"))
+        .count();
+    assert_eq!(welcomes, 1);
+
+    let before = qq.calls().len();
+    qq.say(QQ_OWNER, "m-2", "/chat");
+    qq.wait_for_text(before, QQ_OWNER, "已新建聊天会话");
+    qq.say(QQ_OWNER, "m-3", "/mode manual");
+    qq.wait_for_text(before, QQ_OWNER, "已切换为「谨慎」");
+    let before = qq.calls().len();
+    qq.say(QQ_OWNER, "m-4", "RUN: echo qq-ok");
+    // No buttons on QQ: the card names its id for a text answer.
+    let card = qq.wait_for_text(before, QQ_OWNER, "回复「允许 ");
+    let text = card["markdown"]["content"].as_str().unwrap().to_string();
+    let id = text
+        .split("回复「允许 ")
+        .nth(1)
+        .and_then(|rest| rest.split('」').next())
+        .unwrap()
+        .to_string();
+    qq.say(QQ_OWNER, "m-5", &format!("允许 {id}"));
+    qq.wait_for_text(before, QQ_OWNER, "已允许");
+    qq.wait_for_text(before, QQ_OWNER, "tool said");
+    // No status message: QQ cannot edit one.
+    assert!(!qq
+        .calls()
+        .iter()
+        .skip(before)
+        .any(|(_, _, body)| body.to_string().contains("思考中")));
+    for (_, _, body) in qq.calls() {
+        assert!(!body.to_string().contains(QQ_SECRET));
+    }
+    let saved = fs::read_to_string(state.join("connectors.json")).unwrap();
+    assert!(saved.contains(QQ_APP_ID));
+}

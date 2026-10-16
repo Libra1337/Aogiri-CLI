@@ -466,6 +466,7 @@ mod tests {
             name: "@bot".to_string(),
             username: "bot".to_string(),
             bot_id: "1".to_string(),
+            app_id: None,
             enabled: false,
             proxy: None,
             api: None,

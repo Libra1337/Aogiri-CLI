@@ -14,6 +14,7 @@ mod chat;
 mod discord;
 mod net;
 mod profile;
+mod qq;
 mod redact;
 mod render;
 mod telegram;
@@ -106,6 +107,8 @@ pub(crate) struct Connector {
     pub username: String,
     /// The platform's id of the bot: one connector per bot.
     pub bot_id: String,
+    /// QQ: the bot's AppID (not a secret; the AppSecret is `token`).
+    pub app_id: Option<String>,
     pub enabled: bool,
     /// None: the environment's proxy; `direct`; or an `http://` URL.
     pub proxy: Option<String>,
@@ -133,6 +136,7 @@ impl Connector {
             name: text("name"),
             username: text("username"),
             bot_id: text("bot_id"),
+            app_id: value["app_id"].as_str().map(str::to_string),
             enabled: value["enabled"].as_bool().unwrap_or(true),
             proxy: value["proxy"].as_str().map(str::to_string),
             api: value["api"].as_str().map(str::to_string),
@@ -150,6 +154,7 @@ impl Connector {
             "name": self.name,
             "username": self.username,
             "bot_id": self.bot_id,
+            "app_id": self.app_id,
             "enabled": self.enabled,
             "proxy": self.proxy,
             "api": self.api,
@@ -179,6 +184,7 @@ impl Connector {
         self.api.clone().unwrap_or_else(|| {
             match self.platform.as_str() {
                 "discord" => discord::ORIGIN,
+                "qq" => qq::ORIGIN,
                 _ => telegram::ORIGIN,
             }
             .to_string()
@@ -686,12 +692,14 @@ pub(crate) fn handle(hub: &Arc<Hub>, name: &str, op: &Value) -> Result<Value, St
 }
 
 /// The platforms a connector can be for, with the prefix of their ids.
-const PLATFORMS: [(&str, &str); 2] = [("telegram", "tg"), ("discord", "dc")];
+const PLATFORMS: [(&str, &str); 3] = [("telegram", "tg"), ("discord", "dc"), ("qq", "qq")];
 
-/// Checks a token's shape before anything is sent with it.
-fn check_token(platform: &str, token: &str) -> Result<(), String> {
+/// Checks a token's shape (QQ: the AppSecret, with its AppID) before
+/// anything is sent with it.
+fn check_token(platform: &str, app_id: Option<&str>, token: &str) -> Result<(), String> {
     match platform {
         "discord" => discord::check_token(token),
+        "qq" => qq::check_credentials(app_id.unwrap_or_default(), token),
         _ => telegram::check_token(token),
     }
 }
@@ -700,6 +708,9 @@ fn check_token(platform: &str, token: &str) -> Result<(), String> {
 fn probe(connector: &Connector) -> Result<(String, String), String> {
     match connector.platform.as_str() {
         "discord" => discord::Api::new(connector)?
+            .me()
+            .map(|bot| (bot.id, bot.username)),
+        "qq" => qq::Api::new(connector)?
             .me()
             .map(|bot| (bot.id, bot.username)),
         _ => telegram::Api::new(connector)?
@@ -712,11 +723,22 @@ fn add(hub: &Arc<Hub>, op: &Value) -> Result<Value, String> {
     let platform = op["platform"].as_str().unwrap_or_default();
     let Some((_, prefix)) = PLATFORMS.iter().find(|(name, _)| *name == platform) else {
         return Err(format!(
-            "unknown platform {platform}: use telegram or discord"
+            "unknown platform {platform}: use telegram, discord or qq"
         ));
     };
-    let token = op["token"].as_str().unwrap_or_default().trim().to_string();
-    check_token(platform, &token)?;
+    // QQ signs in with an AppID and an AppSecret (`secret`, or `token`).
+    let token = op["token"]
+        .as_str()
+        .or(op["secret"].as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let app_id = op["app_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    check_token(platform, app_id.as_deref(), &token)?;
     let proxy = proxy_setting(&op["proxy"])?;
     let api = api_setting(&op["api"])?;
     let mut connector = Connector {
@@ -728,6 +750,7 @@ fn add(hub: &Arc<Hub>, op: &Value) -> Result<Value, String> {
         name: String::new(),
         username: String::new(),
         bot_id: String::new(),
+        app_id: (platform == "qq").then_some(app_id).flatten(),
         enabled: true,
         proxy,
         api,
@@ -743,7 +766,11 @@ fn add(hub: &Arc<Hub>, op: &Value) -> Result<Value, String> {
     {
         return Err("this bot is already added".to_string());
     }
-    connector.name = format!("@{username}");
+    connector.name = if username.is_empty() {
+        format!("AppID {bot_id}")
+    } else {
+        format!("@{username}")
+    };
     connector.username = username;
     connector.bot_id = bot_id;
     {
@@ -770,9 +797,13 @@ fn set(hub: &Arc<Hub>, id: &str, op: &Value) -> Result<Value, String> {
         Some(value) => Some(proxy_setting(value)?),
         None => None,
     };
-    let token = match op["token"].as_str().map(str::trim) {
+    let token = match op["token"]
+        .as_str()
+        .or(op["secret"].as_str())
+        .map(str::trim)
+    {
         Some(token) => {
-            check_token(&before.platform, token)?;
+            check_token(&before.platform, before.app_id.as_deref(), token)?;
             Some((token.to_string(), seal(token)?))
         }
         None => None,
@@ -917,6 +948,13 @@ fn start(hub: &Arc<Hub>, id: &str) {
             let mut resume = discord::Resume::default();
             spawn(hub, id, api, move |hub, id, stop, events, connected| {
                 discord::receive(hub, id, &receiver, stop, events, connected, &mut resume)
+            })
+        }),
+        "qq" => qq::Api::new(&connector).map(|api| {
+            let receiver = api.clone();
+            let mut resume = qq::Resume::default();
+            spawn(hub, id, api, move |hub, id, stop, events, connected| {
+                qq::receive(hub, id, &receiver, stop, events, connected, &mut resume)
             })
         }),
         _ => telegram::Api::new(&connector).map(|api| {
@@ -1119,6 +1157,7 @@ mod tests {
             name: "@bot".to_string(),
             username: "bot".to_string(),
             bot_id: "1".to_string(),
+            app_id: None,
             enabled: true,
             proxy: Some("http://u:p@127.0.0.1:7890".to_string()),
             api: None,
