@@ -91,7 +91,6 @@ pub(crate) struct Incoming {
     pub name: String,
     /// The sender's language as the platform reports it (`zh-hans`, `en`).
     pub lang: String,
-    pub id: String,
     pub text: String,
     /// Forwarded from someone else.
     pub forwarded: bool,

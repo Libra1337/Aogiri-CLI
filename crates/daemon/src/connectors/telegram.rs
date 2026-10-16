@@ -27,6 +27,7 @@ const MAX_OUT: u64 = 50 * 1024 * 1024;
 const TEXT: usize = 3500;
 
 /// The bot behind a token.
+#[derive(Debug)]
 pub(crate) struct Bot {
     pub id: String,
     pub username: String,
@@ -500,7 +501,6 @@ pub(crate) fn parse(update: &Value) -> Option<Inbound> {
                 .as_str()
                 .unwrap_or_default()
                 .to_string(),
-            id: id_text(&message["message_id"])?,
             text,
             forwarded: [
                 "forward_origin",
