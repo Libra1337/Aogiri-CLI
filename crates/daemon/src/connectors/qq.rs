@@ -150,10 +150,10 @@ impl Api {
         Err(Failure::Http(status, format!("{message}{code}")))
     }
 
-    /// The access token, fetched again a minute before it runs out.
+    /// The access token, fetched again a minute before it runs out. The
+    /// lock is not held over the request: `scrub` takes it too.
     fn access_token(&self) -> Result<String, Failure> {
-        let mut slot = lock(&self.access);
-        if let Some((token, until)) = slot.as_ref() {
+        if let Some((token, until)) = lock(&self.access).as_ref() {
             if Instant::now() + Duration::from_secs(60) < *until {
                 return Ok(token.clone());
             }
@@ -180,7 +180,7 @@ impl Api {
             .as_u64()
             .or_else(|| reply["expires_in"].as_str().and_then(|s| s.parse().ok()))
             .unwrap_or(7200);
-        *slot = Some((token.clone(), Instant::now() + Duration::from_secs(seconds)));
+        *lock(&self.access) = Some((token.clone(), Instant::now() + Duration::from_secs(seconds)));
         Ok(token)
     }
 
