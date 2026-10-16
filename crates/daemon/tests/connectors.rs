@@ -308,11 +308,17 @@ impl Client {
 
 /// A daemon on its own state, with the address and its local token.
 fn start_daemon() -> (String, String, PathBuf) {
+    start_daemon_with(|_| {})
+}
+
+/// `start_daemon` on a state `prepare` wrote first (as earlier runs left it).
+fn start_daemon_with(prepare: impl FnOnce(&Store)) -> (String, String, PathBuf) {
     let root = temp_dir("connectors-state");
     let state = root.join("daemon");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let store = Store::open(state.clone()).unwrap();
+    prepare(&store);
     let token = store.token().unwrap();
     let agents = lynshen_daemon::Agents::open(root.join("agents")).unwrap();
     thread::spawn(move || lynshen_daemon::serve(listener, store, agents, None, "test", None));
@@ -554,6 +560,98 @@ fn a_telegram_binding_drives_a_session_and_answers_approvals_from_chat() {
     for (_, body) in telegram.calls() {
         assert!(!body.to_string().contains(TOKEN));
     }
+}
+
+/// Binds the owner's account with a code from the desktop; the binding's
+/// device.
+fn bind_owner(desktop: &mut Client, telegram: &Telegram, connector: &str) -> String {
+    desktop.send(json!({ "op": "connector_bind_start", "id": "code", "connector": connector }));
+    let code = desktop.until(|frame| frame["id"] == "code");
+    let code = code["code"].as_str().unwrap().to_string();
+    let before = telegram.calls().len();
+    telegram.say(OWNER, &format!("/start {code}"));
+    let bound = desktop.until(|frame| frame["type"] == "connector_bound");
+    telegram.wait_for(before, |method, body| {
+        method == "sendMessage"
+            && body["chat_id"] == OWNER
+            && body["text"].as_str().unwrap().contains("绑定成功")
+    });
+    bound["device"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn a_chat_binding_lists_and_picks_lynshen_sessions_only() {
+    if cfg!(windows) {
+        return;
+    }
+    let _guard = setup();
+    let project = temp_dir("connectors-engines");
+    fs::create_dir_all(&project).unwrap();
+    let telegram = Telegram::start();
+    // A Claude Code and an OpenCode (ACP) session from earlier desktop runs.
+    let (address, token, _) = start_daemon_with(|store| {
+        for (id, engine, title) in [
+            ("claude-1", "claude", "克劳德的会话"),
+            ("acp-1", "acp", "OpenCode 的会话"),
+        ] {
+            store
+                .record_engine_session(id, &project, None, Some(engine), false)
+                .unwrap();
+            store
+                .record_session_meta(id, &json!({ "title": title }))
+                .unwrap();
+        }
+    });
+    let mut desktop = Client::connect(&address, &token);
+    desktop.send(json!({ "op": "session_list", "id": "list" }));
+    let listed = desktop.until(|frame| frame["id"] == "list");
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 2, "{listed}");
+    let connector = add_connector(&mut desktop, &telegram);
+    bind_owner(&mut desktop, &telegram, &connector);
+    let others = |text: &str| text.contains("克劳德的会话") || text.contains("OpenCode 的会话");
+
+    // The chat sees no session it may drive, and cannot pick the others.
+    let before = telegram.calls().len();
+    telegram.say(OWNER, "/sessions");
+    telegram.wait_for(before, |method, body| {
+        method == "sendMessage" && body["text"].as_str().unwrap().contains("还没有会话")
+    });
+    telegram.say(OWNER, "/use 1");
+    telegram.wait_for(before, |method, body| {
+        method == "sendMessage"
+            && body["text"]
+                .as_str()
+                .unwrap()
+                .contains("发 /sessions 看编号")
+    });
+    assert!(!telegram.texts_to(before, OWNER).iter().any(|t| others(t)));
+
+    // A chat session is listed alone, and picked by its number.
+    telegram.say(OWNER, "/chat");
+    telegram.wait_for(before, |method, body| {
+        method == "sendMessage" && body["text"].as_str().unwrap().contains("已新建聊天会话")
+    });
+    let before = telegram.calls().len();
+    telegram.say(OWNER, "/sessions");
+    let list = telegram.wait_for(before, |method, body| {
+        method == "sendMessage" && body["text"].as_str().unwrap().contains("最近的会话")
+    });
+    let list = list["text"].as_str().unwrap().to_string();
+    assert!(list.contains("1. ") && !list.contains("\n2. "), "{list}");
+    assert!(!others(&list), "{list}");
+    telegram.say(OWNER, "/use 2");
+    telegram.wait_for(before, |method, body| {
+        method == "sendMessage"
+            && body["text"]
+                .as_str()
+                .unwrap()
+                .contains("发 /sessions 看编号")
+    });
+    telegram.say(OWNER, "/use 1");
+    telegram.wait_for(before, |method, body| {
+        method == "sendMessage" && body["text"].as_str().unwrap().contains("已切换到")
+    });
+    assert!(!telegram.texts_to(before, OWNER).iter().any(|t| others(t)));
 }
 
 /// A paired phone's token (`/api/pair` with a desktop's pairing code).
