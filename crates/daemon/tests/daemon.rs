@@ -2728,6 +2728,161 @@ fn an_acp_session_reopens_the_agents_own_conversation() {
     assert_eq!(claude_reply(&frames, &session), "ok: again #2");
 }
 
+/// The fake ACP agent as `opencode` in a folder of its own.
+#[cfg(unix)]
+fn fake_opencode() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = temp_dir("fake-opencode-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let opencode = bin.join("opencode");
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_acp.py"),
+        &opencode,
+    )
+    .unwrap();
+    fs::set_permissions(&opencode, fs::Permissions::from_mode(0o755)).unwrap();
+    opencode
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_modes_run_on_its_agents_and_a_conversation_can_be_copied() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-opencode");
+    fs::create_dir_all(&dir).unwrap();
+    let store = temp_dir("fake-opencode-store");
+    fs::create_dir_all(&store).unwrap();
+    let opencode = fake_opencode();
+    // The user's own OpenCode rules: commands allowed, `rm` denied.
+    let env = json!({
+        "FAKE_ACP_STORE": store,
+        "FAKE_OPENCODE_CONFIG": r#"{"permission":{"bash":{"*":"allow","rm *":"deny"}}}"#,
+    });
+    let options =
+        json!({ "command": opencode, "args": ["acp"], "env": env, "approval_mode": "auto-edit" });
+    let mut desktop = Client::connect(&daemon);
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": options }),
+    );
+    let session = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    desktop.send(json!({ "op": "watch", "session": session }));
+    desktop.until(|f| f["session"] == session.as_str() && f["type"] == "attended");
+
+    // 自动编辑: the daemon's ask agent, with the user's deny kept; the edit
+    // goes ahead without a card.
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "please edit" }));
+    let frames = desktop.until(turn_done(&session));
+    assert_eq!(
+        claude_reply(&frames, &session),
+        "ok: please edit (edited) #1 mode=aogiri rm=deny"
+    );
+    assert!(
+        !frames.iter().any(|f| f["type"] == "approval_request"),
+        "{frames:#?}"
+    );
+    // 谨慎: the same agent, and the edit asks.
+    desktop.send(json!({ "op": "set_approval_mode", "session": session, "mode": "read-only" }));
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "edit again" }));
+    let asked =
+        desktop.until(|f| f["session"] == session.as_str() && f["type"] == "approval_request");
+    let call = asked.last().unwrap()["call_id"].clone();
+    desktop
+        .send(json!({ "op": "approve", "session": session, "call_id": call, "decision": "deny" }));
+    let frames = desktop.until(turn_done(&session));
+    assert_eq!(
+        claude_reply(&frames, &session),
+        "ok: edit again (not edited) #2 mode=aogiri rm=deny"
+    );
+    // 全自动: OpenCode's own build agent.
+    desktop.send(json!({ "op": "set_approval_mode", "session": session, "mode": "full-auto" }));
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "hi" }));
+    let frames = desktop.until(turn_done(&session));
+    assert_eq!(
+        claude_reply(&frames, &session),
+        "ok: hi #3 mode=build rm=deny"
+    );
+
+    // A copy: a new session forks the conversation; the original is left as
+    // it was, and the session list names the desktop's agent.
+    let forked = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": {
+            "command": opencode, "args": ["acp"], "env": env, "approval_mode": "plan",
+            "fork": "agent-1", "acp_agent": { "id": "opencode", "name": "OpenCode" },
+        } }),
+    );
+    let copy = forked["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{forked}"))
+        .to_string();
+    desktop.send(json!({ "op": "watch", "session": copy }));
+    let frames = desktop.until(|f| {
+        f["session"] == copy.as_str()
+            && f["type"] == "transcript"
+            && f["items"].as_array().is_some_and(|items| items.len() == 6)
+    });
+    let items = frames.last().unwrap()["items"].clone();
+    assert_eq!(
+        items[4],
+        json!({ "role": "user", "content": "hi" }),
+        "{items}"
+    );
+    desktop.send(json!({ "op": "user_message", "session": copy, "content": "more" }));
+    let frames = desktop.until(turn_done(&copy));
+    assert_eq!(
+        claude_reply(&frames, &copy),
+        "ok: more #4 mode=plan rm=deny"
+    );
+    let original: Value =
+        serde_json::from_str(&fs::read_to_string(store.join("agent-1.json")).unwrap()).unwrap();
+    assert_eq!(original.as_array().unwrap().len(), 3);
+    let listed = request(&mut desktop, json!({ "op": "session_list" }));
+    let entry = listed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session"] == copy.as_str())
+        .cloned()
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert_eq!(entry["acp_agent"]["id"], "opencode");
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_2_is_refused() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-opencode-2");
+    fs::create_dir_all(&dir).unwrap();
+    let opencode = fake_opencode();
+    let mut desktop = Client::connect(&daemon);
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": {
+            "command": opencode, "args": ["acp"], "env": { "FAKE_OPENCODE_VERSION": "2.0.29" },
+        } }),
+    );
+    let session = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    desktop.send(json!({ "op": "watch", "session": session }));
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "hi" }));
+    let frames = desktop.until(|f| {
+        f["session"] == session.as_str()
+            && f["type"] == "error"
+            && f["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("OpenCode 1.x"))
+    });
+    assert!(!frames.iter().any(|f| f["type"] == "assistant_delta"));
+}
+
 #[test]
 fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
     let _guard = setup();

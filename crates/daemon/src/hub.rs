@@ -346,6 +346,10 @@ impl Hub {
         }
         let agent = agent.map(str::to_string);
         let gateway = options.gateway == Some(true);
+        let acp_agent = options
+            .acp_agent
+            .clone()
+            .filter(|_| engine == Some(engines::Kind::Acp));
         let mut hook_stopper = None;
         let (id, ops, generation) = match engine {
             None => {
@@ -372,6 +376,12 @@ impl Hub {
                 gateway,
             )
             .map_err(|error| error.to_string())?;
+        // Which of the desktop's ACP agents runs it: a client can start it again.
+        if let Some(acp_agent) = acp_agent {
+            self.store
+                .record_session_meta(&id, &json!({ "acp_agent": acp_agent }))
+                .map_err(|error| error.to_string())?;
+        }
         lock(&self.untitled).insert(id.clone());
         self.host(id.clone(), ops, cwd, generation);
         self.set_hook_stopper(&id, hook_stopper);
@@ -440,6 +450,7 @@ impl Hub {
                     gateway: false,
                     group: None,
                     conversation: None,
+                    acp_agent: None,
                 }
             }
             (None, None) => return Err(format!("unknown session {id}")),
@@ -480,6 +491,8 @@ impl Hub {
                         _ => saved.then(|| id.to_string()),
                     },
                     gateway: Some(options.gateway.unwrap_or(record.gateway)),
+                    // A copy is made once, when the session is created.
+                    fork: None,
                     ..options
                 };
                 gateway = options.gateway == Some(true);
@@ -1676,6 +1689,7 @@ impl Hub {
                     "group": record.group,
                     "gateway": record.gateway,
                     "engine": record.engine.as_deref().unwrap_or("lynshen"),
+                    "acp_agent": record.acp_agent,
                     "agent": record.agent,
                     "open": hosted.is_some(),
                     "watchers": hosted.map(|h| h.watchers.len()).unwrap_or(0),
@@ -1919,6 +1933,7 @@ mod tests {
             gateway: false,
             group: None,
             conversation: None,
+            acp_agent: None,
         };
         assert_eq!(
             shown_title(&record, Some(&scheduled)).as_deref(),
