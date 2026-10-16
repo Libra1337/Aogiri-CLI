@@ -617,6 +617,7 @@ mod tests {
             name: String::new(),
             username: String::new(),
             bot_id: String::new(),
+            app_id: None,
             enabled: true,
             proxy: Some("direct".to_string()),
             api: Some("http://127.0.0.1:9".to_string()),

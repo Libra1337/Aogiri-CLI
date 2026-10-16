@@ -13,7 +13,7 @@ Platforms:
 | --- | --- | --- |
 | Telegram | Bot API, `getUpdates` long polling over HTTPS | Implemented |
 | Discord | Gateway WebSocket (direct messages only) and REST | Implemented |
-| QQ official bot | WebSocket gateway and REST | Planned (batch 1) |
+| QQ official bot | WebSocket gateway (single chats) and OpenAPI | Implemented (no buttons, no edits, no files out yet) |
 | WeChat ClawBot, WeCom, Feishu | | Later batches |
 
 Background and the decisions behind this design: the owner's decision of
@@ -52,6 +52,10 @@ Rules:
 
 1. The user creates a bot on the platform and copies its token.
    - Telegram: @BotFather `/newbot`.
+   - QQ: QQ 开放平台 → 创建机器人; the AppID and the AppSecret (开发设置).
+     An unverified bot talks with its admin and up to 20 test accounts,
+     which is enough for one's own bot. In 开发设置 → 回调配置 choose the
+     WebSocket mode.
    - Discord: Developer Portal → New Application → Bot → Reset Token. The
      bot takes direct messages only from people it shares a server with:
      the user adds it to a server of their own with the connector's `link`
@@ -100,8 +104,8 @@ binding cannot read or change connectors or credentials.
 | Op | Fields | Reply |
 | --- | --- | --- |
 | `connector_list` | — | `connectors` |
-| `connector_add` | `platform` (`telegram` or `discord`), `token`, optional `proxy`, `api` | `connector_added` with `connector`; every local client receives `connectors`. The daemon checks the token first; a wrong token or no connection is an error, and nothing is saved |
-| `connector_set` | `connector`, any of `enabled`, `proxy`, `token`, `approvals`, `notify`, `max_mode` | `connectors`. A new `token`, `proxy` or `enabled` restarts the connection |
+| `connector_add` | `platform` (`telegram`, `discord` or `qq`), `token` (QQ: `app_id` and `secret`), optional `proxy`, `api` | `connector_added` with `connector`; every local client receives `connectors`. The daemon checks the token first; a wrong token or no connection is an error, and nothing is saved |
+| `connector_set` | `connector`, any of `enabled`, `proxy`, `token` (QQ: `secret`), `approvals`, `notify`, `max_mode` | `connectors`. A new `token`, `proxy` or `enabled` restarts the connection |
 | `connector_remove` | `connector` | `connector_removed` with `connector`; its bindings are revoked and its credentials deleted |
 | `connector_bind_start` | `connector` | `connector_bind_code` with `connector`, `code`, `expires_at` and `link` (Telegram; `null` for other platforms) |
 
@@ -360,3 +364,37 @@ A path to a credentials file or directory (`.ssh/`, `.aws/`, `.gnupg/`,
   until its settings change; 4007 and 4009 start a new session.
 - The bot answers in Chinese: Discord does not report the account's
   language in a message.
+
+## QQ
+
+- Credentials: the AppID and the AppSecret. The connector signs in with
+  `POST https://api.bot.qq.com/app/getAppAccessToken` for an access token
+  (about 2 hours) and fetches a new one a minute before it runs out. The
+  AppID is saved as it is; the AppSecret like any token (`jcenc1` when
+  asked). `api` replaces the origin (a test server). QQ needs no proxy in
+  mainland China.
+- OpenAPI: `https://api.bot.qq.com` with `Authorization: QQBot <access
+  token>` and `X-Union-Appid`.
+- Receiving: the gateway from `GET /gateway`, Identify with
+  `intents: 33554432` (`GROUP_AND_C2C_EVENT`, 1 << 25) and `shard: [0, 1]`,
+  heartbeats at the interval Hello names, Resume (op 6) after a drop. Only
+  `C2C_MESSAGE_CREATE` (single chats) counts; group messages are ignored.
+  The sender is `author.user_openid`, fixed for the pair of user and bot.
+  QQ may push one message twice: the connector drops a message id it saw.
+- Close codes 4914 (offline: sandbox only), 4915 (banned), 4013 and 4014
+  (events) stop the connector until its settings change; 4009 resumes;
+  others identify again.
+- Sending: `POST /v2/users/<openid>/messages` as Markdown (`msg_type` 2), as
+  text (`msg_type` 0) when QQ refuses it. Within 55 minutes of the user's
+  message, a reply answers it (`msg_id`, `msg_seq`, at most 4 times); after
+  that it is an active message (QQ allows 20 a minute and 1000 a day per
+  user, and the user can turn them off).
+- QQ has no message edits: a turn shows no status message, only
+  `仍在运行（已 N 分钟）` every 10 minutes, then the reply.
+- No buttons (custom buttons need an application to QQ): approval cards
+  name their id, and the user answers `允许 <id>` or `拒绝 <id>`.
+- Files in: attachments by their `url`, at most 20 MB. Files out are not
+  supported yet (QQ takes a local file only through its chunked upload):
+  `/file` says so, `/diff` sends the summary only, and a reply longer
+  than 3 messages ends with a note to read the rest on the desktop.
+- The bot answers in Chinese.

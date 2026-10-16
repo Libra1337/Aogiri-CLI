@@ -429,6 +429,18 @@ impl Chat {
         let pieces = render::split(&text, self.api.limits().text);
         let mut sent = Vec::new();
         for (index, piece) in pieces.iter().enumerate() {
+            if index == MAX_PARTS && self.api.limits().file_out == 0 {
+                // A platform that takes no files from the bot: say what is left.
+                let left: usize = pieces[index..].iter().map(|p| p.chars().count()).sum();
+                let note = match lang {
+                    Lang::Zh => format!("（还有 {left} 字没有发出，完整回复请在电脑或手机远程页查看。）"),
+                    Lang::En => format!("({left} more characters: read the whole reply on the desktop or the phone page.)"),
+                };
+                if let Ok(id) = self.api.send(chat, &note, &[]) {
+                    sent.push(id);
+                }
+                break;
+            }
             if index == MAX_PARTS {
                 let rest = pieces[index..].join("\n\n");
                 let caption = tr(lang, "后面的内容在文件里。", "The rest is in the file.");
@@ -1354,6 +1366,13 @@ impl Chat {
                 if body.trim().is_empty() {
                     return None;
                 }
+                if self.api.limits().file_out == 0 {
+                    return Some(tr(
+                        lang,
+                        "完整的改动请在电脑或手机远程页查看：这个聊天平台还不能接收文件。",
+                        "Read the whole diff on the desktop or the phone page: this chat platform takes no files yet.",
+                    ));
+                }
                 let body = redact::redact(body, &self.hub.connectors.secrets());
                 let caption = if diff["truncated"] == true {
                     tr(
@@ -1420,6 +1439,13 @@ impl Chat {
             ));
         }
         let limit = self.api.limits().file_out;
+        if limit == 0 {
+            return Some(tr(
+                lang,
+                "这个聊天平台还不能接收机器人发的文件，请在电脑或手机远程页查看。",
+                "This chat platform takes no files from the bot yet: open it on the desktop or the phone page.",
+            ));
+        }
         match std::fs::metadata(&real) {
             Ok(meta) if !meta.is_file() => {
                 return Some(tr(lang, "这不是文件。", "That is not a file."))
