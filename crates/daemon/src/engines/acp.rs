@@ -241,6 +241,14 @@ pub struct Acp {
     agent: Option<&'static str>,
     /// A mode switch is on its way to the agent: prompts wait for it.
     configuring: bool,
+    /// OpenCode: the switch on its way (request id, the agent it asks for).
+    switch: Option<(u64, &'static str)>,
+    /// OpenCode has no session config options: switch with `session/set_mode`.
+    set_mode: bool,
+    /// OpenCode did not switch to the agent of a mode other than 全自动:
+    /// why. Messages are refused until a switch succeeds, since the agent
+    /// it runs on may run tools the mode would ask for.
+    mode_failed: Option<String>,
     /// Why this agent cannot run here (OpenCode 2.x).
     refused: Option<String>,
 }
@@ -275,12 +283,17 @@ impl Acp {
             mode: options.approval_mode.clone().filter(|_| opencode),
             agent: None,
             configuring: false,
+            switch: None,
+            set_mode: false,
+            mode_failed: None,
             refused: None,
         }
     }
 
     /// OpenCode: switches the session to the agent `mode` runs on, unless it
-    /// runs there already. Prompts wait until the agent has switched.
+    /// runs there already. Prompts wait until the agent has switched. One
+    /// switch is on its way at a time, so OpenCode cannot apply them out of
+    /// order; a mode picked meanwhile is switched to once it is answered.
     fn switch_agent(&mut self) -> Vec<String> {
         let (Some(mode), Some(session)) = (self.mode.clone(), self.session.clone()) else {
             return Vec::new();
@@ -290,16 +303,122 @@ impl Acp {
             return Vec::new();
         }
         self.agent = Some(agent);
+        // Messages wait for this switch, and go if it succeeds.
+        self.mode_failed = None;
         self.configuring = true;
-        vec![self.request(
-            "session/set_config_option",
-            json!({ "sessionId": session, "configId": "mode", "value": agent }),
-        )]
+        if self.switch.is_some() {
+            return Vec::new();
+        }
+        vec![self.switch_request(&session, agent)]
+    }
+
+    /// Asks OpenCode to run the session on `agent`.
+    fn switch_request(&mut self, session: &str, agent: &'static str) -> String {
+        self.configuring = true;
+        let frame = if self.set_mode {
+            self.request(
+                "session/set_mode",
+                json!({ "sessionId": session, "modeId": agent }),
+            )
+        } else {
+            self.request(
+                "session/set_config_option",
+                json!({ "sessionId": session, "configId": "mode", "value": agent }),
+            )
+        };
+        self.switch = Some((self.next_id, agent));
+        frame
+    }
+
+    /// OpenCode answered a mode switch (`switch_agent`).
+    fn switched(&mut self, id: u64, method: &str, result: &Value, error: &Value) -> Output {
+        let Some((_, asked)) = self.switch.filter(|(switch, _)| *switch == id) else {
+            return Output::default();
+        };
+        self.switch = None;
+        let failure = (!error.is_null()).then(|| match text(&error["message"]) {
+            "" => format!("JSON-RPC error {}", error["code"]),
+            message => message.to_string(),
+        });
+        // An OpenCode without session config options (1.0 has
+        // `session/set_mode` only): the same switch as a session mode.
+        let unknown = failure.as_deref().is_some_and(|message| {
+            error["code"] == -32601 || message.contains("unknown config option")
+        });
+        let wanted = self.agent;
+        if method == "session/set_config_option" && unknown {
+            self.set_mode = true;
+        }
+        // A mode picked meanwhile, or the same switch the other way.
+        let again = wanted != Some(asked) || (method == "session/set_config_option" && unknown);
+        if let (true, Some(agent), Some(session)) = (again, wanted, self.session.clone()) {
+            return Output {
+                events: vec![],
+                frames: vec![self.switch_request(&session, agent)],
+            };
+        }
+        if let Some(message) = failure {
+            return self.switch_failed(asked, &message);
+        }
+        // OpenCode answers with its options as they are now.
+        let current = result["configOptions"]
+            .as_array()
+            .and_then(|options| options.iter().find(|option| option["id"] == "mode"))
+            .and_then(|option| option["currentValue"].as_str());
+        if let Some(current) = current.filter(|current| *current != asked) {
+            return self.switch_failed(asked, &format!("it still runs on {current}"));
+        }
+        self.configuring = false;
+        self.mode_failed = None;
+        match self.next_prompt() {
+            Some(prompt) => Output {
+                frames: vec![prompt],
+                events: vec![json!({ "type": "connecting" })],
+            },
+            None => Output::default(),
+        }
+    }
+
+    /// OpenCode did not switch to `agent`. 全自动 runs anyway: it is OpenCode
+    /// as the user configured it, and the session's agent is no looser.
+    /// Any other mode fails closed: waiting messages are dropped and new ones
+    /// refused until a switch succeeds.
+    fn switch_failed(&mut self, agent: &'static str, message: &str) -> Output {
+        self.agent = None;
+        self.configuring = false;
+        let mode = opencode::mode_label(self.mode.as_deref().unwrap_or_default()).to_string();
+        if agent == "build" {
+            let mut output = Output::events(vec![
+                json!({ "type": "error", "message": format!("[opencode] OpenCode did not switch to {mode} ({message}); it runs on its current agent") }),
+            ]);
+            if let Some(prompt) = self.next_prompt() {
+                output.frames.push(prompt);
+                output.events.push(json!({ "type": "connecting" }));
+            }
+            return output;
+        }
+        let reason = format!(
+            "[opencode] OpenCode did not switch to {mode} ({message}). Messages are not sent until it does: on its current agent, tools could run without asking. Pick the mode again, or update OpenCode (1.x)."
+        );
+        self.mode_failed = Some(reason.clone());
+        let mut events = vec![json!({ "type": "error", "message": reason })];
+        if !self.queued.is_empty() {
+            self.queued.clear();
+            events.push(json!({ "type": "error", "message": "[opencode] The waiting message was not sent." }));
+            if !self.prompt_in_flight {
+                events.push(json!({ "type": "status", "message": "ready" }));
+            }
+        }
+        Output::events(events)
     }
 
     /// The next queued message, when the session can take one.
     fn next_prompt(&mut self) -> Option<String> {
-        if self.session.is_none() || self.prompt_in_flight || self.configuring {
+        if self.session.is_none()
+            || self.prompt_in_flight
+            || self.configuring
+            || self.mode_failed.is_some()
+        {
             return None;
         }
         let next = self.queued.pop_front()?;
@@ -313,7 +432,12 @@ impl Acp {
             .to_string()
     }
 
-    fn prompt(&mut self, blocks: Vec<Value>) -> String {
+    fn prompt(&mut self, mut blocks: Vec<Value>) -> String {
+        // OpenCode reminds its own plan agent by its name; ours by a block
+        // only the model reads.
+        if self.agent == Some(opencode::PLAN_AGENT) {
+            blocks.push(opencode::plan_reminder());
+        }
         self.prompt_in_flight = true;
         self.busy_announced = false;
         let session = self.session.clone();
@@ -531,6 +655,8 @@ impl Acp {
             return;
         };
         match text(&update["sessionUpdate"]) {
+            // The plan reminder is not what the user wrote.
+            "user_message_chunk" if opencode::for_the_model_only(&update["content"]) => {}
             "user_message_chunk" => replay.text("user", update),
             "agent_message_chunk" => replay.text("assistant", update),
             "agent_thought_chunk" => replay.text("reasoning", update),
@@ -572,6 +698,12 @@ impl Acp {
         let Some(method) = self.pending.remove(&id) else {
             return Output::default();
         };
+        if matches!(
+            method.as_str(),
+            "session/set_config_option" | "session/set_mode"
+        ) {
+            return self.switched(id, &method, result, error);
+        }
         if !error.is_null() {
             let message = match text(&error["message"]) {
                 "" => format!("JSON-RPC error {}", error["code"]),
@@ -595,18 +727,6 @@ impl Acp {
                     events: vec![event],
                     frames: vec![self.new_session()],
                 };
-            }
-            if method == "session/set_config_option" {
-                self.configuring = false;
-                self.agent = None;
-                let mut output = Output::events(vec![
-                    json!({ "type": "error", "message": format!("[acp] the agent did not switch modes: {message}") }),
-                ]);
-                if let Some(prompt) = self.next_prompt() {
-                    output.frames.push(prompt);
-                    output.events.push(json!({ "type": "connecting" }));
-                }
-                return output;
             }
             let mut output = Output::events(vec![
                 json!({ "type": "error", "message": format!("[acp] {message}") }),
@@ -668,16 +788,6 @@ impl Acp {
                 events.append(&mut output.events);
                 output.events = events;
                 output
-            }
-            "session/set_config_option" => {
-                self.configuring = false;
-                match self.next_prompt() {
-                    Some(prompt) => Output {
-                        frames: vec![prompt],
-                        events: vec![json!({ "type": "connecting" })],
-                    },
-                    None => Output::default(),
-                }
             }
             "session/prompt" => {
                 let mut output = Output::default();
@@ -799,6 +909,9 @@ impl Adapter for Acp {
         }
         let frames = match text(&op["op"]) {
             "user_message" => {
+                if let Some(reason) = &self.mode_failed {
+                    return Err(reason.clone());
+                }
                 let mut blocks = vec![json!({ "type": "text", "text": op["content"] })];
                 if self.image_prompts {
                     for image in op["images"].as_array().into_iter().flatten().map(text) {
@@ -1257,7 +1370,7 @@ mod tests {
         // 谨慎 asks for edits too.
         for (mode, agent) in [
             ("full-auto", "build"),
-            ("plan", "plan"),
+            ("plan", opencode::PLAN_AGENT),
             ("read-only", opencode::ASK_AGENT),
         ] {
             let out = a
@@ -1275,6 +1388,187 @@ mod tests {
         assert!(same.frames.is_empty());
         assert_eq!(a.approval_mode().as_deref(), Some("auto-edit"));
         assert!(!a.mode_applies_live());
+    }
+
+    /// Answers the request `frames` sent with `answer` (a `result` or an
+    /// `error`).
+    fn answer(a: &mut Acp, frames: &[Value], mut reply: Value) -> Output {
+        reply["id"] = frames[0]["id"].clone();
+        frame(a, reply)
+    }
+
+    fn errors(output: &Output) -> String {
+        output
+            .events
+            .iter()
+            .filter(|e| e["type"] == "error")
+            .map(|e| text(&e["message"]).to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_failed_mode_switch_sends_nothing_until_a_switch_succeeds() {
+        let mut a = Acp::new(Path::new("/p"), &opencode("read-only"));
+        let switched = open_opencode(&mut a);
+        // OpenCode does not know the agent (a config that dropped it).
+        let failed = answer(
+            &mut a,
+            &switched,
+            json!({ "error": { "code": -32602, "message": "Invalid params: mode not found: aogiri" } }),
+        );
+        assert!(failed.frames.is_empty(), "the waiting message is not sent");
+        let message = errors(&failed);
+        assert!(message.contains("did not switch to 谨慎"), "{message}");
+        assert!(
+            message.contains("waiting message was not sent"),
+            "{message}"
+        );
+        assert!(failed
+            .events
+            .iter()
+            .any(|e| e["type"] == "status" && e["message"] == "ready"));
+        // New messages are refused, not queued.
+        let refused = a.encode(&json!({ "op": "user_message", "content": "again" }));
+        assert!(refused.unwrap_err().contains("did not switch"));
+        // Picking the mode again switches again; once it did, messages go.
+        let retry = a
+            .encode(&json!({ "op": "set_approval_mode", "mode": "read-only" }))
+            .unwrap();
+        let retry = sent(&retry.frames);
+        assert_eq!(retry[0]["params"]["value"], opencode::ASK_AGENT);
+        let ok = answer(&mut a, &retry, json!({ "result": {} }));
+        assert!(ok.frames.is_empty() && errors(&ok).is_empty());
+        let prompt = a
+            .encode(&json!({ "op": "user_message", "content": "now" }))
+            .unwrap();
+        assert_eq!(sent(&prompt.frames)[0]["method"], "session/prompt");
+    }
+
+    #[test]
+    fn a_switch_opencode_reports_as_not_done_fails_closed() {
+        let mut a = Acp::new(Path::new("/p"), &opencode("plan"));
+        let switched = open_opencode(&mut a);
+        assert_eq!(switched[0]["params"]["value"], opencode::PLAN_AGENT);
+        let kept = answer(
+            &mut a,
+            &switched,
+            json!({ "result": { "configOptions": [{ "id": "mode", "currentValue": "build" }] } }),
+        );
+        assert!(kept.frames.is_empty());
+        assert!(errors(&kept).contains("计划"), "{}", errors(&kept));
+        assert!(a
+            .encode(&json!({ "op": "user_message", "content": "x" }))
+            .is_err());
+    }
+
+    #[test]
+    fn set_mode_switches_an_opencode_without_session_config_options() {
+        let mut a = Acp::new(Path::new("/p"), &opencode("auto-edit"));
+        let switched = open_opencode(&mut a);
+        let fallback = answer(
+            &mut a,
+            &switched,
+            json!({ "error": { "code": -32601, "message": "Method not found" } }),
+        );
+        assert!(errors(&fallback).is_empty());
+        let fallback = sent(&fallback.frames);
+        assert_eq!(fallback[0]["method"], "session/set_mode");
+        assert_eq!(fallback[0]["params"]["sessionId"], "ses_1");
+        assert_eq!(fallback[0]["params"]["modeId"], opencode::ASK_AGENT);
+        let prompted = sent(&answer(&mut a, &fallback, json!({ "result": {} })).frames);
+        assert_eq!(prompted[0]["method"], "session/prompt");
+        // No plan reminder outside 计划.
+        assert_eq!(prompted[0]["params"]["prompt"].as_array().unwrap().len(), 1);
+        frame(
+            &mut a,
+            json!({ "id": prompted[0]["id"], "result": { "stopReason": "end_turn" } }),
+        );
+        // Later switches use set_mode at once; 计划 adds its reminder.
+        let plan = a
+            .encode(&json!({ "op": "set_approval_mode", "mode": "plan" }))
+            .unwrap();
+        let plan = sent(&plan.frames);
+        assert_eq!(plan[0]["method"], "session/set_mode");
+        assert_eq!(plan[0]["params"]["modeId"], opencode::PLAN_AGENT);
+        answer(&mut a, &plan, json!({ "result": {} }));
+        let prompt = a
+            .encode(&json!({ "op": "user_message", "content": "plan it" }))
+            .unwrap();
+        let blocks = sent(&prompt.frames)[0]["params"]["prompt"].clone();
+        assert_eq!(blocks[0]["text"], "plan it");
+        assert_eq!(blocks[1]["annotations"]["audience"], json!(["assistant"]));
+        assert!(text(&blocks[1]["text"]).contains("Plan mode"));
+        // Neither method: nothing is sent.
+        let mut old = Acp::new(Path::new("/p"), &opencode("read-only"));
+        let switched = open_opencode(&mut old);
+        let fallback = answer(
+            &mut old,
+            &switched,
+            json!({ "error": { "code": -32601, "message": "Method not found" } }),
+        );
+        let failed = answer(
+            &mut old,
+            &sent(&fallback.frames),
+            json!({ "error": { "code": -32601, "message": "Method not found" } }),
+        );
+        assert!(failed.frames.is_empty());
+        assert!(errors(&failed).contains("did not switch"));
+    }
+
+    #[test]
+    fn full_auto_runs_when_its_switch_fails() {
+        let mut a = Acp::new(Path::new("/p"), &opencode("full-auto"));
+        let switched = open_opencode(&mut a);
+        assert_eq!(switched[0]["params"]["value"], "build");
+        let output = answer(
+            &mut a,
+            &switched,
+            json!({ "error": { "code": -32603, "message": "boom" } }),
+        );
+        assert!(errors(&output).contains("全自动"));
+        assert_eq!(sent(&output.frames)[0]["method"], "session/prompt");
+    }
+
+    #[test]
+    fn a_mode_picked_during_a_switch_is_switched_to_after_it() {
+        let mut a = Acp::new(Path::new("/p"), &opencode("full-auto"));
+        let first = open_opencode(&mut a);
+        // 谨慎 while the switch to 全自动 is on its way: one switch at a time.
+        let picked = a
+            .encode(&json!({ "op": "set_approval_mode", "mode": "read-only" }))
+            .unwrap();
+        assert!(picked.frames.is_empty());
+        let next = sent(&answer(&mut a, &first, json!({ "result": {} })).frames);
+        assert_eq!(next.len(), 1, "no prompt before the second switch");
+        assert_eq!(next[0]["params"]["value"], opencode::ASK_AGENT);
+        let prompted = sent(&answer(&mut a, &next, json!({ "result": {} })).frames);
+        assert_eq!(prompted[0]["method"], "session/prompt");
+    }
+
+    #[test]
+    fn the_plan_reminder_stays_out_of_a_replayed_transcript() {
+        let mut a = Acp::new(Path::new("/p"), &reopen("ses_1"));
+        start_and_queue(&mut a, "next");
+        frame(
+            &mut a,
+            json!({ "id": 1, "result": { "agentCapabilities": { "loadSession": true } } }),
+        );
+        let mut reminder = opencode::plan_reminder();
+        reminder["text"] = json!("<system-reminder>plan</system-reminder>");
+        for content in [json!({ "type": "text", "text": "look" }), reminder] {
+            frame(
+                &mut a,
+                update(
+                    json!({ "sessionUpdate": "user_message_chunk", "messageId": "m1", "content": content }),
+                ),
+            );
+        }
+        let loaded = frame(&mut a, json!({ "id": 2, "result": {} }));
+        assert_eq!(
+            loaded.events[0]["items"],
+            json!([{ "role": "user", "content": "look" }])
+        );
     }
 
     #[test]

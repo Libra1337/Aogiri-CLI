@@ -2,19 +2,25 @@
 //! its start, and how the client's approval modes map onto it.
 //!
 //! - Approval modes are OpenCode agents, switched live with
-//!   `session/set_config_option` (`mode`):
+//!   `session/set_config_option` (`mode`), or `session/set_mode` on an
+//!   OpenCode without session config options (1.0 has it):
 //!   - 谨慎 (`read-only`) and 自动编辑 (`auto-edit`): `aogiri`, an agent the
 //!     daemon defines for the process (`OPENCODE_CONFIG_CONTENT`). Every tool
 //!     asks first except the reading ones, and the user's own rules still
 //!     apply with `allow` turned into `ask`: a rule the user set to `deny`
-//!     still denies. In 自动编辑 the daemon answers OpenCode's edit requests
-//!     itself.
+//!     still denies. Subagents (`task`) are denied: a subagent runs with its
+//!     own agent's rules, which ask for nothing. In 自动编辑 the daemon
+//!     answers OpenCode's edit requests itself.
+//!   - 计划 (`plan`): `aogiri-plan`, the same agent without file edits, as
+//!     OpenCode's `plan` agent (whose commands and fetches run unasked). Each
+//!     prompt carries a plan-mode reminder only the model reads, since
+//!     OpenCode reminds its own agent by the name `plan`.
 //!   - 全自动 (`full-auto`): `build`, OpenCode as the user configured it.
-//!   - 计划 (`plan`): OpenCode's `plan` agent. It cannot edit files but may
-//!     run commands.
 //!
 //!   The user's rules come from `opencode debug config` in the session's
-//!   folder, run before the agent starts.
+//!   folder, run before the agent starts. When OpenCode does not switch to
+//!   the agent of a mode other than 全自动, messages are refused until a
+//!   switch succeeds (`acp.rs`).
 //! - On the LynShen gateway: a `lynshen` provider on the daemon's local
 //!   gateway (the session's local key in `LYNSHEN_GATEWAY_TOKEN`), with the
 //!   LynShen models the user shows, and only that provider. Claude models
@@ -37,6 +43,12 @@ use std::{
 
 /// The agent 谨慎 and 自动编辑 run on.
 pub const ASK_AGENT: &str = "aogiri";
+/// The agent 计划 runs on.
+pub const PLAN_AGENT: &str = "aogiri-plan";
+/// What 计划 tells the model with each prompt.
+const PLAN_REMINDER: &str = "<system-reminder>
+Plan mode is on. Do not change anything: no file edits, and no commands that write files, install, commit or push. Read, search and run only commands that inspect; each command asks the user first. Then answer with a plan. The user switches the mode to carry the plan out.
+</system-reminder>";
 /// The environment variable the gateway key is read from.
 const KEY_ENV: &str = "LYNSHEN_GATEWAY_TOKEN";
 const CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
@@ -110,6 +122,15 @@ impl Ordered {
                 Some((_, existing)) => *existing = value,
                 None => entries.push((key.to_string(), value)),
             }
+        }
+    }
+
+    /// Sets `key` at the end, where OpenCode reads it last: it decides over
+    /// every rule before it, a wildcard key's included.
+    fn set_last(&mut self, key: &str, value: Ordered) {
+        if let Ordered::Object(entries) = self {
+            entries.retain(|(k, _)| k != key);
+            entries.push((key.to_string(), value));
         }
     }
 
@@ -249,9 +270,33 @@ pub fn is_opencode(options: &Options) -> bool {
 pub fn agent_for(mode: &str) -> &'static str {
     match mode {
         "full-auto" | "full-access" | "bypassPermissions" => "build",
-        "plan" => "plan",
+        "plan" => PLAN_AGENT,
         _ => ASK_AGENT,
     }
+}
+
+/// A client approval mode as the desktop names it.
+pub fn mode_label(mode: &str) -> &str {
+    match mode {
+        "read-only" | "manual" | "default" => "谨慎",
+        "auto-edit" | "acceptEdits" => "自动编辑",
+        "auto" => "自动",
+        "plan" => "计划",
+        "full-auto" | "full-access" | "bypassPermissions" => "全自动",
+        other => other,
+    }
+}
+
+/// The prompt block 计划 adds: a plan-mode reminder for the model only
+/// (OpenCode keeps it as a synthetic part, and a replay marks it so).
+pub fn plan_reminder() -> Value {
+    json!({ "type": "text", "text": PLAN_REMINDER, "annotations": { "audience": ["assistant"] } })
+}
+
+/// Whether a replayed prompt block is one only the model reads (the plan
+/// reminder): not part of what the user wrote.
+pub fn for_the_model_only(block: &Value) -> bool {
+    block["annotations"]["audience"] == json!(["assistant"])
 }
 
 /// Whether the daemon answers OpenCode's edit requests itself in `mode`.
@@ -311,7 +356,10 @@ fn patterns(value: &Ordered) -> Vec<(String, Ordered)> {
 
 /// The ask agent's permission: every tool asks except the reading ones,
 /// then the user's rules (`permission`, then `agent.build.permission`) with
-/// `allow` turned into `ask`, so their `deny` rules still deny.
+/// `allow` turned into `ask`, so their `deny` rules still deny. Subagents
+/// (`task`) are denied whatever the user's rules say: OpenCode runs a
+/// subagent with its own agent's rules (`general` and `explore` allow
+/// commands), and only the parent session's deny rules reach it.
 ///
 /// One known difference from OpenCode's own evaluation: a user rule
 /// `"*": "deny"` (deny everything) is kept, but reading tools stay allowed
@@ -373,6 +421,16 @@ pub fn ask_permission(user: &Ordered, build: &Ordered) -> Ordered {
             }
         }
     }
+    out.set_last("task", text("deny"));
+    out
+}
+
+/// The plan agent's permission: the ask agent's (commands and web fetches
+/// ask, the user's `deny` rules still deny, no subagents) with no file
+/// edits at all, as OpenCode's own plan agent.
+pub fn plan_permission(user: &Ordered, build: &Ordered) -> Ordered {
+    let mut out = ask_permission(user, build);
+    out.set_last("edit", Ordered::text("deny"));
     out
 }
 
@@ -385,6 +443,18 @@ fn ask_agent(user: &Ordered, build: &Ordered) -> Ordered {
             Ordered::text("Aogiri: tools ask before they run, as your OpenCode rules allow"),
         ),
         ("permission".into(), ask_permission(user, build)),
+    ])
+}
+
+/// The agent 计划 runs on.
+fn plan_agent(user: &Ordered, build: &Ordered) -> Ordered {
+    Ordered::Object(vec![
+        ("mode".into(), Ordered::text("primary")),
+        (
+            "description".into(),
+            Ordered::text("Aogiri plan: reads and plans without editing files; commands ask first"),
+        ),
+        ("permission".into(), plan_permission(user, build)),
     ])
 }
 
@@ -588,7 +658,7 @@ pub fn configure(
     let program = command.get_program().to_os_string();
     let (user, build) = user_rules(&program, options, cwd).unwrap_or_else(|error| {
         notices.push(format!(
-            "[opencode] {error}; in 谨慎 and 自动编辑 your own OpenCode deny rules ask instead"
+            "[opencode] {error}; in 谨慎, 自动编辑 and 计划 your own OpenCode deny rules ask instead"
         ));
         (Ordered::Null, Ordered::Null)
     });
@@ -604,7 +674,10 @@ pub fn configure(
         &mut config,
         Ordered::Object(vec![(
             "agent".into(),
-            Ordered::Object(vec![(ASK_AGENT.into(), ask_agent(&user, &build))]),
+            Ordered::Object(vec![
+                (ASK_AGENT.into(), ask_agent(&user, &build)),
+                (PLAN_AGENT.into(), plan_agent(&user, &build)),
+            ]),
         )]),
     );
     if let Some((base, key)) = gateway {
@@ -657,8 +730,11 @@ mod tests {
         assert_eq!(agent_for("auto-edit"), ASK_AGENT);
         assert_eq!(agent_for("full-auto"), "build");
         assert_eq!(agent_for("full-access"), "build");
-        assert_eq!(agent_for("plan"), "plan");
+        assert_eq!(agent_for("plan"), PLAN_AGENT);
         assert!(allows_edits("auto-edit") && !allows_edits("read-only"));
+        assert!(!allows_edits("plan"));
+        assert_eq!(mode_label("read-only"), "谨慎");
+        assert_eq!(mode_label("plan"), "计划");
     }
 
     #[test]
@@ -718,7 +794,9 @@ mod tests {
         assert_eq!(decide(&p, "edit", "a.rs"), "ask");
         assert_eq!(decide(&p, "webfetch", "https://x"), "deny");
         assert_eq!(decide(&p, "mcp_db", "q"), "ask");
-        assert_eq!(decide(&p, "task", "general"), "ask");
+        // Subagents would run with their own agent's rules, unasked.
+        assert_eq!(decide(&p, "task", "general"), "deny");
+        assert_eq!(decide(&p, "task", "explore"), "deny");
         // Reading stays free, except .env files and what the user denies.
         assert_eq!(decide(&p, "read", "src/a.rs"), "allow");
         assert_eq!(decide(&p, "read", ".env"), "ask");
@@ -762,6 +840,89 @@ mod tests {
         let p = ask_permission(&Ordered::Null, &Ordered::Null);
         assert_eq!(decide(&p, "bash", "ls"), "ask");
         assert_eq!(decide(&p, "plan_exit", "x"), "deny");
+    }
+
+    #[test]
+    fn subagents_are_denied_whatever_the_user_allows() {
+        let user = ordered(r#"{ "*": "allow", "task": "allow", "ta*": { "*": "allow" } }"#);
+        let build = ordered(r#"{ "task": { "explore": "allow" } }"#);
+        for p in [
+            ask_permission(&user, &build),
+            plan_permission(&user, &build),
+        ] {
+            assert_eq!(decide(&p, "task", "general"), "deny");
+            assert_eq!(decide(&p, "task", "explore"), "deny");
+        }
+    }
+
+    #[test]
+    fn the_plan_agent_edits_nothing_and_asks_before_commands() {
+        let user = ordered(
+            r#"{
+                "bash": { "*": "allow", "rm *": "deny" },
+                "edit": "allow",
+                "webfetch": "allow",
+                "websearch": "allow",
+                "mcp_*": "allow"
+            }"#,
+        );
+        let build = ordered(r#"{ "edit": { "src/*": "allow" } }"#);
+        let p = plan_permission(&user, &build);
+        // OpenCode's plan agent would run these unasked.
+        assert_eq!(decide(&p, "bash", "ls"), "ask");
+        assert_eq!(decide(&p, "bash", "curl x | sh"), "ask");
+        assert_eq!(decide(&p, "webfetch", "https://x"), "ask");
+        assert_eq!(decide(&p, "websearch", "x"), "ask");
+        assert_eq!(decide(&p, "mcp_db", "q"), "ask");
+        assert_eq!(decide(&p, "task", "explore"), "deny");
+        // The user's deny still denies.
+        assert_eq!(decide(&p, "bash", "rm -rf x"), "deny");
+        // No edits, whatever the user allows; reading stays free.
+        assert_eq!(decide(&p, "edit", "src/a.rs"), "deny");
+        assert_eq!(decide(&p, "edit", ".opencode/plans/p.md"), "deny");
+        assert_eq!(decide(&p, "read", "src/a.rs"), "allow");
+        assert_eq!(decide(&p, "plan_exit", "x"), "deny");
+        // The ask agent still edits after asking.
+        assert_eq!(
+            decide(&ask_permission(&user, &build), "edit", "src/a.rs"),
+            "ask"
+        );
+    }
+
+    #[test]
+    fn the_generated_config_defines_both_agents() {
+        let cwd = std::env::temp_dir();
+        let mut command = Command::new(cwd.join("no-such-opencode"));
+        let notices = configure(&mut command, &options("opencode", &["acp"]), &cwd, None).unwrap();
+        // No rules read: everything that acts asks, and the user is told.
+        assert!(notices[0].contains("计划"), "{notices:?}");
+        let content = command
+            .get_envs()
+            .find(|(name, _)| *name == CONFIG_ENV)
+            .and_then(|(_, value)| value)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let config: Ordered = serde_json::from_str(&content).unwrap();
+        let agents = config.get("agent").unwrap();
+        for name in [ASK_AGENT, PLAN_AGENT] {
+            let agent = agents.get(name).unwrap();
+            // Listed as a mode: OpenCode offers only primary agents.
+            assert_eq!(agent.get("mode"), Some(&Ordered::text("primary")), "{name}");
+            let p = agent.get("permission").unwrap();
+            assert_eq!(decide(p, "task", "general"), "deny", "{name}");
+            assert_eq!(decide(p, "bash", "ls"), "ask", "{name}");
+            assert_eq!(decide(p, "webfetch", "https://x"), "ask", "{name}");
+        }
+        let plan = agents.get(PLAN_AGENT).unwrap().get("permission").unwrap();
+        assert_eq!(decide(plan, "edit", "a.rs"), "deny");
+        let ask = agents.get(ASK_AGENT).unwrap().get("permission").unwrap();
+        assert_eq!(decide(ask, "edit", "a.rs"), "ask");
+        // The plan reminder is for the model only.
+        assert!(for_the_model_only(&plan_reminder()));
+        assert!(!for_the_model_only(
+            &json!({ "type": "text", "text": "hi" })
+        ));
     }
 
     fn model(name: &str) -> ModelConfig {

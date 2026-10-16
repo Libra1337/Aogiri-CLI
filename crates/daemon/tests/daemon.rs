@@ -2832,12 +2832,30 @@ fn opencode_modes_run_on_its_agents_and_a_conversation_can_be_copied() {
         json!({ "role": "user", "content": "hi" }),
         "{items}"
     );
+    // 计划: the daemon's plan agent, reminded of plan mode with each prompt.
     desktop.send(json!({ "op": "user_message", "session": copy, "content": "more" }));
     let frames = desktop.until(turn_done(&copy));
     assert_eq!(
         claude_reply(&frames, &copy),
-        "ok: more #4 mode=plan rm=deny"
+        "ok: more #4 mode=aogiri-plan rm=deny reminded"
     );
+    // The config OpenCode got: both agents keep the user's deny, ask before
+    // commands and start no subagents; the plan agent edits nothing.
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(store.join("opencode-config.json")).unwrap())
+            .unwrap();
+    for agent in ["aogiri", "aogiri-plan"] {
+        let permission = &config["agent"][agent]["permission"];
+        assert_eq!(config["agent"][agent]["mode"], "primary", "{config}");
+        assert_eq!(permission["*"], "ask", "{config}");
+        assert_eq!(permission["task"], "deny", "{config}");
+        assert_eq!(
+            permission["bash"],
+            json!({ "*": "ask", "rm *": "deny" }),
+            "{config}"
+        );
+    }
+    assert_eq!(config["agent"]["aogiri-plan"]["permission"]["edit"], "deny");
     let original: Value =
         serde_json::from_str(&fs::read_to_string(store.join("agent-1.json")).unwrap()).unwrap();
     assert_eq!(original.as_array().unwrap().len(), 3);
@@ -2850,6 +2868,95 @@ fn opencode_modes_run_on_its_agents_and_a_conversation_can_be_copied() {
         .cloned()
         .unwrap_or_else(|| panic!("{listed}"));
     assert_eq!(entry["acp_agent"]["id"], "opencode");
+}
+
+/// An OpenCode session in `mode` whose fake behaves as `env` says; its id.
+#[cfg(unix)]
+fn opencode_session(desktop: &mut Client, mode: &str, env: Value) -> String {
+    let dir = temp_dir("daemon-opencode-modes");
+    fs::create_dir_all(&dir).unwrap();
+    let store = temp_dir("fake-opencode-modes-store");
+    fs::create_dir_all(&store).unwrap();
+    let mut env = env;
+    env["FAKE_ACP_STORE"] = json!(store);
+    env["FAKE_OPENCODE_CONFIG"] = json!(r#"{"permission":{"bash":{"*":"allow","rm *":"deny"}}}"#);
+    let created = request(
+        desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": {
+            "command": fake_opencode(), "args": ["acp"], "env": env, "approval_mode": mode,
+        } }),
+    );
+    let session = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    desktop.send(json!({ "op": "watch", "session": session }));
+    desktop.until(|f| f["session"] == session.as_str() && f["type"] == "attended");
+    session
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_sends_nothing_while_its_mode_did_not_switch() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut desktop = Client::connect(&daemon);
+    let refused = |session: &str, mode: &'static str| {
+        let session = session.to_string();
+        move |f: &Value| {
+            f["session"] == session.as_str()
+                && f["type"] == "error"
+                && f["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains(&format!("did not switch to {mode}")))
+        }
+    };
+
+    // An OpenCode that cannot switch at all, and one whose config lost the
+    // daemon's agents: in 谨慎 nothing reaches the agent, now or later.
+    for env in [
+        json!({ "FAKE_OPENCODE_MODES": "none" }),
+        json!({ "FAKE_OPENCODE_AGENTS": "build,plan" }),
+    ] {
+        let session = opencode_session(&mut desktop, "read-only", env.clone());
+        desktop.send(json!({ "op": "user_message", "session": session, "content": "hi" }));
+        let mut frames = desktop.until(refused(&session, "谨慎"));
+        desktop.send(json!({ "op": "user_message", "session": session, "content": "again" }));
+        frames.extend(desktop.until(refused(&session, "谨慎")));
+        assert!(
+            !frames.iter().any(|f| f["type"] == "assistant_delta"),
+            "{env}: {frames:#?}"
+        );
+        // 全自动 is OpenCode as the user configured it: it runs anyway.
+        desktop.send(json!({ "op": "set_approval_mode", "session": session, "mode": "full-auto" }));
+        desktop.send(json!({ "op": "user_message", "session": session, "content": "go" }));
+        let frames = desktop.until(turn_done(&session));
+        assert_eq!(
+            claude_reply(&frames, &session),
+            "ok: go #1 mode=build rm=deny",
+            "{env}"
+        );
+    }
+
+    // OpenCode 1.0 has no session config options: session/set_mode.
+    let session = opencode_session(
+        &mut desktop,
+        "plan",
+        json!({ "FAKE_OPENCODE_MODES": "set_mode" }),
+    );
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "hi" }));
+    let frames = desktop.until(turn_done(&session));
+    assert_eq!(
+        claude_reply(&frames, &session),
+        "ok: hi #1 mode=aogiri-plan rm=deny reminded"
+    );
+    desktop.send(json!({ "op": "set_approval_mode", "session": session, "mode": "read-only" }));
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "next" }));
+    let frames = desktop.until(turn_done(&session));
+    assert_eq!(
+        claude_reply(&frames, &session),
+        "ok: next #2 mode=aogiri rm=deny"
+    );
 }
 
 #[cfg(unix)]

@@ -327,14 +327,26 @@ OpenCode (`opencode acp`, 1.x; the command's program is `opencode`) gets
 more from the daemon (`engines/opencode.rs`):
 
 - `approval_mode` works: the modes are OpenCode agents, switched with
-  `session/set_config_option`. `read-only` and `auto-edit` run on `aogiri`,
-  an agent the daemon defines for the process: every tool asks except the
-  reading ones, and the user's own rules (from `opencode debug config`) apply
-  with `allow` turned into `ask`, so their `deny` rules still deny. In
-  `auto-edit` the daemon answers edit requests itself. `full-auto` runs on
-  OpenCode's `build` agent as the user configured it; `plan` on its `plan`
-  agent, which cannot edit files but may run commands. A switch during a
-  turn applies to the next one (`approval_mode_pending`).
+  `session/set_config_option`, or `session/set_mode` when OpenCode has no
+  session config options (OpenCode 1.0 has `session/set_mode`, so every 1.x
+  can switch). `read-only` and `auto-edit` run on `aogiri`, an agent the
+  daemon defines for the process: every tool asks except the reading ones,
+  and the user's own rules (from `opencode debug config`) apply with `allow`
+  turned into `ask`, so their `deny` rules still deny. Subagents (`task`)
+  are denied: OpenCode runs a subagent with its own agent's rules, which ask
+  for nothing. In `auto-edit` the daemon answers edit requests itself.
+  `plan` runs on `aogiri-plan`: the same agent with no file edits at all, so
+  commands and web fetches ask (OpenCode's own `plan` agent runs them
+  unasked); each prompt carries a plan-mode reminder only the model reads
+  (`annotations.audience: ["assistant"]`), left out of replayed transcripts.
+  `full-auto` runs on OpenCode's `build` agent as the user configured it. A
+  switch during a turn applies to the next one (`approval_mode_pending`).
+- A failed switch fails closed: when OpenCode does not switch to the agent
+  of a mode other than `full-auto` (an error, or its `configOptions` name
+  another agent), the waiting message is dropped and later `user_message`s
+  are refused with an `error` event until the mode is picked again and the
+  switch succeeds. A failed switch to `full-auto` only reports the error.
+  One switch is on its way at a time.
 - `lynshen_gateway`: a `lynshen` provider on the local gateway with the
   LynShen models the user shows, and only that provider. Claude models use
   the Anthropic Messages API, OpenAI models the Responses API, the others

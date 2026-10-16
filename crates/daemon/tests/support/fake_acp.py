@@ -7,12 +7,18 @@ and `session/fork` replay one), and numbers its replies by turn.
 Run as `opencode` (a copy of this file by that name) it plays OpenCode 1.x:
 `opencode debug config` prints $FAKE_OPENCODE_CONFIG, `initialize` names it
 (version $FAKE_OPENCODE_VERSION), and each reply says which agent ran it
-(`session/set_config_option` mode) and what the daemon's ask agent does with
-`rm` commands."""
+(`session/set_config_option` or `session/set_mode`), what the daemon's ask
+agent does with `rm` commands, and whether the prompt carried a block for the
+model only (the plan reminder). The agents it knows are build, plan and those
+of $OPENCODE_CONFIG_CONTENT, or $FAKE_OPENCODE_AGENTS (comma-separated).
+$FAKE_OPENCODE_MODES: `set_mode` has no session config options (OpenCode
+1.0), `none` cannot switch at all. With $FAKE_ACP_STORE it writes the config
+it was started with to opencode-config.json there."""
 import json, os, sys
 
 STORE = os.environ.get("FAKE_ACP_STORE", "")
 OPENCODE = os.path.basename(sys.argv[0]) == "opencode"
+MODES = os.environ.get("FAKE_OPENCODE_MODES", "")
 
 if OPENCODE and sys.argv[1:3] == ["debug", "config"]:
     print("starting opencode")
@@ -56,12 +62,30 @@ def ask(kind, title):
         if answer.get("id") == 50:
             return answer["result"]["outcome"].get("optionId") == "ok"
 
+def config():
+    try:
+        return json.loads(os.environ.get("OPENCODE_CONFIG_CONTENT", "{}"))
+    except ValueError:
+        return {}
+
 def rm_rule():
     try:
-        config = json.loads(os.environ.get("OPENCODE_CONFIG_CONTENT", "{}"))
-        return config["agent"]["aogiri"]["permission"]["bash"]["rm *"]
-    except (KeyError, TypeError, ValueError):
+        return config()["agent"]["aogiri"]["permission"]["bash"]["rm *"]
+    except (KeyError, TypeError):
         return "none"
+
+def agents():
+    names = os.environ.get("FAKE_OPENCODE_AGENTS")
+    if names is not None:
+        return names.split(",")
+    return ["build", "plan"] + list((config().get("agent") or {}).keys())
+
+def unknown_method(msg):
+    out({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "Method not found"}})
+
+if OPENCODE and STORE and sys.argv[1:2] == ["acp"]:
+    with open(os.path.join(STORE, "opencode-config.json"), "w") as f:
+        f.write(os.environ.get("OPENCODE_CONFIG_CONTENT", "{}"))
 
 session = "agent-1"
 mode = "build"
@@ -102,8 +126,25 @@ while True:
         replay(session, turns)
         out({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": session}})
     elif method == "session/set_config_option":
-        mode = msg["params"]["value"]
-        out({"jsonrpc": "2.0", "id": msg["id"], "result": {"configOptions": []}})
+        if MODES in ("set_mode", "none"):
+            unknown_method(msg)
+            continue
+        value = msg["params"]["value"]
+        if value not in agents():
+            out({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32602, "message": "Invalid params: mode not found: " + value}})
+            continue
+        mode = value
+        out({"jsonrpc": "2.0", "id": msg["id"], "result": {"configOptions": [{"id": "mode", "category": "mode", "type": "select", "currentValue": mode, "options": [{"value": a, "name": a} for a in agents()]}]}})
+    elif method == "session/set_mode":
+        if MODES == "none":
+            unknown_method(msg)
+            continue
+        value = msg["params"]["modeId"]
+        if value not in agents():
+            out({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32603, "message": "Agent not found: " + value}})
+            continue
+        mode = value
+        out({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
     elif method == "session/prompt":
         text = msg["params"]["prompt"][0]["text"]
         if "tool" in text:
@@ -119,5 +160,7 @@ while True:
             reply = "ok: %s %s %s" % (text, " ".join(sys.argv[1:]), os.environ.get("FAKE_ACP_GREETING", ""))
         if OPENCODE:
             reply += " mode=%s rm=%s" % (mode, rm_rule())
+            if any((b.get("annotations") or {}).get("audience") == ["assistant"] for b in msg["params"]["prompt"]):
+                reply += " reminded"
         update(session, "agent_message_chunk", reply.strip())
         out({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}})
