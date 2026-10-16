@@ -144,6 +144,13 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
+    let style = match take_style_flag(&mut args) {
+        Ok(style) => style,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
     // The engine modes run tool commands in their own process groups; none of
     // them may outlive the engine, however it ends (input closed, a signal,
     // an error).
@@ -162,11 +169,11 @@ fn main() -> io::Result<()> {
     };
     if args.first().map(String::as_str) == Some("--headless") {
         args.remove(0);
-        return exit(run_headless(args, approval_mode));
+        return exit(run_headless(args, approval_mode, style.as_deref()));
     }
     if args.first().map(String::as_str) == Some("serve") {
         let chat = args.iter().skip(1).any(|arg| arg == "--chat");
-        return exit(run_serve(approval_mode, chat));
+        return exit(run_serve(approval_mode, chat, style.as_deref()));
     }
     if args.first().map(String::as_str) == Some("daemon") {
         return exit(run_daemon(&args[1..]));
@@ -238,12 +245,20 @@ fn main() -> io::Result<()> {
         // Startup events (emitted by the TUI) will reflect the switched mode.
         let _ = core.set_approval_mode(mode);
     }
+    if let Some(style) = &style {
+        apply_style_flag(&mut core, style);
+    }
     core.start_update_check();
     let app = TuiApp::new(Runtime(core));
     let result = match args.iter().position(|arg| arg == "--resume") {
-        Some(index) => match args.get(index + 1) {
-            Some(id) => app.with_command(&format!("/resume {id}")).run(),
-            None => {
+        // The resumed conversation takes the style too.
+        Some(index) => match (args.get(index + 1), &style) {
+            (Some(id), Some(style)) => app
+                .with_command(&format!("/resume {id}"))
+                .with_command(&format!("/style {style}"))
+                .run(),
+            (Some(id), None) => app.with_command(&format!("/resume {id}")).run(),
+            (None, _) => {
                 eprintln!("lynshen: --resume requires a session id");
                 std::process::exit(2);
             }
@@ -292,6 +307,9 @@ OPTIONS:
                                          shell commands; full-access runs
                                          everything without prompts and is
                                          not confined to the workspace)
+    --style <id>                         reply style of this conversation
+                                         (TUI, --headless, serve); /style
+                                         lists the styles
     -h, --help                           show this help
     -V, --version                        print the version
 
@@ -326,6 +344,37 @@ fn take_approval_mode_flag(args: &mut Vec<String>) -> Result<Option<ApprovalMode
     ApprovalMode::parse(&value).map(Some)
 }
 
+/// Extracts `--style <id>` (or `--style=<id>`) from `args`.
+fn take_style_flag(args: &mut Vec<String>) -> Result<Option<String>, String> {
+    let Some(index) = args
+        .iter()
+        .position(|arg| arg == "--style" || arg.starts_with("--style="))
+    else {
+        return Ok(None);
+    };
+    let arg = args.remove(index);
+    let value = match arg.strip_prefix("--style=") {
+        Some(value) => value.to_string(),
+        None if index < args.len() => args.remove(index),
+        None => return Err("--style requires a reply style id (see /style)".to_string()),
+    };
+    if value.trim().is_empty() {
+        return Err("--style requires a reply style id (see /style)".to_string());
+    }
+    Ok(Some(value))
+}
+
+/// Gives the engine's conversation the `--style` reply style; an unknown
+/// one stops the program, as a bad flag does.
+fn apply_style_flag(core: &mut AgentCore, style: &str) {
+    for event in core.set_reply_style(Some(style)) {
+        if let AgentEvent::Error(error) = event {
+            eprintln!("lynshen: {error}");
+            std::process::exit(2);
+        }
+    }
+}
+
 /// The approval mode a headless run uses. Headless reads no further stdin, so
 /// approval prompts can never be answered interactively; instead of silently
 /// running everything, headless defaults to the safest mode
@@ -335,12 +384,19 @@ fn headless_approval_mode(flag: Option<ApprovalMode>) -> ApprovalMode {
     flag.unwrap_or(ApprovalMode::Manual)
 }
 
-fn run_headless(args: Vec<String>, approval_mode: Option<ApprovalMode>) -> io::Result<i32> {
+fn run_headless(
+    args: Vec<String>,
+    approval_mode: Option<ApprovalMode>,
+    style: Option<&str>,
+) -> io::Result<i32> {
     let mut prompt = args.join(" ");
     if prompt.trim().is_empty() {
         io::stdin().read_to_string(&mut prompt)?;
     }
     let mut core = AgentCore::new()?.with_version(env!("CARGO_PKG_VERSION"));
+    if let Some(style) = style {
+        apply_style_flag(&mut core, style);
+    }
     let mut stdout = io::stdout();
     let mode = headless_approval_mode(approval_mode);
     for event in core.set_approval_mode(mode) {
@@ -611,7 +667,11 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
 /// `--headless`). Runs until stdin closes or a `shutdown`/`/quit` command.
 ///
 /// `--chat` starts a chat session in `~/.lynshen/chats`.
-fn run_serve(approval_mode: Option<ApprovalMode>, chat: bool) -> io::Result<i32> {
+fn run_serve(
+    approval_mode: Option<ApprovalMode>,
+    chat: bool,
+    style: Option<&str>,
+) -> io::Result<i32> {
     let core = if chat {
         AgentCore::open(lynshen_agent_core::chat::ensure_chats_dir()?)?
     } else {
@@ -621,6 +681,10 @@ fn run_serve(approval_mode: Option<ApprovalMode>, chat: bool) -> io::Result<i32>
     if let Some(mode) = approval_mode {
         // Set before startup_events so the startup approval_mode event reflects it.
         let _ = core.set_approval_mode(mode);
+    }
+    // Before startup_events too: its reply_style event names the style.
+    if let Some(style) = style {
+        apply_style_flag(&mut core, style);
     }
     core.start_update_check();
     let mut stdout = io::stdout();
@@ -812,6 +876,7 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
         AgentEvent::ActionDecided { .. } => "action_decided",
         AgentEvent::Attended(_) => "attended",
         AgentEvent::Sandbox(_) => "sandbox",
+        AgentEvent::ReplyStyle(_) => "reply_style",
         AgentEvent::Escalated { .. } => "escalated",
         AgentEvent::ApprovalMode { .. } => "approval_mode",
         AgentEvent::TrustPrompt { .. } => "trust_prompt",

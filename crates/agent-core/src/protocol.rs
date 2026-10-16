@@ -120,6 +120,15 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
                 Err(error) => vec![AgentEvent::Error(error)],
             }
         }
+        // {"op":"set_style","style":"concise"}; null or "" follows the
+        // default for new conversations.
+        "set_style" => match value.get("style") {
+            None | Some(Value::Null) => core.set_reply_style(None),
+            Some(Value::String(id)) => core.set_reply_style(Some(id.as_str())),
+            Some(_) => vec![AgentEvent::Error(
+                "set_style requires style: a style id or null".to_string(),
+            )],
+        },
         "set_attended" => match value.get("attended").and_then(Value::as_bool) {
             Some(attended) => core.set_attended(attended),
             None => vec![AgentEvent::Error(
@@ -705,6 +714,14 @@ pub fn event_json(event: AgentEvent) -> Value {
                 "mode": dir.mode,
                 "source": dir.source,
             })).collect::<Vec<_>>(),
+        }),
+        AgentEvent::ReplyStyle(view) => json!({
+            "type": "reply_style",
+            "style": view.style,
+            "name": view.name,
+            "source": view.source,
+            "chosen": view.chosen,
+            "missing": view.missing,
         }),
         AgentEvent::Escalated { call_id, by, info } => json!({
             "type": "escalated",
