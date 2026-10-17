@@ -706,8 +706,19 @@ impl Config {
         if !models.iter().any(|entry| entry.name == model) {
             models.insert(0, default_model_config(&model));
         }
-        let reasoning_effort =
+        let mut reasoning_effort =
             read_reasoning_effort(&value, "reasoning_effort", "medium", &model, &models);
+        // The "none" engines up to 0.7.0 left on a reasoning Chat Completions
+        // model, its only tier then, was not the user's choice: it turned
+        // thinking off. Such a model now starts at the provider's default.
+        if reasoning_effort == "none"
+            && listed_none_only(&value, &model)
+            && models
+                .iter()
+                .any(|m| m.name == model && m.reasoning_efforts.iter().any(|e| e == DEFAULT_EFFORT))
+        {
+            reasoning_effort = DEFAULT_EFFORT.to_string();
+        }
         let compact_model = read_string(&value, "compact_model", &model);
         let compact_reasoning_effort = read_reasoning_effort(
             &value,
@@ -955,7 +966,8 @@ impl Config {
     }
 
     /// Conversation-title model: `title_model` when it is one of `models`,
-    /// else the main model; at its lightest reasoning effort.
+    /// else the main model; at its lightest reasoning effort (the provider's
+    /// default only when the model offers nothing else).
     pub fn title(&self) -> (String, String) {
         let model = if self.models.iter().any(|m| m.name == self.title_model) {
             self.title_model.clone()
@@ -966,7 +978,14 @@ impl Config {
             .models
             .iter()
             .find(|m| m.name == model)
-            .and_then(|m| m.reasoning_efforts.first().cloned())
+            .and_then(|m| {
+                let efforts = &m.reasoning_efforts;
+                efforts
+                    .iter()
+                    .find(|effort| *effort != DEFAULT_EFFORT)
+                    .or_else(|| efforts.first())
+                    .cloned()
+            })
             .unwrap_or_default();
         (model, effort)
     }
@@ -1644,14 +1663,24 @@ fn read_reasoning_effort(
         .unwrap_or(&[]);
     if supported.iter().any(|entry| entry == &effort) {
         effort
-    } else if supported.iter().any(|entry| entry == "medium") {
-        "medium".to_string()
     } else {
-        supported
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "medium".to_string())
+        default_effort(supported).unwrap_or("medium").to_string()
     }
+}
+
+/// True when config.json lists `model` as engines up to 0.7.0 wrote every
+/// catalog Chat Completions model: only "none", and no `reasoning`.
+fn listed_none_only(value: &Value, model: &str) -> bool {
+    value
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|entry| entry.get("name").and_then(Value::as_str).map(str::trim) == Some(model))
+        .is_some_and(|entry| {
+            entry.get("reasoning").is_none()
+                && entry.get("reasoning_efforts") == Some(&json!(["none"]))
+        })
 }
 
 /// `subagent_models` as saved in config.json; Desktop edits it while engines
@@ -1721,15 +1750,27 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
         // or the budget tiers older versions wrote for a model that now takes
         // adaptive effort: surface the current tiers (and lift the tiny
         // default cap so high-tier budgets fit) without forcing a re-login.
+        // A catalog model listed with only "none" got that list from engines
+        // up to 0.7.0, which gave it to every Chat Completions model: it takes
+        // the catalog's view now (whether it thinks, and its tiers).
         // An entry that states `reasoning` was set by the user: kept as is.
-        let reasoning_efforts = match reasoning {
-            Some(false) => Vec::new(),
-            Some(true) => reasoning_efforts,
+        let (reasoning, reasoning_efforts) = match reasoning {
+            Some(false) => (reasoning, Vec::new()),
+            Some(true) => (reasoning, reasoning_efforts),
             None if name.starts_with("claude-") && stale_claude_tiers(name, &reasoning_efforts) => {
                 max_output_tokens = max_output_tokens.max(CLAUDE_MIN_MAX_OUTPUT_TOKENS);
-                claude_thinking_tiers(name)
+                (reasoning, claude_thinking_tiers(name))
             }
-            None => reasoning_efforts,
+            None if is_thinking_disabled(&reasoning_efforts) => {
+                match catalog_model(provider, name) {
+                    Some(catalog) if catalog.reasoning == Some(false) => {
+                        (catalog.reasoning, Vec::new())
+                    }
+                    Some(catalog) => (catalog.reasoning, catalog.reasoning_efforts),
+                    None => (reasoning, reasoning_efforts),
+                }
+            }
+            None => (reasoning, reasoning_efforts),
         };
 
         configs.push(ModelConfig {
@@ -2055,12 +2096,13 @@ const EFFORT_ORDER: [&str; 8] = [
 ///
 /// - A model that does not reason gets "" (the request carries no
 ///   reasoning settings).
+/// - "default" leaves the provider's own setting: "" too.
 /// - "ultra" is GPT's name for the top setting, not an API value: the
 ///   request sends the highest other tier the model lists ("max" when it
 ///   lists none), as Codex does.
 /// - Any other effort is sent as it is.
 pub fn request_effort(thinks: bool, tiers: &[String], effort: &str) -> String {
-    if !thinks {
+    if !thinks || effort == DEFAULT_EFFORT {
         return String::new();
     }
     if effort != "ultra" {
@@ -2074,47 +2116,98 @@ pub fn request_effort(thinks: bool, tiers: &[String], effort: &str) -> String {
         .map_or_else(|| "max".to_string(), |tier| tier.to_string())
 }
 
+/// The effort that sends no reasoning setting, so the provider's default
+/// applies: what a Chat Completions model gets when its thinking controls
+/// are not known (see `llm_provider_kit::chat::reasoning_efforts`).
+pub const DEFAULT_EFFORT: &str = llm_provider_kit::chat::DEFAULT_EFFORT;
+
 /// True when an effort list offers no actual thinking — empty, or only "none".
 /// Such a list hides thinking-strength selection in the model picker.
 pub(crate) fn is_thinking_disabled(efforts: &[String]) -> bool {
     efforts.is_empty() || efforts.iter().all(|effort| effort == "none")
 }
 
-/// Reasoning-effort tiers for a catalog model. Upstream's exact ladders live
-/// in KDL class rules we don't compile; this maps the model's dialect to the
-/// tiers LynShen's wire protocols understand.
-fn efforts_for_catalog_model(model: &llm_provider_kit::omp::CatalogModel) -> Vec<String> {
+/// The effort a model starts at: "default" when it lists it (the
+/// provider's own setting), else "medium", else its first tier.
+pub(crate) fn default_effort(efforts: &[String]) -> Option<&str> {
+    [DEFAULT_EFFORT, "medium"]
+        .into_iter()
+        .find(|effort| efforts.iter().any(|offered| offered == effort))
+        .or_else(|| efforts.first().map(String::as_str))
+}
+
+/// Reasoning-effort tiers for a catalog model served over `api`. Upstream's
+/// exact ladders live in KDL class rules we don't compile; this maps the
+/// dialect to the tiers LynShen's wire protocols understand. Chat
+/// Completions servers each take thinking their own way: the kit's table
+/// offers what the provider documents, and the provider's default otherwise.
+fn efforts_for_catalog_model(
+    model: &llm_provider_kit::omp::CatalogModel,
+    api: &str,
+) -> Vec<String> {
     if !model.reasoning {
         return vec!["none".to_string()];
     }
-    match model.api.as_str() {
-        "anthropic-messages" => ["none", "low", "medium", "high", "xhigh", "max"]
-            .iter()
-            .map(|e| e.to_string())
-            .collect(),
-        "openai-completions" | "openrouter" => vec!["none".to_string()],
-        _ => ["none", "low", "medium", "high", "xhigh"]
-            .iter()
-            .map(|e| e.to_string())
-            .collect(),
-    }
+    let tiers: &[&str] = match api {
+        "anthropic-messages" => &["none", "low", "medium", "high", "xhigh", "max"],
+        "openai-completions" | "openrouter" => {
+            llm_provider_kit::chat::reasoning_efforts(&model.base_url, &model.id)
+        }
+        _ => &["none", "low", "medium", "high", "xhigh"],
+    };
+    tiers.iter().map(|e| e.to_string()).collect()
 }
 
-fn model_config_from_catalog(model: &llm_provider_kit::omp::CatalogModel) -> ModelConfig {
+/// `provider`'s catalog model as the engine runs it. The dialect is the one
+/// requests use: api-routes can send a model another way than its `api`.
+fn model_config_from_catalog(
+    provider: &str,
+    model: &llm_provider_kit::omp::CatalogModel,
+) -> ModelConfig {
+    let api = llm_provider_kit::omp::catalog()
+        .api_for(provider, &model.id)
+        .unwrap_or(model.api.as_str());
     ModelConfig {
         name: model.id.clone(),
         context_window: model.context_window,
         max_context_window: 0,
         max_output_tokens: model.max_tokens,
-        reasoning_efforts: efforts_for_catalog_model(model),
+        reasoning_efforts: efforts_for_catalog_model(model, api),
         input_cost: model.input_cost,
         cached_input_cost: model.cached_input_cost,
         output_cost: model.output_cost,
         display_name: Some(model.name.clone()).filter(|name| !name.is_empty() && *name != model.id),
         group_windows: BTreeMap::new(),
-        reasoning: None,
+        // A model the catalog says does not reason gets no reasoning
+        // settings at all ("none" is a 400 on some).
+        reasoning: (!model.reasoning).then_some(false),
         input_modalities: None,
     }
+}
+
+/// The catalog's entry for `provider`'s model `name`, when it serves it.
+fn catalog_model(provider: &str, name: &str) -> Option<ModelConfig> {
+    let catalog = llm_provider_kit::omp::catalog();
+    let model = catalog.models(provider).iter().find(|m| m.id == name)?;
+    catalog.protocol_for(provider, name)?;
+    Some(model_config_from_catalog(provider, model))
+}
+
+/// A model as `lynshen providers` lists it. `reasoning` says whether it
+/// thinks at all, which an effort list of only "default" (the provider
+/// decides) or only "none" (it does not) leaves to the reader otherwise.
+pub fn provider_model_value(model: &ModelConfig) -> Value {
+    json!({
+        "name": model.name,
+        "display_name": model.display_name,
+        "context_window": model.context_window,
+        "max_context_window": model.max_context_window,
+        "max_output_tokens": model.max_output_tokens,
+        "reasoning": model
+            .reasoning
+            .unwrap_or_else(|| !is_thinking_disabled(&model.reasoning_efforts)),
+        "reasoning_efforts": model.reasoning_efforts,
+    })
 }
 
 fn model_config_from_template(model: &llm_provider_kit::ModelTemplate) -> ModelConfig {
@@ -2274,7 +2367,7 @@ pub fn models_for_provider(id: &str) -> Vec<ModelConfig> {
     if !supported.is_empty() {
         return supported
             .iter()
-            .map(|model| model_config_from_catalog(model))
+            .map(|model| model_config_from_catalog(id, model))
             .collect();
     }
     crate::providers::template(id)
@@ -2790,6 +2883,252 @@ mod tests {
             }
             assert!(!models_for_provider(id).is_empty(), "{id}");
         }
+    }
+
+    fn catalog_entry(
+        api: &str,
+        base_url: &str,
+        id: &str,
+        reasoning: bool,
+    ) -> llm_provider_kit::omp::CatalogModel {
+        llm_provider_kit::omp::CatalogModel {
+            id: id.to_string(),
+            name: String::new(),
+            api: api.to_string(),
+            provider: "test".to_string(),
+            base_url: base_url.to_string(),
+            context_window: 128_000,
+            max_tokens: 8_192,
+            reasoning,
+            input: vec!["text".to_string()],
+            input_cost: 0.0,
+            cached_input_cost: 0.0,
+            output_cost: 0.0,
+        }
+    }
+
+    #[test]
+    fn catalog_efforts_follow_each_api_family() {
+        let efforts = |api: &str, base_url: &str, id: &str| {
+            let model = catalog_entry(api, base_url, id, true);
+            efforts_for_catalog_model(&model, api)
+        };
+        assert_eq!(
+            efforts(
+                "anthropic-messages",
+                "https://api.anthropic.com",
+                "claude-x"
+            ),
+            vec!["none", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            efforts("openai-responses", "https://api.openai.com/v1", "gpt-x"),
+            vec!["none", "low", "medium", "high", "xhigh"]
+        );
+        // Chat Completions: the tiers the provider documents, the provider's
+        // default first, and the default alone where nothing is known.
+        assert_eq!(
+            efforts(
+                "openai-completions",
+                "https://api.deepseek.com",
+                "deepseek-v4-pro"
+            ),
+            vec!["default", "none", "low", "high", "max"]
+        );
+        assert_eq!(
+            efforts(
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "deepseek/deepseek-v4-pro"
+            ),
+            vec!["default", "none", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            efforts(
+                "openai-completions",
+                "https://api.minimax.io/v1",
+                "MiniMax-M2.7"
+            ),
+            vec!["default"]
+        );
+
+        // A model that does not reason: "none" for older readers, and no
+        // reasoning settings on the wire.
+        let plain = catalog_entry(
+            "openai-completions",
+            "https://api.moonshot.ai/v1",
+            "moonshot-v1-8k",
+            false,
+        );
+        let config = model_config_from_catalog("test", &plain);
+        assert_eq!(config.reasoning_efforts, vec!["none"]);
+        assert_eq!(config.reasoning, Some(false));
+        assert_eq!(
+            request_effort(config.thinks(), &config.reasoning_efforts, "none"),
+            ""
+        );
+        let thinking = catalog_entry(
+            "openai-completions",
+            "https://api.minimax.io/v1",
+            "MiniMax-M2.7",
+            true,
+        );
+        let config = model_config_from_catalog("test", &thinking);
+        assert_eq!(config.reasoning, None);
+        assert!(config.thinks());
+    }
+
+    #[test]
+    fn no_catalog_model_that_reasons_is_listed_without_thinking() {
+        // Engines up to 0.7.0 listed every reasoning Chat Completions model
+        // with only "none": no effort control, and requests turned thinking off.
+        let catalog = llm_provider_kit::omp::catalog();
+        let mut chat_models = 0;
+        for (id, _, _) in builtin_providers() {
+            for model in catalog.supported_models(&id, catalog.models(&id)) {
+                let config = model_config_from_catalog(&id, model);
+                let listed = provider_model_value(&config);
+                assert_eq!(listed["reasoning"], model.reasoning, "{id}/{}", model.id);
+                let api = catalog.api_for(&id, &model.id).unwrap_or_default();
+                if model.reasoning && matches!(api, "openai-completions" | "openrouter") {
+                    chat_models += 1;
+                    let efforts = &config.reasoning_efforts;
+                    assert_eq!(efforts[0], DEFAULT_EFFORT, "{id}/{}", model.id);
+                    assert_eq!(default_effort(efforts), Some(DEFAULT_EFFORT));
+                    assert_eq!(request_effort(config.thinks(), efforts, DEFAULT_EFFORT), "");
+                }
+            }
+        }
+        assert!(chat_models > 1500, "{chat_models}");
+    }
+
+    #[test]
+    fn providers_json_says_whether_a_model_reasons() {
+        let model = |provider: &str, name: &str| {
+            let models = models_for_provider(provider);
+            let model = models.iter().find(|m| m.name == name).unwrap().clone();
+            provider_model_value(&model)
+        };
+        let pro = model("deepseek", "deepseek-v4-pro");
+        assert_eq!(pro["reasoning"], true);
+        assert_eq!(
+            pro["reasoning_efforts"],
+            json!(["default", "none", "low", "high", "max"])
+        );
+        // Thinks, with nothing to choose: the provider's default.
+        let thinking = model("moonshot", "kimi-k2-thinking");
+        assert_eq!(thinking["reasoning"], true);
+        assert_eq!(thinking["reasoning_efforts"], json!(["default"]));
+        let plain = model("moonshot", "moonshot-v1-8k");
+        assert_eq!(plain["reasoning"], false);
+        assert_eq!(plain["reasoning_efforts"], json!(["none"]));
+        // Without a catalog `reasoning`, the tiers decide.
+        let gpt = provider_model_value(&default_model_config("gpt-5.5"));
+        assert_eq!(gpt["reasoning"], true);
+        assert_eq!(gpt["name"], "gpt-5.5");
+    }
+
+    #[test]
+    fn a_none_only_catalog_entry_from_older_engines_takes_the_catalog_view() {
+        let path = std::env::temp_dir().join("lynshen-none-only/config.json");
+        let config = Config::from_value(
+            r#"{
+                "provider": "moonshot",
+                "model": "kimi-k2.6",
+                "reasoning_effort": "none",
+                "models": [
+                    { "name": "kimi-k2.6", "reasoning_efforts": ["none"] },
+                    { "name": "moonshot-v1-8k", "reasoning_efforts": ["none"] },
+                    { "name": "kimi-k3", "reasoning": true, "reasoning_efforts": ["none", "high"] },
+                    { "name": "my-own", "reasoning_efforts": ["none"] }
+                ]
+            }"#,
+            path,
+        )
+        .unwrap();
+        let k26 = config.model_config("kimi-k2.6");
+        assert_eq!(k26.reasoning_efforts, vec!["default", "none"]);
+        assert!(k26.thinks());
+        // Its "none" was the only tier, not a choice: thinking comes back on.
+        assert_eq!(config.reasoning_effort, "default");
+        let plain = config.model_config("moonshot-v1-8k");
+        assert_eq!(plain.reasoning, Some(false));
+        assert!(plain.reasoning_efforts.is_empty());
+        // What the user stated stays, and a model the catalog lacks too.
+        assert_eq!(
+            config.model_config("kimi-k3").reasoning_efforts,
+            vec!["none", "high"]
+        );
+        assert_eq!(
+            config.model_config("my-own").reasoning_efforts,
+            vec!["none"]
+        );
+
+        // "none" the user picked from a list that offered more stays.
+        let path = std::env::temp_dir().join("lynshen-none-picked/config.json");
+        let config = Config::from_value(
+            r#"{
+                "provider": "moonshot",
+                "model": "kimi-k2.6",
+                "reasoning_effort": "none",
+                "models": [{ "name": "kimi-k2.6", "reasoning_efforts": ["default", "none"] }]
+            }"#,
+            path,
+        )
+        .unwrap();
+        assert_eq!(config.reasoning_effort, "none");
+    }
+
+    #[test]
+    fn a_title_takes_the_lightest_effort_not_the_providers_default() {
+        let path = std::env::temp_dir().join("lynshen-title-effort/config.json");
+        let config = Config::from_value(
+            r#"{
+                "provider": "deepseek",
+                "model": "deepseek-v4-pro",
+                "models": [
+                    { "name": "deepseek-v4-pro", "reasoning_efforts": ["default", "none", "low", "high", "max"] },
+                    { "name": "minimax", "reasoning_efforts": ["default"] }
+                ]
+            }"#,
+            path,
+        )
+        .unwrap();
+        assert_eq!(
+            config.title(),
+            ("deepseek-v4-pro".to_string(), "none".to_string())
+        );
+        let config = Config {
+            title_model: "minimax".to_string(),
+            ..config
+        };
+        assert_eq!(
+            config.title(),
+            ("minimax".to_string(), "default".to_string())
+        );
+    }
+
+    #[test]
+    fn the_default_effort_sends_nothing_and_comes_first() {
+        let tiers = |list: &[&str]| list.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            default_effort(&tiers(&["none", "low", "default"])),
+            Some("default")
+        );
+        assert_eq!(
+            default_effort(&tiers(&["none", "low", "medium"])),
+            Some("medium")
+        );
+        assert_eq!(default_effort(&tiers(&["high", "max"])), Some("high"));
+        assert_eq!(default_effort(&[]), None);
+        assert_eq!(
+            request_effort(true, &tiers(&["default", "none"]), "default"),
+            ""
+        );
+        assert_eq!(
+            request_effort(true, &tiers(&["default", "none"]), "none"),
+            "none"
+        );
     }
 
     #[test]

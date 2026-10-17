@@ -211,6 +211,7 @@ fn request_bodies(system: &str, definitions: &[Value]) -> [(&'static str, usize)
         tools: definitions,
         max_output_tokens: 32_000,
         reasoning_effort: "medium",
+        thinking: chat::ChatThinking::default(),
     });
     let anthropic_tools = anthropic::tool_definitions(definitions);
     let anthropic_body = anthropic::request_body(&anthropic::AnthropicRequest {

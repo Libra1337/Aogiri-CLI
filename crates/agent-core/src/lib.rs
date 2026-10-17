@@ -45,8 +45,8 @@ mod web;
 mod web_fetch;
 
 pub use config::{
-    builtin_providers, lynshen_visible_models, models_for_provider, ApprovalMode, ModelConfig,
-    SubagentModel,
+    builtin_providers, lynshen_visible_models, models_for_provider, provider_model_value,
+    ApprovalMode, ModelConfig, SubagentModel,
 };
 pub use core::{title_completion, AgentCore, ApproveOptions, KeptState};
 pub use event::{
