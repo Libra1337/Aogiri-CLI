@@ -1890,6 +1890,13 @@ impl Adapter for Codex {
                 };
                 vec![json!({ "jsonrpc": "2.0", "id": request, "result": result }).to_string()]
             }
+            // No turn runs: a client that still shows one (it missed the
+            // turn's end) is told that it ended, so Stop always ends the wait.
+            "interrupt" if !self.busy => {
+                return Ok(Output::events(vec![
+                    json!({ "type": "status", "message": "ready" }),
+                ]));
+            }
             "interrupt" => match (self.thread.clone(), self.active_turn.clone()) {
                 (Some(thread), Some(turn)) => vec![self.request(
                     "turn/interrupt",
@@ -2314,6 +2321,74 @@ mod tests {
         let next = sent(&ended.frames);
         assert_eq!(next[0]["method"], "turn/start");
         assert_eq!(next[0]["params"]["input"][0]["text"], "also this");
+    }
+
+    /// A turn whose usage update names the context window, then a client
+    /// that starts watching after it ended (the desktop reopened the
+    /// conversation, or reconnected): it sees no running turn.
+    #[test]
+    fn a_turn_that_ended_does_not_run_for_a_new_watcher() {
+        fn feed(snapshot: &mut super::super::Snapshot, events: &[Value]) {
+            for event in events {
+                snapshot.apply(event);
+            }
+        }
+        let mut c = opened();
+        let mut snapshot = super::super::Snapshot::default();
+        let started = c
+            .encode(&json!({ "op": "user_message", "content": "go" }))
+            .unwrap();
+        let id = sent(&started.frames)[0]["id"].clone();
+        for value in [
+            json!({ "id": id, "result": { "turn": { "id": "turn-1", "status": "inProgress", "items": [] } } }),
+            json!({ "method": "turn/started", "params": { "threadId": "th-1", "turn": { "id": "turn-1" } } }),
+            json!({ "method": "item/started", "params": { "threadId": "th-1", "turnId": "turn-1", "item": { "type": "agentMessage", "id": "m1", "text": "" } } }),
+            json!({ "method": "item/agentMessage/delta", "params": { "threadId": "th-1", "turnId": "turn-1", "itemId": "m1", "delta": "done" } }),
+            json!({ "method": "thread/tokenUsage/updated", "params": { "threadId": "th-1", "turnId": "turn-1", "tokenUsage": {
+                "total": { "totalTokens": 900, "inputTokens": 800, "outputTokens": 100 },
+                "last": { "totalTokens": 900, "inputTokens": 800, "outputTokens": 100 },
+                "modelContextWindow": 272000 } } }),
+        ] {
+            let out = frame(&mut c, value);
+            feed(&mut snapshot, &out.events);
+        }
+        // Mid-turn, the window comes with a status that says the turn runs.
+        let mid = snapshot.events(c.busy());
+        let status = mid.iter().find(|e| e["type"] == "model_status").unwrap();
+        assert_eq!(status["state"], "streaming");
+        assert_eq!(status["context_window"], 272000);
+        assert!(mid.iter().any(|e| e["type"] == "connecting"));
+
+        let ended = frame(
+            &mut c,
+            json!({ "method": "turn/completed", "params": { "threadId": "th-1", "turn": { "id": "turn-1", "status": "completed" } } }),
+        );
+        assert!(ended
+            .events
+            .iter()
+            .any(|e| e["type"] == "status" && e["message"] == "ready"));
+        feed(&mut snapshot, &ended.events);
+        assert!(!c.busy());
+        let after = snapshot.events(c.busy());
+        let status = after.iter().find(|e| e["type"] == "model_status").unwrap();
+        assert_eq!(status["state"], "ready");
+        assert!(!after.iter().any(|e| e["type"] == "connecting"));
+
+        // Stop with no turn running answers that none runs, and asks Codex
+        // for nothing.
+        let stop = c.encode(&json!({ "op": "interrupt" })).unwrap();
+        assert!(stop.frames.is_empty());
+        assert_eq!(
+            stop.events,
+            [json!({ "type": "status", "message": "ready" })]
+        );
+        // Mid-turn it interrupts the turn.
+        busy(&mut c);
+        let stop = c.encode(&json!({ "op": "interrupt" })).unwrap();
+        assert!(stop.events.is_empty());
+        let frames = sent(&stop.frames);
+        assert_eq!(frames[0]["method"], "turn/interrupt");
+        assert_eq!(frames[0]["params"]["turnId"], "turn-1");
     }
 
     #[test]
