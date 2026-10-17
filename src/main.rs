@@ -222,17 +222,8 @@ fn main() -> io::Result<()> {
                     lynshen_agent_core::models_for_provider(&id)
                 };
                 let models = models
-                    .into_iter()
-                    .map(|m| {
-                        json!({
-                            "name": m.name,
-                            "display_name": m.display_name,
-                            "context_window": m.context_window,
-                            "max_context_window": m.max_context_window,
-                            "max_output_tokens": m.max_output_tokens,
-                            "reasoning_efforts": m.reasoning_efforts,
-                        })
-                    })
+                    .iter()
+                    .map(lynshen_agent_core::provider_model_value)
                     .collect::<Vec<_>>();
                 json!({ "id": id, "base_url": base_url, "protocol": protocol, "models": models })
             })

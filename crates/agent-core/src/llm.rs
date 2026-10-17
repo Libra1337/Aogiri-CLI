@@ -1731,6 +1731,7 @@ impl OpenAiClient {
             self.tool_definitions()
         };
         let effort = self.request_effort(variant.effort.unwrap_or(&self.reasoning_effort));
+        let thinking = chat::thinking_for(&self.base_url, &self.model);
         let body = chat::request_body(&chat::ChatRequest {
             model: &self.model,
             system_prompt: &self.system_prompt,
@@ -1738,15 +1739,25 @@ impl OpenAiClient {
             tools: &tools,
             max_output_tokens: self.max_output_tokens,
             reasoning_effort: &effort,
+            thinking,
         });
         let url = chat::completions_url(&self.base_url);
-        self.transport.stream(
+        let mut items = self.transport.stream(
             Protocol::OpenAiChatCompletions,
             &url,
             &body,
             self.read_timeout,
-            &mut |event| emit(map_transport_event(event)?),
-        )
+            &mut |mut event| {
+                if let TransportEvent::Wire(WireEvent::ResponseItem(item)) = &mut event {
+                    keep_chat_reasoning(item, thinking.replay);
+                }
+                emit(map_transport_event(event)?)
+            },
+        )?;
+        for item in &mut items {
+            keep_chat_reasoning(item, thinking.replay);
+        }
+        Ok(items)
     }
 
     /// Estimated tokens of the tool definitions a request carries: the
@@ -2090,9 +2101,13 @@ impl OpenAiClient {
             }
             // Default a subagent to the cheapest supported tier of its model
             // (subagents don't share the parent prompt cache, so this is free
-            // savings). Fall back to the parent effort when tiers are unknown.
+            // savings), or to the provider's own setting where the model
+            // lists it: such a model's "none" is not the user's choice. Fall
+            // back to the parent effort when tiers are unknown.
             None => efforts
-                .first()
+                .iter()
+                .find(|effort| *effort == crate::config::DEFAULT_EFFORT)
+                .or_else(|| efforts.first())
                 .cloned()
                 .unwrap_or_else(|| self.reasoning_effort.clone()),
         };
@@ -4479,6 +4494,18 @@ fn map_transport_event(event: TransportEvent) -> Result<StreamEvent, String> {
     })
 }
 
+/// A chat answer's thinking (`reasoning_content`) stays on its item only
+/// where it goes back with later requests (`replay`); elsewhere it would
+/// count against the context without being sent.
+fn keep_chat_reasoning(item: &mut Value, replay: bool) {
+    if replay {
+        return;
+    }
+    if let Some(item) = item.as_object_mut() {
+        item.remove("reasoning_content");
+    }
+}
+
 fn cache_debug_enabled() -> bool {
     env::var("LYNSHEN_CACHE_DEBUG")
         .ok()
@@ -5247,6 +5274,30 @@ mod tests {
 
     fn settings(client: &OpenAiClient, args: Value) -> Result<SpawnSettings<'_>, String> {
         client.spawn_settings(&args, client.subagent_manager.as_ref().unwrap())
+    }
+
+    #[test]
+    fn a_subagent_on_a_chat_model_keeps_the_providers_thinking() {
+        let mut client = team_client(Default::default());
+        client.reasoning_efforts = vec!["default".to_string(), "none".to_string()];
+        let plain = settings(&client, json!({})).unwrap();
+        assert_eq!(plain.reasoning_effort, "default");
+        let off = settings(&client, json!({ "reasoning_effort": "none" })).unwrap();
+        assert_eq!(off.reasoning_effort, "none");
+    }
+
+    #[test]
+    fn chat_reasoning_is_kept_only_where_it_goes_back() {
+        let item = || {
+            json!({ "type": "function_call", "call_id": "c", "name": "read", "arguments": "{}",
+                    "reasoning_content": "look first" })
+        };
+        let mut kept = item();
+        keep_chat_reasoning(&mut kept, true);
+        assert_eq!(kept["reasoning_content"], "look first");
+        let mut dropped = item();
+        keep_chat_reasoning(&mut dropped, false);
+        assert!(dropped.get("reasoning_content").is_none());
     }
 
     #[test]

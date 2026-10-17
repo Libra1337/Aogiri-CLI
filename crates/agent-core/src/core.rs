@@ -612,16 +612,18 @@ impl AgentCore {
     }
 
     /// The configured effort, or a valid fallback when it isn't one the current
-    /// model supports (e.g. a stale "medium" after switching to a high/max model).
+    /// model supports (e.g. a stale "medium" after switching to a high/max model):
+    /// the provider's default when the model lists it, else "high", else the
+    /// middle tier.
     fn effective_reasoning_effort(&self) -> String {
         let efforts = self.config.current_model_config().reasoning_efforts;
         if efforts.is_empty() || efforts.iter().any(|e| e == &self.config.reasoning_effort) {
             return self.config.reasoning_effort.clone();
         }
-        efforts
-            .iter()
-            .find(|e| e.as_str() == "high")
-            .cloned()
+        [crate::config::DEFAULT_EFFORT, "high"]
+            .into_iter()
+            .find(|effort| efforts.iter().any(|e| e == effort))
+            .map(str::to_string)
             .unwrap_or_else(|| efforts[efforts.len() / 2].clone())
     }
 
@@ -5892,14 +5894,9 @@ impl AgentCore {
 
     fn default_reasoning_effort_for_model(&self, model: &str) -> String {
         let efforts = self.reasoning_efforts_for_model(model);
-        if efforts.iter().any(|effort| effort == "medium") {
-            "medium".to_string()
-        } else {
-            efforts
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "medium".to_string())
-        }
+        crate::config::default_effort(&efforts)
+            .unwrap_or("medium")
+            .to_string()
     }
 
     fn is_reasoning_effort_for_current_model(&self, value: &str) -> bool {
