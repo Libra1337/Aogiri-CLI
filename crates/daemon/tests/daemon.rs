@@ -2558,6 +2558,61 @@ fn a_codex_session_is_named_by_its_thread_and_resumes_with_its_history() {
         .any(|i| i["role"] == "tool" && i["name"] == "bash"));
 }
 
+/// A Codex turn that named its context window mid-turn has ended: a client
+/// that starts watching then (the desktop opened the conversation again, or
+/// reconnected) sees no running turn, and Stop with none running says so.
+#[test]
+fn a_codex_turn_that_ended_is_over_for_a_client_that_watches_later() {
+    let _guard = setup();
+    fake_codex();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-codex-watch");
+    fs::create_dir_all(&dir).unwrap();
+    let mut desktop = Client::connect(&daemon);
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "codex" }),
+    );
+    let session = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    desktop.send(json!({ "op": "watch", "session": session }));
+    desktop.until(|f| f["session"] == session.as_str() && f["type"] == "attended");
+
+    // "usage": the fake sends a usage update that names the context window.
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "usage" }));
+    let frames = desktop.until(turn_done(&session));
+    assert!(
+        frames.iter().any(|f| f["session"] == session.as_str()
+            && f["type"] == "model_status"
+            && f["state"] == "streaming"),
+        "{frames:#?}"
+    );
+
+    let mut later = Client::connect(&daemon);
+    later.send(json!({ "op": "watch", "session": session }));
+    let frames = later.until(|f| f["session"] == session.as_str() && f["type"] == "attended");
+    let snapshot: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f["session"] == session.as_str())
+        .collect();
+    let status = snapshot
+        .iter()
+        .rev()
+        .find(|f| f["type"] == "model_status")
+        .unwrap_or_else(|| panic!("{frames:#?}"));
+    assert_eq!(status["state"], "ready", "{frames:#?}");
+    assert_eq!(status["context_window"], 272000);
+    assert!(
+        !snapshot.iter().any(|f| f["type"] == "connecting"),
+        "{frames:#?}"
+    );
+
+    later.send(json!({ "op": "interrupt", "session": session }));
+    later.until(ready(&session));
+}
+
 #[test]
 fn the_desktop_saves_mcp_servers_for_every_session_without_one() {
     let _guard = setup();

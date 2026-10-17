@@ -543,11 +543,24 @@ impl Snapshot {
         self.approvals.retain(|(id, _)| id != call);
     }
 
+    /// What a client that starts watching gets; `busy`: a turn runs now.
     fn events(&self, busy: bool) -> Vec<Value> {
         let mut events: Vec<Value> = STATE_EVENTS
             .iter()
             .filter_map(|name| self.state.get(name).cloned())
             .collect();
+        // A `model_status` names the engine's state when it was sent. One
+        // sent mid-turn (Codex sends one when its first usage update names
+        // the context window) still says "streaming" once the turn has
+        // ended, and a client would show that turn as running for good. The
+        // state is the engine's now: a running turn adds `connecting` below.
+        if !busy {
+            for event in &mut events {
+                if event["type"] == "model_status" && event.get("state").is_some() {
+                    event["state"] = json!("ready");
+                }
+            }
+        }
         let items: Vec<Value> = self
             .transcript
             .iter()
@@ -1437,6 +1450,35 @@ mod tests {
             .events(false)
             .iter()
             .any(|e| e["type"] == "approval_request"));
+    }
+
+    #[test]
+    fn the_snapshot_names_the_engines_state_now() {
+        let mut snapshot = Snapshot::default();
+        // The latest model_status was sent mid-turn; the turn has ended since.
+        for event in [
+            json!({ "type": "model_status", "model": "gpt-5", "state": "ready" }),
+            json!({ "type": "user_message", "content": "hi" }),
+            json!({ "type": "connecting" }),
+            json!({ "type": "model_status", "model": "gpt-5", "context_window": 272000, "state": "streaming" }),
+            json!({ "type": "assistant_delta", "delta": "done" }),
+            json!({ "type": "status", "message": "ready" }),
+        ] {
+            snapshot.apply(&event);
+        }
+        let idle = snapshot.events(false);
+        let status = idle.iter().find(|e| e["type"] == "model_status").unwrap();
+        assert_eq!(status["state"], "ready");
+        assert_eq!(status["context_window"], 272000);
+        assert!(!idle.iter().any(|e| e["type"] == "connecting"));
+        // A turn that runs still shows: its `connecting` follows the status.
+        let running = snapshot.events(true);
+        let at = |kind: &str| running.iter().position(|e| e["type"] == kind).unwrap();
+        assert!(at("connecting") > at("model_status"));
+        // An engine whose status names no state gets none.
+        let mut plain = Snapshot::default();
+        plain.apply(&json!({ "type": "model_status", "model": "m" }));
+        assert!(plain.events(false)[0].get("state").is_none());
     }
 
     #[test]

@@ -71,6 +71,10 @@ while True:
         reply = "ok: " + text
         out({"method": "item/started", "params": {"item": {"id": "m1", "type": "agentMessage"}}})
         out({"method": "item/agentMessage/delta", "params": {"itemId": "m1", "delta": reply}})
+        if "usage" in text:
+            # Mid-turn, as Codex sends it: the first one names the context window.
+            spent = {"totalTokens": 900, "inputTokens": 800, "outputTokens": 100}
+            out({"method": "thread/tokenUsage/updated", "params": {"turnId": "t1", "tokenUsage": {"total": spent, "last": spent, "modelContextWindow": 272000}}})
         out({"method": "item/completed", "params": {"item": {"id": "m1", "type": "agentMessage", "text": reply}}})
         items.append({"type": "agentMessage", "text": reply})
         turns.append(items)

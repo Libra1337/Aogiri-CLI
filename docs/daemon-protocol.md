@@ -371,7 +371,13 @@ Differences from a lynshen session:
   events, the conversation so far (text and tool results; a reopened
   session starts from the text Claude Code saved) and any open permission
   prompts. Prompts wait for whichever client answers them first; an
-  unwatched session is not switched to deferred actions.
+  unwatched session is not switched to deferred actions. The snapshot's
+  `model_status` names the engine's state at the time of the snapshot
+  (`ready` when no turn runs), not the state it had when it was sent; a
+  running turn adds `connecting`.
+- `interrupt` on a Codex session with no turn running answers
+  `{"type":"status","message":"ready"}`, so a client that still shows a
+  turn stops waiting for it.
 - Switching into or out of full access restarts Claude Code on the same
   conversation (it only honors that mode as a start flag), after the running
   turn. Codex applies a new mode, and a model picked with `/model`, from the
