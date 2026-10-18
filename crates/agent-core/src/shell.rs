@@ -146,6 +146,12 @@ impl Kind {
         matches!(self, Self::Pwsh | Self::WindowsPowerShell)
     }
 
+    /// A POSIX shell (zsh, bash, sh and the like, including Git Bash): one
+    /// whose grammar `command_text` and the read-only classifier understand.
+    pub fn is_posix(self) -> bool {
+        matches!(self, Self::GitBash | Self::Zsh | Self::Bash | Self::Sh)
+    }
+
     /// The shells settings offer on `platform`, in their order.
     pub fn offered(platform: Platform) -> &'static [Kind] {
         match platform {

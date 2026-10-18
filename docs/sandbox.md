@@ -81,7 +81,21 @@ to running commands unsandboxed.
 ## Approvals
 
 A command inside the sandbox needs no approval, except in `manual` mode,
-which still asks for every command. A command that must leave the sandbox
+which asks for every command that changes anything. A command `manual` mode
+still runs without asking is one that provably only reads: every part of it
+(a pipeline, a `&&`/`||`/`;` list, a `for … do … done` loop) is a read-only
+program — `ls`, `cat`, `head`, `tail`, `grep`/`rg`, `find` (no `-exec` or
+`-delete`), `wc`, `ps`, `git status`/`diff`/`log`/`show`/`branch --list`
+and the like — with no redirection except to `/dev/null`, no command
+substitution and nothing that writes, installs or reaches the network. This
+is the same idea as Claude Code's default mode and Codex's known-safe list,
+and it still runs inside the OS sandbox; anything the classifier does not
+recognise falls back to asking. Only a POSIX shell (zsh, bash, sh, Git Bash)
+is classified; under PowerShell every command still asks. Your `ask` rules
+and the built-in ask list come first, so they keep asking even for a
+read-only command.
+
+A command that must leave the sandbox
 (commit to git, write elsewhere) is called with `escalate: true` and a
 `justification`, and goes through the approval mode: `auto` asks the safety
 model, `manual` and `auto-edit` ask you, `full-access` runs it.

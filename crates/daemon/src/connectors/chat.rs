@@ -249,6 +249,11 @@ struct Binding {
     /// Deferred actions and questions already announced.
     actions: HashSet<String>,
     questions: HashSet<String>,
+    /// Sessions the account chose "本轮都允许" (allow all this turn) for:
+    /// the next ordinary approval requests of that session run without a
+    /// card until the turn ends. Each is allowed once, like the per-request
+    /// allow; never an elevation, an escalation or a rule that must ask.
+    allow_turn: HashSet<String>,
     /// Revoked: its client is gone.
     gone: bool,
 }
@@ -354,6 +359,7 @@ impl Chat {
                 .into_iter()
                 .map(|q| q.id)
                 .collect(),
+            allow_turn: HashSet::new(),
             gone: false,
             device,
         };
@@ -960,6 +966,10 @@ impl Chat {
                 let id = argument.trim().to_ascii_uppercase();
                 Some(self.decide(device, &id, command == Command::Allow))
             }
+            Command::AllowTurn => {
+                let id = argument.trim().to_ascii_uppercase();
+                Some(self.allow_rest_of_turn(device, &id))
+            }
             Command::Unbind => {
                 self.tell(
                     device,
@@ -1514,6 +1524,7 @@ impl Chat {
         }
         let parts: Vec<&str> = press.data.split(':').collect();
         let answer = match parts.as_slice() {
+            ["a", id, "t"] => self.allow_rest_of_turn(&device, id),
             ["a", id, answer] => self.decide(&device, id, *answer == "y"),
             ["p", id, answer] => self.plan_press(&device, id, *answer == "y"),
             ["n", index] => {
@@ -1542,34 +1553,22 @@ impl Chat {
                 return error;
             }
         }
-        let decision = if allow { "allow" } else { "deny" };
         let (op, what) = match &target {
-            Target::Call(call) => (
-                json!({ "op": "approve", "session": session, "call_id": call, "decision": decision }),
-                json!({ "session": session, "call": call, "decision": decision }),
-            ),
-            Target::Action(action) => (
-                json!({ "op": "decide_action", "session": session, "action": action, "decision": decision }),
-                json!({ "session": session, "action": action, "decision": decision }),
-            ),
+            Target::Call(call) => self.decision_op(&session, call, allow),
+            Target::Action(action) => {
+                let decision = if allow { "allow" } else { "deny" };
+                (
+                    json!({ "op": "decide_action", "session": session, "action": action, "decision": decision }),
+                    json!({ "session": session, "action": action, "decision": decision }),
+                )
+            }
             Target::Plan(_) => return self.plan_press(device, id, allow),
         };
-        if let Err(error) = self
-            .call(device, op, Duration::from_millis(200))
-            .or_else(|error| {
-                // No reply is the usual answer to a forwarded op.
-                if error == "the daemon did not answer in time" {
-                    Ok(Value::Null)
-                } else {
-                    Err(error)
-                }
-            })
-        {
+        if let Err(error) = self.forward_decision(device, op, what) {
             let text = failed(lang, &error);
             self.tell(device, &text);
             return text;
         }
-        self.hub.connectors.audit(&self.connector, "decide", what);
         let outcome = if allow {
             tr(lang, "已允许", "Allowed")
         } else {
@@ -1577,6 +1576,70 @@ impl Chat {
         };
         self.close_card(id, &outcome);
         outcome
+    }
+
+    /// Allows this request and every ordinary approval of its session for the
+    /// rest of the turn (`allow_turn`): the same reach as the per-request
+    /// 允许, held only until the turn ends. Never offered for an elevation,
+    /// a command that leaves the sandbox, or a rule that must ask, so it can
+    /// never approve `sudo` or a boundary crossing — those stay on the
+    /// desktop or the phone page.
+    fn allow_rest_of_turn(&mut self, device: &str, id: &str) -> String {
+        let lang = self.lang(device);
+        let Some(card) = self.cards.get(id) else {
+            return tr(lang, "这个请求已失效。", "This request is no longer open.");
+        };
+        if card.device != device {
+            return tr(lang, "这不是你的确认请求。", "This request is not yours.");
+        }
+        let (session, target) = (card.session.clone(), card.target.clone());
+        let Target::Call(call) = target else {
+            // Only an ordinary approval request has a turn; a plan or a
+            // deferred action falls back to a plain allow.
+            return self.decide(device, id, true);
+        };
+        if let Err(error) = self.lynshen_only(device, &session) {
+            return error;
+        }
+        let (op, what) = self.decision_op(&session, &call, true);
+        if let Err(error) = self.forward_decision(device, op, what) {
+            let text = failed(lang, &error);
+            self.tell(device, &text);
+            return text;
+        }
+        if let Some(binding) = self.bindings.get_mut(device) {
+            binding.allow_turn.insert(session.clone());
+        }
+        self.hub
+            .connectors
+            .audit(&self.connector, "allow_turn", json!({ "session": session }));
+        let outcome = tr(lang, "本轮都允许", "Allowed for this turn");
+        self.close_card(id, &outcome);
+        outcome
+    }
+
+    /// The `approve` op for a call and the line to audit.
+    fn decision_op(&self, session: &str, call: &str, allow: bool) -> (Value, Value) {
+        let decision = if allow { "allow" } else { "deny" };
+        (
+            json!({ "op": "approve", "session": session, "call_id": call, "decision": decision }),
+            json!({ "session": session, "call": call, "decision": decision }),
+        )
+    }
+
+    /// Sends a decision op to the daemon and audits it; a forwarded op's
+    /// silence is the usual answer, not an error.
+    fn forward_decision(&mut self, device: &str, op: Value, what: Value) -> Result<(), String> {
+        self.call(device, op, Duration::from_millis(200))
+            .or_else(|error| {
+                if error == "the daemon did not answer in time" {
+                    Ok(Value::Null)
+                } else {
+                    Err(error)
+                }
+            })?;
+        self.hub.connectors.audit(&self.connector, "decide", what);
+        Ok(())
     }
 
     fn plan_press(&mut self, device: &str, id: &str, approve: bool) -> String {
@@ -1651,6 +1714,9 @@ impl Chat {
     }
 
     /// A new card for `device`, with buttons as the connector allows.
+    /// `turn_ok`: this request may offer "本轮都允许" (an ordinary call of a
+    /// session a turn is running in), so the user can clear a burst of
+    /// approvals at once.
     #[allow(clippy::too_many_arguments)]
     fn card(
         &mut self,
@@ -1661,6 +1727,7 @@ impl Chat {
         kind: &str,
         what: &str,
         reason: Option<&str>,
+        turn_ok: bool,
     ) {
         let lang = self.lang(device);
         let Some(chat) = self.bindings.get(device).map(|b| b.chat.clone()) else {
@@ -1687,6 +1754,10 @@ impl Chat {
             label: tr(lang, "允许", "Allow"),
             data: format!("a:{id}:y"),
         };
+        let allow_turn = Button {
+            label: tr(lang, "本轮都允许", "Allow this turn"),
+            data: format!("a:{id}:t"),
+        };
         let deny = Button {
             label: tr(lang, "拒绝", "Deny"),
             data: format!("a:{id}:n"),
@@ -1706,6 +1777,14 @@ impl Chat {
                 match lang {
                     Lang::Zh => format!("提权（sudo 等）不能在聊天里批准，只能拒绝；批准请到电脑或手机远程页（{REMOTE_PAGE}）。编号 {id}。"),
                     Lang::En => format!("An elevation (sudo and the like) cannot be approved from chat, only denied; approve it on the desktop or the phone page ({REMOTE_PAGE}). Id {id}."),
+                },
+            )
+        } else if turn_ok {
+            (
+                vec![allow, allow_turn, deny],
+                match lang {
+                    Lang::Zh => format!("编号 {id}：也可以回复「允许 {id}」「本轮 {id}」或「拒绝 {id}」。「本轮都允许」只在这一轮里、对普通命令生效，不含提权。"),
+                    Lang::En => format!("Id {id}: reply \"/allow {id}\", \"/allowturn {id}\" or \"/deny {id}\". \"Allow this turn\" covers ordinary commands of this turn only, never an elevation."),
                 },
             )
         } else {
@@ -1884,6 +1963,11 @@ impl Chat {
                             },
                         );
                     }
+                    // The turn is over: "本轮都允许" lapses, so the next turn
+                    // asks again.
+                    if let Some(binding) = self.bindings.get_mut(device) {
+                        binding.allow_turn.remove(&session);
+                    }
                     self.resolve_calls(&session, None, &tr(lang, "已结束", "Ended"));
                 }
             }
@@ -1896,7 +1980,23 @@ impl Chat {
                     .unwrap_or_default()
                     .to_string();
                 let kind = frame["kind"].as_str().unwrap_or("tool").to_string();
+                // "本轮都允许" earlier this turn: approve this one too, with
+                // no card. Only an ordinary approval is covered — an
+                // elevation, a boundary crossing or a rule that must ask
+                // still gets its own card.
+                let covered = self
+                    .bindings
+                    .get(device)
+                    .is_some_and(|b| b.allow_turn.contains(&session))
+                    && turn_allowable(&kind, &frame);
+                if covered {
+                    let (op, audit) = self.decision_op(&session, &call, true);
+                    if self.forward_decision(device, op, audit).is_ok() {
+                        return;
+                    }
+                }
                 let heading = tr(lang, "需要确认", "Approval needed");
+                let turn_ok = turn_allowable(&kind, &frame);
                 self.card(
                     device,
                     &session,
@@ -1905,6 +2005,7 @@ impl Chat {
                     &kind,
                     &what,
                     frame["justification"].as_str(),
+                    turn_ok,
                 );
             }
             "tool_output" | "action_deferred" => {
@@ -1929,6 +2030,7 @@ impl Chat {
                     if binding.watching.as_deref() == Some(session.as_str()) {
                         binding.watching = None;
                     }
+                    binding.allow_turn.remove(&session);
                 }
                 if turn_session.as_deref() == Some(session.as_str()) {
                     self.finish(device, Ending::Closed);
@@ -2094,6 +2196,7 @@ impl Chat {
                 action["summary"].as_str().unwrap_or_default()
             );
             let heading = tr(lang, "待处理事项", "Pending action");
+            // A deferred action has no running turn to scope "本轮都允许" to.
             self.card(
                 device,
                 &session,
@@ -2102,6 +2205,7 @@ impl Chat {
                 action["kind"].as_str().unwrap_or("tool"),
                 &what,
                 action["justification"].as_str(),
+                false,
             );
         }
     }
@@ -2334,6 +2438,7 @@ enum Command {
     File,
     Open,
     Allow,
+    AllowTurn,
     Deny,
     Unbind,
     Terminal,
@@ -2356,6 +2461,7 @@ impl Command {
             Command::File => "file",
             Command::Open => "open",
             Command::Allow => "allow",
+            Command::AllowTurn => "allowturn",
             Command::Deny => "deny",
             Command::Unbind => "unbind",
             Command::Terminal => "terminal",
@@ -2391,6 +2497,7 @@ fn command_of(text: &str) -> Option<(Command, &str)> {
             "file" => Command::File,
             "open" => Command::Open,
             "allow" => Command::Allow,
+            "allowturn" | "allow_turn" => Command::AllowTurn,
             "deny" => Command::Deny,
             "unbind" => Command::Unbind,
             "terminal" | "term" | "shell" | "sudo" | "tui" => Command::Terminal,
@@ -2409,6 +2516,7 @@ fn command_of(text: &str) -> Option<(Command, &str)> {
         "状态" => (Command::Status, false),
         "模式" => (Command::Mode, true),
         "允许" => (Command::Allow, true),
+        "本轮" => (Command::AllowTurn, true),
         "拒绝" => (Command::Deny, true),
         "解绑" => (Command::Unbind, false),
         "终端" => (Command::Terminal, false),
@@ -2458,6 +2566,18 @@ fn mode_name(mode: &str, lang: Lang) -> String {
         other => (other, other),
     };
     tr(lang, zh, en)
+}
+
+/// Whether "本轮都允许" covers this approval request: an ordinary command
+/// or tool, never an elevation, a command that leaves the sandbox, a write
+/// outside the workspace, or a request a person must decide (an `ask`
+/// rule). This keeps the turn scope to the same reach as the per-request
+/// 允许, and well clear of elevation and boundary crossings.
+fn turn_allowable(kind: &str, frame: &Value) -> bool {
+    if frame["must_ask"].as_bool() == Some(true) {
+        return false;
+    }
+    matches!(kind, "command" | "edit" | "tool")
 }
 
 fn kind_words(kind: &str, lang: Lang) -> String {

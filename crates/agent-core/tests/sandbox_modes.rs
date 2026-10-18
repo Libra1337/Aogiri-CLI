@@ -114,6 +114,42 @@ fn full_access_keeps_the_sandbox_and_reports_what_leaves_it() {
 }
 
 #[test]
+fn manual_mode_runs_read_only_commands_without_asking() {
+    // Only enforced where an OS sandbox runs (macOS and the Linux CI);
+    // elsewhere manual mode gates every command and there is nothing new.
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        return;
+    }
+    let _guard = setup();
+    let dir = temp_dir("modes-manual-read-only");
+    fs::write(dir.join("note.txt"), "hi\n").unwrap();
+    let mut core = open(&dir, ApprovalMode::Manual);
+
+    // A read-only command, and a compound of them, run without a prompt.
+    for command in ["cat note.txt", "ls -la | head -5; wc -l note.txt"] {
+        let events = submit(&mut core, format!("RUN: {command}"));
+        assert!(
+            !events.iter().any(is_approval),
+            "{command} asked: {events:#?}"
+        );
+    }
+
+    // A write still asks, and runs only once allowed.
+    let events = submit(&mut core, "RUN: printf wrote > out.txt".to_string());
+    let call = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ApprovalRequest { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        })
+        .expect("a write asks in manual mode");
+    assert!(!dir.join("out.txt").exists());
+    core.approve(&call, true, false, None);
+    pump(&mut core, is_ready);
+    assert_eq!(fs::read_to_string(dir.join("out.txt")).unwrap(), "wrote");
+}
+
+#[test]
 fn an_allow_rule_lets_an_escalation_out_and_says_so() {
     let _guard = setup();
     let dir = temp_dir("modes-allow-rule");

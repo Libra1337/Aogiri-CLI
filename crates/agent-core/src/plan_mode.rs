@@ -226,10 +226,72 @@ pub fn read_only_refusal(
 /// Programs that only read, whatever their arguments (apart from the
 /// options `forbidden_option` rejects).
 const READ_ONLY_PROGRAMS: &[&str] = &[
-    "cat", "head", "tail", "wc", "ls", "pwd", "echo", "printf", "grep", "egrep", "fgrep", "rg",
-    "find", "tree", "file", "stat", "du", "df", "which", "whereis", "sort", "cut", "tr", "diff",
-    "cmp", "comm", "nl", "basename", "dirname", "realpath", "readlink", "uname", "whoami", "id",
-    "jq", "true", "false", "cd",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "ls",
+    "pwd",
+    "echo",
+    "printf",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "find",
+    "tree",
+    "file",
+    "stat",
+    "du",
+    "df",
+    "which",
+    "whereis",
+    "sort",
+    "cut",
+    "tr",
+    "diff",
+    "cmp",
+    "comm",
+    "nl",
+    "basename",
+    "dirname",
+    "realpath",
+    "readlink",
+    "uname",
+    "whoami",
+    "id",
+    "jq",
+    "true",
+    "false",
+    "cd",
+    "ps",
+    "date",
+    "hostname",
+    "seq",
+    "rev",
+    "paste",
+    "column",
+    "expr",
+    "test",
+    "[",
+    "[[",
+    "base64",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "sha512sum",
+    "cksum",
+];
+
+/// Shell keywords that stand between the simple commands of a compound
+/// command (a `for … do … done` loop, an `if … then … fi`): they run
+/// nothing themselves, so a word list that is only these is read-only. A
+/// compound command is read-only when every simple command between them is.
+/// `case` is left out: its `pattern)` arms are hard to tell from a
+/// subshell, so a command that uses it is not classified read-only.
+const SHELL_KEYWORDS: &[&str] = &[
+    "for", "while", "until", "do", "done", "if", "then", "elif", "else", "fi", "select", "in",
+    "time", "!", "{", "}",
 ];
 
 /// git subcommands that only read.
@@ -250,7 +312,6 @@ const READ_ONLY_GIT: &[&str] = &[
     "show-ref",
     "merge-base",
     "name-rev",
-    "reflog",
 ];
 
 /// Whether `command` provably only reads: a pipeline or list of known
@@ -419,8 +480,30 @@ impl Lexer {
 }
 
 fn words_are_read_only(words: &[String]) -> bool {
-    let Some((program, args)) = words.split_first() else {
-        return false;
+    // `for VAR in a b c` / `select VAR in a b c`: the header assigns a loop
+    // variable and lists literal words, and runs nothing (a `$(…)` list or
+    // the C-style `for ((…))` makes the lexer reject the whole command
+    // first). The loop body is its own simple command, between `do` and
+    // `done`.
+    if matches!(words.first().map(String::as_str), Some("for" | "select")) {
+        return true;
+    }
+    // A compound command's keywords (`do`/`done`, `if … then … fi`) run
+    // nothing: skip them, so the simple command they wrap is judged on its
+    // own, and a part that is only keywords (`done`, `else`) reads.
+    let rest: &[String] = {
+        let mut rest = words;
+        while rest
+            .first()
+            .is_some_and(|word| SHELL_KEYWORDS.contains(&word.as_str()))
+        {
+            rest = &rest[1..];
+        }
+        rest
+    };
+    let Some((program, args)) = rest.split_first() else {
+        // Only keywords (`done`, `fi`, `else`): nothing runs.
+        return true;
     };
     // An environment assignment or a path could run anything.
     if program.contains(['=', '/']) {
@@ -489,8 +572,42 @@ fn forbidden_option(program: &str, arg: &str) -> bool {
         "sort" => {
             arg == "-o" || arg.starts_with("--output") || (arg.starts_with("-o") && arg.len() > 2)
         }
-        "rg" => arg.starts_with("--pre"),
+        // `rg --pre`/`--hostname-bin` run a program; `-z`/`--search-zip`
+        // shell out to a decompressor.
+        "rg" => {
+            arg.starts_with("--pre")
+                || arg.starts_with("--hostname-bin")
+                || matches!(arg, "-z" | "--search-zip")
+        }
         "tree" => arg == "-o",
+        // `base64 -o file` (BSD/macOS) writes a file.
+        "base64" => {
+            arg == "-o"
+                || arg == "--output"
+                || arg.starts_with("--output=")
+                || (arg.starts_with("-o") && arg.len() > 2)
+        }
+        // Following a file never ends, so it keeps the approval gate (and a
+        // shell session) open: keep asking for it.
+        "head" | "tail" => matches!(arg, "-f" | "-F" | "--follow") || arg.starts_with("--follow"),
+        // `file -C` compiles and writes a magic cache.
+        "file" => arg == "-C" || arg == "--compile",
+        // `date -s`/`--set` sets the system clock; `-f file` reads dates
+        // from a file (harmless) but `date` writing nothing else, keep the
+        // set form out.
+        "date" => arg == "-s" || arg.starts_with("--set"),
+        // `ps -E` / the BSD `e` modifier print every process's environment,
+        // which can hold secrets; the ordinary `-e`/`-A` (all processes) is
+        // a dash option and stays allowed. A BSD modifier bundle is a dashless
+        // run of modifier letters (`aux`, `axe`): reject it only when it
+        // carries `e`, so a `-o` column name (`etime`) is not misread.
+        "ps" => {
+            arg == "-E"
+                || arg == "--environment"
+                || (!arg.is_empty()
+                    && arg.contains('e')
+                    && arg.bytes().all(|b| b"auxwjlfrvchmSTe".contains(&b)))
+        }
         _ => false,
     }
 }
@@ -508,10 +625,16 @@ fn git_is_read_only(args: &[&str]) -> bool {
     let Some((&subcommand, options)) = rest.split_first() else {
         return false;
     };
-    if options
-        .iter()
-        .any(|arg| *arg == "-o" || arg.starts_with("--output") || arg.starts_with("--ext-diff"))
-    {
+    if options.iter().any(|arg| {
+        *arg == "-o"
+            || arg.starts_with("--output")
+            || arg.starts_with("--ext-diff")
+            // `git grep -O<pager>` / `--open-files-in-pager` opens the hits
+            // in a program of the caller's choosing.
+            || *arg == "-O"
+            || arg.starts_with("-O")
+            || arg.starts_with("--open-files-in-pager")
+    }) {
         return false;
     }
     match subcommand {
@@ -537,6 +660,8 @@ fn git_is_read_only(args: &[&str]) -> bool {
                 "--get" | "--get-all" | "--get-regexp" | "--list" | "-l"
             )
         }),
+        // `git reflog` reads, but `expire`/`delete` rewrite it.
+        "reflog" => !matches!(options.first(), Some(&"expire") | Some(&"delete")),
         other => READ_ONLY_GIT.contains(&other),
     }
 }
@@ -686,6 +811,81 @@ mod tests {
         assert!(refusal("bash", &escalated, None).is_some());
         let refused = refusal("exec_command", r#"{"cmd":"cargo build"}"#, None).unwrap();
         assert!(refused.contains("`cargo build`"), "{refused}");
+    }
+
+    #[test]
+    fn the_owners_status_commands_read_only() {
+        // The five read-only commands the owner's "现在有什么项目在执行" turn
+        // ran, each of which should run without a prompt in manual mode.
+        for command in [
+            r#"pwd; ls -la"#,
+            r#"ls -la "/Users/chad/Code/proj" 2>/dev/null | head -50"#,
+            r#"ps -axo pid,ppid,etime,command | grep -i "node\|cargo\|python" | grep -v grep | head -20"#,
+            r#"cd /Users/chad/Code/proj && git status --short | head -20; git log --oneline -3 2>/dev/null"#,
+        ] {
+            assert!(is_read_only_command(command), "{command}");
+        }
+        // The port-probe loop runs `curl`, which can POST or exfiltrate, so
+        // it stays "ask": the `本轮都允许` chat action covers the one call.
+        assert!(!is_read_only_command(
+            r#"for p in 3000 5173 8080; do curl -s -o /dev/null -w "%{http_code}" --max-time 2 http://127.0.0.1:$p/ || echo closed; done"#
+        ));
+    }
+
+    #[test]
+    fn read_only_classifier_covers_more_tools_and_compounds() {
+        for command in [
+            // Newly allowed programs.
+            "ps aux",
+            "ps -axo pid,ppid,command",
+            "ps -ef | grep cargo",
+            "date",
+            "date -u +%s",
+            "hostname",
+            "seq 1 10",
+            "base64 Cargo.toml",
+            "sha256sum Cargo.toml",
+            "rev Cargo.toml",
+            "paste a b",
+            "column -t data.txt",
+            "test -f Cargo.toml",
+            "expr 1 + 1",
+            // Keyword-aware compounds: a loop / conditional whose body only
+            // reads.
+            "for f in *.rs; do wc -l \"$f\"; done",
+            "for f in a b c; do cat \"$f\"; done | sort",
+            "while true; do date; done",
+            "if git rev-parse --is-inside-work-tree; then git status; fi",
+            // Read-only git that was already allowed stays so.
+            "git reflog",
+            "git grep -n TODO",
+        ] {
+            assert!(is_read_only_command(command), "{command}");
+        }
+        for command in [
+            // follow never ends: keep asking.
+            "tail -f app.log",
+            "head --follow=name x",
+            // environment / clock / write-outputs.
+            "ps -E 1",
+            "ps axe",
+            "date -s '2020-01-01'",
+            "base64 -o out.b64 Cargo.toml",
+            "file -C",
+            "rg -z pattern archive.gz",
+            "rg --pre ./run x",
+            // git that writes or runs a helper.
+            "git reflog expire --all",
+            "git reflog delete HEAD@{0}",
+            "git grep -O/bin/sh TODO",
+            // case is not classified read-only (ambiguous patterns).
+            "case $x in a) ls;; esac",
+            // C-style for header is rejected by the lexer (arithmetic $(( )))
+            // is not; the (( )) grouping makes it unparseable.
+            "for ((i=0;i<3;i++)); do echo $i; done",
+        ] {
+            assert!(!is_read_only_command(command), "{command:?}");
+        }
     }
 
     #[test]

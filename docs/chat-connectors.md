@@ -89,7 +89,7 @@ In `~/.lynshen/daemon/`:
 | --- | --- |
 | `connectors.json` | The connectors: platform, bot name, settings, proxy and credentials. Mode 0600. With `"encrypt_secrets": true` in config.json and a secret key present (`docs/secrets.md`), each credential is a `jcenc1:` envelope. |
 | `connectors-state.json` | Each connector's position in the platform's update stream (Telegram `offset`) and each binding's current session. Mode 0600. |
-| `connectors.jsonl` | Audit log: connectors added and removed, bindings made, refused and revoked, bind lockouts, approvals and decisions from chat (session, call or action id, decision), chat command names and refused requests. It holds no message content. |
+| `connectors.jsonl` | Audit log: connectors added and removed, bindings made, refused and revoked, bind lockouts, approvals and decisions from chat (session, call or action id, decision), a turn allowance (`allow_turn`, with its session), chat command names and refused requests. It holds no message content. |
 
 Bindings are devices in `devices.jsonl` with `device_kind: "chat"` and the
 connector, platform and peer (the sender's user id). A binding's token hash
@@ -228,6 +228,7 @@ The bot says so in plain words and points to the desktop or the phone page
 | `/file <path>` | Sends a file from the current session's directory (relative or absolute path) |
 | `/open` | The phone page's address, for full details end to end encrypted |
 | `允许 <id>`, `拒绝 <id>` (`/allow`, `/deny`) | Answers an approval card when the platform has no buttons |
+| `本轮 <id>` (`/allowturn <id>`) | Allows an ordinary request and the rest of the turn's ordinary approvals; never an elevation or a boundary crossing |
 | `/unbind`, `解绑` | Removes this binding (the same as revoking it on the desktop) |
 
 A binding has one current session, saved in `connectors-state.json`. A
@@ -270,8 +271,16 @@ unwatches, and approvals become deferred actions again.
 
 An approval card shows the session, the kind in words (`越界命令`,
 `写工作区外文件`, `规则要求确认`, ...), the command or summary (500
-characters) and the model's reason, all redacted (below). It has two
-buttons, 允许 and 拒绝, and a 5-letter id for the text fallback. Only the
+characters) and the model's reason, all redacted (below). It has 允许 and
+拒绝 buttons, and a 5-letter id for the text fallback. An ordinary command,
+edit or tool request of a running turn also has a 本轮都允许 button (text:
+`本轮 <id>` / `/allowturn <id>`): it allows that request and the turn's
+remaining ordinary approvals with no more cards — the same reach as 允许,
+one request at a time, held only until the turn ends. It is never offered
+for an elevation, a command that leaves the sandbox, a write outside the
+workspace, or a request a rule says must be asked, so it can never approve
+`sudo` or a boundary crossing; and it is not 始终允许 (full auto,
+always-allow and sudo stay on the desktop or the phone page). Only the
 bound account's presses count; an id is single use and expires after 30
 minutes. An elevation card has no buttons: it says to handle it on the
 desktop or the phone page.
