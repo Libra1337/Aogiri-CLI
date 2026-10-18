@@ -16,6 +16,7 @@ use crate::{
     },
     tools,
 };
+use llm_provider_kit::omp::{self, OmpCatalog};
 use llm_provider_kit::transport::{
     self, Client as TransportClient, ClientConfig as TransportConfig, StreamEvent as TransportEvent,
 };
@@ -38,12 +39,44 @@ use std::{
 /// dialect (Claude over Anthropic Messages, the rest over Responses), so the
 /// config-wide `protocol` applies to other providers only.
 pub(crate) fn protocol_for(provider: &str, protocol: &str, model: &str) -> Protocol {
+    protocol_in(omp::catalog(), provider, protocol, model)
+}
+
+fn protocol_in(catalog: &OmpCatalog, provider: &str, protocol: &str, model: &str) -> Protocol {
     if provider == "lynshen" {
         return Protocol::resolve("", model);
     }
-    llm_provider_kit::omp::catalog()
+    catalog
         .protocol_for(provider, model)
         .unwrap_or_else(|| Protocol::resolve(protocol, model))
+}
+
+/// The provider a client sends to, as configured (`provider`, `protocol`,
+/// `base_url`), and the catalog that says how it serves each model. A
+/// subagent keeps its parent's, with the parent's key and transport; the
+/// protocol and the URL follow the model it runs on.
+#[derive(Clone)]
+struct Connection {
+    provider: String,
+    protocol: String,
+    base_url: String,
+    catalog: &'static OmpCatalog,
+}
+
+impl Connection {
+    fn protocol(&self, model: &str) -> Protocol {
+        protocol_in(self.catalog, &self.provider, &self.protocol, model)
+    }
+
+    /// Where `model`'s requests go: the configured base URL, moved to the
+    /// URL of the model's own dialect for a provider that serves each at a
+    /// URL of its own (zenmux: Chat Completions under /api/v1, Messages
+    /// under /api/anthropic; see `OmpCatalog::route_base_url`).
+    fn base_url(&self, model: &str) -> String {
+        self.catalog
+            .route_base_url(&self.provider, &self.base_url, model)
+            .unwrap_or_else(|| self.base_url.clone())
+    }
 }
 
 const MAX_SUBAGENT_OUTPUT_BYTES: usize = 16 * 1024;
@@ -94,6 +127,8 @@ pub struct OpenAiClient {
     root_system_prompt: String,
     prompt_cache_key: String,
     mcp: McpManager,
+    connection: Connection,
+    /// Where `model` is served (`Connection::base_url`).
     base_url: String,
     max_output_tokens: u64,
     retry_attempts: usize,
@@ -151,7 +186,6 @@ pub(crate) struct SubagentModelSpec {
     description: String,
     reasoning_efforts: Vec<String>,
     max_output_tokens: u64,
-    protocol: Protocol,
     caps: ModelCaps,
 }
 
@@ -184,6 +218,7 @@ struct SafetySpec {
     model: String,
     reasoning_effort: String,
     protocol: Protocol,
+    base_url: String,
 }
 
 pub struct OpenAiClientConfig<'a> {
@@ -485,7 +520,6 @@ struct SpawnSettings<'a> {
     model: String,
     efforts: Vec<String>,
     caps: ModelCaps,
-    protocol: Protocol,
     reasoning_effort: String,
     /// Why `reasoning_effort` is not the one asked for (the model lacks it).
     effort_note: Option<String>,
@@ -504,7 +538,6 @@ pub(crate) struct ChildSpec {
     reasoning_effort: String,
     efforts: Vec<String>,
     caps: ModelCaps,
-    protocol: Protocol,
     max_output_tokens: u64,
     max_tool_calls: Option<u64>,
     timeout: Option<Duration>,
@@ -734,8 +767,6 @@ fn disabled_tool_error(
 /// (config `subagent_models`, resolved against the configured models).
 pub(crate) fn subagent_offer(
     main: &str,
-    provider: &str,
-    protocol: &str,
     models: &[ModelConfig],
     subagent_models: &[SubagentModel],
 ) -> (Vec<String>, Vec<SubagentModelSpec>) {
@@ -775,7 +806,6 @@ pub(crate) fn subagent_offer(
                 description: entry.description.clone(),
                 reasoning_efforts: model.reasoning_efforts.clone(),
                 max_output_tokens: model.max_output_tokens,
-                protocol: protocol_for(provider, protocol, &model.name),
                 caps: ModelCaps::of(Some(model)),
             })
         })
@@ -785,6 +815,14 @@ pub(crate) fn subagent_offer(
 
 impl OpenAiClient {
     pub fn from_config(config: OpenAiClientConfig<'_>) -> Result<Self, String> {
+        Self::with_catalog(config, omp::catalog())
+    }
+
+    /// `from_config` with the provider looked up in `catalog`.
+    fn with_catalog(
+        config: OpenAiClientConfig<'_>,
+        catalog: &'static OmpCatalog,
+    ) -> Result<Self, String> {
         let api_key = match config.api_key {
             Some(value) if !value.trim().is_empty() => value.trim().to_string(),
             _ => env::var(config.api_key_env).map_err(|_| {
@@ -794,7 +832,14 @@ impl OpenAiClient {
                 )
             })?,
         };
-        let provider_kind = protocol_for(&config.provider, &config.protocol, &config.model);
+        let connection = Connection {
+            provider: config.provider.clone(),
+            protocol: config.protocol.clone(),
+            base_url: config.base_url.clone(),
+            catalog,
+        };
+        let provider_kind = connection.protocol(&config.model);
+        let base_url = connection.base_url(&config.model);
         let transport = TransportClient::new(TransportConfig {
             api_key: &api_key,
             prompt_cache_key: &config.prompt_cache_key,
@@ -813,17 +858,13 @@ impl OpenAiClient {
                 config.provider
             ));
         }
-        let (reasoning_efforts, subagent_models) = subagent_offer(
-            &config.model,
-            &config.provider,
-            &config.protocol,
-            &config.models,
-            &config.subagent_models,
-        );
+        let (reasoning_efforts, subagent_models) =
+            subagent_offer(&config.model, &config.models, &config.subagent_models);
         let entry = |name: &str| config.models.iter().find(|model| model.name == name);
         let caps = ModelCaps::of(entry(&config.model));
         let safety = config.safety_model.map(|model| SafetySpec {
-            protocol: protocol_for(&config.provider, &config.protocol, &model),
+            protocol: connection.protocol(&model),
+            base_url: connection.base_url(&model),
             // Sent as is (one-shot, no client of its own): resolved here.
             reasoning_effort: entry(&model).map_or(
                 config.safety_reasoning_effort.clone(),
@@ -849,7 +890,8 @@ impl OpenAiClient {
             system_prompt: config.system_prompt,
             prompt_cache_key: config.prompt_cache_key,
             mcp: config.mcp,
-            base_url: config.base_url,
+            base_url,
+            connection,
             max_output_tokens: config.max_output_tokens,
             retry_attempts: config.retry_attempts,
             connect_timeout: config.connect_timeout,
@@ -2057,20 +2099,18 @@ impl OpenAiClient {
         }
         let requested_model = text("model").or_else(|| role.and_then(|role| role.model.as_deref()));
         // The child's model: our own, or one of the configured subagent models.
-        let (model, efforts, caps, model_max_output_tokens, protocol) = match requested_model {
+        let (model, efforts, caps, model_max_output_tokens) = match requested_model {
             None => (
                 self.model.clone(),
                 self.reasoning_efforts.clone(),
                 self.caps,
                 self.max_output_tokens,
-                self.provider_kind,
             ),
             Some(name) if name == self.model => (
                 self.model.clone(),
                 self.reasoning_efforts.clone(),
                 self.caps,
                 self.max_output_tokens,
-                self.provider_kind,
             ),
             Some(name) => {
                 let spec = self
@@ -2094,7 +2134,6 @@ impl OpenAiClient {
                     spec.reasoning_efforts.clone(),
                     spec.caps,
                     spec.max_output_tokens,
-                    spec.protocol,
                 )
             }
         };
@@ -2172,7 +2211,6 @@ impl OpenAiClient {
             model,
             efforts,
             caps,
-            protocol,
             reasoning_effort,
             effort_note,
             max_output_tokens,
@@ -2351,7 +2389,6 @@ impl OpenAiClient {
             reasoning_effort: settings.reasoning_effort.clone(),
             efforts: settings.efforts.clone(),
             caps: settings.caps,
-            protocol: settings.protocol,
             max_output_tokens: settings.max_output_tokens,
             max_tool_calls: settings.max_tool_calls,
             timeout: settings.timeout,
@@ -2373,9 +2410,9 @@ impl OpenAiClient {
         }
     }
 
-    /// The client a subagent runs on: this agent's connection and tools,
-    /// with the spec's model, limits and access. An agent with a worktree
-    /// writes only there, its shell included.
+    /// The client a subagent runs on: this agent's provider, key and tools,
+    /// with the spec's model (its protocol and URL), limits and access. An
+    /// agent with a worktree writes only there, its shell included.
     fn child_client(
         &self,
         spec: &ChildSpec,
@@ -2410,7 +2447,9 @@ impl OpenAiClient {
             root_system_prompt: self.root_system_prompt.clone(),
             prompt_cache_key: self.prompt_cache_key.clone(),
             mcp: self.mcp.clone(),
-            base_url: self.base_url.clone(),
+            // The parent's provider, at the URL that serves this model.
+            base_url: self.connection.base_url(&spec.model),
+            connection: self.connection.clone(),
             max_output_tokens: spec.max_output_tokens,
             retry_attempts: self.retry_attempts,
             connect_timeout: self.connect_timeout,
@@ -2423,7 +2462,7 @@ impl OpenAiClient {
             context_budget: 0,
             // Each model speaks its own wire protocol (on the LynShen gateway
             // Claude uses Anthropic Messages, the rest Responses).
-            provider_kind: spec.protocol,
+            provider_kind: self.connection.protocol(&spec.model),
             goal_tool_tx: None,
             propose_plan: false,
             // The child shares the parent's approval channel and live mode.
@@ -3149,7 +3188,7 @@ impl OpenAiClient {
             Protocol::OpenAiResponses
             | Protocol::OpenAiCodexResponses
             | Protocol::AzureOpenAiResponses => (
-                transport::endpoint(safety.protocol, &self.base_url),
+                transport::endpoint(safety.protocol, &safety.base_url),
                 responses::one_shot_body(
                     &safety.model,
                     SAFETY_CLASSIFIER_PROMPT,
@@ -3159,7 +3198,7 @@ impl OpenAiClient {
                 ),
             ),
             Protocol::AnthropicMessages => (
-                anthropic::messages_url(&self.base_url),
+                anthropic::messages_url(&safety.base_url),
                 json!({
                     "model": safety.model,
                     "system": SAFETY_CLASSIFIER_PROMPT,
@@ -3169,7 +3208,7 @@ impl OpenAiClient {
                 }),
             ),
             Protocol::OpenAiChatCompletions => (
-                chat::completions_url(&self.base_url),
+                chat::completions_url(&safety.base_url),
                 json!({
                     "model": safety.model,
                     "messages": [
@@ -5104,8 +5143,9 @@ mod tests {
         assert_eq!(spec.name, "claude-helper");
         assert_eq!(spec.max_output_tokens, 4000);
         // Claude on the gateway speaks Anthropic Messages, not the parent's Responses.
-        assert_eq!(spec.protocol, Protocol::resolve("", "claude-helper"));
-        assert_ne!(spec.protocol, client.provider_kind);
+        let protocol = client.connection.protocol("claude-helper");
+        assert_eq!(protocol, Protocol::AnthropicMessages);
+        assert_ne!(protocol, client.provider_kind);
     }
 
     #[test]
@@ -5415,7 +5455,7 @@ mod tests {
         }
         let (base_url, requests) = quiet_model(NOT_IN_PLAN_RESPONSE, true);
         let mut client = team_client(Default::default());
-        client.base_url = base_url.clone();
+        point_at(&mut client, &base_url);
         let manager = client.subagent_manager.clone().unwrap();
         let spawn = || {
             client.spawn_agent(
@@ -5920,8 +5960,225 @@ mod tests {
     /// A team client whose model calls fail at once (nothing listens).
     fn offline_team_client(agents: crate::config::AgentsConfig) -> OpenAiClient {
         let mut client = team_client(agents);
-        client.base_url = "http://127.0.0.1:9/v1".to_string();
+        point_at(&mut client, "http://127.0.0.1:9/v1");
         client
+    }
+
+    /// Sends `client`'s requests, and its subagents', to `base_url`.
+    fn point_at(client: &mut OpenAiClient, base_url: &str) {
+        client.connection.base_url = base_url.to_string();
+        client.base_url = client.connection.base_url(&client.model);
+    }
+
+    /// A request the split provider got: its path, its head (lowercase) and
+    /// its body.
+    type SeenRequest = (String, String, Value);
+
+    /// A provider that serves each wire dialect at a URL of its own, as
+    /// zenmux does: Chat Completions under /split/v1, Messages under
+    /// /split/anthropic. Its catalog lists one model of each; `<host>` is
+    /// the test server's address.
+    fn split_catalog() -> &'static OmpCatalog {
+        static CATALOG: std::sync::OnceLock<OmpCatalog> = std::sync::OnceLock::new();
+        CATALOG.get_or_init(|| {
+            OmpCatalog::parse(&json!({
+                "apiRoutes": [{
+                    "provider": "split",
+                    "routes": [{ "api": "anthropic-messages", "match": { "prefix": ["claude-"] } }],
+                    "default": "openai-completions"
+                }],
+                "models": { "split": {
+                    "chat-main": { "id": "chat-main", "api": "openai-completions", "baseUrl": "http://<host>/split/v1" },
+                    "claude-helper": { "id": "claude-helper", "api": "anthropic-messages", "baseUrl": "http://<host>/split/anthropic" }
+                } }
+            }))
+        })
+    }
+
+    /// The split provider's server: "OK" on its two endpoints, 404 anywhere
+    /// else. Returns its two base URLs (Chat Completions, Messages) and the
+    /// requests it got.
+    fn split_provider() -> (String, String, Arc<std::sync::Mutex<Vec<SeenRequest>>>) {
+        const CHAT: &str = concat!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        const MESSAGES: &str = concat!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        const MISSING: &str = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 8\r\nConnection: close\r\n\r\nno route";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let log = Arc::clone(&log);
+                thread::spawn(move || {
+                    let mut received = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    let (head, body) = loop {
+                        let Ok(read) = stream.read(&mut chunk) else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        received.extend_from_slice(&chunk[..read]);
+                        let text = String::from_utf8_lossy(&received).to_string();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let head = text[..end].to_lowercase();
+                            let length = head
+                                .lines()
+                                .find_map(|line| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if received.len() >= end + 4 + length {
+                                break (head, received[end + 4..end + 4 + length].to_vec());
+                            }
+                        }
+                    };
+                    let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let answer = match path.as_str() {
+                        "/split/v1/chat/completions" => CHAT,
+                        "/split/anthropic/v1/messages" => MESSAGES,
+                        _ => MISSING,
+                    };
+                    let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    log.lock().unwrap().push((path, head, body));
+                    let _ = stream.write_all(answer.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        (
+            format!("http://{host}/split/v1"),
+            format!("http://{host}/split/anthropic"),
+            seen,
+        )
+    }
+
+    /// A client of the split provider on `model`, configured with `base_url`
+    /// as config.json has it, which may spawn the provider's other model.
+    fn split_client(name: &str, base_url: &str) -> OpenAiClient {
+        let mut config = test_client_config();
+        config.provider = "split".to_string();
+        config.protocol = String::new();
+        config.model = name.to_string();
+        config.base_url = base_url.to_string();
+        config.api_key = Some("parent-key");
+        config.models = vec![
+            model("chat-main", &["low", "high"], 4000),
+            model("claude-helper", &["low", "high"], 4000),
+        ];
+        config.safety_model = Some("claude-helper".to_string());
+        config.subagent_manager = Some(SubagentManager::new(
+            Default::default(),
+            crate::subagents::TeamShared::default(),
+        ));
+        OpenAiClient::with_catalog(config, split_catalog()).unwrap()
+    }
+
+    #[test]
+    fn a_subagent_on_another_dialect_goes_to_that_dialects_url_with_the_parents_key() {
+        let (chat_url, _, seen) = split_provider();
+        let client = split_client("chat-main", &chat_url);
+        assert_eq!(client.provider_kind, Protocol::OpenAiChatCompletions);
+        let reply = client.summarize_text("system", "hi", |_| Ok(())).unwrap();
+        assert_eq!(reply, "OK");
+        let manager = client.subagent_manager.clone().unwrap();
+        let dir = test_dir("split-provider");
+        fs::create_dir_all(&dir).unwrap();
+        let started = client
+            .spawn_agent(
+                "call_s",
+                &json!({ "task_name": "helper", "message": "say OK", "model": "claude-helper" })
+                    .to_string(),
+                &dir,
+                &[],
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert_eq!(started["status"], "running");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let row = loop {
+            let row = manager.runs_json()[0].clone();
+            if row["state"] != "running" && row["state"] != "pending" {
+                break row;
+            }
+            assert!(Instant::now() < deadline, "the agent did not end");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(row["state"], "completed", "{row}");
+        let seen = seen.lock().unwrap();
+        let paths: Vec<&str> = seen.iter().map(|(path, _, _)| path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["/split/v1/chat/completions", "/split/anthropic/v1/messages"]
+        );
+        // The parent's key, in the scheme each dialect takes there.
+        let (_, chat_head, chat_body) = &seen[0];
+        assert!(
+            chat_head.contains("authorization: bearer parent-key"),
+            "{chat_head}"
+        );
+        assert!(!chat_head.contains("anthropic-version"), "{chat_head}");
+        assert_eq!(chat_body["model"], "chat-main");
+        let (_, messages_head, messages_body) = &seen[1];
+        assert!(
+            messages_head.contains("authorization: bearer parent-key"),
+            "{messages_head}"
+        );
+        assert!(
+            messages_head.contains("anthropic-version: "),
+            "{messages_head}"
+        );
+        assert_eq!(messages_body["model"], "claude-helper");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_model_switch_moves_the_main_agent_to_its_models_url() {
+        let (chat_url, messages_url, seen) = split_provider();
+        // `/model claude-helper` changes the model, not config.json's base_url.
+        let claude = split_client("claude-helper", &chat_url);
+        assert_eq!(claude.provider_kind, Protocol::AnthropicMessages);
+        assert_eq!(claude.base_url, messages_url);
+        assert_eq!(claude.request_url(), format!("{messages_url}/v1/messages"));
+        assert_eq!(
+            claude.summarize_text("system", "hi", |_| Ok(())).unwrap(),
+            "OK"
+        );
+        // And back, from a base_url set to the Messages one.
+        let chat = split_client("chat-main", &messages_url);
+        assert_eq!(chat.base_url, chat_url);
+        assert_eq!(
+            chat.summarize_text("system", "hi", |_| Ok(())).unwrap(),
+            "OK"
+        );
+        // The safety classifier's model has its own.
+        assert_eq!(chat.safety.as_ref().unwrap().base_url, messages_url);
+        let paths: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|seen| seen.0.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            ["/split/anthropic/v1/messages", "/split/v1/chat/completions"]
+        );
+        // An endpoint of the user's own is kept for every model.
+        let own = split_client("claude-helper", "http://127.0.0.1:9/proxy");
+        assert_eq!(own.base_url, "http://127.0.0.1:9/proxy");
     }
 
     #[test]

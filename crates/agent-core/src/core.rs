@@ -4735,8 +4735,6 @@ impl AgentCore {
         };
         let (efforts, specs) = crate::llm::subagent_offer(
             &self.config.model,
-            &self.config.provider,
-            &self.config.protocol,
             &self.config.models,
             &self.config.subagent_models,
         );
