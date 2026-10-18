@@ -272,8 +272,10 @@ const BASELINE_CODING_TOKENS: usize = 4521;
 /// team v2 (task board, resume_agent, pick_attempt, background and attempts)
 /// added about 360; 75 since every goal tool and propose_plan are always
 /// offered (about 230), so the tool list, cached with the system prompt,
-/// stays the same for the whole session.
-const MAX_PERCENT_OF_BASELINE: usize = 75;
+/// stays the same for the whole session; 76 since the main agent's
+/// spawn_agent always takes plan_step (about 15), which the plan follows
+/// (plan_progress).
+const MAX_PERCENT_OF_BASELINE: usize = 76;
 
 #[test]
 fn default_coding_request_stays_lean() {
@@ -286,8 +288,8 @@ fn default_coding_request_stays_lean() {
 }
 
 /// The share of the baseline before team v2, plus the fixed goal and plan
-/// tools (see `MAX_PERCENT_OF_BASELINE`).
-const V1_PERCENT_OF_BASELINE: usize = 67;
+/// tools and plan_step (see `MAX_PERCENT_OF_BASELINE`).
+const V1_PERCENT_OF_BASELINE: usize = 68;
 
 /// With `agents.team_v2` off the team is v1's: the first request is smaller
 /// than with v2 and back within the budget it had before v2.

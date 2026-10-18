@@ -87,6 +87,9 @@ pub fn temp_dir(label: &str) -> PathBuf {
 /// waits N ms before answering and a line `RUN: <command>` runs it;
 /// `[history]` answers with every user message of the request. A message
 /// from another conversation (`<session_message …>`) is scripted by its body.
+/// The engine's plan reminder at a turn's end is answered, once a user
+/// message said `MARK_PLAN_DONE`, with update_plan marking every step it
+/// lists completed.
 /// `SLOW_REASONING <n>` streams n reasoning chunks 50 ms apart, then a short
 /// answer; `SLOW_RUN <command>` streams a bash call's arguments in chunks
 /// 50 ms apart (about a second in all). A network that went quiet:
@@ -217,6 +220,9 @@ fn script(request: &Value) -> String {
             json!({ "choices": [{ "index": 0, "delta": { "content": format!("history: {history}") }, "finish_reason": null }] }),
             json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
         ]);
+    }
+    if let Some(reply) = plan_reminder_reply(&messages, &text) {
+        return reply;
     }
     if let Some(reply) = loop_call(&messages) {
         return reply;
@@ -449,6 +455,37 @@ fn loop_call(messages: &[Value]) -> Option<String> {
         json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{
             "index": 0, "id": format!("call_{n}"), "type": "function",
             "function": { "name": name, "arguments": arguments }
+        }] }, "finish_reason": null }] }),
+        json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] }),
+    ]))
+}
+
+/// The answer to the plan reminder at a turn's end scripted by
+/// `MARK_PLAN_DONE` (see `start_fake_model`); None otherwise.
+fn plan_reminder_reply(messages: &[Value], text: &str) -> Option<String> {
+    if !text.starts_with("<system-reminder>\nYour turn is about to end") {
+        return None;
+    }
+    let marked = messages.iter().any(|message| {
+        message["role"] == "user" && content_text(&message["content"]) == "MARK_PLAN_DONE"
+    });
+    if !marked {
+        return None;
+    }
+    // The reminder lists the plan as `N. [status] step`.
+    let plan = text
+        .lines()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once(". [")?;
+            let (_, step) = rest.split_once("] ")?;
+            Some(json!({ "step": step, "status": "completed" }))
+        })
+        .collect::<Vec<_>>();
+    let arguments = json!({ "plan": plan }).to_string();
+    Some(sse(&[
+        json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{
+            "index": 0, "id": "call_plan", "type": "function",
+            "function": { "name": "update_plan", "arguments": arguments }
         }] }, "finish_reason": null }] }),
         json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] }),
     ]))

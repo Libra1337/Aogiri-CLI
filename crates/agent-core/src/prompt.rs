@@ -326,7 +326,7 @@ impl Note {
 pub const NOTE_OPEN: &str = "<system-reminder>\n";
 const NOTE_CLOSE: &str = "\n</system-reminder>";
 
-fn note(body: &str) -> String {
+pub(crate) fn note(body: &str) -> String {
     format!("{NOTE_OPEN}{}{NOTE_CLOSE}", body.trim())
 }
 

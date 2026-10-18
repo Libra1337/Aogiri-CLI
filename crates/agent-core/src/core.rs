@@ -314,6 +314,12 @@ pub struct AgentCore {
     /// instructions or project skills.
     chat: bool,
     plan: Vec<PlanItem>,
+    /// The plan as the model knows it: what its last update_plan left (see
+    /// `plan_progress`).
+    model_plan: Vec<PlanItem>,
+    /// Steps the model set back, and when (ms since the epoch): their
+    /// agents started before that are no evidence for them.
+    plan_set_back: HashMap<String, u64>,
     mcp: McpManager,
     /// Version reported in the startup event and used by the update check.
     /// Binaries override it with their own via `with_version`; the default is
@@ -452,6 +458,8 @@ impl AgentCore {
             host: None,
             chat,
             plan: Vec::new(),
+            model_plan: Vec::new(),
+            plan_set_back: HashMap::new(),
             approval_receiver: None,
             approval_tx: None,
             pending_approvals: HashMap::new(),
@@ -2197,13 +2205,19 @@ impl AgentCore {
 
     fn drain_subagent_events(&mut self) -> Vec<AgentEvent> {
         let mut events = Vec::new();
+        let mut changed = Vec::new();
         for event in self.subagent_manager.drain_events() {
             events.push(match event {
                 TeamEvent::Lifecycle {
                     path,
                     status,
                     message,
-                } => self.lifecycle_event(path, status, message),
+                } => {
+                    if !changed.contains(&path) {
+                        changed.push(path.clone());
+                    }
+                    self.lifecycle_event(path, status, message)
+                }
                 TeamEvent::Message { from, to, summary } => {
                     AgentEvent::AgentMessage { from, to, summary }
                 }
@@ -2226,6 +2240,7 @@ impl AgentCore {
                 TeamEvent::Board => AgentEvent::TaskBoard(self.subagent_manager.board_json()),
             });
         }
+        events.extend(self.advance_plan(&changed));
         // The agent trace: at most two refreshes a second while agents work;
         // a lifecycle change goes out at once.
         let revision = self.subagent_manager.trace_revision();
@@ -2240,6 +2255,38 @@ impl AgentCore {
                 events.push(self.agent_runs_event());
             }
         }
+        events
+    }
+
+    /// The plan steps the lifecycle changes of `changed` (agent paths) prove
+    /// started or done (`plan_progress`): the plan, saved, and its event.
+    fn advance_plan(&mut self, changed: &[String]) -> Vec<AgentEvent> {
+        if changed.is_empty() || self.plan.is_empty() {
+            return Vec::new();
+        }
+        let agents = self.subagent_manager.plan_agents();
+        let set_back = &self.plan_set_back;
+        let manager = &self.subagent_manager;
+        let moved = crate::plan_progress::advance(
+            &mut self.plan,
+            &agents,
+            changed,
+            |agent, step| {
+                set_back
+                    .get(step)
+                    .is_none_or(|at| agent.started_at_ms > *at)
+            },
+            |path| manager.worktree_has_changes(path),
+        );
+        if !moved {
+            return Vec::new();
+        }
+        self.session.set_plan(self.plan.clone());
+        self.subagent_manager
+            .shared()
+            .set_plan_items(self.plan.clone());
+        let mut events = vec![AgentEvent::Plan(self.plan.clone())];
+        events.extend(self.save_session_event());
         events
     }
 
@@ -2621,10 +2668,9 @@ impl AgentCore {
         let new_window = !std::mem::take(&mut self.wake_turn);
         self.subagent_manager
             .begin_turn(self.config.agents.clone(), new_window);
-        self.subagent_manager.shared().set_plan(
-            self.latest_plan_approved(),
-            self.plan.iter().map(|item| item.step.clone()).collect(),
-        );
+        self.subagent_manager
+            .shared()
+            .set_plan(self.latest_plan_approved(), self.plan.clone());
 
         let prompt_tokens =
             crate::tokens::count_text(&self.config.model, &system_prompt).tokens as u64;
@@ -4558,14 +4604,43 @@ impl AgentCore {
                 None,
             );
         };
+        // Where the model sends a step as it knew it, the status its agents
+        // gave it since stays; a step it set back waits for new agents.
+        let mut plan = plan;
+        let merged =
+            crate::plan_progress::merge_model_plan(&mut plan, &self.model_plan, &self.plan);
+        let now = now_ms();
+        for step in merged.set_back {
+            self.plan_set_back.insert(step, now);
+        }
+        self.plan_set_back
+            .retain(|step, _| plan.iter().any(|item| item.step == *step));
         self.plan = plan;
+        self.model_plan = self.plan.clone();
         // Saved with the session (poll_goal_tool_requests saves after each
         // request), so a reopened session has its plan back.
         self.session.set_plan(self.plan.clone());
         self.subagent_manager
             .shared()
-            .set_plan_steps(self.plan.iter().map(|item| item.step.clone()).collect());
-        let output = json!({ "ok": true, "steps": self.plan.len() }).to_string();
+            .set_plan_items(self.plan.clone());
+        let mut output = json!({ "ok": true, "steps": self.plan.len() });
+        if !merged.kept.is_empty() {
+            output["note"] = json!(format!(
+                "Kept from the subagents' progress (send another status to change it): {}",
+                merged
+                    .kept
+                    .iter()
+                    .map(|at| format!(
+                        "{}. [{}] {}",
+                        at + 1,
+                        self.plan[*at].status,
+                        self.plan[*at].step
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        let output = output.to_string();
         (
             ToolGoalResponse {
                 output,
@@ -4584,6 +4659,8 @@ impl AgentCore {
             .last_successful_call("update_plan")
             .and_then(|args| parse_plan(&args))
             .unwrap_or_default();
+        self.model_plan = plan.clone();
+        self.plan_set_back.clear();
         if plan == self.plan {
             return None;
         }
@@ -4591,7 +4668,7 @@ impl AgentCore {
         self.session.set_plan(self.plan.clone());
         self.subagent_manager
             .shared()
-            .set_plan_steps(self.plan.iter().map(|item| item.step.clone()).collect());
+            .set_plan_items(self.plan.clone());
         Some(AgentEvent::Plan(self.plan.clone()))
     }
 
@@ -4914,6 +4991,8 @@ impl AgentCore {
         self.tool_state.set_session_id(self.session.session_id());
         self.reset_team();
         let had_plan = !std::mem::take(&mut self.plan).is_empty();
+        self.model_plan.clear();
+        self.plan_set_back.clear();
         // Release the old session's lock and hold the new one.
         self.session_lock = None;
         self.session_lock =
@@ -5511,6 +5590,8 @@ impl AgentCore {
                 self.reset_team();
                 let had_plan = !self.plan.is_empty();
                 self.plan = self.session.plan().to_vec();
+                self.model_plan = self.plan.clone();
+                self.plan_set_back.clear();
                 let mut events = vec![
                     AgentEvent::Transcript(self.session.transcript_items()),
                     AgentEvent::PendingMessages(Vec::new()),
@@ -6090,6 +6171,14 @@ fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// The clock subagents' start times are on (`subagents::now_ms`).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
 }
 

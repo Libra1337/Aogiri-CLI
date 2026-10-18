@@ -20,6 +20,8 @@ mod mcp;
 mod nicknames;
 mod oauth;
 mod plan_mode;
+mod plan_progress;
+mod plan_reminder;
 mod prompt;
 #[cfg(test)]
 mod prompt_budget;

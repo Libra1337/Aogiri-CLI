@@ -968,6 +968,48 @@ and `files` (the files the step writes). The `plan` event passes them
 through. `subagent_lifecycle` carries `plan_step`: the step given to
 `spawn_agent`, else the step whose `agent` names the subagent.
 
+### Plan progress from subagents
+
+The engine moves a step of the main agent's plan when its subagents prove
+it, and sends `plan` with the new statuses. The agents of a step are the main
+agent's subagents whose `spawn_agent` named it (`plan_step`: the step's text
+or its number from 1; offered to the main agent in every `fanout` mode), or
+whose path or task name the step's `agent` names.
+
+- **Started.** A `pending` step becomes `in_progress` when the first of its
+  agents runs.
+- **Done.** A step becomes `completed` when every one of its agents finished
+  (`completed`) and left nothing to merge: a worktree with changes counts
+  once `merge_agent` applied it (`merged`), a worktree without changes at
+  once. Best-of-N attempts count as one, done once one attempt was applied.
+- An agent that failed, was stopped or ran out of budget (`errored`,
+  `interrupted`, `closed`, `budget_exhausted`), and one whose worktree was
+  discarded or conflicts, never completes a step: the model does.
+- Only forward (`pending` → `in_progress` → `completed`), and only for the
+  steps of agents whose state changed.
+- The model's `update_plan` wins where it changes a step. A step it sets
+  back from the status it has now is moved again only by agents started
+  after that call. A step it sends as it last sent it, whose status the
+  agents changed since, keeps that status, and the call's result has a
+  `note` that says so; sent again with another status, the model's stands.
+
+### Plan reminders
+
+The `plan` event shows the steps as the model last sent them, moved forward
+only as "Plan progress from subagents" says. While the main agent's plan has a step that is
+not `completed` (and the session is not in plan mode), the engine reminds the
+model to keep it current, with a `<system-reminder>` user item that lists the
+plan and that clients do not show:
+
+- **A stale plan.** Before a request, when the conversation has 10 model
+  responses since the last `update_plan` call (or `TodoWrite`) and since the
+  last reminder. A compacted conversation counts from its summary.
+- **The end of a turn.** Once per turn, when the model answers without a
+  tool call and the turn called a tool after the last `update_plan` call or
+  reminder. The answer to this reminder is quiet: its text and reasoning are
+  not streamed or kept, so the user sees only the `update_plan` call it
+  makes. A reply that only updates the plan ends the turn.
+
 ## Loop guard
 
 The engine stops a turn that goes in circles, so an unattended session
