@@ -797,8 +797,13 @@ The `spawn_agent` call's own parameters override the role's values.
 
 ### Model and effort
 
-A subagent runs on its parent's provider and connection; `model` only picks
-which of that provider's models (and so its wire protocol). A provider can
+A subagent runs on its parent's provider, with the parent's key; `model`
+picks which of that provider's models, and so its wire protocol and its URL.
+Some providers serve each protocol at a URL of its own (zenmux: Chat
+Completions under `/api/v1`, Messages under `/api/anthropic`): when the
+configured `base_url` is one of the provider's catalog URLs, the request goes
+to the URL of the subagent's protocol. The main agent does the same after
+`/model`. A provider can
 refuse a model it lists, for example one the account's plan does not
 include: the agent then ends `errored`, and its error starts with the model
 and the endpoint the request went to, followed by the provider's whole
