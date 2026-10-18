@@ -2070,6 +2070,34 @@ impl SubagentManager {
         })
     }
 
+    /// The main agent's subagents, as the plan's progress reads them
+    /// (`plan_progress`).
+    pub(crate) fn plan_agents(&self) -> Vec<crate::plan_progress::StepAgent> {
+        let state = self.inner.state.lock().unwrap();
+        state
+            .agents
+            .values()
+            .filter(|agent| agent.parent_path == ROOT_PATH)
+            .map(|agent| crate::plan_progress::StepAgent {
+                path: agent.path.clone(),
+                task_name: agent.task_name.clone(),
+                plan_step: agent.plan_step.clone(),
+                status: agent.status.as_str().to_string(),
+                worktree: self.inner.shared.has_worktree(&agent.path),
+                attempt_group: agent.attempt_group.clone(),
+                started_at_ms: agent.started_at_ms,
+            })
+            .collect()
+    }
+
+    /// Whether the worktree of `path` holds changes merge_agent would apply
+    /// (asked of git); true when they cannot be read.
+    pub(crate) fn worktree_has_changes(&self, path: &str) -> bool {
+        self.inner.shared.get(path).is_some_and(|pending| {
+            !workspace_changes(&pending.workspace).is_ok_and(|changes| changes.files.is_empty())
+        })
+    }
+
     pub(crate) fn drain_events(&self) -> Vec<TeamEvent> {
         let mut state = self.inner.state.lock().unwrap();
         state.events.drain(..).collect()

@@ -2342,6 +2342,212 @@ fn a_plan_left_alone_for_ten_responses_is_reminded() {
     assert!(shown_notes(&core).is_empty());
 }
 
+/// The plan's statuses in its last `plan` event.
+fn plan_statuses(events: &[AgentEvent]) -> Option<Vec<String>> {
+    plan_steps(events).map(|steps| steps.into_iter().map(|(_, status)| status).collect())
+}
+
+fn three_step_plan(cards: &str) -> String {
+    let plan = serde_json::json!({ "plan": [
+        { "step": "Scaffold", "status": "completed" },
+        { "step": "Cards", "status": cards },
+        { "step": "Enemies", "status": "pending" },
+    ]});
+    format!("CALL update_plan {plan}")
+}
+
+/// Background agents for the plan's step 2 (`[sleep:N]` each).
+fn spawn_for_cards(agents: &[(&str, u64)]) -> String {
+    let calls = agents
+        .iter()
+        .map(|(name, sleep)| {
+            serde_json::json!({ "name": "spawn_agent", "arguments": {
+                "task_name": name, "background": true, "plan_step": "2", "message": format!("[sleep:{sleep}] {name}")
+            }})
+        })
+        .collect::<Vec<_>>();
+    format!("CALLS {}", serde_json::Value::Array(calls))
+}
+
+#[test]
+fn a_plan_step_starts_with_its_first_agent_and_completes_with_its_last() {
+    let _guard = setup();
+    let dir = temp_dir("plan-progress");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.submit_user_message(three_step_plan("pending"));
+    pump(&mut core, is_ready);
+
+    let mut events =
+        core.submit_user_message(spawn_for_cards(&[("deck_a", 300), ("deck_b", 1500)]));
+    // The first agent to start puts step 2 in progress.
+    pump_until(&mut core, &mut events, |events, _| {
+        plan_statuses(events).is_some()
+    });
+    assert_eq!(
+        plan_statuses(&events).unwrap(),
+        ["completed", "in_progress", "pending"]
+    );
+    // One done is not the step done.
+    pump_until(&mut core, &mut events, |_, rows| {
+        rows.iter()
+            .any(|row| row["task"] == "deck_a" && finished(row))
+    });
+    events.extend(core.poll_events());
+    assert_eq!(
+        plan_statuses(&events).unwrap(),
+        ["completed", "in_progress", "pending"]
+    );
+    // Both done: completed, saved with the session.
+    pump_until(&mut core, &mut events, |events, rows| {
+        rows.iter().all(finished) && plan_statuses(events).is_some_and(|s| s[1] == "completed")
+    });
+    assert_eq!(
+        plan_statuses(&events).unwrap(),
+        ["completed", "completed", "pending"]
+    );
+    assert_eq!(row(&core, "deck_b")["state"], "completed");
+    assert_eq!(
+        plan_statuses(&core.state_events()).unwrap(),
+        ["completed", "completed", "pending"]
+    );
+    // The steps it moved, one event each: in progress, then completed.
+    let moves = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Plan(items) => Some(items[1].status.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(moves, ["in_progress", "completed"]);
+}
+
+#[test]
+fn an_agent_that_was_stopped_never_completes_its_step() {
+    let _guard = setup();
+    let dir = temp_dir("plan-progress-stopped");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.submit_user_message(three_step_plan("pending"));
+    pump(&mut core, is_ready);
+
+    let mut events =
+        core.submit_user_message(spawn_for_cards(&[("deck_a", 200), ("deck_b", 3000)]));
+    pump_until(&mut core, &mut events, |_, rows| {
+        rows.iter()
+            .any(|row| row["task"] == "deck_a" && finished(row))
+            && rows
+                .iter()
+                .any(|row| row["task"] == "deck_b" && row["state"] == "running")
+    });
+    let op = serde_json::json!({ "op": "close_agent", "target": "deck_b" });
+    let (_, closed) = lynshen_agent_core::protocol::apply_op(&mut core, &op);
+    events.extend(closed);
+    pump_for(&mut core, &mut events, 500);
+    assert_eq!(row(&core, "deck_b")["state"], "closed");
+    assert_eq!(
+        plan_statuses(&events).unwrap(),
+        ["completed", "in_progress", "pending"]
+    );
+    assert_eq!(
+        plan_statuses(&core.state_events()).unwrap(),
+        ["completed", "in_progress", "pending"]
+    );
+}
+
+#[test]
+fn a_worktree_agent_completes_its_step_once_its_changes_are_merged() {
+    let _guard = setup();
+    let dir = temp_dir("plan-progress-merge");
+    git(&dir, &["init", "-q"]);
+    fs::write(dir.join("README.md"), "hello\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-qm", "init"]);
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.submit_user_message(three_step_plan("pending"));
+    pump(&mut core, is_ready);
+
+    let args = serde_json::json!({
+        "task_name": "builder", "role": "worker", "background": true, "plan_step": "Cards",
+        "message": "build it\nRUN: printf done > feature.txt"
+    });
+    let mut events = core.submit_user_message(format!("CALL spawn_agent {args}"));
+    pump_until(&mut core, &mut events, |_, rows| rows.iter().all(finished));
+    pump_for(&mut core, &mut events, 300);
+    assert_eq!(row(&core, "builder")["state"], "completed");
+    // Finished, but its file waits in the worktree.
+    assert_eq!(
+        plan_statuses(&events).unwrap(),
+        ["completed", "in_progress", "pending"]
+    );
+    let op = serde_json::json!({ "op": "merge_agent", "target": "builder", "action": "apply" });
+    let (_, merged) = lynshen_agent_core::protocol::apply_op(&mut core, &op);
+    assert_eq!(fs::read_to_string(dir.join("feature.txt")).unwrap(), "done");
+    assert_eq!(
+        plan_statuses(&merged).unwrap(),
+        ["completed", "completed", "pending"]
+    );
+}
+
+#[test]
+fn the_models_update_plan_wins_over_what_the_agents_showed() {
+    let _guard = setup();
+    let dir = temp_dir("plan-progress-model");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.submit_user_message(three_step_plan("pending"));
+    pump(&mut core, is_ready);
+    let mut events = core.submit_user_message(spawn_for_cards(&[("deck_a", 2500)]));
+    pump_until(&mut core, &mut events, |events, _| {
+        plan_statuses(events).is_some()
+    });
+    assert_eq!(
+        plan_statuses(&events).unwrap(),
+        ["completed", "in_progress", "pending"]
+    );
+    pump_until(&mut core, &mut events, |events, _| readies(events) >= 1);
+
+    // The model sends step 2 as it knew it: the agents' status stays, and
+    // its result says so.
+    let mut events = core.submit_user_message(three_step_plan("pending"));
+    pump_until(&mut core, &mut events, |events, _| {
+        events.iter().any(is_ready)
+    });
+    assert_eq!(
+        plan_statuses(&events).unwrap(),
+        ["completed", "in_progress", "pending"]
+    );
+    let note = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolOutput { name, output, .. } if name == "update_plan" => {
+                Some(output.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        note.contains("Kept from the subagents' progress")
+            && note.contains("2. [in_progress] Cards"),
+        "{note}"
+    );
+
+    // Sent again, knowing it: the model's pending stands, and the agent
+    // that started before does not complete it.
+    let mut events = core.submit_user_message(three_step_plan("pending"));
+    pump_until(&mut core, &mut events, |events, _| {
+        events.iter().any(is_ready)
+    });
+    assert_eq!(
+        plan_statuses(&events).unwrap(),
+        ["completed", "pending", "pending"]
+    );
+    pump_until(&mut core, &mut events, |_, rows| rows.iter().all(finished));
+    pump_for(&mut core, &mut events, 300);
+    assert_eq!(row(&core, "deck_a")["state"], "completed");
+    assert_eq!(
+        plan_statuses(&core.state_events()).unwrap(),
+        ["completed", "pending", "pending"]
+    );
+}
+
 /// `update_plan` with one pending step.
 fn one_step_plan(step: &str) -> String {
     format!(r#"CALL update_plan {{"plan":[{{"step":"{step}"}}]}}"#)

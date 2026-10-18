@@ -3670,7 +3670,8 @@ fn subagent_definitions(
     if !roles.is_empty() {
         spawn["parameters"]["properties"]["role"] = json!({ "type": "string" });
     }
-    if config.fanout == Fanout::Plan {
+    // The main agent's plan follows the agents of a step (plan_progress).
+    if config.fanout == Fanout::Plan || !subagent {
         spawn["parameters"]["properties"]["plan_step"] = json!({
             "type": "string",
             "description": "The update_plan step it does."
@@ -5697,7 +5698,11 @@ mod tests {
         assert!(description.contains("\n- worker: writes in its own worktree"));
         assert!(description.contains("\n- odd") && !description.contains("- odd:"));
         assert_eq!(spawn["parameters"]["properties"]["role"]["type"], "string");
-        assert!(spawn["parameters"]["properties"]["plan_step"].is_null());
+        // The main agent names the plan step an agent does (plan_progress).
+        assert_eq!(
+            spawn["parameters"]["properties"]["plan_step"]["type"],
+            "string"
+        );
         let send = definitions
             .iter()
             .find(|d| d["name"] == "send_message")
