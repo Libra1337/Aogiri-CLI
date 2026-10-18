@@ -848,6 +848,7 @@ impl OpenAiClient {
             retry_attempts: retry_attempts_from_env(config.retry_attempts),
             cache_debug: cache_debug_enabled(),
             model_headers: config.model_headers,
+            headers: crate::device_id::gateway_headers(&config.provider),
         });
         // Azure is the one provider whose endpoint the catalog cannot supply —
         // deployments live at a per-resource host — so fail with the reason

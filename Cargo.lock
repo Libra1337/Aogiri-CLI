@@ -1026,6 +1026,7 @@ dependencies = [
  "tar",
  "tiktoken-rs",
  "ureq",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

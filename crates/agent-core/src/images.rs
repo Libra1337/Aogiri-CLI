@@ -41,6 +41,8 @@ pub struct ImageTools {
     model: String,
     /// Extra request headers per model name (gateway routing choices).
     headers: HashMap<String, Vec<(String, String)>>,
+    /// The gateway's device header (`device_id`), on every request to it.
+    gateway_headers: Vec<(String, String)>,
     connect_timeout: Duration,
     read_timeout: Duration,
 }
@@ -89,6 +91,7 @@ impl ImageTools {
             api_key,
             model,
             headers: headers.clone(),
+            gateway_headers: crate::device_id::gateway_headers(&config.provider),
             connect_timeout: Duration::from_secs(config.connect_timeout_seconds),
             read_timeout: Duration::from_secs(config.read_timeout_seconds).max(MIN_READ_TIMEOUT),
         })
@@ -104,6 +107,7 @@ impl ImageTools {
             api_key: "test-key".to_string(),
             model: "gpt-image-2".to_string(),
             headers: HashMap::new(),
+            gateway_headers: Vec::new(),
             connect_timeout: Duration::from_secs(1),
             read_timeout: Duration::from_secs(1),
         }
@@ -445,6 +449,9 @@ fn generate(
         .post(&format!("{}/images/{endpoint}", tools.base_url))
         .set("Authorization", &format!("Bearer {}", tools.api_key))
         .set("Accept", "application/json");
+    for (name, value) in &tools.gateway_headers {
+        call = call.set(name, value);
+    }
     for (name, value) in tools.headers.get(model).into_iter().flatten() {
         call = call.set(name, value);
     }
@@ -841,6 +848,7 @@ mod tests {
                 "gpt-image-2".to_string(),
                 vec![("X-Monoize-Provider".to_string(), "p-7".to_string())],
             )]),
+            gateway_headers: vec![("X-LynShen-Device".to_string(), "v1;hw=test".to_string())],
             connect_timeout: Duration::from_secs(2),
             read_timeout: Duration::from_secs(5),
         }
@@ -1164,6 +1172,10 @@ mod tests {
         assert!(head.starts_with("post /images/generations "), "{head}");
         assert!(head.contains("authorization: bearer test-key"));
         assert!(head.contains("x-monoize-provider: p-7"));
+        assert!(
+            head.contains("x-lynshen-device: v1;hw=test"),
+            "the gateway device header goes with the image request"
+        );
         // gpt-image models are not sent response_format.
         assert_eq!(
             body_json(&request),

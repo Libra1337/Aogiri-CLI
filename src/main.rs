@@ -109,6 +109,18 @@ fn main() -> io::Result<()> {
         println!("lynshen {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    // The desktop's own gateway calls send the same device header as the
+    // engine, so one implementation reads the computer's identifiers.
+    if args.first().map(String::as_str) == Some("device-id") {
+        println!(
+            "{}",
+            json!({
+                "header": lynshen_agent_core::device_id::HEADER,
+                "value": lynshen_agent_core::device_id::header_value(),
+            })
+        );
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--help" || a == "-h")
         || args.first().map(String::as_str) == Some("help")
     {
@@ -287,6 +299,7 @@ USAGE:
     lynshen auth-login <provider>         browser OAuth without starting a session
     lynshen providers                     print built-in providers as JSON
     lynshen token                         print a LynShen access token as JSON (refreshed when needed)
+    lynshen device-id                     print this computer's gateway device header as JSON
     lynshen update                        update lynshen to the latest release
     lynshen version                       print the version
 
