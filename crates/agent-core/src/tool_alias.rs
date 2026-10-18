@@ -39,7 +39,7 @@ const ALIASES: &[(&str, &str)] = &[
     ("todowrite", "update_plan"),
 ];
 
-fn key(name: &str) -> String {
+pub(crate) fn key(name: &str) -> String {
     name.chars()
         .filter(char::is_ascii_alphanumeric)
         .map(|c| c.to_ascii_lowercase())

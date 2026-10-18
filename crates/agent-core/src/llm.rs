@@ -929,6 +929,12 @@ impl OpenAiClient {
         let mut tool_calls_executed = 0u64;
         let mut empty_response_continuations = 0usize;
         let mut loop_guard = LoopGuard::default();
+        // Where this turn's items start; whether it was reminded of an
+        // unfinished plan as it ended (`plan_reminder`), and whether the next
+        // response answers that reminder.
+        let turn_start = input.len();
+        let mut end_reminded = false;
+        let mut answering_reminder = false;
         loop {
             if self
                 .deadline
@@ -953,8 +959,15 @@ impl OpenAiClient {
                 return Err(BUDGET_EXHAUSTED.to_string());
             }
             self.append_queued_subagent_messages(input, &mut emit)?;
+            if let Some(note) = self
+                .plan_kept_current()
+                .and_then(|plan| crate::plan_reminder::stale_reminder(input, &plan))
+            {
+                inject_input_item(input, note, &mut emit)?;
+            }
             emit(StreamEvent::CallStart)?;
-            let Some(output_items) = self.stream_turn_request(input, &mut emit)? else {
+            let quiet = std::mem::take(&mut answering_reminder);
+            let Some(output_items) = self.stream_turn_request(input, quiet, &mut emit)? else {
                 // The next request carries the steered message.
                 emit(StreamEvent::ResponseInterrupted)?;
                 continue;
@@ -969,11 +982,24 @@ impl OpenAiClient {
             }
 
             if function_calls.is_empty() {
+                // The answer to the plan reminder at the turn's end, text or
+                // none: the turn is over.
+                if end_reminded {
+                    return Ok(());
+                }
                 if should_continue_after_empty_response(&output_items)
                     && empty_response_continuations < MAX_EMPTY_RESPONSE_CONTINUATIONS
                 {
                     empty_response_continuations += 1;
                     inject_input_item(input, runtime_reminder_item(), &mut emit)?;
+                    continue;
+                }
+                if let Some(note) = self.plan_kept_current().and_then(|plan| {
+                    crate::plan_reminder::end_reminder(&input[turn_start..], &plan)
+                }) {
+                    end_reminded = true;
+                    answering_reminder = true;
+                    inject_input_item(input, note, &mut emit)?;
                     continue;
                 }
                 return Ok(());
@@ -1308,8 +1334,14 @@ impl OpenAiClient {
                     .collect::<Vec<_>>();
                 loop_guard.record_round(&round)
             };
+            // Reminded of the plan as it ended, the model updated it and
+            // did nothing else: the turn ends there.
+            let plan_marked = quiet
+                && tool_results
+                    .iter()
+                    .all(|tool_result| tool_result.request.name == "update_plan");
             push_tool_result_items(input, tool_results);
-            if plan_delivered {
+            if plan_delivered || plan_marked {
                 return Ok(());
             }
             if let Some(error) = failing {
@@ -1326,9 +1358,15 @@ impl OpenAiClient {
     /// passed on. A response whose tool calls are whole is dropped too when
     /// a message came in before they run; once tools run, the message waits
     /// for them.
+    ///
+    /// A `quiet` response answers the plan reminder at the turn's end: the
+    /// user sees only the update_plan call it makes. Its text and reasoning
+    /// are not shown, and not kept unless it calls a tool (its reasoning
+    /// then goes back with the call; its text never).
     fn stream_turn_request(
         &self,
         input: &[Value],
+        quiet: bool,
         emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<Option<Vec<Value>>, String> {
         let request = input.to_vec();
@@ -1354,10 +1392,11 @@ impl OpenAiClient {
                     held.push(event);
                     Ok(())
                 }
+                StreamEvent::Delta(_) | StreamEvent::ReasoningDelta(_) if quiet => Ok(()),
                 event => emit(event),
             }
         });
-        let items = match result {
+        let mut items = match result {
             Ok(items) => items,
             Err(_) if cut => return Ok(None),
             Err(error) => return Err(error),
@@ -1367,6 +1406,13 @@ impl OpenAiClient {
             .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call"));
         if calls_tools && manager.steer_waiting() {
             return Ok(None);
+        }
+        if quiet {
+            let kept = |item: &Value| {
+                calls_tools && item.get("role").and_then(Value::as_str) != Some("assistant")
+            };
+            items.retain(kept);
+            held.retain(|event| !matches!(event, StreamEvent::ResponseItem(item) if !kept(item)));
         }
         for event in held {
             emit(event)?;
@@ -2903,6 +2949,20 @@ impl OpenAiClient {
             inject_input_item(input, item, emit)?;
         }
         Ok(())
+    }
+
+    /// The main agent's update_plan checklist, which its turn keeps current
+    /// (`plan_reminder`); None for a subagent, an agent without update_plan
+    /// and in plan mode, where update_plan does not run.
+    fn plan_kept_current(&self) -> Option<Vec<crate::event::PlanItem>> {
+        if self.agent_depth > 0
+            || self.goal_tool_tx.is_none()
+            || self.approval_mode.get() == ApprovalMode::Plan
+        {
+            return None;
+        }
+        let plan = self.subagent_manager.as_ref()?.shared().plan_items();
+        (!plan.is_empty()).then_some(plan)
     }
 
     fn run_goal_tool(&self, name: &str, arguments: &str) -> Option<tools::ToolExecutionResult> {
@@ -4447,13 +4507,13 @@ fn plan_tool_definition() -> Value {
     json!({
         "type": "function",
         "name": "update_plan",
-        "description": "Show the user a short plan for multi-step work and update it as you go: one step in_progress, finished steps completed. Skip it for simple tasks.",
+        "description": "Show the user a short checklist for multi-step work, and keep it current: the user sees only what you last sent. Call it again each time a step's status changes: mark a step in_progress when you start it and completed as soon as it is done, before you start the next. Keep exactly one step in_progress while work remains. Skip it for simple tasks.",
         "parameters": {
             "type": "object",
             "properties": {
                 "plan": {
                     "type": "array",
-                    "description": "All steps in order, a few words each; replaces the previous plan.",
+                    "description": "All steps in order, a few words each, each with its status; replaces the previous plan.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -5722,7 +5782,14 @@ mod tests {
         let team = client.subagent_manager.as_ref().unwrap().shared();
         team.set_plan(
             true,
-            vec!["Add parser".to_string(), "Write tests".to_string()],
+            ["Add parser", "Write tests"]
+                .map(|step| crate::event::PlanItem {
+                    step: step.to_string(),
+                    status: "pending".to_string(),
+                    agent: None,
+                    files: Vec::new(),
+                })
+                .to_vec(),
         );
         // ...and one of its steps.
         let error = settings(&client, json!({ "role": "worker" }))

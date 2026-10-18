@@ -1,6 +1,7 @@
 use crate::{
     board::{Board, NewTask, Task},
     config::AgentsConfig,
+    event::PlanItem,
     tools::ToolState,
 };
 use serde_json::{json, Value};
@@ -410,7 +411,8 @@ struct PendingWorktree {
 
 /// Worktrees not yet merged or discarded (so a later turn or a client can
 /// still merge them), and the main agent's plan, which `agents.fanout =
-/// plan` checks spawns against.
+/// plan` checks spawns against and the main agent's turn keeps current
+/// (`plan_reminder`).
 #[derive(Clone, Default)]
 pub(crate) struct TeamShared(Arc<Mutex<TeamState>>);
 
@@ -418,24 +420,31 @@ pub(crate) struct TeamShared(Arc<Mutex<TeamState>>);
 struct TeamState {
     worktrees: BTreeMap<String, PendingWorktree>,
     plan_approved: bool,
-    plan_steps: Vec<String>,
+    plan: Vec<PlanItem>,
 }
 
 impl TeamShared {
-    pub(crate) fn set_plan(&self, approved: bool, steps: Vec<String>) {
+    pub(crate) fn set_plan(&self, approved: bool, plan: Vec<PlanItem>) {
         let mut state = self.0.lock().unwrap();
         state.plan_approved = approved;
-        state.plan_steps = steps;
+        state.plan = plan;
     }
 
-    pub(crate) fn set_plan_steps(&self, steps: Vec<String>) {
-        self.0.lock().unwrap().plan_steps = steps;
+    /// The update_plan checklist changed.
+    pub(crate) fn set_plan_items(&self, plan: Vec<PlanItem>) {
+        self.0.lock().unwrap().plan = plan;
     }
 
     /// Whether the latest proposed plan was approved, and the update_plan steps.
     pub(crate) fn plan(&self) -> (bool, Vec<String>) {
         let state = self.0.lock().unwrap();
-        (state.plan_approved, state.plan_steps.clone())
+        let steps = state.plan.iter().map(|item| item.step.clone()).collect();
+        (state.plan_approved, steps)
+    }
+
+    /// The update_plan checklist with each step's status.
+    pub(crate) fn plan_items(&self) -> Vec<PlanItem> {
+        self.0.lock().unwrap().plan.clone()
     }
 
     fn has_worktree(&self, path: &str) -> bool {

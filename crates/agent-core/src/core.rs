@@ -2621,10 +2621,9 @@ impl AgentCore {
         let new_window = !std::mem::take(&mut self.wake_turn);
         self.subagent_manager
             .begin_turn(self.config.agents.clone(), new_window);
-        self.subagent_manager.shared().set_plan(
-            self.latest_plan_approved(),
-            self.plan.iter().map(|item| item.step.clone()).collect(),
-        );
+        self.subagent_manager
+            .shared()
+            .set_plan(self.latest_plan_approved(), self.plan.clone());
 
         let prompt_tokens =
             crate::tokens::count_text(&self.config.model, &system_prompt).tokens as u64;
@@ -4564,7 +4563,7 @@ impl AgentCore {
         self.session.set_plan(self.plan.clone());
         self.subagent_manager
             .shared()
-            .set_plan_steps(self.plan.iter().map(|item| item.step.clone()).collect());
+            .set_plan_items(self.plan.clone());
         let output = json!({ "ok": true, "steps": self.plan.len() }).to_string();
         (
             ToolGoalResponse {
@@ -4591,7 +4590,7 @@ impl AgentCore {
         self.session.set_plan(self.plan.clone());
         self.subagent_manager
             .shared()
-            .set_plan_steps(self.plan.iter().map(|item| item.step.clone()).collect());
+            .set_plan_items(self.plan.clone());
         Some(AgentEvent::Plan(self.plan.clone()))
     }
 

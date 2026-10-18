@@ -2192,6 +2192,156 @@ fn after_a_compaction_the_users_request_is_still_the_last_message_the_model_gets
     );
 }
 
+/// The text of the last message of a request to the fake model.
+fn last_message(request: &serde_json::Value) -> String {
+    let content = &request["messages"].as_array().unwrap().last().unwrap()["content"];
+    match content {
+        serde_json::Value::String(text) => text.clone(),
+        content => content
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|part| part["text"].as_str())
+            .collect(),
+    }
+}
+
+/// The user items of the shown conversation that are the engine's notes.
+fn shown_notes(core: &AgentCore) -> Vec<String> {
+    let AgentEvent::Transcript(items) = core.transcript_event() else {
+        panic!("not a transcript");
+    };
+    items
+        .into_iter()
+        .filter_map(|item| match item {
+            lynshen_agent_core::TranscriptItem::User(text)
+                if text.contains("<system-reminder>") =>
+            {
+                Some(text)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_turn_that_ends_with_its_plan_unfinished_is_reminded_once_and_quietly() {
+    let _guard = setup();
+    let dir = temp_dir("plan-end-reminder");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    // A turn that ends right after its plan update: nothing to remind of.
+    let start = requests().len();
+    core.submit_user_message(update_plan_call());
+    pump(&mut core, is_ready);
+    assert_eq!(requests().len() - start, 2);
+
+    fs::write(dir.join("notes.txt"), "hello\n").unwrap();
+    let start = requests().len();
+    core.submit_user_message(r#"CALL read {"path":"notes.txt"}"#.to_string());
+    let events = pump(&mut core, is_ready);
+    // The read, the answer, then the reminder with the plan.
+    let sent = requests()[start..].to_vec();
+    assert_eq!(sent.len(), 3, "{sent:#?}");
+    let reminder = last_message(&sent[2]);
+    assert!(
+        reminder.starts_with("<system-reminder>\nYour turn is about to end and the plan still has steps that are not completed."),
+        "{reminder}"
+    );
+    assert!(
+        reminder.contains("1. [completed] Read the code\n2. [in_progress] Fix the bug"),
+        "{reminder}"
+    );
+    assert!(!last_message(&sent[1]).contains("<system-reminder>"));
+    // The reply to it (the fake model's echo) is neither shown nor kept.
+    let text = assistant_text(&events);
+    assert!(
+        text.starts_with("tool said:") && !text.contains("user said:"),
+        "{text}"
+    );
+    let AgentEvent::Transcript(items) = core.transcript_event() else {
+        panic!("not a transcript");
+    };
+    assert!(!format!("{items:?}").contains("user said:"), "{items:?}");
+    assert!(shown_notes(&core).is_empty());
+
+    // A turn without a tool call is not reminded; the model keeps the
+    // reminder in its conversation, once.
+    let start = requests().len();
+    core.submit_user_message("HISTORY".to_string());
+    let history = assistant_text(&pump(&mut core, is_ready));
+    assert_eq!(requests().len() - start, 1);
+    assert_eq!(
+        history.matches("Your turn is about to end").count(),
+        1,
+        "{history}"
+    );
+}
+
+#[test]
+fn a_reply_that_only_marks_the_plan_ends_the_turn() {
+    let _guard = setup();
+    let dir = temp_dir("plan-end-marked");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.submit_user_message(update_plan_call());
+    pump(&mut core, is_ready);
+    core.submit_user_message("MARK_PLAN_DONE".to_string());
+    pump(&mut core, is_ready);
+
+    fs::write(dir.join("notes.txt"), "hello\n").unwrap();
+    let start = requests().len();
+    core.submit_user_message(r#"CALL read {"path":"notes.txt"}"#.to_string());
+    let events = pump(&mut core, is_ready);
+    // The read, the answer, the reminder answered with update_plan; no
+    // request after it.
+    assert_eq!(requests().len() - start, 3);
+    let done = vec![
+        ("Read the code".to_string(), "completed".to_string()),
+        ("Fix the bug".to_string(), "completed".to_string()),
+    ];
+    assert_eq!(plan_steps(&events), Some(done));
+    assert!(assistant_text(&events).starts_with("tool said:"));
+    // Done now: the next turn's work is not reminded.
+    let start = requests().len();
+    core.submit_user_message(r#"CALL read {"path":"notes.txt"}"#.to_string());
+    pump(&mut core, is_ready);
+    assert_eq!(requests().len() - start, 2);
+}
+
+#[test]
+fn a_plan_left_alone_for_ten_responses_is_reminded() {
+    let _guard = setup();
+    let dir = temp_dir("plan-stale-reminder");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.submit_user_message(update_plan_call());
+    pump(&mut core, is_ready);
+
+    let start = requests().len();
+    core.submit_user_message(r#"REPEAT 20 bash {"command":"echo {n}"}"#.to_string());
+    pump(&mut core, is_ready);
+    let sent = requests()[start..].to_vec();
+    // The first turn's answer and nine calls are ten responses since the
+    // update: the tenth request carries the reminder (and the fake model,
+    // seeing it last, answers it with text and ends the turn).
+    assert_eq!(sent.len(), 10, "{sent:#?}");
+    assert!(sent[..9]
+        .iter()
+        .all(|request| !last_message(request).contains("<system-reminder>")));
+    let reminder = last_message(&sent[9]);
+    assert!(
+        reminder.starts_with("<system-reminder>\nThe plan has not been updated in a while."),
+        "{reminder}"
+    );
+    assert!(
+        reminder.contains("Never mention this reminder to the user"),
+        "{reminder}"
+    );
+    assert!(
+        reminder.contains("2. [in_progress] Fix the bug"),
+        "{reminder}"
+    );
+    assert!(shown_notes(&core).is_empty());
+}
+
 /// `update_plan` with one pending step.
 fn one_step_plan(step: &str) -> String {
     format!(r#"CALL update_plan {{"plan":[{{"step":"{step}"}}]}}"#)

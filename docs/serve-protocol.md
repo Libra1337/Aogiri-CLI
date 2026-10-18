@@ -963,6 +963,23 @@ and `files` (the files the step writes). The `plan` event passes them
 through. `subagent_lifecycle` carries `plan_step`: the step given to
 `spawn_agent`, else the step whose `agent` names the subagent.
 
+### Plan reminders
+
+The `plan` event shows the steps as the model last sent them; the engine
+never marks a step itself. While the main agent's plan has a step that is
+not `completed` (and the session is not in plan mode), the engine reminds the
+model to keep it current, with a `<system-reminder>` user item that lists the
+plan and that clients do not show:
+
+- **A stale plan.** Before a request, when the conversation has 10 model
+  responses since the last `update_plan` call (or `TodoWrite`) and since the
+  last reminder. A compacted conversation counts from its summary.
+- **The end of a turn.** Once per turn, when the model answers without a
+  tool call and the turn called a tool after the last `update_plan` call or
+  reminder. The answer to this reminder is quiet: its text and reasoning are
+  not streamed or kept, so the user sees only the `update_plan` call it
+  makes. A reply that only updates the plan ends the turn.
+
 ## Loop guard
 
 The engine stops a turn that goes in circles, so an unattended session
