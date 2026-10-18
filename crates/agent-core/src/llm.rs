@@ -4507,13 +4507,13 @@ fn plan_tool_definition() -> Value {
     json!({
         "type": "function",
         "name": "update_plan",
-        "description": "Show the user a short checklist for multi-step work, and keep it current: the user sees only what you last sent. Call it again each time a step's status changes: mark a step in_progress when you start it and completed as soon as it is done, before you start the next. Keep exactly one step in_progress while work remains. Skip it for simple tasks.",
+        "description": "Show the user a short plan for multi-step work: mark a step in_progress when you start it, completed as soon as it is done. Skip it for simple tasks.",
         "parameters": {
             "type": "object",
             "properties": {
                 "plan": {
                     "type": "array",
-                    "description": "All steps in order, a few words each, each with its status; replaces the previous plan.",
+                    "description": "All steps in order, a few words each; replaces the previous plan.",
                     "items": {
                         "type": "object",
                         "properties": {
