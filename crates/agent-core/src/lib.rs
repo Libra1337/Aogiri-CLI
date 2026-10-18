@@ -7,6 +7,7 @@ mod commands;
 mod config;
 mod core;
 pub mod custom_commands;
+pub mod device_id;
 pub mod event;
 mod hooks;
 pub mod host;

@@ -89,7 +89,8 @@ pub struct SearchModel {
     pub model: String,
     url: String,
     api_key: String,
-    /// The gateway route chosen for this model (`monoize_providers`).
+    /// The gateway's device header (`device_id`), then the route chosen for
+    /// this model (`monoize_providers`).
     headers: Vec<(String, String)>,
     connect_timeout: Duration,
 }
@@ -144,7 +145,10 @@ impl SearchModel {
             model: model.to_string(),
             url: llm_provider_kit::anthropic::messages_url(config.base_url.trim()),
             api_key,
-            headers: headers.get(model).cloned().unwrap_or_default(),
+            headers: crate::device_id::gateway_headers(&config.provider)
+                .into_iter()
+                .chain(headers.get(model).cloned().unwrap_or_default())
+                .collect(),
             connect_timeout: Duration::from_secs(config.connect_timeout_seconds),
         })
     }
@@ -1515,7 +1519,12 @@ mod tests {
         let model = SearchModel::from_config(&monoize, Some("key".to_string()), &headers).unwrap();
         assert_eq!(model.model, DEFAULT_SEARCH_MODEL);
         assert_eq!(model.url, "https://gateway.test/v1/messages");
-        assert_eq!(model.headers, headers[DEFAULT_SEARCH_MODEL]);
+        // The gateway's device header (when this computer has one), then the route.
+        let expected: Vec<(String, String)> = crate::device_id::gateway_headers("monoize")
+            .into_iter()
+            .chain(headers[DEFAULT_SEARCH_MODEL].clone())
+            .collect();
+        assert_eq!(model.headers, expected);
         assert!(SearchModel::from_config(&monoize, None, &headers)
             .unwrap_err()
             .contains("API key"));
