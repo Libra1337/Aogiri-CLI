@@ -271,7 +271,8 @@ An `approval_request` event carries, besides the call:
 
 - `kind`: what the user decides.
   - `edit`: a file edit inside the workspace (manual mode).
-  - `command`: a command inside the sandbox (manual mode), or any command
+  - `command`: a command inside the sandbox (manual mode, unless the
+    command provably only reads: those run without asking), or any command
     where there is no sandbox to leave. Also what `write_stdin` types into
     a running shell.
   - `escalation`: a command that leaves the sandbox (`escalate: true`).

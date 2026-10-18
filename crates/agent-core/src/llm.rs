@@ -3047,11 +3047,14 @@ impl OpenAiClient {
             // Inside the sandbox a command needs no approval; only the
             // strictest mode still asks for every command, as a mode does:
             // a switch to a looser mode or "always allow" lets it run, and
-            // so does a prefix the session allowed inside the sandbox. A
-            // sandbox nothing enforces (Windows) leaves it to the mode.
+            // so does a prefix the session allowed inside the sandbox, or a
+            // command that only reads (a strict classifier, like the default
+            // mode of Claude Code and Codex's known-safe list). A sandbox
+            // nothing enforces (Windows) leaves it to the mode.
             _ if sandbox.enforced() && !escalated => {
                 if self.approval_mode.get() == ApprovalMode::Manual
                     && !sandbox.allowed_in_sandbox(command)
+                    && !self.reads_only_in_sandbox(command)
                 {
                     SandboxGate::Mode
                 } else {
@@ -3061,6 +3064,19 @@ impl OpenAiClient {
             _ => SandboxGate::Mode,
         };
         (gate, Some(check))
+    }
+
+    /// Whether `command` provably only reads, so manual mode runs it in the
+    /// sandbox without asking (like the default mode of Claude Code and
+    /// Codex's known-safe list). The classifier (`plan_mode`) understands a
+    /// POSIX shell's grammar, so it applies only when the commands run in
+    /// one (zsh, bash, sh, Git Bash); under PowerShell nothing is
+    /// auto-allowed. The call is still run inside the sandbox: this only
+    /// skips the manual-mode prompt, never an `ask`/`forbid` rule or the
+    /// built-in ask list (those are matched before this).
+    fn reads_only_in_sandbox(&self, command: &str) -> bool {
+        self.tool_state.shell().shell.kind.is_posix()
+            && crate::plan_mode::is_read_only_command(command)
     }
 
     /// `needs_approval` for one call: merge_agent asks only to apply, since
@@ -6495,6 +6511,68 @@ mod tests {
         assert!(client.call_needs_approval(&bash("cargo test")));
         client.approval_mode.set(ApprovalMode::AutoEdit);
         assert_eq!(client.sandbox_gate(&bash("cargo test")), SandboxGate::Run);
+    }
+
+    #[test]
+    fn manual_mode_runs_read_only_commands_without_asking() {
+        let (tx, _rx) = mpsc::channel();
+        let client = approval_test_client(ApprovalMode::Manual, Some(tx));
+        client
+            .tool_state
+            .set_sandbox(Some(crate::sandbox::SandboxPolicy {
+                mode: crate::sandbox::SandboxMode::WorkspaceWrite,
+                ..crate::sandbox::SandboxPolicy::default_for_platform()
+            }));
+        let bash = |command: &str| ToolCallRequest {
+            call_id: "c".to_string(),
+            name: "bash".to_string(),
+            arguments: json!({ "command": command }).to_string(),
+        };
+        // Only meaningful where an OS sandbox enforces the mode (the manual
+        // branch): elsewhere every command already runs by the mode.
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            // Read-only commands, including the owner's status checks, run
+            // in the sandbox without a prompt.
+            for command in [
+                "pwd; ls -la",
+                "ps -axo pid,command | grep cargo | head -20",
+                "cd crates && git status --short | head -20; git log --oneline -3 2>/dev/null",
+                "git diff HEAD | head -50",
+            ] {
+                assert_eq!(
+                    client.sandbox_gate(&bash(command)),
+                    SandboxGate::Run,
+                    "{command}"
+                );
+            }
+            // A write, an install and a network command still ask by the mode.
+            for command in [
+                "printf x > note.txt",
+                "cargo build",
+                "curl -s -o /dev/null http://127.0.0.1:3000/",
+            ] {
+                assert_eq!(
+                    client.sandbox_gate(&bash(command)),
+                    SandboxGate::Mode,
+                    "{command}"
+                );
+                assert!(client.call_needs_approval(&bash(command)), "{command}");
+            }
+            // An `ask` rule still asks even when every part reads.
+            let mut sandbox = crate::sandbox::SandboxPolicy {
+                mode: crate::sandbox::SandboxMode::WorkspaceWrite,
+                ..crate::sandbox::SandboxPolicy::default_for_platform()
+            };
+            sandbox.rules.push(crate::sandbox::CommandRule {
+                prefix: "git log".into(),
+                action: crate::sandbox::RuleAction::Ask,
+            });
+            client.tool_state.set_sandbox(Some(sandbox));
+            assert_eq!(
+                client.sandbox_gate(&bash("git log --oneline")),
+                SandboxGate::Ask
+            );
+        }
     }
 
     #[test]

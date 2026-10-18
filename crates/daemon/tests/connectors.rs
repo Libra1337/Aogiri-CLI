@@ -442,13 +442,14 @@ fn a_telegram_binding_drives_a_session_and_answers_approvals_from_chat() {
         method == "sendMessage" && body["text"].as_str().unwrap().contains("已切换为「谨慎」")
     });
 
-    // A task that needs an approval: the card comes with buttons.
+    // A task that needs an approval: the card comes with buttons. A write
+    // asks (a read-only command would run without a card in manual mode).
     let before = telegram.calls().len();
-    telegram.say(OWNER, "RUN: echo chat-ok");
+    telegram.say(OWNER, "RUN: printf chat-ok > chat-ok.txt");
     let card = telegram.wait_for(before, |method, body| {
         method == "sendMessage" && body["reply_markup"]["inline_keyboard"][0].is_array()
     });
-    assert!(card["text"].as_str().unwrap().contains("echo chat-ok"));
+    assert!(card["text"].as_str().unwrap().contains("chat-ok.txt"));
     let buttons = card["reply_markup"]["inline_keyboard"][0]
         .as_array()
         .unwrap();
@@ -652,6 +653,86 @@ fn a_chat_binding_lists_and_picks_lynshen_sessions_only() {
         method == "sendMessage" && body["text"].as_str().unwrap().contains("已切换到")
     });
     assert!(!telegram.texts_to(before, OWNER).iter().any(|t| others(t)));
+}
+
+#[test]
+fn allow_this_turn_covers_a_bursts_remaining_approvals() {
+    if cfg!(windows) {
+        return;
+    }
+    let _guard = setup();
+    let telegram = Telegram::start();
+    let (address, token, _) = start_daemon();
+    let mut desktop = Client::connect(&address, &token);
+    let connector = add_connector(&mut desktop, &telegram);
+    bind_owner(&mut desktop, &telegram, &connector);
+
+    // A chat session in careful (manual) mode, where each write asks.
+    let before = telegram.calls().len();
+    telegram.say(OWNER, "/chat");
+    telegram.wait_for(before, |method, body| {
+        method == "sendMessage" && body["text"].as_str().unwrap().contains("已新建聊天会话")
+    });
+    telegram.say(OWNER, "/mode manual");
+    telegram.wait_for(before, |method, body| {
+        method == "sendMessage" && body["text"].as_str().unwrap().contains("已切换为「谨慎」")
+    });
+
+    // One turn with two writes: the first asks with a 「本轮都允许」 button.
+    let before = telegram.calls().len();
+    let calls = json!([
+        { "name": "bash", "arguments": { "command": "printf a > first.txt" } },
+        { "name": "bash", "arguments": { "command": "printf b > second.txt" } },
+    ]);
+    telegram.say(OWNER, &format!("CALLS {calls}"));
+    let card = telegram.wait_for(before, |method, body| {
+        method == "sendMessage" && body["reply_markup"]["inline_keyboard"][0].is_array()
+    });
+    let buttons = card["reply_markup"]["inline_keyboard"][0]
+        .as_array()
+        .unwrap();
+    let turn = buttons
+        .iter()
+        .find_map(|b| b["callback_data"].as_str().filter(|d| d.ends_with(":t")))
+        .expect("a 本轮都允许 button")
+        .to_string();
+    assert!(card["text"].as_str().unwrap().contains("first.txt"));
+
+    // Press it: this call runs, and the turn's next approval runs with no
+    // second card.
+    let cards_before = telegram
+        .calls()
+        .iter()
+        .filter(|(m, b)| m == "sendMessage" && b["reply_markup"]["inline_keyboard"][0].is_array())
+        .count();
+    let pressed = telegram.press(OWNER, &turn);
+    let ack = telegram.wait_for(before, |method, body| {
+        method == "answerCallbackQuery" && body["callback_query_id"] == pressed.as_str()
+    });
+    assert_eq!(ack["text"], "本轮都允许");
+    // The turn finishes (the reply follows as a new message).
+    telegram.wait_for(before, |method, body| {
+        method == "editMessageText" && body["text"].as_str().unwrap().contains("完成")
+    });
+    // No second approval card was posted for the second write.
+    let cards_after = telegram
+        .calls()
+        .iter()
+        .filter(|(m, b)| m == "sendMessage" && b["reply_markup"]["inline_keyboard"][0].is_array())
+        .count();
+    assert_eq!(cards_after, cards_before, "a second card was posted");
+
+    // Both writes landed.
+    let chats = PathBuf::from(std::env::var("HOME").unwrap()).join(".lynshen/chats");
+    assert_eq!(fs::read_to_string(chats.join("first.txt")).unwrap(), "a");
+    assert_eq!(fs::read_to_string(chats.join("second.txt")).unwrap(), "b");
+
+    // The turn is over: a new turn asks again (the scope did not persist).
+    let before = telegram.calls().len();
+    telegram.say(OWNER, "RUN: printf c > third.txt");
+    telegram.wait_for(before, |method, body| {
+        method == "sendMessage" && body["reply_markup"]["inline_keyboard"][0].is_array()
+    });
 }
 
 /// A paired phone's token (`/api/pair` with a desktop's pairing code).
@@ -1006,7 +1087,8 @@ fn a_discord_dm_binding_drives_a_session_with_buttons() {
     discord.say(DC_OWNER, "/mode manual", false);
     discord.wait_for(before, posted("dm-4242", "已切换为「谨慎」"));
     let before = discord.calls().len();
-    discord.say(DC_OWNER, "RUN: echo dc-ok", false);
+    // A write asks (a read-only command runs without a card in manual mode).
+    discord.say(DC_OWNER, "RUN: printf dc-ok > dc-ok.txt", false);
     let card = discord.wait_for(before, |method, _, body| {
         method == "POST" && body["components"][0]["components"].is_array()
     });
@@ -1306,7 +1388,8 @@ fn a_qq_single_chat_binding_answers_approvals_as_text() {
     qq.say(QQ_OWNER, "m-3", "/mode manual");
     qq.wait_for_text(before, QQ_OWNER, "已切换为「谨慎」");
     let before = qq.calls().len();
-    qq.say(QQ_OWNER, "m-4", "RUN: echo qq-ok");
+    // A write asks (a read-only command runs without a card in manual mode).
+    qq.say(QQ_OWNER, "m-4", "RUN: printf qq-ok > qq-ok.txt");
     // No buttons on QQ: the card names its id for a text answer.
     let card = qq.wait_for_text(before, QQ_OWNER, "回复「允许 ");
     let text = card["markdown"]["content"].as_str().unwrap().to_string();

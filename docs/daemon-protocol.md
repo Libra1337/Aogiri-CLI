@@ -483,7 +483,11 @@ An agent's shell commands run in an OS sandbox (Seatbelt on macOS,
 writes against the same rules and can also read and write the agent's
 directories.
 
-A command inside the sandbox needs no approval (except under `manual`). A
+A command inside the sandbox needs no approval (except under `manual`, which
+still asks for every command that changes anything; a command every part of
+which provably only reads — `ls`, `cat`, `grep`, `find` without `-exec`/`-delete`,
+`git status`/`diff`/`log`, … in a POSIX shell — runs without asking, inside the
+sandbox). A
 command that must leave it (commit to git, write elsewhere) is called with
 `escalate: true` and a `justification` and goes through the approval mode:
 `auto` asks the safety model, the others ask a person, and an unattended
