@@ -229,3 +229,54 @@ fn stop_pauses_an_active_goal_instead_of_starting_its_next_turn() {
 
     core.handle_command("/goal clear");
 }
+
+/// The turn stats the engine records: one per turn, after its reply, for a
+/// finished turn and for a stopped one, kept in the transcript a reopened
+/// conversation shows (ticket #39).
+#[test]
+fn each_turn_records_its_model_and_duration_finished_or_stopped() {
+    let _guard = setup();
+    let mut core = AgentCore::open(temp_dir("turn-stats")).unwrap();
+
+    core.submit_user_message("first".to_string());
+    let finished = pump(&mut core, is_ready);
+    let live: Vec<_> = finished
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TurnStats(stats) => Some(stats.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(live.len(), 1, "{finished:#?}");
+    assert!(!live[0].model.is_empty());
+    assert!(live[0]
+        .ttft_ms
+        .is_some_and(|ttft| ttft <= live[0].elapsed_ms));
+
+    let before = requests_saying("STALL");
+    core.submit_user_message("STALL".to_string());
+    wait_for_requests("STALL", before + 1);
+    let stopped = core.interrupt();
+    assert!(
+        stopped
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnStats(stats) if stats.ttft_ms.is_none())),
+        "{stopped:#?}"
+    );
+    // Stopping again (nothing running) records nothing more.
+    assert!(core.interrupt().is_empty());
+
+    let AgentEvent::Transcript(items) = core.transcript_event() else {
+        panic!("not a transcript");
+    };
+    let roles: Vec<&str> = items
+        .iter()
+        .map(|item| match item {
+            lynshen_agent_core::TranscriptItem::User(_) => "user",
+            lynshen_agent_core::TranscriptItem::Assistant(_) => "assistant",
+            lynshen_agent_core::TranscriptItem::TurnStats(_) => "stats",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(roles, ["user", "assistant", "stats", "user", "stats"]);
+}
