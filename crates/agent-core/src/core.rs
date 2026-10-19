@@ -1501,7 +1501,7 @@ impl AgentCore {
                 .chain([
                     config.model.clone(),
                     config.compact().0,
-                    config.safety_model.clone(),
+                    config.safety().0,
                     config.image_model.clone(),
                 ]);
             for name in names {
