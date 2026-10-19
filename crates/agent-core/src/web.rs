@@ -134,9 +134,13 @@ impl std::fmt::Debug for SearchModel {
 
 /// The wire on which `model` can search natively on `provider`, or why it
 /// cannot. Only these have a provider-side search tool that works through
-/// the gateways (probed 2026-10-19): Claude over Messages, GPT over
+/// the gateways (probed 2026-10-19/20): Claude over Messages, GPT over
 /// Responses. Gemini's grounding and Grok's live search do not come
-/// through; DeepSeek, GLM, Kimi, Qwen and MiniMax have none.
+/// through. DeepSeek (Responses `web_search`, v4-pro), GLM (`web_search`
+/// chat tool), Kimi (`$web_search` builtin function), Qwen (`enable_search`)
+/// and MiniMax (server `web_search`) have one at their own APIs, but the
+/// gateway's channels for them are Chat Completions relays that drop or
+/// ignore it, so they go to the gateway's search.
 fn native_search_wire(provider: &str, model: &str) -> Result<NativeSearch, String> {
     let name = model.to_ascii_lowercase();
     let wire = if llm_provider_kit::is_anthropic_model(&name) {
