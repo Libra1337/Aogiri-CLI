@@ -249,6 +249,9 @@ fn script(request: &Value) -> String {
             json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] }),
         ]);
     }
+    if let Some(reply) = thinking_only_reply(&messages) {
+        return reply;
+    }
     if last["role"] == "user" {
         match text.as_str() {
             "STALL" => return STALL.to_string(),
@@ -382,6 +385,30 @@ fn script(request: &Value) -> String {
         json!({ "choices": [{ "index": 0, "delta": { "content": reply }, "finish_reason": null }] }),
         json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
     ])
+}
+
+/// Thinking and no answer, scripted by the user's latest message (the
+/// engine's empty-response reminders after it do not count):
+/// `THINK_LENGTH` stops on the output limit, `THINK_FILTER` on a content
+/// filter, `THINK_EMPTY` normally (every time it is reminded, too).
+fn thinking_only_reply(messages: &[Value]) -> Option<String> {
+    let asked = messages
+        .iter()
+        .rev()
+        .filter(|message| message["role"] == "user")
+        .map(|message| content_text(&message["content"]))
+        .find(|text| !text.starts_with("<runtime_reminder>"))?;
+    let finish = match asked.as_str() {
+        "THINK_LENGTH" => "length",
+        "THINK_FILTER" => "content_filter",
+        "THINK_EMPTY" => "stop",
+        _ => return None,
+    };
+    Some(sse(&[
+        json!({ "choices": [{ "index": 0, "delta": { "reasoning_content": "thinking" }, "finish_reason": null }] }),
+        json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": finish }] }),
+        json!({ "choices": [], "usage": { "prompt_tokens": 5, "completion_tokens": 8192 } }),
+    ]))
 }
 
 /// The answer to a summary request scripted by `SUMMARY_CALLS_TOOL`,

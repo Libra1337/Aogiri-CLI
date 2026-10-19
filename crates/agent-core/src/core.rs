@@ -6239,6 +6239,9 @@ fn is_context_overflow(error: &str) -> bool {
     let lower = error.to_lowercase();
     [
         "context_length_exceeded",
+        // Claude stopped on the window before any answer (the kit's
+        // NoAnswer::ContextWindow error).
+        "model_context_window_exceeded",
         "maximum context length",
         "prompt is too long",
         "prompt too long",
@@ -7314,6 +7317,9 @@ mod model_config_tests {
         ));
         assert!(is_context_overflow(
             "input length and `max_tokens` exceed context limit: 188240 + 32000 > 200000"
+        ));
+        assert!(is_context_overflow(
+            "模型只输出了思考，没有给出回答：上下文窗口用完了。 (stop reason model_context_window_exceeded)"
         ));
         assert!(!is_context_overflow("HTTP 429: rate limited"));
     }
