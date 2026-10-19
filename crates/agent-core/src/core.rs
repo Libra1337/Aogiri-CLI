@@ -2522,6 +2522,7 @@ impl AgentCore {
                 self.provider_api_key(),
                 &model_headers,
             ),
+            gateway: crate::web::GatewaySearch::from_config(&self.config, self.provider_api_key()),
         }));
         let context = PromptContext {
             date: current_utc_date(),

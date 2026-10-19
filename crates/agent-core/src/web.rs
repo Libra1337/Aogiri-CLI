@@ -1,13 +1,19 @@
 //! The `web_search` and `web_fetch` tools' engines.
 //!
-//! `web_search` asks a model that searches on its provider's side (a Claude
-//! model with Anthropic's `web_search` tool, `web_search_model`) through the
-//! user's gateway, whatever model the conversation runs on: the provider
-//! reaches the open web wherever this machine is, and the conversation gets
-//! the sources and what they say instead of whole pages. Without such a model,
-//! or when it fails, it searches from this machine: a search engine's own
-//! HTML result page, no key and no login. The LynShen gateway's own search
-//! (POST /tools/v1/search) is used only when `web_search_engine` names it.
+//! `web_search` (engine `auto`, the default) tries, in this order, and stops
+//! at the first that finds pages:
+//! 1. native search by the conversation's own model, when its provider can
+//!    run a search tool on its side: a Claude model with Anthropic's
+//!    `web_search` server tool over Messages, a GPT model with the Responses
+//!    `web_search` tool. `web_search_model` names another model for this step
+//!    instead (empty: the conversation's model).
+//! 2. the gateway's search (POST /tools/v1/search on a LynShen or Monoize
+//!    gateway, with the key the conversation already uses). The gateway
+//!    searches with a key it holds itself; no search key is on this machine.
+//! 3. this machine: a search engine's own HTML result page, no key, no login.
+//!
+//! The result says which one answered (`engine`, and `model` when a model
+//! searched) and, when an earlier step failed, why (`note`).
 //!
 //! `web_fetch` fetches from this machine unless `web_fetch_engine` names a
 //! gateway engine (POST /tools/v1/fetch); the local engine lives in
@@ -15,11 +21,12 @@
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-/// `auto` (the default) searches through `web_search_model`, falling back
-/// to this machine; `gateway` goes through the LynShen gateway's search. The
-/// other names are ones earlier builds wrote, read as `auto`.
+/// `auto` (the default) runs the chain above; `gateway` goes to the LynShen
+/// gateway's search only. The other names are ones earlier builds wrote,
+/// read as `auto`.
 pub const SEARCH_ENGINES: &[&str] = &[
     "auto", "gateway", "local", "model", "native", "parallel", "brave",
 ];
@@ -28,23 +35,28 @@ pub const FETCH_ENGINES: &[&str] = &["local", "jina", "firecrawl", "parallel"];
 /// but `auto`, `parallel` and `brave`), so a config.json this version saves
 /// still loads in an older engine left running across an update.
 pub const DEFAULT_SEARCH_ENGINE: &str = "auto";
-/// How a result says the search model answered it.
-const MODEL_ENGINE: &str = "model";
 pub const DEFAULT_FETCH_ENGINE: &str = "local";
-/// `web_search_model`: a Claude model the gateway serves with Anthropic's
-/// `web_search` tool. The smallest one: it only searches and reports.
-pub const DEFAULT_SEARCH_MODEL: &str = "claude-haiku-5-5";
-/// Searches the search model may run for one `web_search` call: the query,
-/// and a refinement or two when the first results miss.
+/// `web_search_model` empty: the conversation's own model searches.
+pub const DEFAULT_SEARCH_MODEL: &str = "";
+/// What 0.7.7 and earlier wrote as the default `web_search_model`. A config
+/// that still holds it never chose it, so it reads as the new default.
+pub const RETIRED_SEARCH_MODEL: &str = "claude-haiku-5-5";
+/// Searches the model may run for one `web_search` call: the query, and a
+/// refinement or two when the first results miss.
 const MODEL_SEARCH_MAX_USES: u64 = 3;
 const MODEL_SEARCH_MAX_TOKENS: u64 = 1500;
 /// A search and its report take 5–15 s; the rest is a slow upstream.
 const MODEL_SEARCH_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const MODEL_SEARCH_SYSTEM: &str = "You search the web for another AI agent and report what the results say. Always search first; never answer from memory. Report the facts that answer the query, each followed by its source URL in parentheses. Copy numbers, versions, dates and names exactly as the pages give them. If the results do not answer the query, say so and say what they did cover. Plain text, no preamble, at most 300 words.";
+/// A model whose route answered without searching (no server tool on that
+/// route) is not asked again for this long: each try costs a model call.
+const NO_TOOL_PAUSE: Duration = Duration::from_secs(30 * 60);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The gateway gives a fetch vendor 30 s per page; this leaves room for it.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// The gateway's search answers in about a second; 30 s is a stuck upstream.
+const GATEWAY_SEARCH_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SEARCH_RESULTS: u64 = 10;
 const QUERY_MAX_CHARS: usize = 400;
 /// A result page is a few hundred KB of markup at most.
@@ -60,37 +72,51 @@ pub struct WebTools {
     pub encrypt_secrets: bool,
     pub search_engine: String,
     pub fetch_engine: String,
-    /// A LynShen session exists; only gateway search needs one.
+    /// A LynShen session exists; only the `gateway` engine needs one.
     pub signed_in: bool,
-    /// The model `web_search` asks, or why there is none (no gateway, no
-    /// key, `web_search_model` empty or not served).
+    /// Step 1: the model that searches natively, or why none does (not a
+    /// model whose provider runs a search tool, no gateway key, ...).
     pub search_model: Result<SearchModel, String>,
+    /// Step 2: the gateway's search, or why there is none.
+    pub gateway: Result<GatewaySearch, String>,
 }
 
 impl WebTools {
-    /// Whether `web_search` goes through the gateway's search instead of a
-    /// model or this machine.
+    /// Whether `web_search` goes only through the LynShen gateway's search
+    /// (`web_search_engine: gateway`, with the LynShen login).
     pub fn gateway_search(&self) -> bool {
         self.search_engine == "gateway"
     }
 
-    /// Whether `web_search` can run at all: a model or this machine always
-    /// can, the gateway needs a LynShen login.
+    /// Whether `web_search` can run at all: the default chain always can
+    /// (this machine is its last step), the `gateway` engine needs a login.
     pub fn search_available(&self) -> bool {
         !self.gateway_search() || self.signed_in
     }
 }
 
-/// The model behind `web_search` and how to reach it: the gateway the
-/// conversation already uses, over Anthropic Messages, which every model on
-/// a LynShen or Monoize gateway is served through.
+/// The wire a model searches over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeSearch {
+    /// Anthropic Messages with the `web_search_20250305` server tool.
+    Messages,
+    /// OpenAI Responses with the `web_search` tool, streamed: the gateway's
+    /// GPT routes answer a non-streaming request with a stream.
+    Responses,
+}
+
+/// The model behind step 1 and how to reach it: the provider the
+/// conversation already uses.
 #[derive(Clone)]
 pub struct SearchModel {
     pub model: String,
+    pub wire: NativeSearch,
+    /// Whether this is the conversation's own model (not `web_search_model`).
+    pub conversation: bool,
     url: String,
     api_key: String,
     /// The gateway's device header (`device_id`), then the route chosen for
-    /// this model (`monoize_providers`).
+    /// this model (`monoize_providers` / `lynshen_groups`).
     headers: Vec<(String, String)>,
     connect_timeout: Duration,
 }
@@ -100,40 +126,68 @@ impl std::fmt::Debug for SearchModel {
         formatter
             .debug_struct("SearchModel")
             .field("model", &self.model)
+            .field("wire", &self.wire)
             .field("url", &self.url)
             .finish_non_exhaustive()
     }
 }
 
+/// The wire on which `model` can search natively on `provider`, or why it
+/// cannot. Only these have a provider-side search tool that works through
+/// the gateways (probed 2026-10-19): Claude over Messages, GPT over
+/// Responses. Gemini's grounding and Grok's live search do not come
+/// through; DeepSeek, GLM, Kimi, Qwen and MiniMax have none.
+fn native_search_wire(provider: &str, model: &str) -> Result<NativeSearch, String> {
+    let name = model.to_ascii_lowercase();
+    let wire = if llm_provider_kit::is_anthropic_model(&name) {
+        NativeSearch::Messages
+    } else if name.starts_with("gpt-") && !name.starts_with("gpt-image") {
+        NativeSearch::Responses
+    } else {
+        return Err(format!("{model} has no native web search"));
+    };
+    // OpenAI's own API serves the Responses tool with the same Bearer key;
+    // every other provider's endpoint (and Anthropic's own, whose keys are
+    // not Bearer) is unknown ground, and a wrong guess costs a model call.
+    let known = match wire {
+        NativeSearch::Messages => matches!(provider, "lynshen" | "monoize"),
+        NativeSearch::Responses => matches!(provider, "lynshen" | "monoize" | "openai"),
+    };
+    if known {
+        Ok(wire)
+    } else {
+        Err(format!("{provider} does not run a search tool for {model}"))
+    }
+}
+
 impl SearchModel {
-    /// The search model for this config, or why there is none.
+    /// Step 1 for this config and conversation model, or why there is none.
     pub(crate) fn from_config(
         config: &crate::config::Config,
         api_key: Option<String>,
         headers: &HashMap<String, Vec<(String, String)>>,
     ) -> Result<Self, String> {
-        // Only a LynShen or Monoize gateway serves a Claude model next to
-        // whatever the conversation runs on; another provider's endpoint
-        // would answer 404 on every search.
-        if !matches!(config.provider.as_str(), "lynshen" | "monoize") {
-            return Err(format!(
-                "{} is not a LynShen or Monoize gateway",
-                config.provider
-            ));
-        }
-        let model = config.web_search_model.trim();
+        let pinned = config.web_search_model.trim();
+        let (model, conversation) = if pinned.is_empty() {
+            (config.model.trim(), true)
+        } else {
+            (pinned, false)
+        };
         if model.is_empty() {
-            return Err("web_search_model is empty".to_string());
+            return Err("no model".to_string());
         }
+        let wire = native_search_wire(&config.provider, model)?;
         // A gateway that has listed its models and left this one out cannot
         // serve it. LynShen's list is its own; Monoize's is `models`.
-        let served = if config.provider == "lynshen" {
-            &config.lynshen_models
-        } else {
-            &config.models
-        };
-        if !served.is_empty() && !served.iter().any(|entry| entry.name == model) {
-            return Err(format!("the gateway does not serve {model}"));
+        if !conversation {
+            let served = if config.provider == "lynshen" {
+                &config.lynshen_models
+            } else {
+                &config.models
+            };
+            if !served.is_empty() && !served.iter().any(|entry| entry.name == model) {
+                return Err(format!("the gateway does not serve {model}"));
+            }
         }
         let api_key = api_key
             .filter(|key| !key.trim().is_empty())
@@ -141,9 +195,16 @@ impl SearchModel {
             .map(|key| key.trim().to_string())
             .filter(|key| !key.is_empty())
             .ok_or_else(|| format!("no API key for {}", config.provider))?;
+        let base = config.base_url.trim();
+        let url = match wire {
+            NativeSearch::Messages => llm_provider_kit::anthropic::messages_url(base),
+            NativeSearch::Responses => llm_provider_kit::responses::responses_url(base),
+        };
         Ok(Self {
             model: model.to_string(),
-            url: llm_provider_kit::anthropic::messages_url(config.base_url.trim()),
+            wire,
+            conversation,
+            url,
             api_key,
             headers: crate::device_id::gateway_headers(&config.provider)
                 .into_iter()
@@ -152,6 +213,58 @@ impl SearchModel {
             connect_timeout: Duration::from_secs(config.connect_timeout_seconds),
         })
     }
+}
+
+/// Step 2: the gateway's own search, reached with the key the conversation
+/// uses. Only LynShen and Monoize gateways have one.
+#[derive(Clone)]
+pub struct GatewaySearch {
+    url: String,
+    api_key: String,
+    headers: Vec<(String, String)>,
+    connect_timeout: Duration,
+}
+
+impl std::fmt::Debug for GatewaySearch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewaySearch")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GatewaySearch {
+    pub(crate) fn from_config(
+        config: &crate::config::Config,
+        api_key: Option<String>,
+    ) -> Result<Self, String> {
+        if !matches!(config.provider.as_str(), "lynshen" | "monoize") {
+            return Err(format!(
+                "{} is not a LynShen or Monoize gateway",
+                config.provider
+            ));
+        }
+        let api_key = api_key
+            .filter(|key| !key.trim().is_empty())
+            .or_else(|| std::env::var(&config.api_key_env).ok())
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| format!("no API key for {}", config.provider))?;
+        Ok(Self {
+            url: format!("{}/tools/v1/search", gateway_origin(&config.base_url)),
+            api_key,
+            headers: crate::device_id::gateway_headers(&config.provider),
+            connect_timeout: Duration::from_secs(config.connect_timeout_seconds),
+        })
+    }
+}
+
+/// The gateway's origin from its API base URL (`https://host/v1` →
+/// `https://host`): the tools live beside `/v1`, not under it.
+fn gateway_origin(base_url: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    base.strip_suffix("/v1").unwrap_or(base).to_string()
 }
 
 pub fn search_definition() -> Value {
@@ -179,8 +292,8 @@ pub fn run_search(args: &Value, web: Option<&WebTools>) -> Value {
         return search(
             args,
             web.search_model.as_ref().ok(),
-            &LivePoster,
-            &LiveFetcher,
+            web.gateway.as_ref().ok(),
+            &Live,
         );
     }
     let body = match search_body(args, &web.search_engine) {
@@ -332,57 +445,127 @@ fn fetch_result(value: &Value, requested_url: &str, max_bytes: Option<u64>) -> V
 }
 
 // ---------------------------------------------------------------------------
-// Model search: a Claude model runs Anthropic's `web_search` on the
-// provider's side and reports what the results say, with their sources.
+// The chain: native search by a model, the gateway's search, this machine.
 // ---------------------------------------------------------------------------
 
-/// How the search model is asked. A test injects its own.
-pub(crate) trait ModelPoster {
-    fn post(&self, model: &SearchModel, body: &Value) -> Result<Value, String>;
+/// Everything `web_search` reaches over the network. A test injects its own.
+pub(crate) trait SearchIo {
+    /// One native search request; the reply as JSON (Messages), or the
+    /// output items of a completed stream (Responses).
+    fn ask_model(&self, model: &SearchModel, body: &Value) -> Result<Value, String>;
+    /// POST to the gateway's search; its JSON reply.
+    fn ask_gateway(&self, gateway: &GatewaySearch, body: &Value) -> Result<Value, String>;
+    /// A search engine's result page.
+    fn get_page(&self, url: &str) -> Result<String, String>;
 }
 
-struct LivePoster;
+struct Live;
 
-impl ModelPoster for LivePoster {
-    fn post(&self, model: &SearchModel, body: &Value) -> Result<Value, String> {
+impl SearchIo for Live {
+    fn ask_model(&self, model: &SearchModel, body: &Value) -> Result<Value, String> {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(model.connect_timeout)
             .timeout_read(MODEL_SEARCH_READ_TIMEOUT)
             .build();
         let mut request = agent
             .post(&model.url)
-            .set("Authorization", &format!("Bearer {}", model.api_key))
-            .set(
+            .set("Authorization", &format!("Bearer {}", model.api_key));
+        if model.wire == NativeSearch::Messages {
+            request = request.set(
                 "anthropic-version",
                 llm_provider_kit::anthropic::ANTHROPIC_VERSION,
             );
+        } else {
+            request = request.set("Accept", "text/event-stream");
+        }
         for (name, value) in &model.headers {
             request = request.set(name, value);
         }
-        match request.send_json(body.clone()) {
-            Ok(response) => response
+        let response = request.send_json(body.clone()).map_err(status_error)?;
+        match model.wire {
+            NativeSearch::Messages => response
                 .into_json::<Value>()
                 .map_err(|error| format!("unreadable reply: {error}")),
-            Err(ureq::Error::Status(code, response)) => {
-                let body = response.into_json::<Value>().unwrap_or(Value::Null);
-                let message = body
-                    .pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("request failed");
-                Err(format!("HTTP {code}: {message}"))
+            NativeSearch::Responses => {
+                let items =
+                    llm_provider_kit::responses::read_sse_stream(response.into_reader(), |_| {
+                        Ok(())
+                    })?;
+                Ok(Value::Array(items))
             }
-            Err(ureq::Error::Transport(transport)) => Err(format!("unreachable: {transport}")),
         }
+    }
+
+    fn ask_gateway(&self, gateway: &GatewaySearch, body: &Value) -> Result<Value, String> {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(gateway.connect_timeout)
+            .timeout_read(GATEWAY_SEARCH_READ_TIMEOUT)
+            .build();
+        let mut request = agent
+            .post(&gateway.url)
+            .set("Authorization", &format!("Bearer {}", gateway.api_key));
+        for (name, value) in &gateway.headers {
+            request = request.set(name, value);
+        }
+        request
+            .send_json(body.clone())
+            .map_err(status_error)?
+            .into_json::<Value>()
+            .map_err(|error| format!("unreadable reply: {error}"))
+    }
+
+    fn get_page(&self, url: &str) -> Result<String, String> {
+        crate::web_fetch::get_text(url, SEARCH_USER_AGENT, MAX_SEARCH_PAGE_BYTES)
     }
 }
 
-/// `web_search` on the default engine: the search model when there is one,
-/// this machine when there is none or it fails.
+/// An HTTP failure as one line: the status and the server's own message.
+fn status_error(error: ureq::Error) -> String {
+    match error {
+        ureq::Error::Status(code, response) => {
+            let body = response.into_json::<Value>().unwrap_or(Value::Null);
+            let message = body
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("request failed");
+            format!("HTTP {code}: {message}")
+        }
+        ureq::Error::Transport(transport) => format!("unreachable: {transport}"),
+    }
+}
+
+/// Models whose route answered without searching, and when: they are not
+/// asked again before `NO_TOOL_PAUSE` has passed.
+fn no_tool_models() -> &'static Mutex<HashMap<String, Instant>> {
+    static MODELS: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    MODELS.get_or_init(Default::default)
+}
+
+fn paused(model: &str) -> bool {
+    no_tool_models()
+        .lock()
+        .ok()
+        .and_then(|models| models.get(model).copied())
+        .is_some_and(|since| since.elapsed() < NO_TOOL_PAUSE)
+}
+
+fn pause(model: &str) {
+    if let Ok(mut models) = no_tool_models().lock() {
+        models.insert(model.to_string(), Instant::now());
+    }
+}
+
+/// Why a model's reply carried no search: its route has no search tool. Such
+/// a model is paused rather than asked every time.
+const ANSWERED_WITHOUT_SEARCHING: &str = "it answered without searching";
+
+/// `web_search` on the default engine: the chain in the module docs.
 fn search(
     args: &Value,
     model: Option<&SearchModel>,
-    poster: &dyn ModelPoster,
-    fetcher: &dyn PageFetcher,
+    gateway: Option<&GatewaySearch>,
+    io: &dyn SearchIo,
 ) -> Value {
     let query = match search_query(args) {
         Ok(query) => query,
@@ -392,39 +575,81 @@ fn search(
         Ok(max) => max,
         Err(error) => return json!({ "error": error }),
     };
-    let Some(model) = model else {
-        return local_search(args, fetcher);
-    };
     let freshness = args.get("freshness").and_then(Value::as_str);
-    let reply = poster
-        .post(model, &model_search_body(&model.model, &query, freshness))
-        .and_then(|reply| read_model_search(&reply, max_results));
-    let failure = match reply {
-        Ok(mut value) => {
-            crate::log_info!(
-                "web_search",
-                "searched",
-                engine = MODEL_ENGINE,
-                model = model.model.clone(),
-                results = value["results"].as_array().map_or(0, Vec::len)
-            );
-            value["query"] = json!(query);
-            value["engine"] = json!(MODEL_ENGINE);
-            value["model"] = json!(model.model);
-            return value;
+    let mut skipped: Vec<String> = Vec::new();
+
+    if let Some(model) = model.filter(|model| !paused(&model.model)) {
+        let reply = io
+            .ask_model(model, &model_search_body(model, &query, freshness))
+            .and_then(|reply| match model.wire {
+                NativeSearch::Messages => read_model_search(&reply, max_results),
+                NativeSearch::Responses => read_responses_search(&reply, max_results),
+            });
+        match reply {
+            Ok(mut value) => {
+                crate::log_info!(
+                    "web_search",
+                    "searched",
+                    engine = "model",
+                    model = model.model.clone(),
+                    results = value["results"].as_array().map_or(0, Vec::len)
+                );
+                value["query"] = json!(query);
+                value["engine"] = json!("model");
+                value["model"] = json!(model.model);
+                if !model.conversation {
+                    value["note"] = json!(format!(
+                        "searched by {} (web_search_model), not the conversation's model",
+                        model.model
+                    ));
+                }
+                return value;
+            }
+            Err(error) => {
+                crate::log_warn!(
+                    "web_search",
+                    "model search failed",
+                    model = model.model.clone(),
+                    error = error.clone()
+                );
+                if error == ANSWERED_WITHOUT_SEARCHING {
+                    pause(&model.model);
+                }
+                skipped.push(format!("{} could not search ({error})", model.model));
+            }
         }
-        Err(error) => error,
-    };
-    crate::log_warn!(
-        "web_search",
-        "model search failed",
-        model = model.model.clone(),
-        error = failure.clone()
-    );
-    // This machine's search may still answer; the model learns why it is
-    // reading that instead.
-    let why = format!("{} could not search ({failure})", model.model);
-    let mut local = local_search(args, fetcher);
+    }
+
+    if let Some(gateway) = gateway {
+        match gateway_search(gateway, io, &query, max_results, freshness) {
+            Ok(mut value) => {
+                crate::log_info!(
+                    "web_search",
+                    "searched",
+                    engine = "gateway",
+                    results = value["results"].as_array().map_or(0, Vec::len)
+                );
+                value["query"] = json!(query);
+                if !skipped.is_empty() {
+                    value["note"] = json!(format!(
+                        "{}, so the gateway's search answered",
+                        skipped.join("; ")
+                    ));
+                }
+                return value;
+            }
+            Err(error) => {
+                crate::log_warn!("web_search", "gateway search failed", error = error.clone());
+                skipped.push(format!("the gateway's search failed ({error})"));
+            }
+        }
+    }
+
+    let mut local = local_search(args, io);
+    if skipped.is_empty() {
+        return local;
+    }
+    let why = skipped.join("; ");
     if let Some(error) = local.get("error").and_then(Value::as_str) {
         local["error"] = json!(format!("{why}; {error}"));
     } else {
@@ -439,24 +664,179 @@ fn search(
     local
 }
 
-fn model_search_body(model: &str, query: &str, freshness: Option<&str>) -> Value {
+/// Step 2: the gateway's search. An error when it fails or finds nothing.
+fn gateway_search(
+    gateway: &GatewaySearch,
+    io: &dyn SearchIo,
+    query: &str,
+    max_results: usize,
+    freshness: Option<&str>,
+) -> Result<Value, String> {
+    let mut body = json!({ "query": query, "max_results": max_results });
+    if let Some(period) = freshness {
+        body["freshness"] = json!(period);
+    }
+    let reply = io.ask_gateway(gateway, &body)?;
+    let results: Vec<Value> = reply
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let url = item.get("url").and_then(Value::as_str)?;
+            let text = |key: &str| {
+                item.get(key)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+            };
+            let mut result = json!({ "title": text("title").unwrap_or(url), "url": url });
+            // The summary is written for a model to read; the snippet is the
+            // short form when there is none.
+            if let Some(snippet) = text("summary").or_else(|| text("snippet")) {
+                result["snippet"] = json!(snippet);
+            }
+            if let Some(date) = text("published_at") {
+                result["published"] = json!(date);
+            }
+            Some(result)
+        })
+        .take(max_results)
+        .collect();
+    if results.is_empty() {
+        return Err("it found no pages".to_string());
+    }
+    let engine = reply
+        .get("engine")
+        .and_then(Value::as_str)
+        .unwrap_or("gateway");
+    Ok(json!({ "engine": format!("gateway ({engine})"), "results": results }))
+}
+
+fn model_search_body(model: &SearchModel, query: &str, freshness: Option<&str>) -> Value {
     let mut ask = format!("Query: {query}");
     if let Some(period) = freshness {
         ask.push_str(&format!(
             "\nOnly use pages published within the past {period}."
         ));
     }
-    json!({
-        "model": model,
-        "max_tokens": MODEL_SEARCH_MAX_TOKENS,
-        "system": MODEL_SEARCH_SYSTEM,
-        "messages": [{ "role": "user", "content": ask }],
-        "tools": [{
-            "type": "web_search_20250305",
-            "name": "web_search",
-            "max_uses": MODEL_SEARCH_MAX_USES,
-        }],
-    })
+    match model.wire {
+        NativeSearch::Messages => json!({
+            "model": model.model,
+            "max_tokens": MODEL_SEARCH_MAX_TOKENS,
+            "system": MODEL_SEARCH_SYSTEM,
+            "messages": [{ "role": "user", "content": ask }],
+            "tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": MODEL_SEARCH_MAX_USES,
+            }],
+        }),
+        NativeSearch::Responses => json!({
+            "model": model.model,
+            "instructions": MODEL_SEARCH_SYSTEM,
+            "input": ask,
+            "tools": [{ "type": "web_search" }],
+            "reasoning": { "effort": "low" },
+            "max_output_tokens": MODEL_SEARCH_MAX_TOKENS * 2,
+            "store": false,
+            "stream": true,
+        }),
+    }
+}
+
+/// A Responses search's output items as `web_search` returns them: the
+/// report, the searches it ran, and the pages its report cites.
+fn read_responses_search(items: &Value, max_results: usize) -> Result<Value, String> {
+    let items = items.as_array().ok_or("the reply carried no output")?;
+    let mut searches = Vec::new();
+    let mut report = String::new();
+    let mut pages: Vec<Value> = Vec::new();
+    let mut searched = false;
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("web_search_call") => {
+                searched = true;
+                if let Some(query) = item.pointer("/action/query").and_then(Value::as_str) {
+                    searches.push(query.to_string());
+                }
+                for source in item
+                    .pointer("/action/sources")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(url) = source.get("url").and_then(Value::as_str) {
+                        push_page(&mut pages, url, None);
+                    }
+                }
+            }
+            Some("message") => {
+                for part in item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
+                    for note in part
+                        .get("annotations")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|note| {
+                            note.get("type").and_then(Value::as_str) == Some("url_citation")
+                        })
+                    {
+                        if let Some(url) = note.get("url").and_then(Value::as_str) {
+                            push_page(&mut pages, url, note.get("title").and_then(Value::as_str));
+                        }
+                    }
+                    report.push_str(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !searched {
+        return Err(ANSWERED_WITHOUT_SEARCHING.to_string());
+    }
+    if pages.is_empty() {
+        return Err("its searches found no pages".to_string());
+    }
+    // Cited pages were pushed after the sources of the calls; cited first.
+    pages.sort_by_key(|page| page.get("cited").is_none());
+    for page in &mut pages {
+        if let Some(map) = page.as_object_mut() {
+            map.remove("cited");
+        }
+    }
+    pages.truncate(max_results);
+    Ok(json!({ "searches": searches, "summary": cap_report(&report), "results": pages }))
+}
+
+/// Adds a page once; a page with a title came from a citation.
+fn push_page(pages: &mut Vec<Value>, url: &str, title: Option<&str>) {
+    let title = title.filter(|title| !title.is_empty());
+    if let Some(page) = pages.iter_mut().find(|page| page["url"] == url) {
+        if let Some(title) = title {
+            page["title"] = json!(title);
+            page["cited"] = json!(true);
+        }
+        return;
+    }
+    let mut page = json!({ "title": title.unwrap_or(url), "url": url });
+    if title.is_some() {
+        page["cited"] = json!(true);
+    }
+    pages.push(page);
+}
+
+fn cap_report(report: &str) -> String {
+    let report = report.trim();
+    match report.char_indices().nth(MAX_REPORT_CHARS) {
+        Some((end, _)) => format!("{}…", &report[..end]),
+        None => report.to_string(),
+    }
 }
 
 /// The longest report the conversation gets; the model is asked for 300
@@ -539,7 +919,7 @@ fn read_model_search(reply: &Value, max_results: usize) -> Result<Value, String>
     if pages.is_empty() {
         return Err(match (errors.first(), searches.is_empty()) {
             (Some(error), _) => format!("the search failed: {error}"),
-            (None, true) => "it answered without searching".to_string(),
+            (None, true) => ANSWERED_WITHOUT_SEARCHING.to_string(),
             (None, false) => "its searches found no pages".to_string(),
         });
     }
@@ -556,31 +936,13 @@ fn read_model_search(reply: &Value, max_results: usize) -> Result<Value, String>
             .unwrap_or(usize::MAX)
     });
     pages.truncate(max_results);
-    let report = report.trim();
-    let report = match report.char_indices().nth(MAX_REPORT_CHARS) {
-        Some((end, _)) => format!("{}…", &report[..end]),
-        None => report.to_string(),
-    };
-    Ok(json!({ "searches": searches, "summary": report, "results": pages }))
+    Ok(json!({ "searches": searches, "summary": cap_report(&report), "results": pages }))
 }
 
 // ---------------------------------------------------------------------------
 // Local search: a search engine's own HTML result page, parsed here. No key,
 // no login, and the same proxy as web_fetch.
 // ---------------------------------------------------------------------------
-
-/// How the local engine reaches a result page. A test injects its own.
-pub(crate) trait PageFetcher {
-    fn get(&self, url: &str) -> Result<String, String>;
-}
-
-struct LiveFetcher;
-
-impl PageFetcher for LiveFetcher {
-    fn get(&self, url: &str) -> Result<String, String> {
-        crate::web_fetch::get_text(url, SEARCH_USER_AGENT, MAX_SEARCH_PAGE_BYTES)
-    }
-}
 
 #[derive(Debug, PartialEq)]
 struct SearchResult {
@@ -590,8 +952,9 @@ struct SearchResult {
 }
 
 /// A result page to try: Bing first (its markup is stable and its snippets
-/// are the longest), its China host when the global one is unreachable, then
-/// DuckDuckGo's HTML endpoint.
+/// are the longest), its China host when the global one is unreachable,
+/// DuckDuckGo's HTML endpoint, then Sogou, which answers from networks in
+/// China where the others are blocked or redirected.
 struct SearchSource {
     engine: &'static str,
     url: fn(&str) -> String,
@@ -614,9 +977,16 @@ const SEARCH_SOURCES: &[SearchSource] = &[
         url: |query| format!("https://html.duckduckgo.com/html/?q={query}"),
         parse: parse_duckduckgo,
     },
+    SearchSource {
+        engine: "sogou",
+        url: |query| format!("https://www.sogou.com/web?query={query}"),
+        parse: parse_sogou,
+    },
 ];
 
-fn local_search(args: &Value, fetcher: &dyn PageFetcher) -> Value {
+/// Step 3: this machine's search. The error is in Chinese: it is the last
+/// step, and the user reads it.
+fn local_search(args: &Value, io: &dyn SearchIo) -> Value {
     let query = match search_query(args) {
         Ok(query) => query,
         Err(error) => return json!({ "error": error }),
@@ -629,19 +999,19 @@ fn local_search(args: &Value, fetcher: &dyn PageFetcher) -> Value {
     let mut failures = Vec::new();
     for source in SEARCH_SOURCES {
         let url = (source.url)(&encoded);
-        match fetcher.get(&url) {
+        match io.get_page(&url) {
             Ok(page) => {
                 let results = (source.parse)(&page, max_results);
                 if results.is_empty() {
-                    failures.push(format!("{}: {}", source.engine, empty_page_reason(&page)));
+                    failures.push(format!("{}：{}", source.engine, empty_page_reason(&page)));
                     continue;
                 }
                 // An engine the network redirects elsewhere answers a page of
                 // its own: results shaped right and about something else. Such
-                // a page names none of the query's words, so the next engine
-                // gets its turn rather than the model getting nonsense.
+                // a page names one of the query's words at most, so the next
+                // engine gets its turn rather than the model getting nonsense.
                 if !results_match_query(&query, &results) {
-                    failures.push(format!("{}: answered about something else", source.engine));
+                    failures.push(format!("{}：结果与查询无关", source.engine));
                     continue;
                 }
                 crate::log_info!(
@@ -669,29 +1039,59 @@ fn local_search(args: &Value, fetcher: &dyn PageFetcher) -> Value {
                 }
                 return value;
             }
-            Err(error) => failures.push(format!("{}: {error}", source.engine)),
+            Err(error) => failures.push(format!("{}：{error}", source.engine)),
         }
     }
     crate::log_warn!("web_search", "search failed", error = failures.join("; "));
     json!({
         "query": query,
-        "error": format!("no search engine answered ({}). Check the network or the HTTP_PROXY settings, or fetch a known URL with web_fetch.", failures.join("; ")),
+        "error": format!("本机的搜索引擎都没有给出结果（{}）", failures.join("；")),
     })
 }
 
-/// Whether results are about the query: taken together they name more than
-/// half of its words (longer than two characters, so "the" or "in" prove
-/// nothing). A page the network answers in place of the engine is about its
-/// own subject and names one word of the query at most — often the broadest
-/// one ("rust" for "rust ureq crate"). A query of only short or non-Latin
-/// words cannot be checked this way and counts as matching.
+/// Latin words that say nothing about what a page is about.
+const FILLER_WORDS: &[&str] = &[
+    "the", "and", "for", "with", "how", "what", "when", "where", "which", "who", "why", "does",
+    "from", "into", "about", "are", "was", "can", "you", "your", "this", "that", "there", "have",
+    "has", "not", "but", "all", "any", "get", "its", "new", "latest", "newest", "current",
+    "version", "best", "use", "using", "vs",
+];
+
+/// The query's telling parts: Latin words longer than two characters that
+/// are not filler, and each pair of adjacent CJK characters (Chinese has no
+/// spaces; a pair is the shortest unit that names something).
+fn query_terms(query: &str) -> Vec<String> {
+    let lower = query.to_lowercase();
+    let mut terms: Vec<String> = Vec::new();
+    for word in lower.split(|c: char| !c.is_alphanumeric() || is_cjk(c)) {
+        if word.chars().count() > 2 && word.is_ascii() && !FILLER_WORDS.contains(&word) {
+            terms.push(word.to_string());
+        }
+    }
+    let chars: Vec<char> = lower.chars().collect();
+    for pair in chars.windows(2) {
+        if is_cjk(pair[0]) && is_cjk(pair[1]) {
+            terms.push(pair.iter().collect());
+        }
+    }
+    terms.sort_unstable();
+    terms.dedup();
+    terms
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}')
+}
+
+/// Whether results are about the query. A page the network answers in place
+/// of the engine is about its own subject and names one term of the query at
+/// most, often the broadest one ("rust" for "rust ureq crate"). Results
+/// count as matching when they name more than half of the query's terms, or
+/// at least two and a third of them (a long question whose answer uses other
+/// words). A query without telling terms cannot be checked and matches.
 fn results_match_query(query: &str, results: &[SearchResult]) -> bool {
-    let words: Vec<String> = query
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|word| word.chars().count() > 2 && word.is_ascii())
-        .map(str::to_ascii_lowercase)
-        .collect();
-    if words.is_empty() {
+    let terms = query_terms(query);
+    if terms.is_empty() {
         return true;
     }
     let text = results
@@ -699,12 +1099,12 @@ fn results_match_query(query: &str, results: &[SearchResult]) -> bool {
         .map(|result| format!("{} {} {}", result.title, result.url, result.snippet))
         .collect::<Vec<_>>()
         .join(" ")
-        .to_ascii_lowercase();
-    let found = words
+        .to_lowercase();
+    let found = terms
         .iter()
-        .filter(|word| text.contains(word.as_str()))
+        .filter(|term| text.contains(term.as_str()))
         .count();
-    found * 2 > words.len()
+    found * 2 > terms.len() || (found >= 2 && found * 3 >= terms.len())
 }
 
 /// Why a page carried no results, as far as it says itself.
@@ -715,13 +1115,15 @@ fn empty_page_reason(page: &str) -> &'static str {
         "captcha",
         "unusual traffic",
         "are you a human",
+        "antispider",
+        "安全验证",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
     {
-        "the engine asked for a captcha"
+        "要求人机验证"
     } else {
-        "the result page held no results"
+        "结果页里没有结果"
     }
 }
 
@@ -784,6 +1186,58 @@ fn parse_duckduckgo(html: &str, max_results: usize) -> Vec<SearchResult> {
                     last.snippet = link.text;
                 }
             }
+        }
+    }
+    results
+}
+
+/// Sogou wraps each organic result in `div.vrwrap`: a heading with the
+/// title behind Sogou's own `/link?url=` redirect, the target itself in a
+/// `data-url` attribute, and the snippet in a `space-txt` or
+/// `cacheresult_summary` block.
+fn parse_sogou(html: &str, max_results: usize) -> Vec<SearchResult> {
+    let mut results: Vec<SearchResult> = Vec::new();
+    for block in split_blocks(html, "class=\"vrwrap\"") {
+        let title = element_html(block, "h3")
+            .map(strip_tags)
+            .unwrap_or_default();
+        // The heading's own link when it points straight at the page (Sogou's
+        // redirect is relative, so `result_url` passes it over), else the
+        // first `data-url` of the block.
+        let target = first_link(element_html(block, "h3").unwrap_or(""))
+            .map(|(href, _)| href)
+            .into_iter()
+            .chain(
+                block
+                    .match_indices(" data-url=")
+                    .filter_map(|(at, _)| crate::web_fetch::attr_value(&block[at..], "data-url")),
+            )
+            .find_map(|href| result_url(&href));
+        let Some(url) = target else {
+            continue;
+        };
+        if title.is_empty() || results.iter().any(|result| result.url == url) {
+            continue;
+        }
+        let snippet = ["cacheresult_summary", "space-txt", "str-info", "str_info"]
+            .iter()
+            .find_map(|marker| {
+                let at = block.find(marker)?;
+                let rest = &block[at..];
+                let start = rest.find('>')? + 1;
+                let end = rest[start..]
+                    .find("</div")
+                    .map_or(rest.len(), |end| start + end);
+                Some(strip_tags(&rest[start..end])).filter(|text| !text.is_empty())
+            })
+            .unwrap_or_default();
+        results.push(SearchResult {
+            title,
+            url,
+            snippet,
+        });
+        if results.len() >= max_results {
+            break;
         }
     }
     results
@@ -896,7 +1350,12 @@ fn result_url(href: &str) -> Option<String> {
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let own = ["bing.com", "duckduckgo.com", "microsofttranslator.com"];
+    let own = [
+        "bing.com",
+        "duckduckgo.com",
+        "microsofttranslator.com",
+        "sogou.com",
+    ];
     if own
         .iter()
         .any(|engine| host == *engine || host.ends_with(&format!(".{engine}")))
@@ -1060,6 +1519,7 @@ mod tests {
             fetch_engine: "local".to_string(),
             signed_in: true,
             search_model: Err("none in this test".to_string()),
+            gateway: Err("none in this test".to_string()),
         };
         for web in [None, Some(&local)] {
             let result = run_fetch(&json!({ "url": "ftp://example.com" }), web);
@@ -1085,6 +1545,7 @@ mod tests {
             fetch_engine: "local".to_string(),
             signed_in: false,
             search_model: Err("none in this test".to_string()),
+            gateway: Err("none in this test".to_string()),
         };
         assert!(!web.gateway_search());
         assert!(web.search_available());
@@ -1101,8 +1562,16 @@ mod tests {
         asked: std::cell::RefCell<Vec<String>>,
     }
 
-    impl PageFetcher for FakeFetcher {
-        fn get(&self, url: &str) -> Result<String, String> {
+    impl SearchIo for FakeFetcher {
+        fn ask_model(&self, _: &SearchModel, _: &Value) -> Result<Value, String> {
+            Err("no model in this test".to_string())
+        }
+
+        fn ask_gateway(&self, _: &GatewaySearch, _: &Value) -> Result<Value, String> {
+            Err("no gateway in this test".to_string())
+        }
+
+        fn get_page(&self, url: &str) -> Result<String, String> {
             self.asked.borrow_mut().push(url.to_string());
             self.pages
                 .iter()
@@ -1254,7 +1723,7 @@ mod tests {
         };
         let result = local_search(&json!({ "query": "ureq rust crate" }), &fetcher);
         let error = result["error"].as_str().unwrap_or_default();
-        assert!(error.contains("something else"), "{result}");
+        assert!(error.contains("结果与查询无关"), "{result}");
         assert!(result.get("results").is_none(), "{result}");
 
         // What this machine really answers for "rust ureq crate": the Rust
@@ -1276,7 +1745,7 @@ mod tests {
             result["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("something else"),
+                .contains("结果与查询无关"),
             "{result}"
         );
         // The same page for a query it does answer is a result.
@@ -1292,14 +1761,14 @@ mod tests {
 
     #[test]
     fn a_query_the_results_cannot_be_checked_against_is_taken_as_it_is() {
-        // Only short or non-Latin words: nothing to compare, so the engine's
-        // answer stands.
+        // Only short words and single CJK characters: nothing to compare, so
+        // the engine's answer stands.
         let fetcher = FakeFetcher {
             pages: vec![("www.bing.com", Ok(BING_PAGE.to_string()))],
             asked: Default::default(),
         };
         assert_eq!(
-            local_search(&json!({ "query": "围棋 AI" }), &fetcher)["engine"],
+            local_search(&json!({ "query": "go 棋 AI" }), &fetcher)["engine"],
             "bing"
         );
     }
@@ -1332,32 +1801,79 @@ mod tests {
         };
         let result = local_search(&json!({ "query": "x" }), &dead);
         let error = result["error"].as_str().unwrap();
-        assert!(error.contains("no search engine answered"), "{error}");
+        assert!(error.contains("本机的搜索引擎都没有给出结果"), "{error}");
         assert_eq!(dead.asked.borrow().len(), SEARCH_SOURCES.len());
     }
 
-    /// A search model that answers with a fixed reply and records the
-    /// requests it got.
-    struct FakePoster {
-        reply: Result<Value, String>,
-        asked: std::cell::RefCell<Vec<Value>>,
+    /// Fixed answers for each step, recording what each was asked.
+    struct FakeIo {
+        model: Result<Value, String>,
+        gateway: Result<Value, String>,
+        pages: FakeFetcher,
+        asked_model: std::cell::RefCell<Vec<Value>>,
+        asked_gateway: std::cell::RefCell<Vec<Value>>,
     }
 
-    impl ModelPoster for FakePoster {
-        fn post(&self, _model: &SearchModel, body: &Value) -> Result<Value, String> {
-            self.asked.borrow_mut().push(body.clone());
-            self.reply.clone()
+    impl FakeIo {
+        fn new(model: Result<Value, String>, gateway: Result<Value, String>) -> Self {
+            Self {
+                model,
+                gateway,
+                pages: FakeFetcher {
+                    pages: vec![("www.bing.com", Ok(BING_PAGE.to_string()))],
+                    asked: Default::default(),
+                },
+                asked_model: Default::default(),
+                asked_gateway: Default::default(),
+            }
         }
     }
 
-    fn search_model() -> SearchModel {
+    impl SearchIo for FakeIo {
+        fn ask_model(&self, _: &SearchModel, body: &Value) -> Result<Value, String> {
+            self.asked_model.borrow_mut().push(body.clone());
+            self.model.clone()
+        }
+
+        fn ask_gateway(&self, _: &GatewaySearch, body: &Value) -> Result<Value, String> {
+            self.asked_gateway.borrow_mut().push(body.clone());
+            self.gateway.clone()
+        }
+
+        fn get_page(&self, url: &str) -> Result<String, String> {
+            self.pages.get_page(url)
+        }
+    }
+
+    fn search_model(model: &str, wire: NativeSearch, conversation: bool) -> SearchModel {
         SearchModel {
-            model: DEFAULT_SEARCH_MODEL.to_string(),
+            model: model.to_string(),
+            wire,
+            conversation,
             url: "https://gateway.test/v1/messages".to_string(),
             api_key: "key".to_string(),
             headers: Vec::new(),
             connect_timeout: Duration::from_secs(1),
         }
+    }
+
+    fn gateway() -> GatewaySearch {
+        GatewaySearch {
+            url: "https://gateway.test/tools/v1/search".to_string(),
+            api_key: "key".to_string(),
+            headers: Vec::new(),
+            connect_timeout: Duration::from_secs(1),
+        }
+    }
+
+    /// The gateway's search reply (DeepSeek behind it).
+    fn gateway_reply() -> Value {
+        json!({ "object": "web.search", "engine": "deepseek", "query": "q", "results": [
+            { "title": "ureq 3.4.2", "url": "https://crates.io/crates/ureq",
+              "snippet": "Simple HTTP", "summary": "ureq 3.4.2 was released on 2026-09-13.",
+              "published_at": "2026-09-13T00:00:00Z", "site_name": "crates.io" },
+            { "title": "ureq docs", "url": "https://docs.rs/ureq", "snippet": "API docs" }
+        ] })
     }
 
     /// A Messages reply with one search, as the gateway returns it (the
@@ -1426,127 +1942,410 @@ mod tests {
         assert!(read_model_search(&json!({ "error": "x" }), 10).is_err());
     }
 
+    /// A Responses search as the stream's output items: one search call
+    /// with its sources, then the cited report.
+    fn responses_reply() -> Value {
+        json!([
+            { "type": "reasoning", "id": "rs_1", "summary": [] },
+            { "type": "web_search_call", "id": "ws_1", "status": "completed",
+              "action": { "type": "search", "query": "ureq latest version",
+                          "sources": [{ "type": "url", "url": "https://docs.rs/ureq" },
+                                      { "type": "url", "url": "https://crates.io/crates/ureq" }] } },
+            { "type": "message", "role": "assistant", "content": [{
+                "type": "output_text",
+                "text": "The newest ureq is 3.4.2 (crates.io).",
+                "annotations": [{ "type": "url_citation", "url": "https://crates.io/crates/ureq",
+                                  "title": "ureq - crates.io", "start_index": 0, "end_index": 10 }]
+            }] }
+        ])
+    }
+
     #[test]
-    fn web_search_asks_the_search_model_and_falls_back_to_this_machine() {
-        let model = search_model();
-        let fetcher = FakeFetcher {
-            pages: vec![("www.bing.com", Ok(BING_PAGE.to_string()))],
-            asked: Default::default(),
-        };
-        let poster = FakePoster {
-            reply: Ok(searched_reply()),
-            asked: Default::default(),
-        };
+    fn a_responses_search_reports_its_cited_pages_first() {
+        let result = read_responses_search(&responses_reply(), 10).unwrap();
+        assert_eq!(result["searches"], json!(["ureq latest version"]));
+        assert_eq!(result["summary"], "The newest ureq is 3.4.2 (crates.io).");
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0],
+            json!({ "title": "ureq - crates.io", "url": "https://crates.io/crates/ureq" })
+        );
+        assert_eq!(
+            results[1],
+            json!({ "title": "https://docs.rs/ureq", "url": "https://docs.rs/ureq" })
+        );
+        // A reply without a search call is the model answering from memory.
+        let unsearched =
+            json!([{ "type": "message", "content": [{ "type": "output_text", "text": "3.0" }] }]);
+        assert_eq!(
+            read_responses_search(&unsearched, 10).unwrap_err(),
+            ANSWERED_WITHOUT_SEARCHING
+        );
+    }
+
+    #[test]
+    fn the_conversation_model_searches_first() {
+        // Claude: the Messages server tool.
+        let claude = search_model("claude-test-a", NativeSearch::Messages, true);
+        let io = FakeIo::new(Ok(searched_reply()), Ok(gateway_reply()));
         let result = search(
             &json!({ "query": " ureq latest ", "freshness": "week" }),
-            Some(&model),
-            &poster,
-            &fetcher,
+            Some(&claude),
+            Some(&gateway()),
+            &io,
         );
         assert_eq!(result["engine"], "model", "{result}");
-        assert_eq!(result["model"], DEFAULT_SEARCH_MODEL);
+        assert_eq!(result["model"], "claude-test-a");
         assert_eq!(result["query"], "ureq latest");
-        assert!(fetcher.asked.borrow().is_empty());
-        // One request: the query, the period and the provider-side tool.
-        let asked = poster.asked.borrow();
-        assert_eq!(asked[0]["model"], DEFAULT_SEARCH_MODEL);
+        // The conversation's own model: nothing to point out.
+        assert!(result.get("note").is_none(), "{result}");
+        assert!(io.asked_gateway.borrow().is_empty());
+        assert!(io.pages.asked.borrow().is_empty());
+        let asked = io.asked_model.borrow();
+        assert_eq!(asked[0]["model"], "claude-test-a");
         assert_eq!(asked[0]["tools"][0]["type"], "web_search_20250305");
         let ask = asked[0]["messages"][0]["content"].as_str().unwrap();
         assert!(
             ask.contains("ureq latest") && ask.contains("past week"),
             "{ask}"
         );
+        drop(asked);
 
-        // The model fails: this machine searches, and says why.
-        let poster = FakePoster {
-            reply: Err("HTTP 502: upstream".to_string()),
-            asked: Default::default(),
-        };
-        let result = search(&json!({ "query": "rust" }), Some(&model), &poster, &fetcher);
-        assert_eq!(result["engine"], "bing", "{result}");
-        let note = result["note"].as_str().unwrap();
-        assert!(
-            note.contains(DEFAULT_SEARCH_MODEL) && note.contains("HTTP 502"),
-            "{note}"
+        // GPT: the Responses tool, streamed.
+        let gpt = search_model("gpt-test-a", NativeSearch::Responses, true);
+        let io = FakeIo::new(Ok(responses_reply()), Ok(gateway_reply()));
+        let result = search(
+            &json!({ "query": "ureq" }),
+            Some(&gpt),
+            Some(&gateway()),
+            &io,
         );
+        assert_eq!(result["engine"], "model", "{result}");
+        assert_eq!(result["model"], "gpt-test-a");
+        let asked = io.asked_model.borrow();
+        assert_eq!(asked[0]["tools"][0]["type"], "web_search");
+        assert_eq!(asked[0]["stream"], true);
+        drop(asked);
 
-        // Both fail: one error naming both.
-        let dead = FakeFetcher {
-            pages: vec![],
-            asked: Default::default(),
-        };
-        let result = search(&json!({ "query": "rust" }), Some(&model), &poster, &dead);
-        let error = result["error"].as_str().unwrap();
+        // A pinned web_search_model says it was not the conversation's model.
+        let pinned = search_model("claude-test-b", NativeSearch::Messages, false);
+        let io = FakeIo::new(Ok(searched_reply()), Ok(gateway_reply()));
+        let result = search(&json!({ "query": "ureq" }), Some(&pinned), None, &io);
         assert!(
-            error.contains("HTTP 502") && error.contains("no search engine answered"),
-            "{error}"
+            result["note"]
+                .as_str()
+                .unwrap()
+                .contains("not the conversation's model"),
+            "{result}"
         );
-
-        // No search model: this machine, and the model is never asked.
-        let poster = FakePoster {
-            reply: Ok(searched_reply()),
-            asked: Default::default(),
-        };
-        let result = search(&json!({ "query": "rust" }), None, &poster, &fetcher);
-        assert_eq!(result["engine"], "bing");
-        assert!(poster.asked.borrow().is_empty());
-
-        // Bad arguments never reach either.
-        let result = search(&json!({ "query": " " }), Some(&model), &poster, &fetcher);
-        assert_eq!(result["error"], "missing query");
-        assert!(poster.asked.borrow().is_empty());
     }
 
     #[test]
-    fn the_search_model_comes_from_a_gateway_that_serves_it() {
-        let config = |value: Value| {
-            crate::config::Config::from_value(
-                &value.to_string(),
-                std::path::PathBuf::from("config.json"),
-            )
-            .unwrap()
-        };
+    fn a_model_that_cannot_search_hands_over_to_the_gateway() {
+        // The model's route fails: the gateway's search answers, and says why.
+        let model = search_model("claude-test-c", NativeSearch::Messages, true);
+        let io = FakeIo::new(
+            Err("HTTP 503: No available upstream provider".to_string()),
+            Ok(gateway_reply()),
+        );
+        let result = search(
+            &json!({ "query": "ureq", "max_results": 1, "freshness": "day" }),
+            Some(&model),
+            Some(&gateway()),
+            &io,
+        );
+        assert_eq!(result["engine"], "gateway (deepseek)", "{result}");
+        assert_eq!(
+            result["results"],
+            json!([{ "title": "ureq 3.4.2", "url": "https://crates.io/crates/ureq",
+                     "snippet": "ureq 3.4.2 was released on 2026-09-13.",
+                     "published": "2026-09-13T00:00:00Z" }])
+        );
+        let note = result["note"].as_str().unwrap();
+        assert!(
+            note.contains("claude-test-c") && note.contains("HTTP 503"),
+            "{note}"
+        );
+        assert_eq!(
+            io.asked_gateway.borrow()[0],
+            json!({ "query": "ureq", "max_results": 1, "freshness": "day" })
+        );
+        assert!(io.pages.asked.borrow().is_empty());
+
+        // A model without native search: straight to the gateway, no note.
+        let io = FakeIo::new(Ok(searched_reply()), Ok(gateway_reply()));
+        let result = search(&json!({ "query": "ureq" }), None, Some(&gateway()), &io);
+        assert_eq!(result["engine"], "gateway (deepseek)");
+        assert!(result.get("note").is_none(), "{result}");
+        assert!(io.asked_model.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_route_without_the_search_tool_is_paused() {
+        // The route answered from memory: the gateway answers, and the model
+        // is not asked again for a while.
+        let model = search_model("claude-test-no-tool", NativeSearch::Messages, true);
+        let unsearched = json!({ "content": [{ "type": "text", "text": "From memory" }] });
+        let io = FakeIo::new(Ok(unsearched), Ok(gateway_reply()));
+        for _ in 0..2 {
+            let result = search(
+                &json!({ "query": "ureq" }),
+                Some(&model),
+                Some(&gateway()),
+                &io,
+            );
+            assert_eq!(result["engine"], "gateway (deepseek)", "{result}");
+        }
+        assert_eq!(io.asked_model.borrow().len(), 1);
+        // An error that is not about the tool does not pause the model.
+        let flaky = search_model("claude-test-flaky", NativeSearch::Messages, true);
+        let io = FakeIo::new(Err("HTTP 502: upstream".to_string()), Ok(gateway_reply()));
+        for _ in 0..2 {
+            search(
+                &json!({ "query": "ureq" }),
+                Some(&flaky),
+                Some(&gateway()),
+                &io,
+            );
+        }
+        assert_eq!(io.asked_model.borrow().len(), 2);
+    }
+
+    #[test]
+    fn this_machine_searches_last_and_says_why() {
+        let model = search_model("claude-test-d", NativeSearch::Messages, true);
+        let io = FakeIo::new(
+            Err("HTTP 502: upstream".to_string()),
+            Err("HTTP 503: web search is not available right now".to_string()),
+        );
+        let result = search(
+            &json!({ "query": "rust" }),
+            Some(&model),
+            Some(&gateway()),
+            &io,
+        );
+        assert_eq!(result["engine"], "bing", "{result}");
+        let note = result["note"].as_str().unwrap();
+        assert!(
+            note.contains("HTTP 502") && note.contains("gateway's search failed"),
+            "{note}"
+        );
+        // An empty gateway answer is a failure too.
+        let io = FakeIo::new(Err("x".to_string()), Ok(json!({ "results": [] })));
+        let result = search(
+            &json!({ "query": "rust" }),
+            Some(&model),
+            Some(&gateway()),
+            &io,
+        );
+        assert_eq!(result["engine"], "bing", "{result}");
+        assert!(result["note"].as_str().unwrap().contains("found no pages"));
+
+        // Everything fails: one error naming every step, ending in Chinese.
+        let mut io = FakeIo::new(
+            Err("HTTP 502: upstream".to_string()),
+            Err("HTTP 503: down".to_string()),
+        );
+        io.pages.pages.clear();
+        let result = search(
+            &json!({ "query": "rust" }),
+            Some(&model),
+            Some(&gateway()),
+            &io,
+        );
+        let error = result["error"].as_str().unwrap();
+        assert!(
+            error.contains("HTTP 502")
+                && error.contains("HTTP 503")
+                && error.contains("本机的搜索引擎都没有给出结果"),
+            "{error}"
+        );
+
+        // Bad arguments reach nothing.
+        let io = FakeIo::new(Ok(searched_reply()), Ok(gateway_reply()));
+        let result = search(
+            &json!({ "query": " " }),
+            Some(&model),
+            Some(&gateway()),
+            &io,
+        );
+        assert_eq!(result["error"], "missing query");
+        assert!(io.asked_model.borrow().is_empty() && io.asked_gateway.borrow().is_empty());
+    }
+
+    fn config(value: Value) -> crate::config::Config {
+        crate::config::Config::from_value(
+            &value.to_string(),
+            std::path::PathBuf::from("config.json"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_conversation_model_searches_where_its_provider_can() {
         let mut headers = HashMap::new();
         headers.insert(
-            DEFAULT_SEARCH_MODEL.to_string(),
+            "claude-sonnet-5".to_string(),
             vec![("X-Monoize-Provider".to_string(), "p-1".to_string())],
         );
-        let monoize = config(json!({
-            "provider": "monoize", "protocol": "chat", "model": "glm-5.3",
-            "base_url": "https://gateway.test/v1",
-            "models": [{ "name": "glm-5.3" }, { "name": DEFAULT_SEARCH_MODEL }]
+        let key = || Some("key".to_string());
+        let claude = config(json!({
+            "provider": "monoize", "protocol": "chat", "model": "claude-sonnet-5",
+            "base_url": "https://gateway.test/v1"
         }));
-        let model = SearchModel::from_config(&monoize, Some("key".to_string()), &headers).unwrap();
-        assert_eq!(model.model, DEFAULT_SEARCH_MODEL);
+        let model = SearchModel::from_config(&claude, key(), &headers).unwrap();
+        assert_eq!(model.model, "claude-sonnet-5");
+        assert_eq!(model.wire, NativeSearch::Messages);
+        assert!(model.conversation);
         assert_eq!(model.url, "https://gateway.test/v1/messages");
         // The gateway's device header (when this computer has one), then the route.
         let expected: Vec<(String, String)> = crate::device_id::gateway_headers("monoize")
             .into_iter()
-            .chain(headers[DEFAULT_SEARCH_MODEL].clone())
+            .chain(headers["claude-sonnet-5"].clone())
             .collect();
         assert_eq!(model.headers, expected);
-        assert!(SearchModel::from_config(&monoize, None, &headers)
+        assert!(SearchModel::from_config(&claude, None, &headers)
             .unwrap_err()
             .contains("API key"));
 
-        let without = config(json!({
-            "provider": "monoize", "model": "glm-5.3", "models": [{ "name": "glm-5.3" }]
+        let gpt = config(json!({
+            "provider": "lynshen", "model": "gpt-6-sol", "base_url": "https://api.lynshen.org/v1"
         }));
-        assert!(
-            SearchModel::from_config(&without, Some("key".to_string()), &headers)
-                .unwrap_err()
-                .contains("does not serve")
-        );
-        let off = config(json!({
-            "provider": "monoize", "model": "glm-5.3", "web_search_model": " "
+        let model = SearchModel::from_config(&gpt, key(), &headers).unwrap();
+        assert_eq!(model.wire, NativeSearch::Responses);
+        assert_eq!(model.url, "https://api.lynshen.org/v1/responses");
+
+        // No native search: the gateway's search is the first step.
+        for model in [
+            "deepseek-v4.1-flash",
+            "gemini-3.8-flash",
+            "grok-4.5",
+            "gpt-image-2",
+        ] {
+            let other = config(json!({ "provider": "monoize", "model": model }));
+            assert!(
+                SearchModel::from_config(&other, key(), &headers).is_err(),
+                "{model}"
+            );
+        }
+        // A provider that may not run the tool is not guessed at.
+        let zenmux = config(json!({ "provider": "zenmux", "model": "claude-sonnet-5" }));
+        assert!(SearchModel::from_config(&zenmux, key(), &headers).is_err());
+
+        // web_search_model pins another model, which the gateway must serve.
+        let pinned = config(json!({
+            "provider": "monoize", "model": "deepseek-v4.1-flash", "web_search_model": "claude-sonnet-5",
+            "models": [{ "name": "deepseek-v4.1-flash" }, { "name": "claude-sonnet-5" }]
         }));
-        assert!(
-            SearchModel::from_config(&off, Some("key".to_string()), &headers)
-                .unwrap_err()
-                .contains("empty")
+        let model = SearchModel::from_config(&pinned, key(), &headers).unwrap();
+        assert_eq!(model.model, "claude-sonnet-5");
+        assert!(!model.conversation);
+        let unserved = config(json!({
+            "provider": "monoize", "model": "deepseek-v4.1-flash", "web_search_model": "claude-sonnet-5",
+            "models": [{ "name": "deepseek-v4.1-flash" }]
+        }));
+        assert!(SearchModel::from_config(&unserved, key(), &headers)
+            .unwrap_err()
+            .contains("does not serve"));
+        // The retired default reads as unset: the conversation's model searches.
+        let old = config(json!({
+            "provider": "monoize", "model": "gpt-6-sol", "web_search_model": "claude-haiku-5-5"
+        }));
+        assert_eq!(
+            SearchModel::from_config(&old, key(), &headers)
+                .unwrap()
+                .model,
+            "gpt-6-sol"
         );
+    }
+
+    #[test]
+    fn the_gateway_search_lives_beside_v1_on_a_gateway() {
+        let key = || Some("key".to_string());
+        let monoize = config(json!({
+            "provider": "monoize", "model": "glm-5.3", "base_url": "https://www.lynshen.org/v1/"
+        }));
+        let gateway = GatewaySearch::from_config(&monoize, key()).unwrap();
+        assert_eq!(gateway.url, "https://www.lynshen.org/tools/v1/search");
+        assert_eq!(
+            gateway.headers,
+            crate::device_id::gateway_headers("monoize")
+        );
+        assert!(GatewaySearch::from_config(&monoize, None).is_err());
         let direct = config(json!({ "provider": "deepseek", "model": "deepseek-chat" }));
-        assert!(SearchModel::from_config(&direct, Some("key".to_string()), &headers).is_err());
+        assert!(GatewaySearch::from_config(&direct, key()).is_err());
+    }
+
+    /// Sogou's organic blocks, trimmed to the parts the parser reads.
+    const SOGOU_PAGE: &str = r#"<html><body>
+        <div class="vrwrap"><h3 class="vr-title"><a href="/link?url=abc">Rust 一个简单方便的 http 库 <em>ureq</em></a></h3>
+        <div class="fz-mid space-txt">ureq 是一个 Rust 的 HTTP 客户端</div>
+        <a class="citeLinkClass" href="/link?url=abc"></a><div data-url="https://mp.weixin.qq.com/s/x"></div></div>
+        <div class="vrwrap"><h3 class="vr-title"><a href="https://github.com/algesten/ureq">algesten/ureq</a></h3>
+        <div class="fz-mid" id="cacheresult_summary_1">A simple, safe HTTP client</div></div>
+        <div class="vrwrap"><h3 class="vr-title"><a href="/link?url=nourl">No target</a></h3></div>
+        </body></html>"#;
+
+    #[test]
+    fn sogou_results_take_the_target_page() {
+        let results = parse_sogou(SOGOU_PAGE, 10);
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert_eq!(results[0].title, "Rust 一个简单方便的 http 库 ureq");
+        assert_eq!(results[0].url, "https://mp.weixin.qq.com/s/x");
+        assert_eq!(results[0].snippet, "ureq 是一个 Rust 的 HTTP 客户端");
+        assert_eq!(results[1].url, "https://github.com/algesten/ureq");
+        assert_eq!(results[1].snippet, "A simple, safe HTTP client");
+        assert_eq!(parse_sogou(SOGOU_PAGE, 1).len(), 1);
+    }
+
+    #[test]
+    fn sogou_answers_where_the_others_are_blocked() {
+        let fetcher = FakeFetcher {
+            pages: vec![
+                ("www.bing.com", Err("connection reset".to_string())),
+                ("cn.bing.com", Err("connection reset".to_string())),
+                (
+                    "html.duckduckgo.com",
+                    Ok("<html>anomaly-modal captcha</html>".to_string()),
+                ),
+                ("www.sogou.com", Ok(SOGOU_PAGE.to_string())),
+            ],
+            asked: Default::default(),
+        };
+        let result = local_search(&json!({ "query": "rust ureq" }), &fetcher);
+        assert_eq!(result["engine"], "sogou", "{result}");
+        assert_eq!(fetcher.asked.borrow().len(), 4);
+    }
+
+    #[test]
+    fn chinese_queries_are_checked_too() {
+        let page = |title: &str, snippet: &str| {
+            vec![SearchResult {
+                title: title.to_string(),
+                url: "https://news.test/a".to_string(),
+                snippet: snippet.to_string(),
+            }]
+        };
+        let terms = query_terms("2026年诺贝尔物理学奖 the latest");
+        assert!(
+            terms.contains(&"物理".to_string()) && !terms.contains(&"latest".to_string()),
+            "{terms:?}"
+        );
+        assert!(results_match_query(
+            "2026年诺贝尔物理学奖",
+            &page("2026年诺贝尔物理学奖揭晓", "瑞典皇家科学院宣布")
+        ));
+        // What a hijacked page answers: about its own subject.
+        assert!(!results_match_query(
+            "2026年诺贝尔物理学奖",
+            &page("公务员考试培训", "华图在线")
+        ));
+        // Filler words prove nothing: "latest version" alone is not the query.
+        assert!(!results_match_query(
+            "ureq latest version",
+            &page("Latest version of Windows", "the newest version")
+        ));
     }
 
     #[test]
@@ -1554,7 +2353,7 @@ mod tests {
     fn live_local_search_returns_results() {
         let result = local_search(
             &json!({ "query": "rust ureq crate", "max_results": 3 }),
-            &LiveFetcher,
+            &Live,
         );
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
         assert!(result.get("error").is_none(), "{result}");
