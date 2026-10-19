@@ -216,6 +216,64 @@ pub fn catalog_json() -> Value {
     json!({ "type": "gateway_catalog", "models": models, "groups": groups })
 }
 
+/// The desktop plan of the account this computer is signed in with (the
+/// gateway's `GET /api/desktop/oauth/plan`), for the phone's 今天用量: the
+/// plan's name and its windows with the share used. Cached a minute.
+/// `plan: null` when signed in without a plan; an error when not signed in.
+pub fn plan_quota_json() -> Result<Value, String> {
+    static CACHE: Mutex<Option<(Instant, Value)>> = Mutex::new(None);
+    if let Some((at, value)) = CACHE.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        if at.elapsed() < Duration::from_secs(60) {
+            return Ok(value.clone());
+        }
+    }
+    let upstream = live_upstream()?;
+    let url = format!(
+        "{}/api/desktop/oauth/plan",
+        upstream.api.trim_end_matches('/')
+    );
+    let reply: Value = agent()
+        .get(&url)
+        .set("Authorization", &format!("Bearer {}", upstream.token))
+        .timeout(Duration::from_secs(15))
+        .call()
+        .map_err(|error| error.to_string())?
+        .into_json()
+        .map_err(|error| error.to_string())?;
+    let value = plan_quota_from(&reply);
+    *CACHE.lock().unwrap_or_else(|p| p.into_inner()) = Some((Instant::now(), value.clone()));
+    Ok(value)
+}
+
+/// `plan_quota` from the gateway's plan status: each window's share used.
+fn plan_quota_from(reply: &Value) -> Value {
+    let plan = &reply["plan"];
+    if plan.is_null() || plan["active"] == false {
+        return json!({ "type": "plan_quota", "plan": null, "windows": [] });
+    }
+    let number = |v: &Value| {
+        v.as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .or(v.as_f64())
+    };
+    let windows: Vec<Value> = plan["windows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| {
+            let quota = number(&w["quota_cny"])?;
+            let used = number(&w["used_cny"]).unwrap_or(0.0);
+            let pct = if quota > 0.0 {
+                (used / quota * 100.0).clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            Some(json!({ "kind": w["kind"], "used_pct": pct.round(), "resets_at": w["resets_at"] }))
+        })
+        .collect();
+    json!({ "type": "plan_quota", "plan": plan["name"], "windows": windows })
+}
+
 fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
@@ -574,6 +632,28 @@ fn reply_error(out: &mut TcpStream, status: u16, message: &str) -> Result<(), St
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{json, Value};
+
+    #[test]
+    fn the_plan_quota_is_the_share_of_each_window_used() {
+        let reply = json!({ "plan": { "name": "Sprout", "windows": [
+            { "kind": "5h", "quota_cny": "10", "used_cny": "2.5", "resets_at": "2026-10-19T12:00:00Z" },
+            { "kind": "7d", "quota_cny": "50", "used_cny": "60", "resets_at": null },
+        ] } });
+        let quota = super::plan_quota_from(&reply);
+        assert_eq!(quota["plan"], "Sprout");
+        assert_eq!(quota["windows"][0]["used_pct"], 25.0);
+        assert_eq!(quota["windows"][1]["used_pct"], 100.0);
+        assert_eq!(
+            super::plan_quota_from(&json!({ "plan": null }))["windows"],
+            json!([])
+        );
+        assert_eq!(
+            super::plan_quota_from(&json!({ "plan": { "active": false } }))["plan"],
+            Value::Null
+        );
+    }
+
     use super::*;
     use std::net::TcpListener;
     use std::thread;

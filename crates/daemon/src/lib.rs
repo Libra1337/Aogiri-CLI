@@ -444,6 +444,12 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         });
         return;
     }
+    // 今天用量 on the phone: the account's plan, from the gateway.
+    if name == "plan_quota" {
+        let hub = Arc::clone(hub);
+        thread::spawn(move || respond(&hub, client, &request, gateway::plan_quota_json()));
+        return;
+    }
     if name == "gateway_catalog" {
         let hub = Arc::clone(hub);
         thread::spawn(move || respond(&hub, client, &request, Ok(gateway::catalog_json())));

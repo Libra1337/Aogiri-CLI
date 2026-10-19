@@ -189,7 +189,7 @@ every connected client.
 
 | Op | Fields | Reply |
 | --- | --- | --- |
-| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers`, `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at`, `entries` (how many entries the engine saved for a LynShen session, null for other engines; 0 for one opened without a first message) |
+| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers`, `running` (a turn runs or messages wait; the list is sent again when it changes), `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at`, `entries` (how many entries the engine saved for a LynShen session, null for other engines; 0 for one opened without a first message) |
 | `gateway_catalog` | — | `gateway_catalog`: `models` (the LynShen models the user chose to show, `lynshen_models` in config.json) and `groups` (the gateway's groups with their models and multipliers); empty when not signed in or offline. For clients that cannot read this machine's login (the remote page) |
 | `restart_when_idle` | — | none. Desktop only: this daemon exits once no session is running (after a `daemon_restarting` broadcast), so the desktop can start a newer one without cutting off a task |
 | `session_meta` | `session`, and any of `title`, `archived`, `hidden`, `group` | none; every client receives the new `sessions` list. An empty title goes back to the engine's label; a hidden session leaves `session_list` and `session_history` (its conversation stays on disk). A session created here is titled after its first user message (first line, 40 characters) unless a client titled it first. After its 1st and 3rd turns, then every 5th, the title model (`title_model` in config.json, else the main `model`) renames it from the project name, the current title, the first and latest requests and the start of the latest reply. A title a client set with `session_meta` is never replaced |
@@ -204,6 +204,7 @@ every connected client.
 | `device_confirm` | `device` | `device_confirmed`: a pending device may connect (local clients only) |
 | `device_scopes` | `device`, `scopes` | `device_scopes`: the device's elevated scopes are exactly these (local clients only; see "Device scopes") |
 | `pair_cancel` | optional `code` | `pair_cancelled`: the code (or every open one) pairs nobody (local clients only) |
+| `plan_quota` | — | `plan_quota` with `plan` (the account's desktop plan name, or null) and `windows: [{kind, used_pct, resets_at}]`, from the gateway (cached a minute); an error when this computer is not signed in. The phone's 今天用量 |
 | `device_me` | — | `device_me` with `device`, `name`, `scopes` (a local client: `local: true` and every scope) |
 | `device_forget_me` | — | `device_forgotten`, then the sending device is revoked (devices only) |
 | `device_revoke` | `device` | `device_revoked` (local clients only) |
