@@ -18,6 +18,7 @@ pub mod logging;
 mod loop_guard;
 pub mod machine;
 mod mcp;
+pub mod network_proxy;
 mod nicknames;
 mod oauth;
 mod plan_mode;
