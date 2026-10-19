@@ -859,6 +859,7 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
         AgentEvent::SubagentTranscript { .. } => "subagent_transcript",
         AgentEvent::PlanDraft { .. } => "plan_draft",
         AgentEvent::ProposedPlan { .. } => "proposed_plan",
+        AgentEvent::TurnStats(_) => "turn_stats",
         AgentEvent::Usage {
             input_tokens,
             cached_input_tokens,

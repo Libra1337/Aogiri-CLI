@@ -1,5 +1,5 @@
 use crate::{
-    event::{PlanItem, TranscriptItem, TreeNodeView},
+    event::{PlanItem, TranscriptItem, TreeNodeView, TurnStats},
     prompt::{Note, SessionPrompt},
     tokens, tools,
 };
@@ -97,6 +97,9 @@ pub enum EntryKind {
         summary: String,
         replaced_through: u64,
     },
+    /// The figures of the turn that ended here (model, duration, tokens).
+    /// For the transcript only: the model never sees them.
+    TurnStats(TurnStats),
 }
 
 #[derive(Debug, Clone)]
@@ -1152,6 +1155,7 @@ impl SessionStore {
             EntryKind::Compaction { summary, .. } => Some(TranscriptItem::Compaction {
                 summary: summary.clone(),
             }),
+            EntryKind::TurnStats(stats) => Some(TranscriptItem::TurnStats(stats.clone())),
         })
     }
 
@@ -2035,9 +2039,10 @@ fn render_entry_for_resume_summary(entry: &SessionEntry) -> Option<String> {
         EntryKind::ProposedPlan { title, status, .. } => {
             Some(format!("Proposed plan ({status}): {title}"))
         }
-        EntryKind::PinnedSkill { .. } | EntryKind::Branch { .. } | EntryKind::Compaction { .. } => {
-            None
-        }
+        EntryKind::PinnedSkill { .. }
+        | EntryKind::Branch { .. }
+        | EntryKind::Compaction { .. }
+        | EntryKind::TurnStats(_) => None,
     }
 }
 
@@ -2153,7 +2158,7 @@ fn context_item_for_entry(entry: &SessionEntry) -> Option<Value> {
         EntryKind::Context { content, .. } => Some(context_item(content)),
         // The plan itself reaches the model as the propose_plan call; the
         // status record is for the transcript only.
-        EntryKind::ProposedPlan { .. } => None,
+        EntryKind::ProposedPlan { .. } | EntryKind::TurnStats(_) => None,
     }
 }
 
@@ -2176,6 +2181,7 @@ fn count_context_entry(kind: &EntryKind, counts: &mut ContextEntryCounts) {
         EntryKind::ProposedPlan { .. } => {}
         EntryKind::UserImage { .. } => {}
         EntryKind::Compaction { .. } => {}
+        EntryKind::TurnStats(_) => {}
     }
 }
 
@@ -2204,6 +2210,7 @@ fn context_entry_label(entry: &SessionEntry) -> String {
         } => format!("note:{}", note.as_str()),
         EntryKind::ProposedPlan { .. } => "proposed plan".to_string(),
         EntryKind::Compaction { .. } => "compaction".to_string(),
+        EntryKind::TurnStats(_) => "turn stats".to_string(),
     }
 }
 
@@ -2290,6 +2297,11 @@ fn entry_to_json(entry: &SessionEntry) -> Value {
             "summary": summary,
             "replaced_through": replaced_through
         }),
+        EntryKind::TurnStats(stats) => {
+            let mut value = stats.to_json();
+            value["type"] = json!("turn_stats");
+            value
+        }
     };
     json!({
         "id": entry.id.0,
@@ -2353,6 +2365,7 @@ fn entry_from_json(value: &Value) -> Option<SessionEntry> {
             summary: kind_value.get("summary")?.as_str()?.to_string(),
             replaced_through: kind_value.get("replaced_through")?.as_u64()?,
         },
+        "turn_stats" => EntryKind::TurnStats(TurnStats::from_json(kind_value)?),
         _ => return None,
     };
 
@@ -3113,6 +3126,60 @@ mod tests {
             item,
             TranscriptItem::User(text) if text.contains("date")
         )));
+    }
+
+    #[test]
+    fn turn_stats_survive_reopening_in_the_transcript_but_not_the_context() {
+        let root = test_dir("turn-stats");
+        let profile = root.join("profile");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut session = SessionStore::new();
+        let session_id = session.session_id().to_string();
+        let stats = TurnStats {
+            model: "claude-opus-5-5".to_string(),
+            elapsed_ms: 49_200,
+            ttft_ms: Some(20_200),
+            input_tokens: 797_300,
+            output_tokens: 606,
+            tools: 1,
+            cost: 0.25,
+        };
+        session.append(EntryKind::User {
+            content: "hi".to_string(),
+        });
+        session.append(EntryKind::ResponseItem {
+            item: json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "hello" }] }),
+        });
+        session.append(EntryKind::TurnStats(stats.clone()));
+        session.save_for_cwd(&profile, &cwd).unwrap();
+
+        let loaded = SessionStore::load_for_cwd(&profile, &cwd, &session_id).unwrap();
+        let items = loaded.transcript_items();
+        assert!(matches!(items.last(), Some(TranscriptItem::TurnStats(kept)) if *kept == stats));
+        assert!(matches!(&items[1], TranscriptItem::Assistant(text) if text == "hello"));
+        // The model never sees them.
+        assert_eq!(loaded.context_items().len(), 2);
+        // A snapshot keeps them too; a stat without ttft reads back without one.
+        let mut loaded = loaded;
+        let quick = TurnStats {
+            ttft_ms: None,
+            ..stats.clone()
+        };
+        loaded.append(EntryKind::TurnStats(quick.clone()));
+        loaded.set_goal_objective("ship", None).unwrap();
+        loaded.save_for_cwd(&profile, &cwd).unwrap();
+        let reloaded = SessionStore::load_for_cwd(&profile, &cwd, &session_id).unwrap();
+        let kept: Vec<TurnStats> = reloaded
+            .transcript_items()
+            .into_iter()
+            .filter_map(|item| match item {
+                TranscriptItem::TurnStats(stats) => Some(stats),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kept, vec![stats, quick]);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
