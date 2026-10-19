@@ -204,6 +204,7 @@ every connected client.
 | `device_confirm` | `device` | `device_confirmed`: a pending device may connect (local clients only) |
 | `device_scopes` | `device`, `scopes` | `device_scopes`: the device's elevated scopes are exactly these (local clients only; see "Device scopes") |
 | `pair_cancel` | optional `code` | `pair_cancelled`: the code (or every open one) pairs nobody (local clients only) |
+| `plan_quota` | — | `plan_quota` with `plan` (the account's desktop plan name, or null) and `windows: [{kind, used_pct, resets_at}]`, from the gateway (cached a minute); an error when this computer is not signed in. The phone's 今天用量 |
 | `device_me` | — | `device_me` with `device`, `name`, `scopes` (a local client: `local: true` and every scope) |
 | `device_forget_me` | — | `device_forgotten`, then the sending device is revoked (devices only) |
 | `device_revoke` | `device` | `device_revoked` (local clients only) |
