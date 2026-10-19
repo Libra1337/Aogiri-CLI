@@ -1091,6 +1091,14 @@ impl CommandShell {
             env.retain(|(key, _)| key != name);
             env.push((name.into(), value.into()));
         }
+        // The proxy set in the app (config.json `network_proxy`) replaces
+        // the shell's own (`network_proxy.rs`).
+        if let Some(proxy) = crate::network_proxy::configured() {
+            for (name, value) in crate::network_proxy::command_env(&proxy) {
+                env.retain(|(key, _)| key != name);
+                env.push((name.into(), value.into()));
+            }
+        }
         Invocation {
             program: self.shell.path.display().to_string(),
             args,

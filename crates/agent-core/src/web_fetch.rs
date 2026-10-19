@@ -282,6 +282,10 @@ pub(crate) fn env_proxy(url: &str) -> Option<String> {
     if host.is_empty() || no_proxy(&host) {
         return None;
     }
+    // The proxy set in the app (config.json `network_proxy`) comes first.
+    if let Some(proxy) = crate::network_proxy::configured() {
+        return Some(proxy);
+    }
     let scheme_vars: &[&str] = if url.starts_with("https://") {
         &["https_proxy", "HTTPS_PROXY"]
     } else {
