@@ -22,6 +22,7 @@ mod push_policy;
 mod relay;
 mod requirements;
 mod schedules;
+mod scopes;
 mod session;
 mod session_messages;
 mod skill_market;
@@ -35,6 +36,7 @@ mod usage;
 mod webpush;
 
 pub use agents::Agents;
+pub use hub::check_code;
 pub use store::Store;
 
 use hub::Hub;
@@ -342,10 +344,22 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         });
         return;
     }
+    // A paired device does what its scopes allow (`scopes`): elevated ops
+    // are granted per device on the desktop. Checked before anything else
+    // but the chat profile, so every path below holds it.
+    if let Some(device) = hub.device_of(client).filter(|_| !hub.is_chat(client)) {
+        if let Err(message) = scopes::check(hub, &device, name, &op) {
+            reply(json!({ "type": "error", "message": message, "code": "scope_required" }));
+            return;
+        }
+    }
     if matches!(
         name,
         "pair_start"
             | "pair_link"
+            | "pair_cancel"
+            | "device_confirm"
+            | "device_scopes"
             | "device_list"
             | "device_revoke"
             | "relay_status"
@@ -562,6 +576,45 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             .start_pairing()
             .map(|(code, expires_at)| json!({ "type": "pairing", "code": code, "expires_at": expires_at })),
         ("device_list", _) => Ok(hub.devices_json()),
+        // The pairing dialog closed: its code no longer pairs anyone.
+        ("pair_cancel", _) => {
+            hub.cancel_pairing(op["code"].as_str());
+            Ok(json!({ "type": "pair_cancelled" }))
+        }
+        // The check codes matched: the device may connect.
+        ("device_confirm", _) => match op["device"].as_str() {
+            Some(device) => hub
+                .confirm_device(device)
+                .map(|()| json!({ "type": "device_confirmed", "device": device })),
+            None => Err("device_confirm requires device".to_string()),
+        },
+        ("device_scopes", _) => match (op["device"].as_str(), op["scopes"].as_array()) {
+            (Some(device), Some(list)) => {
+                let list: Vec<String> = list.iter().filter_map(|s| s.as_str().map(str::to_string)).collect();
+                hub.set_device_scopes(device, &list)
+                    .map(|()| json!({ "type": "device_scopes", "device": device, "scopes": list }))
+            }
+            _ => Err("device_scopes requires device and scopes".to_string()),
+        },
+        // A paired device asks what it may do here (its scopes).
+        ("device_me", _) => match hub.device_of(client).and_then(|id| hub.store.device(&id)) {
+            Some(device) => Ok(json!({
+                "type": "device_me",
+                "device": device.id,
+                "name": device.name,
+                "scopes": device.scopes,
+            })),
+            None => Ok(json!({ "type": "device_me", "local": true, "scopes": scopes::ELEVATED })),
+        },
+        // A paired phone forgets this computer: its own record goes.
+        ("device_forget_me", _) => match hub.device_of(client) {
+            Some(device) => {
+                let reply = json!({ "type": "device_forgotten", "device": device });
+                hub.send_to(client, &with_id(reply.clone(), &request));
+                hub.revoke_device(&device).map(|()| Value::Null)
+            }
+            None => Err("only a paired device forgets itself".to_string()),
+        },
         ("device_revoke", _) => match op["device"].as_str() {
             Some(device) => hub
                 .revoke_device(device)
@@ -880,6 +933,13 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         (name, None) => Err(format!("{name} requires session")),
     };
     respond(hub, client, &request, result);
+}
+
+fn with_id(mut frame: Value, request: &Value) -> Value {
+    if !request.is_null() {
+        frame["id"] = request.clone();
+    }
+    frame
 }
 
 /// Replies to an op: `Null` means no reply; the frame echoes the op's `id`.

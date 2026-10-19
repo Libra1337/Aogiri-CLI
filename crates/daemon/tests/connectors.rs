@@ -753,10 +753,11 @@ fn pair_phone(address: &str, desktop: &mut Client) -> String {
     let mut answer = String::new();
     stream.read_to_string(&mut answer).unwrap();
     let json = answer.split("\r\n\r\n").nth(1).unwrap_or_default();
-    serde_json::from_str::<Value>(json).unwrap()["token"]
-        .as_str()
-        .unwrap()
-        .to_string()
+    let paired = serde_json::from_str::<Value>(json).unwrap();
+    // A new device connects once the desktop confirms it.
+    desktop.send(json!({ "op": "device_confirm", "device": paired["device"], "id": "confirm" }));
+    desktop.until(|frame| frame["id"] == "confirm");
+    paired["token"].as_str().unwrap().to_string()
 }
 
 #[test]

@@ -1071,6 +1071,9 @@ pub(crate) fn bind(
         token_hash: crate::store::token_hash(&random_hex(32).map_err(|e| e.to_string())?),
         paired_at: now(),
         revoked: false,
+        scopes: Vec::new(),
+        pending: false,
+        check: None,
         chat: Some(ChatPeer {
             connector: connector.id.clone(),
             platform: connector.platform.clone(),

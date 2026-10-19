@@ -165,9 +165,13 @@ The client is the initiator and knows the daemon static key from pairing.
    first connection after scanning a link.
 2. The daemon authorizes the client static key `rs`:
    - `rs` belongs to a paired, non-revoked device → allowed as that device;
-   - else, `pair` is a valid unexpired code → the device is paired now
-     (`devices.jsonl` entry with `token_hash = hex(SHA-256(rs))`, so revocation
-     and listing reuse the existing device store), allowed;
+   - else, `pair` is a valid unexpired code → the device is paired now,
+     pending (`devices.jsonl` entry with `token_hash = hex(SHA-256(rs))`,
+     `pending: true` and a 6-digit `check` from the handshake hash after
+     msg 1), and msg 2 is `{"ok":false,"pending":true,"device","check"}`
+     followed by `close`; it is allowed once the computer confirms it
+     (`device_confirm`, daemon-protocol.md "Remote devices");
+   - a pending device's key → msg 2 `pending` again, with its first `check`;
    - else → the daemon sends msg 2 with payload `{"ok":false,"error":"..."}`
      and then `close`.
 3. **msg 2** (daemon → client, `<- e, ee, se`), payload

@@ -600,9 +600,22 @@ fn handshake(
         .get_remote_static()
         .ok_or("handshake without a client key")?
         .to_vec();
-    let verdict = authorize(hub, &key, &hello);
+    // The check code both sides show: from this connection's handshake hash
+    // after msg 1, which binds both static keys and the ephemeral one.
+    let check = crate::hub::check_code(noise.get_handshake_hash());
+    let verdict = authorize(hub, &key, &hello, check);
     let reply = match &verdict {
-        Ok(device) => json!({ "ok": true, "device": device.id, "name": device.name }),
+        Ok(Verdict::Accepted(device)) => {
+            json!({ "ok": true, "device": device.id, "name": device.name })
+        }
+        // Paired, not trusted yet: the phone shows the same code and waits.
+        Ok(Verdict::Pending(device)) => json!({
+            "ok": false,
+            "pending": true,
+            "device": device.id,
+            "check": device.check,
+            "error": "confirm this device on the computer: compare the check code",
+        }),
         Err(error) => json!({ "ok": false, "error": error }),
     };
     let written = noise
@@ -610,19 +623,44 @@ fn handshake(
         .map_err(|error| error.to_string())?;
     out.send(Frame::Data(id, buffer[..written].to_vec()).encode())
         .map_err(|_| "relay connection closed".to_string())?;
-    let device = verdict?;
-    Ok((noise::Transport::new(noise)?, device))
+    match verdict? {
+        Verdict::Accepted(device) => Ok((noise::Transport::new(noise)?, device)),
+        Verdict::Pending(_) => Err("waiting for the computer to confirm the device".to_string()),
+    }
+}
+
+enum Verdict {
+    Accepted(Device),
+    /// Paired now; the computer has not confirmed it (§4 step 2).
+    Pending(Device),
 }
 
 /// The device a client static key belongs to: an already paired one, or a
-/// new one when msg 1 carries a valid pairing code (§4 step 2).
-fn authorize(hub: &Hub, key: &[u8], hello: &Value) -> Result<Device, String> {
+/// new one, pending until the computer confirms it, when msg 1 carries a
+/// valid pairing code (§4 step 2). A pending device that connects again is
+/// told it still waits, with its first check code.
+fn authorize(hub: &Hub, key: &[u8], hello: &Value, check: String) -> Result<Verdict, String> {
     let hash = bytes_hash(key);
     if let Some(device) = hub.store.device_for_hash(&hash) {
-        return Ok(device);
+        return Ok(Verdict::Accepted(device));
+    }
+    if let Some(device) = hub
+        .store
+        .devices()
+        .into_iter()
+        .find(|d| !d.revoked && d.pending && d.chat.is_none() && d.token_hash == hash)
+    {
+        return Ok(Verdict::Pending(device));
     }
     match hello["pair"].as_str() {
-        Some(code) => hub.pair_hash(code, hello["name"].as_str().unwrap_or_default(), hash),
+        Some(code) => hub
+            .pair_pending(
+                code,
+                hello["name"].as_str().unwrap_or_default(),
+                hash,
+                check,
+            )
+            .map(Verdict::Pending),
         None => Err("this device is not paired".to_string()),
     }
 }
@@ -717,28 +755,68 @@ mod tests {
     }
 
     #[test]
-    fn authorization_pairs_with_a_code_and_honours_revocation() {
+    fn authorization_pairs_with_a_code_waits_for_the_computer_and_honours_revocation() {
         let hub = hub("authorize");
         let (_, phone) = noise::generate_keypair().unwrap();
         let (_, stranger) = noise::generate_keypair().unwrap();
+        let check = || "123456".to_string();
+        let accepted = |verdict: Result<Verdict, String>| match verdict {
+            Ok(Verdict::Accepted(device)) => Some(device),
+            _ => None,
+        };
 
         // Unknown key without a code, or with a wrong one.
-        assert!(authorize(&hub, &phone, &json!({ "name": "phone" })).is_err());
-        assert!(authorize(&hub, &phone, &json!({ "pair": "WRONG123" })).is_err());
+        assert!(authorize(&hub, &phone, &json!({ "name": "phone" }), check()).is_err());
+        assert!(authorize(&hub, &phone, &json!({ "pair": "WRONG123" }), check()).is_err());
 
-        // A valid code pairs the key; the code is single use.
+        // A valid code pairs the key, pending; the code is single use.
         let (code, _) = hub.start_pairing().unwrap();
-        let device = authorize(&hub, &phone, &json!({ "name": "phone", "pair": code })).unwrap();
-        assert_eq!(device.name, "phone");
+        let Ok(Verdict::Pending(device)) = authorize(
+            &hub,
+            &phone,
+            &json!({ "name": "phone", "pair": code }),
+            check(),
+        ) else {
+            panic!("a new device waits for the computer");
+        };
+        assert_eq!(
+            (device.name.as_str(), device.check.as_deref()),
+            ("phone", Some("123456"))
+        );
         assert_eq!(device.token_hash, bytes_hash(&phone));
-        assert!(authorize(&hub, &stranger, &json!({ "pair": code })).is_err());
+        assert!(authorize(&hub, &stranger, &json!({ "pair": code }), check()).is_err());
+        // Back before the computer confirmed it: still waiting, same code.
+        let Ok(Verdict::Pending(again)) = authorize(&hub, &phone, &json!({}), "999999".to_string())
+        else {
+            panic!("still pending");
+        };
+        assert_eq!(again.check.as_deref(), Some("123456"));
+        assert_eq!(hub.devices_json()["devices"][0]["pending"], true);
 
-        // The paired key comes back without a code, as the same device.
-        assert_eq!(authorize(&hub, &phone, &json!({})).unwrap().id, device.id);
+        // Confirmed on the computer: the key comes back as the same device.
+        hub.confirm_device(&device.id).unwrap();
+        assert_eq!(
+            accepted(authorize(&hub, &phone, &json!({}), check()))
+                .unwrap()
+                .id,
+            device.id
+        );
         assert_eq!(hub.devices_json()["devices"][0]["id"], device.id.as_str());
 
         hub.revoke_device(&device.id).unwrap();
-        assert!(authorize(&hub, &phone, &json!({})).is_err());
+        assert!(authorize(&hub, &phone, &json!({}), check()).is_err());
+    }
+
+    #[test]
+    fn a_closed_pairing_dialog_takes_its_code_back() {
+        let hub = hub("cancel");
+        let (_, phone) = noise::generate_keypair().unwrap();
+        let (code, _) = hub.start_pairing().unwrap();
+        hub.cancel_pairing(Some(&code.to_lowercase()));
+        assert!(authorize(&hub, &phone, &json!({ "pair": code }), "1".to_string()).is_err());
+        let (code, _) = hub.start_pairing().unwrap();
+        hub.cancel_pairing(None);
+        assert!(authorize(&hub, &phone, &json!({ "pair": code }), "1".to_string()).is_err());
     }
 
     #[test]

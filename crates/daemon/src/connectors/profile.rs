@@ -217,6 +217,9 @@ mod tests {
                 token_hash: "x".to_string(),
                 paired_at: 1,
                 revoked: false,
+                scopes: Vec::new(),
+                pending: false,
+                check: None,
                 chat: Some(ChatPeer {
                     connector: "tg-1".to_string(),
                     platform: "telegram".to_string(),
