@@ -921,6 +921,7 @@ impl Hub {
         };
         if changed {
             self.broadcast(&self.agents_json());
+            self.broadcast(&self.sessions_json());
         }
     }
 
@@ -1857,6 +1858,7 @@ impl Hub {
         let records = self.store.sessions();
         let saved = saved_by_id(records.iter().map(|record| record.cwd.as_path()));
         let sessions = lock(&self.sessions);
+        let busy = lock(&self.busy).clone();
         let list: Vec<Value> = records
             .into_iter()
             // An agent's session stays on its agent's page even when a
@@ -1886,6 +1888,8 @@ impl Hub {
                     "agent": record.agent,
                     "open": hosted.is_some(),
                     "watchers": hosted.map(|h| h.watchers.len()).unwrap_or(0),
+                    // A turn runs (or messages wait): 进行中 on the phone.
+                    "running": busy.contains(&record.id),
                 })
             })
             .collect();
