@@ -8,6 +8,7 @@
 //! events.
 
 use crate::{
+    engines,
     hub::{lock, Hub},
     store::now,
 };
@@ -142,12 +143,22 @@ pub fn extensions(hub: Arc<Hub>, session: String) -> Option<HostExtensions> {
         context: Arc::new(String::new),
         exclusive: false,
         gate: Arc::new(|name| match name {
-            "send_to_session" if Setting::current() == Setting::Ask => HostGate::Ask,
-            "send_to_session" => HostGate::Outward,
+            "send_to_session" | "start_session" if Setting::current() == Setting::Ask => {
+                HostGate::Ask
+            }
+            "send_to_session" | "start_session" => HostGate::Outward,
             _ => HostGate::ReadOnly,
         }),
-        summary: Arc::new(move |_, arguments| {
+        summary: Arc::new(move |name, arguments| {
             let args = serde_json::from_str::<Value>(arguments).unwrap_or_default();
+            if name == "start_session" {
+                return format!(
+                    "{} {}\n{}",
+                    args["engine"].as_str().unwrap_or("lynshen"),
+                    args["model"].as_str().unwrap_or_default(),
+                    clip(args["message"].as_str().unwrap_or_default(), 500)
+                );
+            }
             let to = args["session"].as_str().unwrap_or_default();
             format!(
                 "{} ({to})\n{}",
@@ -192,6 +203,18 @@ fn run(
             setting,
             stopped,
         ),
+        "start_session" => {
+            let target = start(hub, me, args)?;
+            send(
+                hub,
+                me,
+                &target,
+                &text("message")?,
+                args["wait_reply"] == true,
+                setting,
+                stopped,
+            )
+        }
         other => Err(format!("unknown tool {other}")),
     }
 }
@@ -433,6 +456,83 @@ fn send(
             sent["note"] = json!("no reply within 10 minutes; read_session shows it later");
             Ok(sent)
         }
+    }
+}
+
+/// Starts a helper conversation for `start_session` (Aogiri ticket #48):
+/// in this conversation's project, on `engine` (lynshen, claude or codex)
+/// with `model` and `effort` when given, titled `title`, in the sender's
+/// approval mode or a stricter one, so it may never do more than the
+/// sender may. Returns its id; the message is sent as `send_to_session`
+/// sends one.
+fn start(hub: &Arc<Hub>, me: &str, args: &Value) -> Result<String, String> {
+    let text = |key: &str| {
+        args[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    if text("message").is_none() {
+        return Err("start_session requires message".to_string());
+    }
+    let engine = engines::Kind::parse(&text("engine").unwrap_or_default())?;
+    if engine == Some(engines::Kind::Acp) {
+        return Err("start_session runs lynshen, claude or codex".to_string());
+    }
+    let cwd = hub
+        .store
+        .sessions()
+        .into_iter()
+        .find(|record| record.id == me)
+        .map(|record| record.cwd)
+        .ok_or("this conversation is not one of the daemon's")?;
+    let sender = hub.messages.mode(me).unwrap_or_else(|| "plan".to_string());
+    let mode = helper_mode(&sender, text("approval_mode").as_deref())?;
+    let options = engines::Options {
+        approval_mode: Some(mode.clone()),
+        model: text("model"),
+        effort: text("effort"),
+        ..engines::Options::default()
+    };
+    let handle = hub.handle().ok_or("the daemon is stopping")?;
+    let id = handle.create_engine_session(Some(cwd), None, false, engine, options)?;
+    // The lynshen engine takes its mode, model and effort as ops.
+    hub.forward(&id, json!({ "op": "set_approval_mode", "mode": mode }))?;
+    if engine.is_none() {
+        if let Some(model) = text("model") {
+            let effort = text("effort").unwrap_or_default();
+            hub.forward(
+                &id,
+                json!({ "op": "command", "input": format!("/model {model} {effort}").trim_end() }),
+            )?;
+        }
+    }
+    let title =
+        text("title").unwrap_or_else(|| clip(&one_line(&text("message").unwrap_or_default()), 40));
+    if let Err(error) = hub
+        .store
+        .record_session_meta(&id, &json!({ "title": title }))
+    {
+        lynshen_agent_core::log_warn!(
+            "daemon",
+            "helper title not saved",
+            error = error.to_string()
+        );
+    }
+    Ok(id)
+}
+
+/// The approval mode a helper runs in: the one asked for when it may do no
+/// more than the sender's, else the sender's. Full access is never given.
+fn helper_mode(sender: &str, asked: Option<&str>) -> Result<String, String> {
+    match asked {
+        Some(asked) if rank(asked) > rank(sender) || rank(asked) > rank("auto") => Err(format!(
+            "approval_mode {asked} may do more than this conversation's {sender}"
+        )),
+        Some(asked) => Ok(asked.to_string()),
+        None if rank(sender) > rank("auto") => Ok("auto".to_string()),
+        None => Ok(sender.to_string()),
     }
 }
 
@@ -815,6 +915,25 @@ fn definitions() -> Vec<Value> {
         }),
         json!({
             "type": "function",
+            "name": "start_session",
+            "description": "Start a helper conversation in this project, on another engine or model, and send it a task (it arrives as its first message): e.g. a review on Codex, a check on Claude Code, a second opinion on another model. It runs in this conversation's approval mode or a stricter one, and shows in the user's list. With wait_reply, wait (up to 10 minutes) for its reply.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "engine": { "type": "string", "enum": ["lynshen", "claude", "codex"], "description": "Default: lynshen." },
+                    "model": { "type": "string", "description": "The engine's model name; default: the engine's own." },
+                    "effort": { "type": "string", "description": "Reasoning effort the engine offers (e.g. low, medium, high, xhigh, max)." },
+                    "approval_mode": { "type": "string", "enum": ["plan", "manual", "auto-edit", "auto"], "description": "Default: this conversation's." },
+                    "title": { "type": "string" },
+                    "message": { "type": "string", "description": "Self-contained: the helper does not see this conversation." },
+                    "wait_reply": { "type": "boolean" }
+                },
+                "required": ["message"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
             "name": "send_to_session",
             "description": "Send a message to another conversation's AI; it arrives there as its next message. With wait_reply, wait (up to 10 minutes) and get its reply.",
             "parameters": {
@@ -938,6 +1057,38 @@ mod tests {
             USER_LIMIT + 1
         );
         assert!(!turns.iter().any(|turn| turn.to_string().contains("secret")));
+    }
+
+    #[test]
+    fn a_helper_never_runs_in_a_looser_mode_than_its_sender() {
+        assert_eq!(helper_mode("auto", None).unwrap(), "auto");
+        assert_eq!(helper_mode("auto", Some("plan")).unwrap(), "plan");
+        assert!(helper_mode("manual", Some("auto")).is_err());
+        // Full access is never passed on.
+        assert_eq!(helper_mode("full-access", None).unwrap(), "auto");
+        assert!(helper_mode("full-access", Some("full-access")).is_err());
+    }
+
+    #[test]
+    fn start_session_is_offered_beside_the_message_tools() {
+        let names: Vec<String> = definitions()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "list_sessions",
+                "read_session",
+                "start_session",
+                "send_to_session"
+            ]
+        );
+        let start = &definitions()[2]["parameters"]["properties"];
+        assert_eq!(
+            start["engine"]["enum"],
+            json!(["lynshen", "claude", "codex"])
+        );
     }
 
     #[test]
