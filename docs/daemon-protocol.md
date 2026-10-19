@@ -900,7 +900,7 @@ whose main directory is the first path (or `null`).
 ## Messages between conversations
 
 Every LynShen session the daemon hosts (an agent's too, besides its own
-tools; not the dispatcher's) has three tools for the user's other
+tools; not the dispatcher's) has four tools for the user's other
 conversations on this daemon:
 
 | Tool | Arguments | Result |
@@ -908,6 +908,8 @@ conversations on this daemon:
 | `list_sessions` | optional `query` (matches title or directory) | `sessions: [{session, title, cwd, engine, state, updated_at}]`: the other sessions, not archived or hidden, most recently active first, at most 30. `state` is `idle`, `busy` or `closed`. |
 | `read_session` | `session`, optional `turns` (1–10, default 3) | `{session, title, state, turns: [{user, reply}]}`: the latest requests and the reply text to each (tool calls left out). A request keeps its first 1000 characters, a reply its last 3000, all turns together about 12000 (the oldest go first). |
 | `send_to_session` | `session`, `message`, optional `wait_reply` | `{id, session, title, status}` with `status` `delivered` (the receiver was idle and starts on it) or `queued` (it runs after the receiver's current work). With `wait_reply: true` the call waits until the receiver has handled the message and returns `status: "replied"` with `reply` (the last 4000 characters of its reply); it gives up after 10 minutes (the result then has a `note`) or when the sender's turn is stopped (an error; the message stays sent). |
+
+| `start_session` | `message`, optional `engine` (`lynshen`, `claude`, `codex`), `model`, `effort`, `approval_mode` (`plan`, `manual`, `auto-edit`, `auto`), `title`, `wait_reply` | as `send_to_session`, to a new conversation: started in the sender's project on that engine, model and effort, in the sender's approval mode or a stricter one (never full access), listed for the user; the message is its first. Aogiri ticket #48 |
 
 A closed receiver is opened first. The message is the receiver's next user
 message (it starts a run, or queues behind the running one), so a Claude
