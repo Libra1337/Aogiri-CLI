@@ -4937,7 +4937,7 @@ mod tests {
         let text = json!({ "type": "message", "role": "assistant",
             "content": [{ "type": "output_text", "text": "hi" }] });
         let call = json!({ "type": "function_call", "call_id": "c", "name": "ls" });
-        assert!(!has_visible_answer(&[thinking.clone()]));
+        assert!(!has_visible_answer(std::slice::from_ref(&thinking)));
         assert!(has_visible_answer(&[thinking.clone(), text]));
         assert!(has_visible_answer(&[thinking, call]));
     }
