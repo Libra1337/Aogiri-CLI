@@ -747,7 +747,7 @@ fn disabled_tool_error(
     }
     if name == "web_search" && !tool_state.web_search_enabled() {
         return Some(
-            "web_search is set to a gateway engine (web_search_engine in config.json), which needs a LynShen login. Run /login, or set web_search_engine to \"local\" to search from this machine."
+            "web_search is set to the LynShen gateway's search (web_search_engine \"gateway\" in config.json), which needs a LynShen login. Run /login, or set web_search_engine to \"auto\"."
                 .to_string(),
         );
     }

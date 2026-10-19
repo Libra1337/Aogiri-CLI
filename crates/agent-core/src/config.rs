@@ -355,11 +355,11 @@ pub struct Config {
     /// the workspace's path (see `project_key`). Read only: changes are
     /// written to the file (`edit_config_json`).
     pub projects: Value,
-    /// Engine behind `web_search`: `model` (the default) or `gateway`; see
+    /// Engine behind `web_search`: `auto` (the default) or `gateway`; see
     /// `crate::web`.
     pub web_search_engine: String,
-    /// Model `web_search` asks on the gateway (`web_search_model`). Empty:
-    /// search from this machine only.
+    /// Model that runs `web_search` natively (`web_search_model`). Empty
+    /// (the default): the conversation's own model.
     pub web_search_model: String,
     /// Engine behind `web_fetch`: `local` fetches from this machine, the
     /// others go through the LynShen gateway (`crate::web::FETCH_ENGINES`).
@@ -826,11 +826,14 @@ impl Config {
                 crate::web::DEFAULT_SEARCH_ENGINE,
                 crate::web::SEARCH_ENGINES,
             )?),
-            // Empty is a choice here: no model, this machine's search only.
+            // Empty: the conversation's own model searches. The default
+            // earlier versions wrote was never the user's choice.
             web_search_model: value
                 .get("web_search_model")
                 .and_then(Value::as_str)
-                .map_or(crate::web::DEFAULT_SEARCH_MODEL, str::trim)
+                .map(str::trim)
+                .filter(|model| *model != crate::web::RETIRED_SEARCH_MODEL)
+                .unwrap_or(crate::web::DEFAULT_SEARCH_MODEL)
                 .to_string(),
             web_fetch_engine: read_web_engine(
                 &value,
@@ -3923,22 +3926,20 @@ mod tests {
     }
 
     #[test]
-    fn web_search_model_defaults_and_can_be_turned_off() {
+    fn web_search_model_defaults_to_the_conversation_model_and_can_be_pinned() {
         let dir = std::env::temp_dir().join(format!("lynshen-search-model-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
         let read = |text: &str| Config::from_value(text, path.clone()).unwrap();
-        assert_eq!(
-            read("{}").web_search_model,
-            crate::web::DEFAULT_SEARCH_MODEL
-        );
+        assert_eq!(read("{}").web_search_model, "");
         assert_eq!(
             read(r#"{"web_search_model":" claude-sonnet-5-5 "}"#).web_search_model,
             "claude-sonnet-5-5"
         );
-        let off = read(r#"{"web_search_model":""}"#);
-        assert_eq!(off.web_search_model, "");
-        off.save().unwrap();
+        // The default 0.7.7 and earlier wrote reads as unset, and is saved so.
+        let old = read(r#"{"web_search_model":"claude-haiku-5-5"}"#);
+        assert_eq!(old.web_search_model, "");
+        old.save().unwrap();
         let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["web_search_model"], "");
         let _ = fs::remove_dir_all(&dir);
