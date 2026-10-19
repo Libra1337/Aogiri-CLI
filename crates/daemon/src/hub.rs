@@ -981,6 +981,7 @@ impl Hub {
             body,
             url: None,
             session: None,
+            answer: None,
         });
     }
 
@@ -994,6 +995,7 @@ impl Hub {
             body,
             url: Some(url),
             session: None,
+            answer: None,
         });
     }
 
@@ -1656,6 +1658,7 @@ impl Hub {
                 body: "这一轮出错了，没有做完",
                 url: None,
                 session: Some(session),
+                answer: None,
             }),
             Err(error) => {
                 lynshen_agent_core::log_warn!("daemon", "failure report not saved", error = error)

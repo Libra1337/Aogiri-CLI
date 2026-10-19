@@ -53,7 +53,7 @@ impl Kind {
         matches!(self, Kind::Approval | Kind::Error)
     }
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Kind::Approval => "approval",
             Kind::Error => "error",
@@ -149,8 +149,20 @@ pub struct Outgoing {
     pub url: String,
     /// The session it is about, when one.
     pub session: Option<String>,
+    /// What answers the approval it is about from the notification (the
+    /// app's 允许/拒绝 buttons), when it is one.
+    pub answer: Option<Answer>,
     /// Notices merged into this one (1: just itself).
     pub count: u32,
+}
+
+/// The request an approval notice is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// An `approval_request`: `approve` with this `call_id`.
+    Call(String),
+    /// An `action_deferred`: `decide_action` with this `action`.
+    Action(String),
 }
 
 impl Outgoing {
@@ -174,6 +186,81 @@ impl Outgoing {
         }
         payload
     }
+}
+
+impl Outgoing {
+    /// What APNs and FCM carry (relay-protocol.md, "Native push"). Apple
+    /// and Google can read it, so it holds the generic text and ids only:
+    /// an update's own text (a reply, a summary, an error message) stays
+    /// on the computer and the app reads it once opened.
+    pub fn native_payload(&self, host: Option<&str>) -> Value {
+        let body = match self.kind {
+            Kind::Update if self.count > 1 => {
+                format!("打开 Aogiri 查看（另有 {} 条）", self.count - 1)
+            }
+            Kind::Update => "打开 Aogiri 查看".to_string(),
+            _ => self.body.clone(),
+        };
+        let mut payload = json!({
+            "title": self.title,
+            "body": body,
+            "kind": self.kind.name(),
+            "level": match self.level {
+                Level::Log | Level::Silent => "silent",
+                Level::Normal => "normal",
+                Level::Urgent => "urgent",
+            },
+        });
+        let ids = [
+            ("tag", Some(self.tag.as_str())),
+            ("session", self.session.as_deref()),
+            ("host", host),
+            (
+                "call_id",
+                match &self.answer {
+                    Some(Answer::Call(id)) => Some(id.as_str()),
+                    _ => None,
+                },
+            ),
+            (
+                "action_id",
+                match &self.answer {
+                    Some(Answer::Action(id)) => Some(id.as_str()),
+                    _ => None,
+                },
+            ),
+        ];
+        for (name, value) in ids {
+            if let Some(value) = value.filter(|v| native_id(v)) {
+                payload[name] = json!(value);
+            }
+        }
+        if self.url.starts_with("/remote") && native_url(&self.url) {
+            payload["url"] = json!(self.url);
+        }
+        if self.count > 1 {
+            payload["count"] = json!(self.count);
+        }
+        payload
+    }
+}
+
+/// An id the relay passes on to APNs and FCM (`[A-Za-z0-9._:-]`, at most
+/// 128): one that is not is left out rather than refused.
+fn native_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+}
+
+fn native_url(value: &str) -> bool {
+    value.len() <= 256
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | '.' | ':' | '/' | '?' | '=' | '&' | '%')
+        })
 }
 
 /// How long notices about one thing wait for more of the same before going
@@ -391,6 +478,7 @@ mod tests {
             body: "b".to_string(),
             url: "/remote".to_string(),
             session: Some(tag.to_string()),
+            answer: None,
             count: 1,
         }
     }
@@ -520,6 +608,40 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn a_native_notice_carries_generic_text_and_ids_only() {
+        let mut approval = notice(Kind::Approval, "s1");
+        approval.body = "「修登录页」等你批准".to_string();
+        approval.url = "/remote?host=h1&session=s1".to_string();
+        approval.answer = Some(Answer::Call("call_9".to_string()));
+        assert_eq!(
+            approval.native_payload(Some("h1")),
+            json!({
+                "title": "t", "body": "「修登录页」等你批准", "kind": "approval", "level": "urgent",
+                "tag": "s1", "session": "s1", "host": "h1", "call_id": "call_9",
+                "url": "/remote?host=h1&session=s1",
+            })
+        );
+        // An update's text (a reply, a summary, an error) stays here.
+        let mut update = notice(Kind::Update, "R-1");
+        update.body = "the end of a reply with /Users/me/secret.txt".to_string();
+        update.session = None;
+        update.url = "/remote?requirement=R-1".to_string();
+        update.count = 3;
+        let payload = update.native_payload(None);
+        assert_eq!(payload["body"], "打开 Aogiri 查看（另有 2 条）");
+        assert_eq!(payload["count"], 3);
+        assert_eq!(payload["url"], "/remote?requirement=R-1");
+        assert!(payload.get("host").is_none() && payload.get("session").is_none());
+        // Ids the relay would refuse are left out.
+        let mut odd = notice(Kind::Error, "a tag with spaces");
+        odd.answer = Some(Answer::Action("act/1".to_string()));
+        odd.level = Level::Silent;
+        let payload = odd.native_payload(None);
+        assert!(payload.get("tag").is_none() && payload.get("action_id").is_none());
+        assert_eq!(payload["level"], "silent");
     }
 
     #[test]

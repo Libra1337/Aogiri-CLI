@@ -19,8 +19,20 @@ sudo ./lynshen-relay -gen-vapid /etc/lynshen-relay/vapid.json   # prints the pub
 # systemd unit: LoadCredential=vapid:/etc/lynshen-relay/vapid.json
 ```
 
-Not implemented: Getui (the endpoint answers 501). Tests: `go test ./...`
-(the RFC 8291 example, VAPID tokens, every refusal, host and client streams).
+APNs and FCM for the Aogiri app (relay-protocol.md, "Native push"), each
+only with its credentials (root-only files, passed in by systemd):
+
+```sh
+sudo install -m 0600 AuthKey_<KEYID>.p8 /etc/lynshen-relay/apns.p8
+sudo install -m 0600 <firebase-service-account>.json /etc/lynshen-relay/fcm.json
+# systemd unit: LoadCredential=apns:/etc/lynshen-relay/apns.p8
+#               LoadCredential=fcm:/etc/lynshen-relay/fcm.json
+#               Environment=LYNSHEN_RELAY_APNS_KEY_ID=<KEYID> LYNSHEN_RELAY_APNS_TEAM_ID=<TEAMID>
+```
+
+Without them those providers answer 501; Web Push is unaffected. Not
+implemented: Getui (501). Tests: `go test ./...` (the RFC 8291 example, VAPID
+and APNs/FCM tokens, every refusal, provider answers, host and client streams).
 
 Interop check against a real daemon:
 `cargo run -p lynshen-daemon --example relay_phone -- ws://127.0.0.1:18095/relay/v1 '<pair link>'`

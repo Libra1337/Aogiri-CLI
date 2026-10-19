@@ -713,6 +713,7 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             .unsubscribe(
                 op["endpoint"]
                     .as_str()
+                    .or(op["token"].as_str().map(|t| t.trim()))
                     .or(op["client_id"].as_str())
                     .unwrap_or_default(),
             )

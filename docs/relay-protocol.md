@@ -111,11 +111,11 @@ plus jitter.
 `GET /relay/v1/healthz` → `200 ok`.
 Logs: connects/disconnects with host id and stream counts; never payloads.
 
-### Web Push and Getui
+### Web Push and native push
 
-The relay sends Web Push notifications, and 个推 (Getui) notifications to the
-LynShen Android app, for connected hosts; it keeps no subscriptions and stores
-nothing it passes on.
+The relay sends Web Push notifications to browsers, and APNs and FCM
+notifications to the Aogiri app, for connected hosts; it keeps no
+subscriptions and stores nothing it passes on.
 
 - `GET /relay/v1/push/key` → `{"key":"<VAPID public key, base64url>"}`: the
   `applicationServerKey` a browser subscribes with.
@@ -142,17 +142,67 @@ nothing it passes on.
     replayed signature or stale `ts`, `403` host not connected or not a push
     service, `400` bad body, `413` too large for the push service, `429`,
     `502` the push service failed.
-- The same request with `"subscription":{"provider":"getui","client_id":"<cid>"}`
-  and a plaintext `payload` `{"title","body","session"?}` goes to the Android
-  app through Getui REST API v2; tapping the notification opens the app with
-  `type=relay`, `host=<host id>` and `session`. `501` while Getui is not
-  configured (this relay does not implement Getui yet).
+- The same request with `"subscription":{"provider":"apns","token":"<hex>","environment":"production"|"sandbox"}`
+  or `{"provider":"fcm","token":"<registration token>"}` and a plaintext
+  `payload` goes to the Aogiri app (see "Native push"). `"provider":"getui"`
+  with `client_id` is reserved for 个推 (Getui) and answers `501` (not
+  implemented).
+
+### Native push (APNs, FCM)
+
+Apple and Google can read what goes through them, so a daemon sends a
+short generic notice and ids, never a command, a path or a reply:
+`payload` = `{"title","body","kind","level","tag"?,"session"?,"host"?,"call_id"?,"action_id"?,"url"?,"count"?}`.
+`title` at most 80 characters and `body` at most 200; `kind` one of
+`approval`, `error`, `done`, `update`, `test`; `level` one of `silent`,
+`normal`, `urgent` (default `normal`); the ids at most 128 characters of
+`[A-Za-z0-9._:-]`; `url` a `/remote…` path. `encrypted` is refused (`400`).
+Ids are what the app needs to open the session (`host`, `session`) and to
+answer an approval from the notification (`call_id` for `approve`,
+`action_id` for `decide_action`).
+
+- **APNs** (HTTP/2, token auth): `POST https://api.push.apple.com/3/device/<token>`
+  (`environment` `sandbox`: `api.sandbox.push.apple.com`; development builds
+  get sandbox tokens, TestFlight and App Store builds production ones), with
+  `authorization: bearer <ES256 JWT {iss: team id, iat}, kid: key id>`
+  (reused for 40 minutes), `apns-topic` (the bundle id, `com.lynshen.aogiri`),
+  `apns-push-type: alert`, `apns-priority` 10 (5 for `silent`),
+  `apns-expiration` now + `ttl`, `apns-collapse-id` = `topic`. Body:
+  `{"aps":{"alert":{"title","body"},"thread-id":<session or tag>,"sound":"default"
+  (not for silent),"interruption-level":"time-sensitive"|"active"|"passive",
+  "category":"approval"},"body":{<kind, tag and the ids>}}`. `category`
+  `approval` (the app's 允许/拒绝 actions) is set for one approval with a
+  `call_id` or `action_id`. `body` is where expo-notifications reads the data.
+- **FCM HTTP v1**: an OAuth 2.0 access token from the service account's
+  RS256 JWT assertion (RFC 7523, scope `firebase.messaging`, reused until
+  5 minutes before it expires), then
+  `POST https://fcm.googleapis.com/v1/projects/<project>/messages:send` with a
+  data-only message `{"token", "data":{"title","message","tag","channelId","categoryId"?,"body":<JSON of the ids>},
+  "android":{"priority":"HIGH" ("NORMAL" for silent),"ttl":"<ttl>s","collapse_key":<topic>}}`.
+  expo-notifications shows it itself (so the category's buttons work);
+  `channelId` is `approvals` (urgent), `updates` (normal) or `quiet`
+  (silent): the app creates these channels.
+- Replies as for Web Push. `410` (forget the token): APNs `410`, or `400`
+  `BadDeviceToken` / `DeviceTokenNotForTopic`; FCM `UNREGISTERED`,
+  `SENDER_ID_MISMATCH` or `404`. The reply text names the provider's status
+  and reason code. `501` when that provider is not configured.
+
+Credentials stay on the relay's server in root-only files, passed in by
+systemd like the VAPID key: `LoadCredential=apns:/etc/lynshen-relay/apns.p8`
+(the `.p8` key from Apple, with `-apns-key-id` and `-apns-team-id` or
+`LYNSHEN_RELAY_APNS_KEY_ID` / `LYNSHEN_RELAY_APNS_TEAM_ID`; `-apns-topic`
+defaults to `com.lynshen.aogiri`) and `LoadCredential=fcm:/etc/lynshen-relay/fcm.json`
+(the Firebase service account key). `-apns-key` and `-fcm-account` name the
+files directly. The relay starts without either: that provider answers
+`501`, and Web Push is unaffected. Push routes are served when at least one
+of VAPID, APNs or FCM is configured; without VAPID `/relay/v1/push/key` is
+`404` and a browser subscription gets `501`.
 
 The relay serves Web Push with a VAPID key file: `-vapid-file <path>`, or
 the systemd credential `vapid` (`LoadCredential=vapid:/etc/lynshen-relay/vapid.json`,
 so the file can stay root-only). `lynshen-relay -gen-vapid <path>` writes a
 new one (0600, never replacing a file) and prints its public key. Without a
-key the push endpoints are not served (404). Browsers' subscriptions are bound
+key (and no APNs or FCM) the push endpoints are not served (404). Browsers' subscriptions are bound
 to the key: a new key means every phone must turn notifications on again.
 
 ## 4. Noise session (client ⇄ daemon, inside one stream)

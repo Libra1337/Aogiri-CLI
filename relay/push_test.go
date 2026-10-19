@@ -242,7 +242,7 @@ func newPushFixture(t *testing.T) *pushFixture {
 	}))
 	t.Cleanup(f.service.Close)
 	f.relay = newRelay()
-	f.push = newPusher(f.relay, v)
+	f.push = newPusher(f.relay, v, nil)
 	f.push.client = f.service.Client()
 	service, _ := url.Parse(f.service.URL)
 	f.push.allow = func(endpoint string) (*url.URL, bool) {
