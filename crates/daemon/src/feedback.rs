@@ -184,10 +184,10 @@ mod tests {
             ],
             "with_logs": false
         });
-        let ticket = ticket(&op).unwrap();
-        assert_eq!(ticket["title"], "web 端想提工单");
-        assert_eq!(ticket["category"], "feature");
-        let names: Vec<&str> = ticket["attachments"]
+        let made = ticket(&op).unwrap();
+        assert_eq!(made["title"], "web 端想提工单");
+        assert_eq!(made["category"], "feature");
+        let names: Vec<&str> = made["attachments"]
             .as_array()
             .unwrap()
             .iter()
