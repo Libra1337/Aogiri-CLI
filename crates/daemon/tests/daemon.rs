@@ -1380,6 +1380,20 @@ fn http(daemon: &Daemon, request: &str) -> (u16, String) {
     (status, response)
 }
 
+/// Pairs a device over the LAN with `code` and confirms it on `desktop`:
+/// its token, ready to connect.
+fn paired_token(daemon: &Daemon, desktop: &mut Client, code: &str) -> String {
+    let (status, response) = http(daemon, &pair_request(code));
+    assert_eq!(status, 200, "{response}");
+    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let confirmed = request(
+        desktop,
+        json!({ "op": "device_confirm", "device": body["device"] }),
+    );
+    assert_eq!(confirmed["type"], "device_confirmed", "{confirmed}");
+    body["token"].as_str().unwrap().to_string()
+}
+
 fn pair_request(code: &str) -> String {
     let body = json!({ "code": code, "name": "phone" }).to_string();
     format!(
@@ -1436,6 +1450,22 @@ fn a_device_pairs_with_a_code_from_the_desktop_until_revoked() {
     // The code works once.
     let (status, _) = http(&daemon, &pair_request(&code));
     assert_eq!(status, 403);
+    // The token opens nothing until the desktop confirms the device, whose
+    // check code is the one the phone computes from its token.
+    assert!(tungstenite::connect(format!("ws://{}/?token={token}", daemon.address)).is_err());
+    let pending = desktop
+        .until(|frame| frame["type"] == "device_pending")
+        .pop()
+        .unwrap();
+    {
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            pending["check"],
+            lynshen_daemon::check_code(&Sha256::digest(token.as_bytes())).as_str()
+        );
+    }
+    desktop.send(json!({ "op": "device_confirm", "device": device, "id": 40 }));
+    desktop.until(|frame| frame["id"] == 40);
 
     // The phone reaches sessions and agents, but cannot pair more devices.
     let mut phone = Client::connect_with(&daemon, &token);
@@ -1620,6 +1650,29 @@ impl FakeRelay {
         }
     }
 
+    /// `connect`, also returning the handshake hash after msg 1.
+    fn connect_hashed(
+        &mut self,
+        stream: u32,
+        client_key: &[u8],
+        host_key: &[u8],
+        hello: Value,
+    ) -> (Value, (), Vec<u8>) {
+        use lynshen_daemon::noise;
+        self.send(1, stream, &[]);
+        let mut initiator = noise::initiator(client_key, host_key).unwrap();
+        let mut buffer = vec![0u8; noise::MAX_MESSAGE];
+        let written = initiator
+            .write_message(hello.to_string().as_bytes(), &mut buffer)
+            .unwrap();
+        let hash = initiator.get_handshake_hash().to_vec();
+        self.send(2, stream, &buffer[..written]);
+        let (kind, message) = self.next_on(stream);
+        assert_eq!(kind, 2);
+        let read = initiator.read_message(&message, &mut buffer).unwrap();
+        (serde_json::from_slice(&buffer[..read]).unwrap(), (), hash)
+    }
+
     /// Opens a stream and runs the client's handshake; returns msg 2's
     /// payload and the client transport.
     fn connect(
@@ -1736,17 +1789,36 @@ fn a_relay_client_pairs_gets_hello_and_is_dropped_on_revoke() {
         .unwrap();
     let mut relay = FakeRelay { host };
 
-    // A new phone pairs with the code and gets the usual greeting.
+    // A new phone pairs with the code: it waits, and both sides show the
+    // same check code (the phone's from its own handshake hash).
     let (phone_key, _) = lynshen_daemon::noise::generate_keypair().unwrap();
-    let (reply, mut phone) = relay.connect(
-        1,
+    let (reply, _, hash) = relay.connect_hashed(
+        7,
         &phone_key,
         &host_key,
         json!({ "name": "phone", "pair": code }),
     );
+    assert_eq!(
+        (reply["ok"].clone(), reply["pending"].clone()),
+        (json!(false), json!(true)),
+        "{reply}"
+    );
+    let check = lynshen_daemon::check_code(&hash);
+    assert_eq!(reply["check"], check.as_str());
+    assert_eq!(relay.next_on(7), (3, Vec::new()));
+    let pending = desktop
+        .until(|frame| frame["type"] == "device_pending")
+        .pop()
+        .unwrap();
+    assert_eq!(pending["check"], check.as_str());
+    let device = reply["device"].as_str().unwrap().to_string();
+    desktop.send(json!({ "op": "device_confirm", "device": device, "id": 41 }));
+    desktop.until(|frame| frame["id"] == 41);
+
+    // Confirmed: the phone connects without a code and gets the greeting.
+    let (reply, mut phone) = relay.connect(1, &phone_key, &host_key, json!({ "name": "phone" }));
     assert_eq!(reply["ok"], true, "{reply}");
     assert_eq!(reply["name"], "phone");
-    let device = reply["device"].as_str().unwrap().to_string();
     let (kind, message) = relay.next_on(1);
     assert_eq!(kind, 2);
     let hello: Value = serde_json::from_slice(&phone.open(&message).unwrap().unwrap()).unwrap();
@@ -2648,9 +2720,8 @@ fn the_desktop_saves_mcp_servers_for_every_session_without_one() {
         .as_str()
         .unwrap()
         .to_string();
-    let (_, response) = http(&daemon, &pair_request(&code));
-    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    let mut phone = Client::connect_with(&daemon, body["token"].as_str().unwrap());
+    let token = paired_token(&daemon, &mut desktop, &code);
+    let mut phone = Client::connect_with(&daemon, &token);
     for op in [
         json!({ "op": "mcp_set", "server": server }),
         json!({ "op": "mcp_set", "session": session, "server": server }),
@@ -2682,9 +2753,8 @@ fn only_the_desktop_starts_acp_agents_which_run_like_any_session() {
         .as_str()
         .unwrap()
         .to_string();
-    let (_, response) = http(&daemon, &pair_request(&code));
-    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    let mut phone = Client::connect_with(&daemon, body["token"].as_str().unwrap());
+    let token = paired_token(&daemon, &mut desktop, &code);
+    let mut phone = Client::connect_with(&daemon, &token);
     let refused = request(
         &mut phone,
         json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": options }),
@@ -3116,9 +3186,8 @@ fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
         .as_str()
         .unwrap()
         .to_string();
-    let (_, response) = http(&daemon, &pair_request(&code));
-    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    let mut phone = Client::connect_with(&daemon, body["token"].as_str().unwrap());
+    let token = paired_token(&daemon, &mut desktop, &code);
+    let mut phone = Client::connect_with(&daemon, &token);
     for op in ["skills_catalog", "skill_install"] {
         let refused = request(
             &mut phone,
@@ -3509,9 +3578,8 @@ fn the_desktop_lists_switches_creates_and_deletes_skills() {
         .as_str()
         .unwrap()
         .to_string();
-    let (_, response) = http(&daemon, &pair_request(&code));
-    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    let mut phone = Client::connect_with(&daemon, body["token"].as_str().unwrap());
+    let token = paired_token(&daemon, &mut desktop, &code);
+    let mut phone = Client::connect_with(&daemon, &token);
     for op in [
         "skills_list",
         "skill_set_enabled",
@@ -3641,9 +3709,8 @@ fn the_desktop_lists_saves_and_deletes_reply_styles() {
         .as_str()
         .unwrap()
         .to_string();
-    let (_, response) = http(&daemon, &pair_request(&code));
-    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    let mut phone = Client::connect_with(&daemon, body["token"].as_str().unwrap());
+    let token = paired_token(&daemon, &mut desktop, &code);
+    let mut phone = Client::connect_with(&daemon, &token);
     for op in ["styles_list", "style_save", "style_delete"] {
         let refused = request(
             &mut phone,
@@ -4420,11 +4487,10 @@ fn a_phone_is_told_when_a_session_waits_and_not_while_it_looks_at_it() {
         .to_string();
     let (status, response) = http(&daemon, &pair_request(&code));
     assert_eq!(status, 200, "{response}");
-    let token = serde_json::from_str::<Value>(response.split("\r\n\r\n").nth(1).unwrap()).unwrap()
-        ["token"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let paired = serde_json::from_str::<Value>(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let token = paired["token"].as_str().unwrap().to_string();
+    desktop.send(json!({ "op": "device_confirm", "device": paired["device"], "id": 91 }));
+    desktop.until(|frame| frame["id"] == 91);
     let mut phone = Client::connect_with(&daemon, &token);
     let p256dh =
         "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4";
@@ -4525,4 +4591,141 @@ fn a_phone_is_told_when_a_session_waits_and_not_while_it_looks_at_it() {
         "pushed to a revoked device"
     );
     std::env::remove_var("LYNSHEN_AT_COMPUTER");
+}
+
+#[test]
+fn a_phone_does_more_than_look_send_and_approve_only_once_the_desktop_grants_it() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("scopes-session");
+    let mut desktop = Client::connect(&daemon);
+    let session = desktop.create_session(&dir);
+    desktop.send(json!({ "op": "pair_start", "id": 1 }));
+    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let token = paired_token(&daemon, &mut desktop, &code);
+    let mut phone = Client::connect_with(&daemon, &token);
+    let device = request(&mut desktop, json!({ "op": "device_list" }))["devices"][0].clone();
+    assert_eq!(device["scopes"], json!([]));
+    let me = request(&mut phone, json!({ "op": "device_me" }));
+    assert_eq!(
+        (me["device"].clone(), me["scopes"].clone()),
+        (device["id"].clone(), json!([]))
+    );
+
+    let elevated = [
+        (
+            json!({ "op": "set_approval_mode", "session": session, "mode": "full-access" }),
+            "full_auto",
+        ),
+        (
+            json!({ "op": "dispatch_send", "text": "x", "approval_mode": "full-access" }),
+            "full_auto",
+        ),
+        (
+            json!({ "op": "command", "session": session, "input": "/permissions full-access" }),
+            "full_auto",
+        ),
+        (
+            json!({ "op": "set_sandbox", "session": session, "mode": "full-access" }),
+            "full_access",
+        ),
+        (json!({ "op": "project_add", "path": "/" }), "add_folder"),
+        (
+            json!({ "op": "term_open", "cwd": dir, "cols": 80, "rows": 24 }),
+            "terminal",
+        ),
+    ];
+    for (op, scope) in &elevated {
+        let refused = request(&mut phone, op.clone());
+        assert_eq!(refused["code"], "scope_required", "{op}: {refused}");
+        assert!(refused["message"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("scope_required:{scope}:")));
+    }
+    // Ordinary work goes on.
+    phone.send(json!({ "op": "set_approval_mode", "session": session, "mode": "auto" }));
+    phone.until(|f| f["type"] == "approval_mode" && f["mode"] == "auto");
+    assert_eq!(
+        request(&mut phone, json!({ "op": "session_list" }))["type"],
+        "sessions"
+    );
+    // A phone cannot grant itself.
+    let refused = request(
+        &mut phone,
+        json!({ "op": "device_scopes", "device": device["id"], "scopes": ["full_auto"] }),
+    );
+    assert_eq!(refused["type"], "error");
+
+    // Granted on the desktop: 全自动 and the terminal; the rest stay refused.
+    let granted = request(
+        &mut desktop,
+        json!({ "op": "device_scopes", "device": device["id"], "scopes": ["full_auto", "terminal"] }),
+    );
+    assert_eq!(granted["scopes"], json!(["full_auto", "terminal"]));
+    let refused = request(
+        &mut desktop,
+        json!({ "op": "device_scopes", "device": device["id"], "scopes": ["root"] }),
+    );
+    assert_eq!(refused["type"], "error");
+    phone.until(|f| f["type"] == "device_scopes_changed");
+    phone.send(json!({ "op": "set_approval_mode", "session": session, "mode": "full-access" }));
+    phone.until(|f| f["type"] == "approval_mode" && f["mode"] == "full-access");
+    let refused = request(&mut phone, json!({ "op": "project_add", "path": "/" }));
+    assert_eq!(refused["code"], "scope_required");
+    // Taken back: refused again.
+    request(
+        &mut desktop,
+        json!({ "op": "device_scopes", "device": device["id"], "scopes": [] }),
+    );
+    let refused = request(
+        &mut phone,
+        json!({ "op": "set_approval_mode", "session": session, "mode": "full-access" }),
+    );
+    assert_eq!(refused["code"], "scope_required");
+}
+
+#[test]
+fn a_phone_that_forgets_the_computer_is_revoked_there() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut desktop = Client::connect(&daemon);
+    desktop.send(json!({ "op": "pair_start", "id": 1 }));
+    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let token = paired_token(&daemon, &mut desktop, &code);
+    let mut phone = Client::connect_with(&daemon, &token);
+    let reply = request(&mut phone, json!({ "op": "device_forget_me" }));
+    assert_eq!(reply["type"], "device_forgotten");
+    let list = request(&mut desktop, json!({ "op": "device_list" }));
+    assert_eq!(list["devices"], json!([]));
+    assert!(tungstenite::connect(format!("ws://{}/?token={token}", daemon.address)).is_err());
+    // A desktop has no device to forget.
+    assert_eq!(
+        request(&mut desktop, json!({ "op": "device_forget_me" }))["type"],
+        "error"
+    );
+}
+
+#[test]
+fn a_closed_pairing_code_pairs_nobody() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut desktop = Client::connect(&daemon);
+    desktop.send(json!({ "op": "pair_start", "id": 1 }));
+    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        request(&mut desktop, json!({ "op": "pair_cancel", "code": code }))["type"],
+        "pair_cancelled"
+    );
+    let (status, _) = http(&daemon, &pair_request(&code));
+    assert_eq!(status, 403);
 }

@@ -228,15 +228,105 @@ impl Hub {
 
     /// Trades a pairing code for a new device and its token. The token is
     /// returned once and only its hash is stored.
+    /// The device waits for the computer to confirm it, as over the relay;
+    /// its check code is from the token's SHA-256, which the phone computes
+    /// from the token it got.
     pub fn pair(&self, code: &str, name: &str) -> Result<(Device, String), String> {
+        use sha2::{Digest, Sha256};
         let token = random_hex(32).map_err(|error| error.to_string())?;
-        let device = self.pair_hash(code, name, token_hash(&token))?;
+        let check = check_code(&Sha256::digest(token.as_bytes()));
+        let device = self.pair_pending(code, name, token_hash(&token), check)?;
         Ok((device, token))
     }
 
+    /// Drops a pairing code shown on the desktop (its dialog closed); every
+    /// open code when `code` is None.
+    pub fn cancel_pairing(&self, code: Option<&str>) {
+        let mut pairings = lock(&self.pairings);
+        match code {
+            Some(code) => {
+                pairings.remove(&code.trim().to_ascii_uppercase());
+            }
+            None => pairings.clear(),
+        }
+    }
+
+    /// A relay client paired with a code: a device that waits for the
+    /// computer to confirm it (the 6-digit check code both sides show,
+    /// `device_confirm`). It cannot connect until then.
+    /// `check`: the code from this pairing's channel (`check_code`).
+    pub fn pair_pending(
+        &self,
+        code: &str,
+        name: &str,
+        token_hash: String,
+        check: String,
+    ) -> Result<Device, String> {
+        let device = self.new_device(code, name, token_hash, Some(check))?;
+        self.broadcast_local(&json!({
+            "type": "device_pending",
+            "device": device.id,
+            "name": device.name,
+            "check": device.check,
+        }));
+        Ok(device)
+    }
+
+    /// The computer confirms a pending device (its check code matched).
+    pub fn confirm_device(&self, id: &str) -> Result<(), String> {
+        let device = self
+            .store
+            .device(id)
+            .ok_or_else(|| format!("unknown device {id}"))?;
+        if !device.pending {
+            return Ok(());
+        }
+        self.store
+            .record_device_confirmed(id)
+            .map_err(|error| error.to_string())?;
+        self.broadcast_local(&self.devices_json());
+        Ok(())
+    }
+
+    /// Grants `id` exactly these elevated scopes (`scopes.rs`).
+    pub fn set_device_scopes(&self, id: &str, scopes: &[String]) -> Result<(), String> {
+        if let Some(bad) = scopes
+            .iter()
+            .find(|scope| !crate::scopes::ELEVATED.contains(&scope.as_str()))
+        {
+            return Err(format!("unknown scope {bad}"));
+        }
+        if self
+            .store
+            .device(id)
+            .is_none_or(|device| device.chat.is_some())
+        {
+            return Err(format!("unknown device {id}"));
+        }
+        self.store
+            .record_device_scopes(id, scopes)
+            .map_err(|error| error.to_string())?;
+        self.broadcast_local(&self.devices_json());
+        // The device's own connections hear of it (they ask `device_me`).
+        let text = json!({ "type": "device_scopes_changed" }).to_string();
+        for client in lock(&self.clients).values() {
+            if client.device.as_deref() == Some(id) {
+                let _ = client.outbox.send(text.clone());
+            }
+        }
+        Ok(())
+    }
+
     /// Trades a pairing code for a new device identified by `token_hash`
-    /// (a token's hash, or a relay client's static key hash).
-    pub fn pair_hash(&self, code: &str, name: &str, token_hash: String) -> Result<Device, String> {
+    /// (a token's hash, or a relay client's static key hash). `check`:
+    /// Some(code) for a device that waits for the computer.
+    fn new_device(
+        &self,
+        code: &str,
+        name: &str,
+        token_hash: String,
+        check: Option<String>,
+    ) -> Result<Device, String> {
         let code = code.trim().to_ascii_uppercase();
         let valid = lock(&self.pairings)
             .remove(&code)
@@ -255,6 +345,9 @@ impl Hub {
             paired_at: now(),
             revoked: false,
             chat: None,
+            scopes: Vec::new(),
+            pending: check.is_some(),
+            check,
         };
         self.store
             .record_device(&device)
@@ -294,7 +387,12 @@ impl Hub {
                     "paired_at": device.paired_at,
                     "kind": if device.chat.is_some() { "chat" } else { "device" },
                     "last_seen": seen.get(&device.id),
+                    "scopes": device.scopes,
+                    "pending": device.pending,
                 });
+                if device.pending {
+                    item["check"] = json!(device.check);
+                }
                 if let Some(chat) = &device.chat {
                     item["platform"] = json!(chat.platform);
                     item["connector"] = json!(chat.connector);
@@ -1860,6 +1958,33 @@ impl Hub {
 
 /// A random code of `len` characters from `PAIRING_ALPHABET` (pairing and
 /// chat binding codes).
+/// The 6-digit check code both sides of a pairing show (the user compares
+/// them before the computer trusts the device): from the Noise handshake
+/// hash of the pairing connection over the relay, which binds both sides'
+/// keys; from the device token's SHA-256 over the LAN. The first 8 bytes,
+/// big-endian, modulo 10^6.
+pub fn check_code(bytes: &[u8]) -> String {
+    let mut first = [0u8; 8];
+    for (to, from) in first.iter_mut().zip(bytes) {
+        *to = *from;
+    }
+    format!("{:06}", u64::from_be_bytes(first) % 1_000_000)
+}
+
+/// The kind of an approval request waiting in `session` (`call` or a
+/// deferred action id), for the scope check.
+impl Hub {
+    pub(crate) fn approval_kind(&self, session: &str, id: &str) -> Option<String> {
+        self.connectors.pending_kind(session, id).or_else(|| {
+            self.store
+                .open_actions()
+                .into_iter()
+                .find(|action| action.id == id && action.session_id == session)
+                .map(|action| action.kind.unwrap_or_else(|| "tool".to_string()))
+        })
+    }
+}
+
 pub(crate) fn new_code(len: usize) -> Result<String, String> {
     let mut bytes = vec![0u8; len];
     getrandom::getrandom(&mut bytes).map_err(|error| error.to_string())?;
@@ -1997,6 +2122,15 @@ mod tests {
     use super::*;
     use crate::{store::now, Agents};
     use std::{fs, sync::mpsc};
+
+    #[test]
+    fn the_check_code_is_the_first_8_bytes_modulo_a_million() {
+        // The phone page computes the same (src/lib/relay/socket.ts).
+        let mut bytes = [0u8; 32];
+        bytes[5..8].copy_from_slice(&[0x0f, 0x42, 0x41]);
+        assert_eq!(check_code(&bytes), "000001");
+        assert_eq!(check_code(&[0xff; 32]), "551615");
+    }
 
     #[test]
     fn titles_come_from_what_was_asked_never_a_delivery_header() {

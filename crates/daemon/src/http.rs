@@ -94,9 +94,11 @@ fn pair(hub: &Hub, body: &[u8]) -> Response {
     let code = request["code"].as_str().unwrap_or_default();
     let name = request["name"].as_str().unwrap_or_default();
     match hub.pair(code, name) {
+        // The token connects once the computer confirms the device; the
+        // phone shows the check code (from the token) meanwhile.
         Ok((device, token)) => Response::json(
             200,
-            json!({ "device": device.id, "name": device.name, "token": token }),
+            json!({ "device": device.id, "name": device.name, "token": token, "pending": true }),
         ),
         Err(error) => Response::json(403, json!({ "error": error })),
     }

@@ -71,13 +71,52 @@ A phone pairs once and then connects with its own token:
 
 1. A local client sends `pair_start` and shows the returned 8-character
    `code` (valid 5 minutes, single use), for example as a QR code of
-   `<address>/remote?pair=<code>`.
-2. The phone's page posts the code to `/api/pair` and keeps the token.
-3. The phone connects to the WebSocket with that token.
+   `<address>/remote?pair=<code>`. When the dialog closes it sends
+   `pair_cancel` (`code`, or none for every open code): the code pairs
+   nobody from then on.
+2. The phone's page posts the code to `/api/pair` and keeps the token. The
+   reply has `pending: true`: the device exists but its token connects only
+   once the computer confirms it.
+3. Every local client gets `{"type":"device_pending","device","name","check"}`.
+   `check` is a 6-digit code. Over the LAN it comes from the SHA-256 of the
+   token: the first 8 bytes, big-endian, modulo 10^6, zero-padded. The phone
+   computes the same code from its token. The desktop shows both codes side
+   by side, and the user confirms with `device_confirm` (`device`) or refuses
+   with `device_revoke`. `device_list` shows a waiting device with
+   `pending: true` and its `check`.
+4. The phone connects to the WebSocket with its token.
+
+### Device scopes
+
+A paired device may look, send messages and approve ordinary requests. Four
+more scopes are granted per device on the computer
+(`{"op":"device_scopes","device","scopes":[…]}`, local clients only, the
+whole list each time). The device's connections then get
+`{"type":"device_scopes_changed"}`.
+
+| Scope | What it allows |
+| --- | --- |
+| `full_auto` | 全自动: `set_approval_mode` / `approve_plan` / `requirement_begin` / `requirement_confirm` with `full-access` (or another engine's full mode), `dispatch_send` with `approval_mode: "full-access"`, `/permissions full-access`, `agent_update` / `agent_create` of the approval mode, sandbox, directories or command rules |
+| `full_access` | Running outside the sandbox: `set_sandbox` and `/sandbox` with `full-access`, approving (`approve` / `decide_action` with `allow`) an `escalation` or an `elevation` |
+| `add_folder` | `project_add`, `project_create`, `workspaces_set`, `add_directory`, an approval's `add_dir`, approving an `outside_write`, `/trust` |
+| `terminal` | `term_open`, `term_input`, `term_resize`, `term_close`, `session_tui` |
+
+An op that needs a scope the device lacks fails with
+`{"type":"error","code":"scope_required","message":"scope_required:<scope>: …"}`.
+A deny is always allowed. `device_list` lists each device's `scopes`. A
+device asks for its own with `{"op":"device_me"}`, which replies `device_me`
+with `device`, `name` and `scopes`. A local client gets `local: true` and
+every scope. A device paired before scopes has none.
+
+`{"op":"device_forget_me"}` (a device only) revokes the sender, and the
+reply `device_forgotten` comes first. The phone sends it when the user
+forgets this computer.
 
 Device tokens reach every op except `pair_start`, `pair_link`,
-`device_list`, `device_revoke`, `relay_status` and `relay_set`, which only
-local clients (holding the daemon token) may send. `device_revoke` drops the device's open connections at once.
+`pair_cancel`, `device_confirm`, `device_scopes`, `device_list`,
+`device_revoke`, `relay_status` and `relay_set`, which only local clients
+(holding the daemon token) may send. `device_revoke` drops the device's
+open connections at once.
 
 To reach the daemon from a phone, keep it on `127.0.0.1` and expose the
 port over HTTPS with `tailscale serve` or a reverse proxy; the daemon has no
@@ -96,8 +135,17 @@ it from anywhere through end-to-end encrypted streams
    (`https://app.lynshen.org/remote#pair=<host>.<key>.<code>`, the origin
    taken from the relay URL) as a QR code. The code is a `pair_start` code.
 2. The phone's page connects through the relay with the code in its first
-   Noise message and is paired as a device keyed by its Noise static key.
-3. Later connections need no code. Relay devices show up in `device_list`;
+   Noise message and is paired as a device keyed by its Noise static key. It
+   waits for the computer: msg 2 is
+   `{"ok":false,"pending":true,"device","check"}` and the stream closes.
+   `check` comes from the Noise handshake hash after msg 1 (first 8 bytes,
+   big-endian, modulo 10^6). That hash binds both static keys and the
+   ephemeral key, so a phone that is not this one, or a relay in the middle,
+   cannot show the same code. Local clients get `device_pending` with the
+   same code (see Remote devices).
+3. Once the computer confirms the device (`device_confirm`), later
+   connections need no code. Until then, each try is answered `pending` with
+   the first code. Relay devices show up in `device_list`, and
    `device_revoke` closes their streams.
 
 A relay stream then behaves exactly like a device's local WebSocket.
@@ -152,7 +200,12 @@ every connected client.
 | `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` opens a closed session first, as `session_open` does (an error when it cannot), and also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `approval_mode_pending`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
 | `actions_list` | — | `actions`: undecided deferred actions across all sessions, and in `closed` the ones closed lately (as in `questions`) |
 | `pair_start` | — | `pairing` with `code` and `expires_at` (local clients only) |
-| `device_list` | — | `devices`: paired, unrevoked devices with `id`, `name`, `paired_at`, `kind` (`device`, or `chat` for a chat binding, which also has `platform`, `connector` and `last_seen`) (local clients only) |
+| `device_list` | — | `devices`: paired, unrevoked devices with `id`, `name`, `paired_at`, `kind` (`device`, or `chat` for a chat binding, which also has `platform`, `connector` and `last_seen`), `scopes`, `pending` (and `check` while pending) (local clients only) |
+| `device_confirm` | `device` | `device_confirmed`: a pending device may connect (local clients only) |
+| `device_scopes` | `device`, `scopes` | `device_scopes`: the device's elevated scopes are exactly these (local clients only; see "Device scopes") |
+| `pair_cancel` | optional `code` | `pair_cancelled`: the code (or every open one) pairs nobody (local clients only) |
+| `device_me` | — | `device_me` with `device`, `name`, `scopes` (a local client: `local: true` and every scope) |
+| `device_forget_me` | — | `device_forgotten`, then the sending device is revoked (devices only) |
 | `device_revoke` | `device` | `device_revoked` (local clients only) |
 | `relay_status` | — | `relay_status` with `enabled`, `connected`, `host` (the host id), `url` (null with `--no-relay`) (local clients only) |
 | `relay_set` | `enabled` | `relay_status`; turns the relay connection on or off and remembers it (local clients only) |

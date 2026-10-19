@@ -184,6 +184,14 @@ pub struct Device {
     /// Set for a chat binding (see `connectors`): never a WebSocket or
     /// relay device.
     pub chat: Option<ChatPeer>,
+    /// Elevated scopes granted on the computer (`scopes.rs`); empty: look,
+    /// send messages and approve ordinary requests only.
+    pub scopes: Vec<String>,
+    /// Paired and waiting for the computer to confirm it (pairing check
+    /// code): it may not connect until then.
+    pub pending: bool,
+    /// The check code shown on both sides while pending.
+    pub check: Option<String>,
 }
 
 /// The chat account a binding stands for.
@@ -956,6 +964,10 @@ impl Store {
             "kind": "paired", "id": device.id, "name": device.name,
             "token_hash": device.token_hash, "at": device.paired_at,
         });
+        if device.pending {
+            entry["pending"] = json!(true);
+            entry["check"] = json!(device.check);
+        }
         if let Some(chat) = &device.chat {
             entry["device_kind"] = json!("chat");
             entry["connector"] = json!(chat.connector);
@@ -965,6 +977,22 @@ impl Store {
             entry["lang"] = json!(chat.lang);
         }
         self.append(DEVICES, entry)
+    }
+
+    /// The elevated scopes `id` has from now on (replacing earlier ones).
+    pub fn record_device_scopes(&self, id: &str, scopes: &[String]) -> io::Result<()> {
+        self.append(
+            DEVICES,
+            json!({ "kind": "scopes", "id": id, "scopes": scopes, "at": now() }),
+        )
+    }
+
+    /// The computer confirmed a pending device.
+    pub fn record_device_confirmed(&self, id: &str) -> io::Result<()> {
+        self.append(
+            DEVICES,
+            json!({ "kind": "confirmed", "id": id, "at": now() }),
+        )
     }
 
     pub fn record_device_revoked(&self, id: &str) -> io::Result<()> {
@@ -978,6 +1006,24 @@ impl Store {
             .filter(|entry| entry["kind"] == "revoked")
             .filter_map(|entry| entry["id"].as_str())
             .collect();
+        let confirmed: HashSet<&str> = entries
+            .iter()
+            .filter(|entry| entry["kind"] == "confirmed")
+            .filter_map(|entry| entry["id"].as_str())
+            .collect();
+        // The latest grant per device.
+        let mut scopes: HashMap<&str, Vec<String>> = HashMap::new();
+        for entry in entries.iter().filter(|entry| entry["kind"] == "scopes") {
+            if let Some(id) = entry["id"].as_str() {
+                let list = entry["scopes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|scope| scope.as_str().map(str::to_string))
+                    .collect();
+                scopes.insert(id, list);
+            }
+        }
         entries
             .iter()
             .filter(|entry| entry["kind"] == "paired")
@@ -993,6 +1039,10 @@ impl Store {
                 });
                 Some(Device {
                     revoked: revoked.contains(id.as_str()),
+                    scopes: scopes.get(id.as_str()).cloned().unwrap_or_default(),
+                    // A record from before the check code is trusted as it was.
+                    pending: entry["pending"] == true && !confirmed.contains(id.as_str()),
+                    check: entry["check"].as_str().map(str::to_string),
                     id,
                     name: text("name"),
                     token_hash: entry["token_hash"].as_str()?.to_string(),
@@ -1011,9 +1061,9 @@ impl Store {
     /// The active device with this token hash. A relay device's hash is of
     /// its Noise static key. A chat binding never connects this way.
     pub fn device_for_hash(&self, hash: &str) -> Option<Device> {
-        self.devices()
-            .into_iter()
-            .find(|device| !device.revoked && device.chat.is_none() && device.token_hash == hash)
+        self.devices().into_iter().find(|device| {
+            !device.revoked && !device.pending && device.chat.is_none() && device.token_hash == hash
+        })
     }
 
     /// An active device by id.
@@ -1653,6 +1703,9 @@ mod tests {
                 paired_at: 1,
                 revoked: false,
                 chat: None,
+                scopes: Vec::new(),
+                pending: false,
+                check: None,
             })
             .unwrap();
         // First run here: claimed, nothing reset.
@@ -1682,6 +1735,9 @@ mod tests {
                 paired_at: 1,
                 revoked: false,
                 chat: None,
+                scopes: Vec::new(),
+                pending: false,
+                check: None,
             })
             .unwrap();
         assert_eq!(store.device_for_token("secret").unwrap().id, "d1");
@@ -1712,11 +1768,47 @@ mod tests {
                 paired_at: 1,
                 revoked: false,
                 chat: Some(peer.clone()),
+                scopes: Vec::new(),
+                pending: false,
+                check: None,
             })
             .unwrap();
         assert_eq!(store.device("d2").unwrap().chat, Some(peer));
         assert!(store.device_for_token("chat-secret").is_none());
         store.record_device_revoked("d2").unwrap();
         assert!(store.device("d2").is_none());
+    }
+
+    #[test]
+    fn a_device_keeps_its_latest_scopes_and_waits_until_confirmed() {
+        let store = store("device-scopes");
+        let phone = |id: &str, pending: bool| Device {
+            id: id.to_string(),
+            name: "iPhone".to_string(),
+            token_hash: token_hash(id),
+            paired_at: 1,
+            revoked: false,
+            chat: None,
+            scopes: Vec::new(),
+            pending,
+            check: pending.then(|| "123456".to_string()),
+        };
+        store.record_device(&phone("old", false)).unwrap();
+        store.record_device(&phone("new", true)).unwrap();
+        // A device from before scopes has none; one paired now waits.
+        assert!(store.device("old").unwrap().scopes.is_empty());
+        assert!(store.device_for_token("old").is_some());
+        assert!(store.device("new").unwrap().pending);
+        assert!(store.device_for_token("new").is_none(), "unconfirmed");
+        store.record_device_confirmed("new").unwrap();
+        assert!(store.device_for_token("new").is_some());
+        let grant = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        store
+            .record_device_scopes("new", &grant(&["terminal", "full_auto"]))
+            .unwrap();
+        store
+            .record_device_scopes("new", &grant(&["full_auto"]))
+            .unwrap();
+        assert_eq!(store.device("new").unwrap().scopes, grant(&["full_auto"]));
     }
 }
