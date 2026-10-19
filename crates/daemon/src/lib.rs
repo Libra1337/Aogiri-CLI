@@ -9,6 +9,7 @@ mod agents;
 mod connectors;
 mod dispatch;
 mod engines;
+mod feedback;
 mod files;
 mod gateway;
 mod http;
@@ -442,6 +443,13 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             let shells = lynshen_agent_core::shell::shells_json(op["refresh"] == true);
             respond(&hub, client, &request, Ok(shells));
         });
+        return;
+    }
+    // A bug report from the phone page, sent with this computer's sign-in
+    // (Aogiri ticket #45).
+    if name == "feedback_send" {
+        let hub = Arc::clone(hub);
+        thread::spawn(move || respond(&hub, client, &request, feedback::send(&op)));
         return;
     }
     // 今天用量 on the phone: the account's plan, from the gateway.
