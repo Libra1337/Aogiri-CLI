@@ -63,6 +63,8 @@ type notice struct {
 	CallID   string `json:"call_id"`
 	ActionID string `json:"action_id"`
 	Count    int    `json:"count"`
+	// The daemon's remote page for it (/remote?…), for the web fallback.
+	URL string `json:"url"`
 }
 
 // data is what the app reads from a tapped notification (Expo's `data`).
@@ -75,6 +77,9 @@ func (n *notice) data() map[string]any {
 	}
 	if n.Count > 1 {
 		data["count"] = n.Count
+	}
+	if n.URL != "" {
+		data["url"] = n.URL
 	}
 	return data
 }
@@ -125,7 +130,23 @@ func parseNotice(raw json.RawMessage) (*notice, error) {
 			return nil, errors.New("bad payload id")
 		}
 	}
+	if n.URL != "" && !remoteURL(n.URL) {
+		return nil, errors.New("bad payload url")
+	}
 	return &n, nil
+}
+
+// remoteURL is a path of the remote page with a plain query.
+func remoteURL(value string) bool {
+	if len(value) > 256 || !strings.HasPrefix(value, "/remote") {
+		return false
+	}
+	for _, c := range value {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("-_.:/?=&%", c)) {
+			return false
+		}
+	}
+	return true
 }
 
 // nativeTarget is a device token of one provider.

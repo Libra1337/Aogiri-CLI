@@ -1,4 +1,4 @@
-// Web Push for paired phones (docs/relay-protocol.md, "Web Push and Getui").
+// Web Push for paired phones (docs/relay-protocol.md, "Web Push and native push").
 // A daemon connected to this relay asks it to deliver one notification to a
 // browser subscription it holds; the relay signs the request for the push
 // service with its VAPID key (RFC 8292) and passes the message on. A daemon

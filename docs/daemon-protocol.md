@@ -978,12 +978,18 @@ that turn's reply.
 ## Notifications
 
 A paired device's browser registers its Web Push subscription with
-`{"op":"push_subscribe","subscription":{"endpoint":"…","keys":{"p256dh":"…","auth":"…"}}}`,
-the LynShen Android app its 个推 (Getui) client id with
-`{"op":"push_subscribe","subscription":{"provider":"getui","client_id":"…"}}`
-(only paired devices; dropped when the device is revoked) and removes it with
-`{"op":"push_unsubscribe","endpoint":"…"}` or `{"op":"push_unsubscribe","client_id":"…"}`.
-A client id registered again by another device moves to that device.
+`{"op":"push_subscribe","subscription":{"endpoint":"…","keys":{"p256dh":"…","auth":"…"}}}`;
+the Aogiri app its APNs device token (hex, 32-200 characters) with
+`{"op":"push_subscribe","subscription":{"provider":"apns","token":"…","environment":"production"|"sandbox"}}`
+(`environment` defaults to `production`: TestFlight and App Store builds;
+development builds get `sandbox` tokens) or its FCM registration token with
+`{"op":"push_subscribe","subscription":{"provider":"fcm","token":"…"}}`
+(`{"provider":"getui","client_id":"…"}` is kept for 个推, which the relay does
+not serve yet). Only paired devices; dropped when the device is revoked.
+`{"op":"push_unsubscribe","endpoint":"…"}`, `{"op":"push_unsubscribe","token":"…"}`
+or `{"op":"push_unsubscribe","client_id":"…"}` removes one. A token or
+client id registered again by another device moves to that device. An
+unknown `provider` or a malformed token is an `error`.
 
 The daemon notifies, through the relay (relay-protocol.md, Web Push):
 
@@ -1012,16 +1018,25 @@ device disconnects. `{"op":"push_rules"}` replies `push_rules` with `rules:
 `{"op":"push_rules_set","rules":{…}}` changes any of the first four and
 replies the same. `LYNSHEN_AT_COMPUTER=0|1` overrides the presence check.
 
-A notification carries `{title, body, tag, url, kind, level, session?}`
+A browser's notification carries `{title, body, tag, url, kind, level, session?}`
 (`kind`: `approval`, `error`, `done`, `update`, `test`), encrypted for the
-browser before it leaves the daemon. Its text names the session and what it
+browser before it leaves the daemon. APNs and FCM cannot be encrypted for
+the app (the phone's system shows the text), so the Aogiri app's
+notification carries the same title and generic text, except that an
+`update`'s text (a reply, a summary, an error message) becomes
+「打开 Aogiri 查看」, plus ids only: `{title, body, kind, level, tag, session?,
+host?, call_id?, action_id?, url?, count?}` (relay-protocol.md, "Native push").
+`call_id` (an `approval_request`, answered with `approve`) or `action_id`
+(an `action_deferred`, answered with `decide_action`) lets the app answer
+from the notification's 允许/拒绝 buttons; a question has neither. Its text names the session and what it
 waits for, never a command, a path or a reply: the phone reads those over
 the encrypted channel once opened. `url` is `/remote?host=<host id>&session=<id>`
 for a session, `/remote?requirement=R-1` for a requirement, else `/remote`.
 `{"op":"push_test"}` (paired devices only) sends a test notification to that
-device's browsers now (not counted) and replies `push_tested` with `results:
-[{service, status}]` (or `error`): the push service's host (`getui` for the
-Android app) and its answer, as the relay passed it on.
+device's browsers and apps now (not counted) and replies `push_tested` with
+`results: [{service, status}]` (or `error`): the push service's host for a
+browser, `apns`, `apns-sandbox` or `fcm` for the app, and its answer as the
+relay passed it on (`501`: the relay has no credentials for it).
 
 ## Session ops
 

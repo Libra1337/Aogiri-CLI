@@ -110,6 +110,7 @@ func approvalNotice() map[string]any {
 	return map[string]any{
 		"title": "等你处理", "body": "「修登录页」等你批准", "kind": "approval", "level": "urgent",
 		"tag": "s-1", "session": "s-1", "host": "h0st-1d", "call_id": "call_9",
+		"url": "/remote?host=h0st-1d&session=s-1",
 	}
 }
 
@@ -169,7 +170,7 @@ func TestAnApprovalGoesToAPNsWithItsCategoryAndIDsOnly(t *testing.T) {
 		payload.Aps["sound"] != "default" || payload.Aps["interruption-level"] != "time-sensitive" || payload.Aps["thread-id"] != "s-1" {
 		t.Fatalf("aps %v", payload.Aps)
 	}
-	want := map[string]any{"kind": "approval", "tag": "s-1", "session": "s-1", "host": "h0st-1d", "call_id": "call_9"}
+	want := map[string]any{"kind": "approval", "tag": "s-1", "session": "s-1", "host": "h0st-1d", "call_id": "call_9", "url": "/remote?host=h0st-1d&session=s-1"}
 	if len(payload.Body) != len(want) {
 		t.Fatalf("data %v", payload.Body)
 	}
@@ -254,6 +255,7 @@ func TestNativeRefusals(t *testing.T) {
 		{"long body", map[string]any{"subscription": good, "payload": map[string]any{"title": "x", "kind": "done", "body": strings.Repeat("长", maxNoticeBody+1)}}, 400},
 		{"bad kind", map[string]any{"subscription": good, "payload": map[string]any{"title": "x", "kind": "command"}}, 400},
 		{"bad id", map[string]any{"subscription": good, "payload": map[string]any{"title": "x", "kind": "done", "session": "s 1"}}, 400},
+		{"bad url", map[string]any{"subscription": good, "payload": map[string]any{"title": "x", "kind": "done", "url": "https://evil.example/"}}, 400},
 	}
 	for _, c := range cases {
 		if status, text := f.post(c.request, nil); status != c.want {
