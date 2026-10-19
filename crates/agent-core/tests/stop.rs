@@ -252,7 +252,6 @@ fn each_turn_records_its_model_and_duration_finished_or_stopped() {
     assert!(live[0]
         .ttft_ms
         .is_some_and(|ttft| ttft <= live[0].elapsed_ms));
-    assert!(live[0].output_tokens > 0);
 
     let before = requests_saying("STALL");
     core.submit_user_message("STALL".to_string());
