@@ -15,8 +15,10 @@ mod http;
 mod hub;
 pub mod install;
 pub mod noise;
+mod presence;
 mod projects;
 mod push;
+mod push_policy;
 mod relay;
 mod requirements;
 mod schedules;
@@ -30,6 +32,7 @@ mod terminal;
 mod titles;
 mod uploads;
 mod usage;
+mod webpush;
 
 pub use agents::Agents;
 pub use store::Store;
@@ -627,6 +630,17 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 .map(|()| json!({ "type": "push_subscribed" })),
             None => Err("only a paired device subscribes to notifications".to_string()),
         },
+        // The session a phone shows on screen now: nothing about it is
+        // pushed to that phone (`push::viewing`).
+        ("push_viewing", _) => match hub.device_of(client) {
+            Some(device) => {
+                push::viewing(hub, &device, op["session"].as_str());
+                Ok(json!({ "type": "push_viewing" }))
+            }
+            None => Ok(json!({ "type": "push_viewing" })),
+        },
+        ("push_rules", _) => Ok(push::rules_json(hub)),
+        ("push_rules_set", _) => push::set_rules(hub, &op["rules"]),
         ("push_unsubscribe", _) => hub
             .push
             .unsubscribe(

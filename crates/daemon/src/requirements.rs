@@ -152,6 +152,15 @@ impl Requirements {
         json!({ "type": "requirements", "requirements": list })
     }
 
+    /// `session` works on an open requirement, which tells the phones about
+    /// it itself (`observe`).
+    pub fn covers(&self, session: &str) -> bool {
+        lock(&self.data)
+            .list
+            .iter()
+            .any(|r| r["state"] == "open" && sessions(r).any(|s| s == session))
+    }
+
     pub fn get(&self, id: &str) -> Option<Value> {
         lock(&self.data)
             .list

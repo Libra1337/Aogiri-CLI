@@ -187,6 +187,12 @@ impl Relay {
         Ok(identity)
     }
 
+    /// This computer's host id at the relay, once it has an identity.
+    pub fn host_id(&self) -> Option<String> {
+        self.url.as_ref()?;
+        self.identity().ok().map(|identity| identity.host_id())
+    }
+
     /// Turns the relay on or off; persisted across restarts.
     pub fn set_enabled(&self, store: &Store, enabled: bool) -> Result<(), String> {
         if self.url.is_none() {
@@ -230,23 +236,50 @@ impl Relay {
 impl Relay {
     /// Asks the relay to deliver a Web Push or Getui notification (see
     /// `push`): signed with the host key, which the relay only accepts from
-    /// a host connected to it. Returns the relay's HTTP status (410: the
+    /// a host connected to it. A Web Push message is encrypted here for the
+    /// browser (RFC 8291), so the relay passes on ciphertext; Getui takes
+    /// the plaintext. Returns the relay's HTTP status (410: the
     /// subscription is gone).
-    pub fn push(&self, subscription: &Value, payload: &Value) -> Result<u16, String> {
+    pub fn push(
+        &self,
+        subscription: &Value,
+        payload: &Value,
+        delivery: &Delivery,
+    ) -> Result<u16, String> {
         let url = self.url.as_deref().ok_or("the relay is disabled")?;
         let identity = self.identity()?;
-        let subscription = if subscription["provider"] == "getui" {
-            json!({ "provider": "getui", "client_id": subscription["client_id"] })
-        } else {
-            json!({ "endpoint": subscription["endpoint"], "keys": subscription["keys"] })
-        };
-        let body = json!({
+        let mut nonce = [0u8; 12];
+        getrandom::getrandom(&mut nonce).map_err(|error| error.to_string())?;
+        let mut body = json!({
             "pub": URL_SAFE_NO_PAD.encode(identity.signing.verifying_key().as_bytes()),
             "ts": crate::store::now(),
-            "subscription": subscription,
-            "payload": payload,
-        })
-        .to_string();
+            "nonce": URL_SAFE_NO_PAD.encode(nonce),
+            "urgency": delivery.urgency,
+            "ttl": delivery.ttl,
+        });
+        if let Some(topic) = &delivery.topic {
+            body["topic"] = json!(topic);
+        }
+        if subscription["provider"] == "getui" {
+            body["subscription"] =
+                json!({ "provider": "getui", "client_id": subscription["client_id"] });
+            body["payload"] = payload.clone();
+        } else {
+            let key = |name: &str| {
+                subscription["keys"][name]
+                    .as_str()
+                    .and_then(|text| URL_SAFE_NO_PAD.decode(text.trim_end_matches('=')).ok())
+                    .ok_or_else(|| format!("the subscription has no {name} key"))
+            };
+            let message = crate::webpush::encrypt(
+                payload.to_string().as_bytes(),
+                &key("p256dh")?,
+                &key("auth")?,
+            )?;
+            body["subscription"] = json!({ "endpoint": subscription["endpoint"] });
+            body["encrypted"] = json!(URL_SAFE_NO_PAD.encode(message));
+        }
+        let body = body.to_string();
         let mut signed = PUSH_CONTEXT.to_vec();
         signed.extend_from_slice(body.as_bytes());
         let signature = identity.signing.sign(&signed);
@@ -264,6 +297,18 @@ impl Relay {
             Err(error) => Err(error.to_string()),
         }
     }
+}
+
+/// How the push service treats one notification (RFC 8030 5).
+#[derive(Debug, Clone)]
+pub struct Delivery {
+    /// `low`, `normal` or `high`.
+    pub urgency: &'static str,
+    /// Seconds the push service keeps it for a phone that is offline.
+    pub ttl: u64,
+    /// A newer notification with the same topic replaces one not yet
+    /// delivered.
+    pub topic: Option<String>,
 }
 
 /// What a push request's signature covers, before its body.

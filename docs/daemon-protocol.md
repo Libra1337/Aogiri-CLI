@@ -929,16 +929,45 @@ the LynShen Android app its 个推 (Getui) client id with
 `{"op":"push_subscribe","subscription":{"provider":"getui","client_id":"…"}}`
 (only paired devices; dropped when the device is revoked) and removes it with
 `{"op":"push_unsubscribe","endpoint":"…"}` or `{"op":"push_unsubscribe","client_id":"…"}`.
-A client id registered again by another device moves to that device. The daemon notifies when a
-dispatch's plan waits for the user, a task waits for an approval, a
-dispatch is done, an open requirement turns to `review`, `confirm` or
-`approval`, and an agent proposes to note or close a requirement,
-through the relay (relay-protocol.md, Web Push). `{"op":"push_test"}` (paired devices
-only) sends a test notification to that device's browsers now and replies
-`push_tested` with `results: [{service, status}]` (or `error`): the push
-service's host (`getui` for the Android app) and its answer, as the relay passed it on. A notification's `url` is
-the remote page, with `?requirement=R-1` for a requirement; one about a session
-also carries `session`, which the Android app opens.
+A client id registered again by another device moves to that device.
+
+The daemon notifies, through the relay (relay-protocol.md, Web Push):
+
+- a session waits for the user: an `approval_request` (a question too) or an
+  `action_deferred` (level `urgent`). While someone is at the computer (input
+  in the last 3 minutes) an `approval_request` waits 45 s for the desktop to
+  answer it, and is not sent when it was;
+- a turn ended on an error (`urgent`; an agent's becomes a report with the
+  same notice);
+- a turn ended while nobody was at the computer and no client watched the
+  session, with no request of it still waiting (`normal`);
+- a dispatch's plan waits, a task waits for an approval, a dispatch is done,
+  an open requirement turns to `review`, `confirm` or `approval`, an agent
+  proposes to note or close a requirement, an agent closes an item
+  (`normal`). Sessions of a dispatch or an open requirement get only these.
+
+Rules (`push_policy`, settings.json `push`): waiting for the user and errors
+always go; the rest count toward `daily_budget` (20) and are `silent` (no
+sound) from `quiet_start` to `quiet_end` (23:00–08:00, local time). Notices
+about one thing close together go as one ("…（另有 N 条）"): approvals and
+errors after 5 s, the rest after 20 s. Nothing is sent about a session to a
+device that shows it now: `{"op":"push_viewing","session":"s…"}` (or
+`null`) says which one, valid for 90 s unless said again, and until the
+device disconnects. `{"op":"push_rules"}` replies `push_rules` with `rules:
+{daily_budget, quiet_start, quiet_end, turn_done, sent_today}`;
+`{"op":"push_rules_set","rules":{…}}` changes any of the first four and
+replies the same. `LYNSHEN_AT_COMPUTER=0|1` overrides the presence check.
+
+A notification carries `{title, body, tag, url, kind, level, session?}`
+(`kind`: `approval`, `error`, `done`, `update`, `test`), encrypted for the
+browser before it leaves the daemon. Its text names the session and what it
+waits for, never a command, a path or a reply: the phone reads those over
+the encrypted channel once opened. `url` is `/remote?host=<host id>&session=<id>`
+for a session, `/remote?requirement=R-1` for a requirement, else `/remote`.
+`{"op":"push_test"}` (paired devices only) sends a test notification to that
+device's browsers now (not counted) and replies `push_tested` with `results:
+[{service, status}]` (or `error`): the push service's host (`getui` for the
+Android app) and its answer, as the relay passed it on.
 
 ## Session ops
 

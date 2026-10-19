@@ -4,12 +4,17 @@
 //! which signs the request for the push service (VAPID) or sends it through
 //! Getui, and passes the title and text on without keeping them.
 
+pub use crate::push_policy::{Kind, Level};
 use crate::{
     hub::{lock, Hub},
-    store::write_private,
+    push_policy::{Clock, Outgoing, Policy, Rules},
+    relay::Delivery,
+    store::{write_private, Store},
 };
+use base64::Engine;
 use serde_json::{json, Value};
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -17,16 +22,22 @@ use std::{
 };
 
 const FILE: &str = "push.json";
+/// The daemon setting with the rules (`push_policy::Rules`).
+const SETTING: &str = "push";
 
 pub struct Push {
     path: PathBuf,
     /// `{device, endpoint, keys: {p256dh, auth}}`, one per browser, or
     /// `{device, provider: "getui", client_id}`, one per Android app.
     subscriptions: Mutex<Vec<Value>>,
+    policy: Mutex<Policy>,
+    /// The session each connected device has on screen now and when it
+    /// said so (`push_viewing`): nothing about it is sent to that device.
+    viewing: Mutex<HashMap<String, (String, u64)>>,
 }
 
 impl Push {
-    pub fn load(dir: &Path) -> Self {
+    pub fn load(dir: &Path, store: &Store) -> Self {
         let path = dir.join(FILE);
         let subscriptions = fs::read_to_string(&path)
             .ok()
@@ -36,6 +47,8 @@ impl Push {
         Self {
             path,
             subscriptions: Mutex::new(subscriptions),
+            policy: Mutex::new(Policy::new(Rules::from_json(&store.setting(SETTING)))),
+            viewing: Mutex::new(HashMap::new()),
         }
     }
 
@@ -112,7 +125,7 @@ fn service(subscription: &Value) -> &str {
 
 /// `push_test`: a test notification to `device`'s browsers, sent now, with
 /// each push service's answer (passed on by the relay): the phone can tell
-/// whether a notification left, and through which service.
+/// whether a notification left, and through which service. Not counted.
 pub fn test(hub: &Arc<Hub>, device: &str) -> Value {
     let list: Vec<Value> = lock(&hub.push.subscriptions)
         .iter()
@@ -120,16 +133,23 @@ pub fn test(hub: &Arc<Hub>, device: &str) -> Value {
         .cloned()
         .collect();
     let payload = json!({
-        "title": "LynShen",
-        "body": "测试通知：这台设备能收到电脑发来的通知。",
+        "title": "Aogiri",
+        "body": "测试通知：这台手机能收到电脑发来的通知。",
         "tag": "push-test",
         "url": "/remote",
+        "kind": "test",
+        "level": "normal",
     });
+    let delivery = Delivery {
+        urgency: "normal",
+        ttl: 60,
+        topic: None,
+    };
     let results: Vec<Value> = list
         .iter()
         .map(|subscription| {
             let service = service(subscription);
-            match hub.relay.push(subscription, &payload) {
+            match hub.relay.push(subscription, &payload, &delivery) {
                 Ok(status) => json!({ "service": service, "status": status }),
                 Err(error) => json!({ "service": service, "error": error }),
             }
@@ -138,43 +158,310 @@ pub fn test(hub: &Arc<Hub>, device: &str) -> Value {
     json!({ "type": "push_tested", "results": results })
 }
 
-/// Notifies every subscribed phone, in the background. `tag` groups the
-/// notifications of one thing (a later one replaces it) and is the session
-/// the Android app opens; a phone whose subscription expired is forgotten.
-pub fn notify(hub: &Arc<Hub>, title: &str, body: &str, tag: &str) {
-    send(
+/// A notice for the paired phones, before the rules (`push_policy`).
+pub struct Notice<'a> {
+    pub kind: Kind,
+    pub level: Level,
+    /// Groups the notices of one thing: a later one replaces it on the phone.
+    pub tag: &'a str,
+    pub title: &'a str,
+    pub body: &'a str,
+    /// The remote page to open on a tap; None: the session's page (with
+    /// `session`), else the remote page.
+    pub url: Option<&'a str>,
+    /// The session it is about: not sent to a device that looks at it now.
+    pub session: Option<&'a str>,
+}
+
+/// Notifies the paired phones: the rules decide whether and how, and each
+/// phone's browsers get it in the background unless the phone looks at the
+/// session it is about.
+pub fn notify(hub: &Arc<Hub>, notice: Notice) {
+    let outgoing = outgoing(hub, notice);
+    let ready = {
+        let mut policy = lock(&hub.push.policy);
+        policy.offer(outgoing, &Clock::now())
+    };
+    for outgoing in ready {
+        deliver(hub, outgoing);
+    }
+}
+
+fn outgoing(hub: &Hub, notice: Notice) -> Outgoing {
+    // A session's page on this computer (a phone may pair several).
+    let url = match (notice.url, notice.session) {
+        (Some(url), _) => url.to_string(),
+        (None, Some(session)) => match hub.relay.host_id() {
+            Some(host) => format!("/remote?host={host}&session={session}"),
+            None => format!("/remote?session={session}"),
+        },
+        (None, None) => "/remote".to_string(),
+    };
+    Outgoing {
+        level: notice.level,
+        kind: notice.kind,
+        tag: notice.tag.to_string(),
+        title: clip(notice.title, 80),
+        body: clip(notice.body, 160),
+        url,
+        session: notice.session.map(str::to_string),
+        count: 1,
+    }
+}
+
+/// Sends what waited to merge and is due now (from the scheduler tick).
+pub fn tick(hub: &Arc<Hub>) {
+    let ready = {
+        let mut policy = lock(&hub.push.policy);
+        if !policy.has_waiting() {
+            return;
+        }
+        policy.due(&Clock::now())
+    };
+    for outgoing in ready {
+        deliver(hub, outgoing);
+    }
+}
+
+/// How long a phone's "I look at this session" lasts unless it says it
+/// again: a page the phone froze (locked, in the background) cannot say it
+/// stopped.
+pub const VIEWING_TTL_MS: u64 = 90_000;
+
+/// `push_viewing`: the session `device` shows on screen now, or none.
+pub fn viewing(hub: &Hub, device: &str, session: Option<&str>) {
+    let now = crate::store::now();
+    match session.filter(|s| !s.is_empty()) {
+        Some(session) => {
+            lock(&hub.push.viewing).insert(device.to_string(), (session.to_string(), now));
+            lock(&hub.push.policy).forget(session);
+        }
+        None => {
+            lock(&hub.push.viewing).remove(device);
+        }
+    }
+}
+
+/// A device's last connection ended: it looks at nothing.
+pub fn gone(hub: &Hub, device: &str) {
+    lock(&hub.push.viewing).remove(device);
+}
+
+/// The devices that look at `session` now.
+fn looking_at(hub: &Hub, session: &str) -> HashSet<String> {
+    let now = crate::store::now();
+    lock(&hub.push.viewing)
+        .iter()
+        .filter(|(_, (s, at))| s == session && now.saturating_sub(*at) < VIEWING_TTL_MS)
+        .map(|(device, _)| device.clone())
+        .collect()
+}
+
+/// Holds an approval notice for `ms` (someone is at the computer: the
+/// desktop may answer it first).
+pub fn hold(hub: &Arc<Hub>, notice: Notice, ms: u64) {
+    let outgoing = outgoing(hub, notice);
+    lock(&hub.push.policy).hold(outgoing, &Clock::now(), ms);
+}
+
+/// The approval waiting about `session` was answered: not sent.
+pub fn answered(hub: &Hub, session: &str) {
+    let mut policy = lock(&hub.push.policy);
+    if policy.has_waiting() {
+        policy.answered(session);
+    }
+}
+
+/// How long an approval waits for the desktop while someone is at the
+/// computer before the phones are told.
+pub const DESKTOP_FIRST_MS: u64 = 45_000;
+
+/// A session event: the phones hear about a request that waits, a turn
+/// that ended on an error, and a turn that ended while nobody was at the
+/// computer. Dispatch and requirement sessions tell their own story
+/// (`dispatch`, `requirements`); an agent's failed turn becomes a report.
+/// `failed`: the error that ended the turn just now; `ended`: a turn ended.
+pub fn observe(hub: &Arc<Hub>, session: &str, event: &Value, ended: bool, failed: Option<&str>) {
+    let kind = event["type"].as_str().unwrap_or_default();
+    let waiting = matches!(kind, "approval_request" | "action_deferred");
+    // A call that ran or was answered settles a held approval.
+    if matches!(kind, "tool_output" | "action_decided") {
+        answered(hub, session);
+        return;
+    }
+    if !(waiting || ended || failed.is_some()) {
+        return;
+    }
+    // Clients of a dispatch or requirement session get their own notices.
+    if hub.dispatch.covers(session) || hub.requirements.covers(session) {
+        return;
+    }
+    let Some(record) = hub.store.sessions().into_iter().find(|r| r.id == session) else {
+        return;
+    };
+    let name = crate::hub::shown_title(&record, None).unwrap_or_else(|| "一个会话".to_string());
+    let name = clip(&name, 40);
+    if waiting {
+        // An approval_request asks a person now; action_deferred was put on
+        // the desk because nobody watched. A question from Claude Code
+        // (questions) is asked the same way.
+        let question = event["questions"].as_array().is_some_and(|q| !q.is_empty());
+        let body = if question {
+            format!("「{name}」在等你回答")
+        } else {
+            format!("「{name}」等你批准")
+        };
+        let notice = Notice {
+            kind: Kind::Approval,
+            level: Level::Urgent,
+            tag: session,
+            title: "等你处理",
+            body: &body,
+            url: None,
+            session: Some(session),
+        };
+        if kind == "approval_request" && crate::presence::at_computer() {
+            hold(hub, notice, DESKTOP_FIRST_MS);
+        } else {
+            notify(hub, notice);
+        }
+        return;
+    }
+    if failed.is_some() {
+        // An agent's failed turn is a report with its own notice.
+        if record.agent.is_none() {
+            let body = format!("「{name}」这一轮出错了，没有做完");
+            notify(
+                hub,
+                Notice {
+                    kind: Kind::Error,
+                    level: Level::Urgent,
+                    tag: session,
+                    title: "会话出错",
+                    body: &body,
+                    url: None,
+                    session: Some(session),
+                },
+            );
+        }
+        return;
+    }
+    // A turn ended. Only worth a notice when nobody is at the computer to
+    // see it, and not for a session someone (the desktop, a phone) watches
+    // right now: whoever watches it sees it end.
+    let rules_on = lock(&hub.push.policy).rules.turn_done;
+    if !rules_on || crate::presence::at_computer() || hub.watched(session) {
+        return;
+    }
+    // A request of this turn still waits: its notice stands (a later one
+    // with the same tag would replace it on the phone).
+    if hub
+        .store
+        .open_actions()
+        .iter()
+        .any(|a| a.session_id == session)
+    {
+        return;
+    }
+    let body = format!("「{name}」这一轮做完了");
+    notify(
         hub,
-        json!({ "title": title, "body": clip(body, 300), "tag": tag, "url": "/remote", "session": tag }),
+        Notice {
+            kind: Kind::TurnDone,
+            level: Level::Normal,
+            tag: session,
+            title: "本轮完成",
+            body: &body,
+            url: None,
+            session: Some(session),
+        },
     );
 }
 
-/// `notify` whose notification opens `url` on the remote page.
-pub fn notify_at(hub: &Arc<Hub>, title: &str, body: &str, tag: &str, url: &str) {
-    send(
-        hub,
-        json!({ "title": title, "body": clip(body, 300), "tag": tag, "url": url }),
-    );
-}
-
-fn send(hub: &Arc<Hub>, payload: Value) {
+fn deliver(hub: &Arc<Hub>, outgoing: Outgoing) {
+    let looking = outgoing
+        .session
+        .as_deref()
+        .map(|session| looking_at(hub, session))
+        .unwrap_or_default();
+    let payload = outgoing.payload();
+    let delivery = Delivery {
+        urgency: outgoing.level.urgency(),
+        // An approval is stale after a while; the rest keep a day.
+        ttl: if outgoing.kind == Kind::Approval {
+            60 * 60
+        } else {
+            24 * 60 * 60
+        },
+        topic: topic(&outgoing.tag),
+    };
     let list = lock(&hub.push.subscriptions).clone();
     for subscription in list {
+        if subscription["device"]
+            .as_str()
+            .is_some_and(|d| looking.contains(d))
+        {
+            continue;
+        }
         let hub = Arc::clone(hub);
         let payload = payload.clone();
+        let delivery = delivery.clone();
         // 410: the relay says the push service dropped the subscription.
-        thread::spawn(move || match hub.relay.push(&subscription, &payload) {
-            Ok(410) => {
-                let _ = hub.push.unsubscribe(key(&subscription));
-            }
-            Ok(status) if status >= 300 => {
-                lynshen_agent_core::log_warn!("daemon", "push refused", status = status);
-            }
-            Ok(_) => {}
-            Err(error) => {
-                lynshen_agent_core::log_warn!("daemon", "push failed", error = error);
-            }
-        });
+        thread::spawn(
+            move || match hub.relay.push(&subscription, &payload, &delivery) {
+                Ok(410) => {
+                    let _ = hub.push.unsubscribe(key(&subscription));
+                }
+                Ok(status) if status >= 300 => {
+                    lynshen_agent_core::log_warn!("daemon", "push refused", status = status);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    lynshen_agent_core::log_warn!("daemon", "push failed", error = error);
+                }
+            },
+        );
     }
+}
+
+/// A push service topic for `tag` (RFC 8030 5.4: up to 32 base64url
+/// characters): one notice not yet delivered gives way to a newer one.
+fn topic(tag: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    if tag.is_empty() {
+        return None;
+    }
+    let digest = Sha256::digest(tag.as_bytes());
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..18]))
+}
+
+/// The rules as the phone shows them, with today's count.
+pub fn rules_json(hub: &Hub) -> Value {
+    let mut policy = lock(&hub.push.policy);
+    let mut rules = policy.rules.to_json();
+    rules["sent_today"] = json!(policy.sent_today(&Clock::now()));
+    json!({ "type": "push_rules", "rules": rules })
+}
+
+/// `push_rules_set`: changes the rules (kept in settings.json `push`).
+pub fn set_rules(hub: &Hub, value: &Value) -> Result<Value, String> {
+    let mut merged = lock(&hub.push.policy).rules.to_json();
+    if let (Some(into), Some(from)) = (merged.as_object_mut(), value.as_object()) {
+        for (k, v) in from {
+            if matches!(
+                k.as_str(),
+                "daily_budget" | "quiet_start" | "quiet_end" | "turn_done"
+            ) {
+                into.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    let rules = Rules::from_json(&merged);
+    hub.store
+        .set_setting(SETTING, rules.to_json())
+        .map_err(|error| error.to_string())?;
+    lock(&hub.push.policy).rules = rules;
+    Ok(rules_json(hub))
 }
 
 fn clip(text: &str, limit: usize) -> String {
@@ -194,7 +481,8 @@ mod tests {
     fn keeps_web_push_and_getui_subscriptions_per_device() {
         let dir = std::env::temp_dir().join(format!("lynshen-push-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let push = Push::load(&dir);
+        let store = Store::open(dir.join("state")).unwrap();
+        let push = Push::load(&dir, &store);
         let web = json!({ "endpoint": "https://web.push.apple.com/a", "keys": { "p256dh": "p", "auth": "a" } });
         let phone = json!({ "provider": "getui", "client_id": "abc123" });
         push.subscribe("d1", &web).unwrap();
@@ -207,7 +495,7 @@ mod tests {
         ] {
             assert!(push.subscribe("d1", &bad).is_err());
         }
-        let list = Push::load(&dir).subscriptions.into_inner().unwrap();
+        let list = Push::load(&dir, &store).subscriptions.into_inner().unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(
             list[1],

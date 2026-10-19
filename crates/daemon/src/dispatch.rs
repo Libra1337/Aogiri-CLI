@@ -85,6 +85,12 @@ impl Dispatches {
 
     /// The dispatch and task a session is running now, when it runs one
     /// (a session has at most one: see `plan` and `start_task`).
+    /// `session` is a dispatcher's or one of its live tasks': the dispatch
+    /// tells the phones about it itself.
+    pub fn covers(&self, session: &str) -> bool {
+        self.get(session).is_some() || self.task_of(session).is_some()
+    }
+
     fn task_of(&self, session: &str) -> Option<(String, u64)> {
         lock(&self.list).iter().find_map(|d| {
             d["tasks"].as_array()?.iter().find_map(|task| {

@@ -4,7 +4,7 @@ Lets a paired phone (the PWA at `https://app.lynshen.org`) reach a desktop's
 `lynshen daemon` from outside the LAN. Three parties:
 
 - **host**: the daemon. Keeps one outbound WebSocket to the relay.
-- **relay**: `lynshen-relay` (Go, LynShen-backend `cmd/lynshen-relay`). Forwards
+- **relay**: `lynshen-relay` (Go, this repo's `relay/`). Forwards
   opaque bytes between a client and its host. Holds no keys, sees no content,
   stores nothing on disk.
 - **client**: the PWA (or any device). Opens one WebSocket per session to the
@@ -120,27 +120,40 @@ nothing it passes on.
 - `GET /relay/v1/push/key` → `{"key":"<VAPID public key, base64url>"}`: the
   `applicationServerKey` a browser subscribes with.
 - `POST /relay/v1/push`, body
-  `{"pub":"<host Ed25519 public key>","ts":<ms>,"subscription":{"endpoint","keys":{"p256dh","auth"}},"payload":{…}}`,
+  `{"pub":"<host Ed25519 public key>","ts":<ms>,"nonce":"<random>","subscription":{"endpoint"},"encrypted":"<message>","urgency","ttl","topic"}`,
   header `X-LynShen-Signature`: base64url Ed25519 signature over
-  `"lynshen-relay-push-v1:" + body`. Accepted only from a host connected now,
-  within 5 minutes of `ts`, at most 60 per host per minute, for endpoints of
-  the browser push services, payload at most 3 KB. Replies `204` sent, `410`
-  the subscription is gone (forget it), `401`/`403`/`400`/`429`/`502`
-  otherwise.
+  `"lynshen-relay-push-v1:" + body`.
+  - `encrypted`: the notification already encrypted for the browser by the
+    daemon (RFC 8291 `aes128gcm`, one record, at most 4096 bytes), so the
+    relay passes on ciphertext it cannot read; the relay adds its VAPID
+    `Authorization` (RFC 8292, ES256, `aud` the push service's origin, valid
+    12 h) and posts it to `endpoint`.
+  - A daemon before 0.7.6 sends `"payload":{…}` (plaintext, at most 3 KB) and
+    `subscription.keys` instead; the relay encrypts it and forgets it.
+  - `urgency` (`low`, `normal`, `high`), `ttl` (seconds, default 86400, at
+    most 28 days) and `topic` (at most 32 base64url characters) become the
+    RFC 8030 headers. `nonce` only makes the signature unique.
+  - Accepted only from a host connected now, within 5 minutes of `ts`, a
+    signature not seen before, at most 60 per host per minute (and 120 per
+    IP), for endpoints of the browser push services (`fcm.googleapis.com`,
+    `android.googleapis.com`, `updates.push.services.mozilla.com`,
+    `*.push.apple.com`, `*.notify.windows.com`; https, no port). Replies
+    `204` sent, `410` the subscription is gone (forget it), `401` bad or
+    replayed signature or stale `ts`, `403` host not connected or not a push
+    service, `400` bad body, `413` too large for the push service, `429`,
+    `502` the push service failed.
 - The same request with `"subscription":{"provider":"getui","client_id":"<cid>"}`
-  goes to the Android app through Getui REST API v2 (its own channel while the
-  app runs, the phone vendor's channel otherwise). `payload` is
-  `{"title","body","session"?}` (title required); tapping the notification
-  opens the app with `type=relay`, `host=<host id>` and `session`. Same checks
-  and replies; `410` when Getui does not know the client id, `501` when Getui
-  (or, for a Web Push subscription, VAPID) is not configured.
+  and a plaintext `payload` `{"title","body","session"?}` goes to the Android
+  app through Getui REST API v2; tapping the notification opens the app with
+  `type=relay`, `host=<host id>` and `session`. `501` while Getui is not
+  configured (this relay does not implement Getui yet).
 
-The relay serves Web Push with `-vapid-file` (keys created on first start)
-and Getui with the environment variables `GETUI_APP_ID`, `GETUI_APP_KEY`,
-`GETUI_MASTER_SECRET` (and optionally `GETUI_VENDOR_OPTIONS`, a JSON object
-passed as `push_channel.android.ups.options`, e.g.
-`{"XM":{"/extra.channel_id":"…"},"OP":{"/channel_id":"…"}}`); with neither,
-these endpoints are not served.
+The relay serves Web Push with a VAPID key file: `-vapid-file <path>`, or
+the systemd credential `vapid` (`LoadCredential=vapid:/etc/lynshen-relay/vapid.json`,
+so the file can stay root-only). `lynshen-relay -gen-vapid <path>` writes a
+new one (0600, never replacing a file) and prints its public key. Without a
+key the push endpoints are not served (404). Browsers' subscriptions are bound
+to the key: a new key means every phone must turn notifications on again.
 
 ## 4. Noise session (client ⇄ daemon, inside one stream)
 

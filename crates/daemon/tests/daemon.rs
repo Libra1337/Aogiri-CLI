@@ -4345,3 +4345,184 @@ fn a_claude_conversation_receives_a_message_and_replies() {
     assert!(reply.contains("\nuse the new API\n"), "{reply}");
     assert_eq!(message_statuses(&frames, &claude), ["delivered", "replied"]);
 }
+
+/// The relay's push endpoint, in-process: every `POST /relay/v1/push` body
+/// and its signature header, answered 204.
+fn fake_push_relay() -> (String, std::sync::mpsc::Receiver<(Value, String)>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let (mut length, mut signature, mut line) = (0usize, String::new(), String::new());
+                reader.read_line(&mut line).unwrap();
+                let path = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    let header = line.trim_end();
+                    if header.is_empty() {
+                        break;
+                    }
+                    let (name, value) = header.split_once(':').unwrap_or_default();
+                    match name.to_ascii_lowercase().as_str() {
+                        "content-length" => length = value.trim().parse().unwrap(),
+                        "x-lynshen-signature" => signature = value.trim().to_string(),
+                        _ => {}
+                    }
+                }
+                let mut body = vec![0u8; length];
+                reader.read_exact(&mut body).unwrap();
+                let mut stream = stream;
+                let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+                if path == "/relay/v1/push" {
+                    let _ = tx.send((serde_json::from_slice(&body).unwrap(), signature));
+                }
+            });
+        }
+    });
+    (address, rx)
+}
+
+#[test]
+fn a_phone_is_told_when_a_session_waits_and_not_while_it_looks_at_it() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let _guard = setup();
+    // Nobody at the computer: the approval goes at once.
+    std::env::set_var("LYNSHEN_AT_COMPUTER", "0");
+    let (address, pushes) = fake_push_relay();
+    let root = temp_dir("push-state");
+    let daemon = start_daemon_with(
+        root.join("daemon"),
+        root.join("agents"),
+        // No relay listens for the host connection here; pushes are plain
+        // HTTP to the same address.
+        Some(format!("ws://{address}/relay/v1")),
+    );
+    // A paired device with a browser subscription (the phone's keys never
+    // reach the relay: the message is encrypted for them).
+    let mut desktop = Client::connect(&daemon);
+    desktop.send(json!({ "op": "pair_start", "id": 1 }));
+    let code = desktop.until(|frame| frame["id"] == 1).pop().unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, response) = http(&daemon, &pair_request(&code));
+    assert_eq!(status, 200, "{response}");
+    let token = serde_json::from_str::<Value>(response.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+        ["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut phone = Client::connect_with(&daemon, &token);
+    let p256dh =
+        "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4";
+    let reply = request(
+        &mut phone,
+        json!({ "op": "push_subscribe", "subscription": {
+            "endpoint": "https://web.push.apple.com/abc",
+            "keys": { "p256dh": p256dh, "auth": "BTBZMqHH6r4Tts7J_aSIgg" },
+        }}),
+    );
+    assert_eq!(reply["type"], "push_subscribed");
+    let rules = request(&mut phone, json!({ "op": "push_rules" }));
+    assert_eq!(
+        (
+            rules["rules"]["daily_budget"].clone(),
+            rules["rules"]["quiet_start"].clone(),
+            rules["rules"]["quiet_end"].clone()
+        ),
+        (json!(20), json!("23:00"), json!("08:00"))
+    );
+
+    // A session nobody watches asks for an approval: it is deferred, and
+    // the phone is told without what the command is.
+    let dir = temp_dir("push-session");
+    let session = desktop.create_session(&dir);
+    desktop.send(json!({ "op": "session_meta", "session": session, "title": "缓存分片" }));
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "RUN: printf secret-token > marker.txt" }));
+    desktop.until(ready(&session));
+    let (body, signature) = pushes
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a push");
+    let public: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(body["pub"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let signature: [u8; 64] = URL_SAFE_NO_PAD
+        .decode(signature)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let signed = [
+        b"lynshen-relay-push-v1:".as_slice(),
+        body.to_string().as_bytes(),
+    ]
+    .concat();
+    // The body as sent: re-serialised it must still verify (serde_json keeps order).
+    VerifyingKey::from_bytes(&public)
+        .unwrap()
+        .verify(&signed, &Signature::from_bytes(&signature))
+        .unwrap();
+    assert_eq!(
+        body["subscription"],
+        json!({ "endpoint": "https://web.push.apple.com/abc" })
+    );
+    assert_eq!(body["urgency"], "high");
+    assert!(
+        body.get("payload").is_none(),
+        "the relay gets no plaintext: {body}"
+    );
+    let encrypted = URL_SAFE_NO_PAD
+        .decode(body["encrypted"].as_str().unwrap())
+        .unwrap();
+    assert!(encrypted.len() > 86 + 16);
+    assert!(!String::from_utf8_lossy(&encrypted).contains("secret-token"));
+
+    // While the phone shows that session, nothing about it is pushed to it.
+    let reply = request(
+        &mut phone,
+        json!({ "op": "push_viewing", "session": session }),
+    );
+    assert_eq!(reply["type"], "push_viewing");
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "RUN: printf again > marker2.txt" }));
+    desktop.until(ready(&session));
+    // (Approvals close together merge and go up to 5 s later.)
+    assert!(
+        pushes.recv_timeout(Duration::from_secs(7)).is_err(),
+        "pushed to a phone that looks at it"
+    );
+    // Once it shows another page, it is told again.
+    request(&mut phone, json!({ "op": "push_viewing", "session": null }));
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "RUN: printf back > marker4.txt" }));
+    desktop.until(ready(&session));
+    let (body, _) = pushes
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a push after the phone left the session");
+    assert_eq!(body["urgency"], "high");
+
+    // A revoked device's subscription goes with it.
+    desktop.send(json!({ "op": "device_list", "id": 2 }));
+    let device = desktop.until(|frame| frame["id"] == 2).pop().unwrap()["devices"][0]["id"].clone();
+    desktop.send(json!({ "op": "device_revoke", "device": device, "id": 3 }));
+    desktop.until(|frame| frame["id"] == 3);
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "RUN: printf third > marker3.txt" }));
+    desktop.until(ready(&session));
+    assert!(
+        pushes.recv_timeout(Duration::from_secs(7)).is_err(),
+        "pushed to a revoked device"
+    );
+    std::env::remove_var("LYNSHEN_AT_COMPUTER");
+}

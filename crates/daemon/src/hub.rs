@@ -160,7 +160,7 @@ impl Hub {
             dispatch: crate::dispatch::Dispatches::load(store.dir()),
             requirements,
             uploads,
-            push: crate::push::Push::load(store.dir()),
+            push: crate::push::Push::load(store.dir(), &store),
             connectors: crate::connectors::Connectors::load(store.dir()),
             seen: Mutex::new(HashMap::new()),
             terminals: Default::default(),
@@ -313,7 +313,15 @@ impl Hub {
     /// Drops the client, its watches and its terminals; sessions it was the
     /// last watcher of become unattended.
     pub fn remove_client(&self, client: u64) {
-        lock(&self.clients).remove(&client);
+        let removed = lock(&self.clients).remove(&client);
+        if let Some(device) = removed.and_then(|client| client.device) {
+            let still = lock(&self.clients)
+                .values()
+                .any(|other| other.device.as_deref() == Some(device.as_str()));
+            if !still {
+                crate::push::gone(self, &device);
+            }
+        }
         self.terminals.close_client(client);
         let watched: Vec<String> = lock(&self.sessions)
             .iter()
@@ -818,6 +826,13 @@ impl Hub {
         }
     }
 
+    /// A client watches `session` now (it is attended).
+    pub fn watched(&self, session: &str) -> bool {
+        lock(&self.sessions)
+            .get(session)
+            .is_some_and(|hosted| !hosted.watchers.is_empty())
+    }
+
     /// A session is running a turn or has messages waiting.
     pub fn is_busy(&self, session: &str) -> bool {
         lock(&self.busy).contains(session)
@@ -859,18 +874,38 @@ impl Hub {
     }
 
     pub fn notify(&self, title: &str, body: &str, tag: &str) {
-        if let Some(hub) = self.me.upgrade() {
-            crate::push::notify(&hub, title, body, tag);
-        }
-        self.connectors.notify(title, body, tag);
+        self.notify_with(crate::push::Notice {
+            kind: crate::push::Kind::Update,
+            level: crate::push::Level::Normal,
+            tag,
+            title,
+            body,
+            url: None,
+            session: None,
+        });
     }
 
     /// `notify` whose notification opens `url` on the remote page.
     pub fn notify_at(&self, title: &str, body: &str, tag: &str, url: &str) {
+        self.notify_with(crate::push::Notice {
+            kind: crate::push::Kind::Update,
+            level: crate::push::Level::Normal,
+            tag,
+            title,
+            body,
+            url: Some(url),
+            session: None,
+        });
+    }
+
+    /// A notice with its kind and level (see `push_policy`); the chat bots
+    /// that want notices get it too.
+    pub fn notify_with(&self, notice: crate::push::Notice) {
+        self.connectors
+            .notify(notice.title, notice.body, notice.tag);
         if let Some(hub) = self.me.upgrade() {
-            crate::push::notify_at(&hub, title, body, tag, url);
+            crate::push::notify(&hub, notice);
         }
-        self.connectors.notify(title, body, tag);
     }
 
     /// A session's conversation as the title model sees it for a note: its
@@ -1028,6 +1063,7 @@ impl Hub {
         self.fire_due_schedules();
         self.expire_questions();
         self.deliver_pending();
+        crate::push::tick(self);
         // The daemon runs for days: a tokenizer no session used for a while
         // is loaded again by the next count.
         lynshen_agent_core::release_idle_tokenizers(TOKENIZER_IDLE);
@@ -1472,6 +1508,9 @@ impl Hub {
         if due {
             self.retitle(session);
         }
+        if let Some(hub) = self.me.upgrade() {
+            crate::push::observe(&hub, session, event, ended, failed.as_deref());
+        }
         if let Some(error) = failed {
             self.report_failed_turn(session, &error);
         }
@@ -1510,7 +1549,15 @@ impl Hub {
             read: false,
         };
         match self.post_report(&report) {
-            Ok(()) => self.notify(&report.title, error, session),
+            Ok(()) => self.notify_with(crate::push::Notice {
+                kind: crate::push::Kind::Error,
+                level: crate::push::Level::Urgent,
+                tag: session,
+                title: &report.title,
+                body: "这一轮出错了，没有做完",
+                url: None,
+                session: Some(session),
+            }),
             Err(error) => {
                 lynshen_agent_core::log_warn!("daemon", "failure report not saved", error = error)
             }

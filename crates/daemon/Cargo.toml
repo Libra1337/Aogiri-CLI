@@ -12,6 +12,9 @@ ed25519-dalek = "2"
 getrandom = "0.2"
 lynshen-agent-core = { path = "../agent-core" }
 portable-pty = "0.9"
+# Web Push encryption (RFC 8291): P-256 ECDH, HKDF, AES-128-GCM. Already in
+# the build through rustls.
+ring = "0.17"
 # Pins rustls's crypto provider to ring (already used by ureq) so `wss://`
 # relay connections never need aws-lc.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -21,3 +24,8 @@ sha2 = "0.10"
 snow = { version = "0.10", default-features = false, features = ["std", "use-chacha20poly1305", "use-curve25519", "use-getrandom", "use-sha2"] }
 tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 ureq = "2"
+
+# The computer's idle time, for "not at the computer" notifications.
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_System_SystemInformation"]
