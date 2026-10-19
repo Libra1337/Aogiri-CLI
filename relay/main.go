@@ -13,9 +13,12 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -323,17 +326,74 @@ func (rl *relay) serveConnect(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func main() {
-	listen := flag.String("listen", "127.0.0.1:18095", "address to listen on")
-	flag.Parse()
-	rl := &relay{hosts: map[string]*host{}, rate: &limiter{events: map[string][]time.Time{}}}
+func newRelay() *relay {
+	return &relay{hosts: map[string]*host{}, rate: &limiter{events: map[string][]time.Time{}}}
+}
+
+// routes are the relay's endpoints; push ones only with a VAPID key.
+func routes(rl *relay, push *pusher) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/relay/v1/host", rl.serveHost)
 	mux.HandleFunc("/relay/v1/connect", rl.serveConnect)
 	mux.HandleFunc("/relay/v1/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("ok"))
 	})
-	server := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	if push != nil {
+		mux.HandleFunc("/relay/v1/push/key", push.serveKey)
+		mux.HandleFunc("/relay/v1/push", push.servePush)
+	}
+	return mux
+}
+
+// vapidPath is -vapid-file, else the `vapid` credential systemd passes in
+// (LoadCredential=vapid:…), else none: push is then not served.
+func vapidPath(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	if dir := os.Getenv("CREDENTIALS_DIRECTORY"); dir != "" {
+		path := filepath.Join(dir, "vapid")
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return ""
+}
+
+func main() {
+	listen := flag.String("listen", "127.0.0.1:18095", "address to listen on")
+	vapidFlag := flag.String("vapid-file", "", "VAPID key file (default: the systemd credential `vapid`); Web Push is served only with one")
+	subject := flag.String("vapid-subject", "https://app.lynshen.org", "contact the push services see in the VAPID token (mailto: or https:)")
+	generate := flag.String("gen-vapid", "", "write a new VAPID key file at this path (0600, never replaced) and exit")
+	testPush := flag.String("test-push-origin", "", "for local tests only: also post to this push service origin (https://host:port), trusting its certificate")
+	flag.Parse()
+	if *generate != "" {
+		if err := generateVAPID(*generate); err != nil {
+			log.Fatal(err)
+		}
+		v, err := loadVAPID(*generate, *subject)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(b64.EncodeToString(v.public))
+		return
+	}
+	rl := newRelay()
+	var push *pusher
+	if path := vapidPath(*vapidFlag); path != "" {
+		v, err := loadVAPID(path, *subject)
+		if err != nil {
+			log.Fatal(err)
+		}
+		push = newPusher(rl, v)
+		if *testPush != "" {
+			allowTestOrigin(push, *testPush)
+		}
+		log.Printf("web push on, VAPID key %s", b64.EncodeToString(v.public))
+	} else {
+		log.Printf("web push off: no VAPID key")
+	}
+	server := &http.Server{Addr: *listen, Handler: routes(rl, push), ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("lynshen-relay listening on %s", *listen)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)

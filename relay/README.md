@@ -10,8 +10,17 @@ go build -o lynshen-relay .
 ```
 
 Put it behind TLS at `https://app.lynshen.org/relay/v1/*` (the daemon default).
-Implemented: host auth, client streams, limits of §3.3, `healthz`. Not
-implemented: Web Push and Getui (§3.3, the endpoints are not served).
+Implemented: host auth, client streams, limits of §3.3, `healthz`, and Web
+Push (`/relay/v1/push/key`, `/relay/v1/push`) when it has a VAPID key:
+
+```sh
+sudo install -d -m 0700 /etc/lynshen-relay
+sudo ./lynshen-relay -gen-vapid /etc/lynshen-relay/vapid.json   # prints the public key
+# systemd unit: LoadCredential=vapid:/etc/lynshen-relay/vapid.json
+```
+
+Not implemented: Getui (the endpoint answers 501). Tests: `go test ./...`
+(the RFC 8291 example, VAPID tokens, every refusal, host and client streams).
 
 Interop check against a real daemon:
 `cargo run -p lynshen-daemon --example relay_phone -- ws://127.0.0.1:18095/relay/v1 '<pair link>'`

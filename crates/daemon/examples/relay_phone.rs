@@ -2,7 +2,11 @@
 //! `<relay>/connect?host=<id>`, pairs with a `#pair=` link, completes the
 //! Noise handshake and prints the daemon's first frame (docs/relay-protocol.md).
 //!
-//! cargo run -p lynshen-daemon --example relay_phone -- <ws-relay-base> <pair-link>
+//! cargo run -p lynshen-daemon --example relay_phone -- <ws-relay-base> <pair-link> [<subscription json>]
+//!
+//! With a Web Push subscription (a browser's `PushSubscription.toJSON()`),
+//! the phone then subscribes with it, asks for a test notification and
+//! prints the `push_tested` reply: the push path through the relay.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use lynshen_daemon::noise;
 use serde_json::json;
@@ -49,6 +53,36 @@ fn main() {
                 text.chars().take(160).collect::<String>()
             );
             break;
+        }
+    }
+    let Some(subscription) = args.get(3) else {
+        return;
+    };
+    let subscription: serde_json::Value =
+        serde_json::from_str(subscription).expect("subscription json");
+    for (id, op) in [
+        (
+            1,
+            json!({ "op": "push_subscribe", "subscription": subscription, "id": 1 }),
+        ),
+        (2, json!({ "op": "push_test", "id": 2 })),
+    ] {
+        for chunk in transport.seal(op.to_string().as_bytes()).unwrap() {
+            socket.send(Message::binary(chunk)).unwrap();
+        }
+        loop {
+            let message = match socket.read().expect("reply") {
+                Message::Binary(bytes) => bytes,
+                _ => continue,
+            };
+            let Some(frame) = transport.open(&message).expect("decrypt") else {
+                continue;
+            };
+            let frame: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            if frame["id"] == id {
+                println!("reply {id}: {frame}");
+                break;
+            }
         }
     }
 }
