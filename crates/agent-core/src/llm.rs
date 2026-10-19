@@ -20,7 +20,7 @@ use llm_provider_kit::omp::{self, OmpCatalog};
 use llm_provider_kit::transport::{
     self, Client as TransportClient, ClientConfig as TransportConfig, StreamEvent as TransportEvent,
 };
-use llm_provider_kit::{anthropic, chat, responses, Protocol, WireEvent};
+use llm_provider_kit::{anthropic, chat, responses, NoAnswer, Protocol, WireEvent};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -81,6 +81,9 @@ impl Connection {
 
 const MAX_SUBAGENT_OUTPUT_BYTES: usize = 16 * 1024;
 const MAX_EMPTY_RESPONSE_CONTINUATIONS: usize = 2;
+/// The turn's error when the reply is still empty after the
+/// empty-response reminders.
+pub const NO_ANSWER_ERROR: &str = "模型没有给出回答。";
 /// Read cap for the `auto` mode safety-classifier call so a slow or stuck
 /// classification falls back to the interactive prompt quickly.
 const SAFETY_REVIEW_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1010,7 +1013,13 @@ impl OpenAiClient {
             }
             emit(StreamEvent::CallStart)?;
             let quiet = std::mem::take(&mut answering_reminder);
-            let Some(output_items) = self.stream_turn_request(input, quiet, &mut emit)? else {
+            // A reply with only thinking that stopped on the output limit or
+            // a refusal ends the turn with its error at once: a reminder
+            // would spend the same thinking for the same outcome.
+            let Some(output_items) = self
+                .stream_turn_request(input, quiet, &mut emit)
+                .map_err(user_facing_error)?
+            else {
                 // The next request carries the steered message.
                 emit(StreamEvent::ResponseInterrupted)?;
                 continue;
@@ -1030,12 +1039,18 @@ impl OpenAiClient {
                 if end_reminded {
                     return Ok(());
                 }
-                if should_continue_after_empty_response(&output_items)
-                    && empty_response_continuations < MAX_EMPTY_RESPONSE_CONTINUATIONS
-                {
-                    empty_response_continuations += 1;
-                    inject_input_item(input, runtime_reminder_item(), &mut emit)?;
-                    continue;
+                if should_continue_after_empty_response(&output_items) {
+                    if empty_response_continuations < MAX_EMPTY_RESPONSE_CONTINUATIONS {
+                        empty_response_continuations += 1;
+                        inject_input_item(input, runtime_reminder_item(), &mut emit)?;
+                        continue;
+                    }
+                    // Still empty after the reminders, and nothing of this
+                    // turn answered the user: say so instead of ending
+                    // silently.
+                    if !has_visible_answer(&input[turn_start..]) {
+                        return Err(NO_ANSWER_ERROR.to_string());
+                    }
                 }
                 if let Some(note) = self.plan_kept_current().and_then(|plan| {
                     crate::plan_reminder::end_reminder(&input[turn_start..], &plan)
@@ -4618,6 +4633,33 @@ fn should_continue_after_empty_response(output_items: &[Value]) -> bool {
     })
 }
 
+/// Whether these items hold output the user saw: assistant text or a tool
+/// call. Thinking alone is not.
+fn has_visible_answer(items: &[Value]) -> bool {
+    items.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call")
+            || (item.get("role").and_then(Value::as_str) == Some("assistant")
+                && !extract_response_text(item).trim().is_empty())
+    })
+}
+
+/// The user-facing error for the kit's [`NoAnswer`] error: a reply with only
+/// thinking that stopped on the output limit, the context window or a
+/// refusal. Other errors pass through. The kit's details stay at the end for
+/// diagnosis; `model_context_window_exceeded` there lets the core compact
+/// and retry (`is_context_overflow`).
+fn user_facing_error(error: String) -> String {
+    let Some((kind, details)) = NoAnswer::from_error(&error) else {
+        return error;
+    };
+    let message = match kind {
+        NoAnswer::OutputLimit => "模型只输出了思考，没有给出回答：输出上限用完了。可以调高这个模型的输出上限，或降低思考强度后重试。",
+        NoAnswer::ContextWindow => "模型只输出了思考，没有给出回答：上下文窗口用完了。",
+        NoAnswer::Refusal => "模型拒绝回答了这个请求。",
+    };
+    format!("{message} {details}")
+}
+
 fn runtime_reminder_item() -> Value {
     json!({
         "role": "user",
@@ -4874,6 +4916,30 @@ mod tests {
             "name": "ls",
             "arguments": "{}"
         })]));
+    }
+
+    #[test]
+    fn no_answer_errors_become_user_facing_chinese() {
+        let error = user_facing_error(NoAnswer::OutputLimit.error("max_tokens", Some(8192)));
+        assert!(error.starts_with("模型只输出了思考，没有给出回答：输出上限用完了。"));
+        assert!(error.ends_with("(stop reason max_tokens, 8192 output tokens)"));
+        let error = user_facing_error(NoAnswer::Refusal.error("refusal", None));
+        assert_eq!(error, "模型拒绝回答了这个请求。 (stop reason refusal)");
+        let error =
+            user_facing_error(NoAnswer::ContextWindow.error("model_context_window_exceeded", None));
+        assert!(error.contains("model_context_window_exceeded"));
+        assert_eq!(user_facing_error("HTTP 500".into()), "HTTP 500");
+    }
+
+    #[test]
+    fn thinking_alone_is_no_visible_answer() {
+        let thinking = json!({ "type": "reasoning", "summary": [] });
+        let text = json!({ "type": "message", "role": "assistant",
+            "content": [{ "type": "output_text", "text": "hi" }] });
+        let call = json!({ "type": "function_call", "call_id": "c", "name": "ls" });
+        assert!(!has_visible_answer(std::slice::from_ref(&thinking)));
+        assert!(has_visible_answer(&[thinking.clone(), text]));
+        assert!(has_visible_answer(&[thinking, call]));
     }
 
     #[test]
