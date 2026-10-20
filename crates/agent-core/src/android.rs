@@ -245,7 +245,9 @@ fn call(au: &Path, tool: &str, command: &str) -> Result<Value, CallError> {
     result.map_err(|error| {
         *slot = None;
         CallError {
-            message: format!("android-use stopped answering: {error}. Read the screen before acting again."),
+            message: format!(
+                "android-use stopped answering: {error}. Read the screen before acting again."
+            ),
             hint: None,
         }
     })
@@ -274,7 +276,10 @@ fn start(au: &Path) -> Result<Server, CallError> {
         let busy = error.contains("connection closed") || error.contains("another au serve");
         CallError {
             message: format!("android-use did not start: {error}"),
-            hint: busy.then(|| "另一个程序（另一个 LynShen 或 au serve）正在控制这台手机。关掉它后再试。".to_string()),
+            hint: busy.then(|| {
+                "另一个程序（另一个 LynShen 或 au serve）正在控制这台手机。关掉它后再试。"
+                    .to_string()
+            }),
         }
     })?;
     Ok(Server {
@@ -576,8 +581,7 @@ pub fn status(enabled: bool, doctor: bool) -> Value {
 /// `au setup`: enrolls the one connected phone and installs the helper app
 /// on it, which then opens Accessibility for the user to switch it on.
 pub fn setup() -> Result<Value, String> {
-    let au = installed_binary()
-        .ok_or_else(|| format!("android-use {VERSION} is not installed"))?;
+    let au = installed_binary().ok_or_else(|| format!("android-use {VERSION} is not installed"))?;
     // The server holds the state lock; setup needs it.
     stop_server();
     let report = run_au_json(&au, &["setup", "--json", "--no-agents"], SETUP_TIMEOUT)
@@ -845,7 +849,11 @@ fn describe_step(step: &[String], app: Option<&str>) -> (String, Option<String>)
         ("take", facing) => (
             format!(
                 "用{}摄像头拍照",
-                if facing == "front" { "前置" } else { "后置" }
+                if facing == "front" {
+                    "前置"
+                } else {
+                    "后置"
+                }
             ),
             None,
         ),
@@ -876,7 +884,10 @@ pub fn always_asks(name: &str, arguments: &str) -> bool {
         .and_then(|args| args["command"].as_str().map(str::to_string))
         .unwrap_or_default();
     split_steps(&command).iter().any(|step| {
-        let first = step.first().map(|w| w.to_ascii_lowercase()).unwrap_or_default();
+        let first = step
+            .first()
+            .map(|w| w.to_ascii_lowercase())
+            .unwrap_or_default();
         matches!(first.as_str(), "take" | "record")
     })
 }
@@ -1023,7 +1034,10 @@ mod tests {
                 assert!(asset.contains(VERSION) && asset.contains(os) && asset.contains(arch));
                 assert_eq!(sha.len(), 64);
                 assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
-                assert_eq!(archive_kind(asset), if os == "windows" { "zip" } else { "tar.gz" });
+                assert_eq!(
+                    archive_kind(asset),
+                    if os == "windows" { "zip" } else { "tar.gz" }
+                );
             }
         }
         assert!(asset_for("freebsd", "x86_64").is_none());
@@ -1060,7 +1074,11 @@ mod tests {
             builder.append_data(&mut header, name, body).unwrap();
         };
         if with_binary {
-            add(binary_name(), b"#!/bin/sh\necho '{\"version\":\"1.2.0\"}'\n", 0o644);
+            add(
+                binary_name(),
+                b"#!/bin/sh\necho '{\"version\":\"1.2.0\"}'\n",
+                0o644,
+            );
         }
         add("LICENSE", b"MIT License", 0o644);
         builder.into_inner().unwrap().finish().unwrap()
@@ -1082,7 +1100,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&au).unwrap().permissions().mode() & 0o777, 0o755);
+            assert_eq!(
+                fs::metadata(&au).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
         }
         // No staging folder is left beside it.
         let left = fs::read_dir(&root).unwrap().count();
@@ -1121,7 +1142,10 @@ mod tests {
         let act = |command: &str, app: Option<&str>| describe(ACT_TOOL, command, app);
         assert_eq!(act(r#"tap "发送""#, Some("微信")), "在 微信 里点「发送」");
         assert_eq!(
-            act(r#"open app "微信" then type "晚上好" in "输入框" then tap "发送""#, None),
+            act(
+                r#"open app "微信" then type "晚上好" in "输入框" then tap "发送""#,
+                None
+            ),
             "打开「微信」，然后在 微信 里在「输入框」里输入「晚上好」，然后在 微信 里点「发送」"
         );
         assert_eq!(
@@ -1130,28 +1154,43 @@ mod tests {
         );
         assert_eq!(act("tap e7", None), "在手机上点屏幕上标号 e7 的控件");
         assert_eq!(
-            act(r#"press home then open app "Chrome" then page open "https://example.com""#, None),
+            act(
+                r#"press home then open app "Chrome" then page open "https://example.com""#,
+                None
+            ),
             "回到主屏幕，然后打开「Chrome」，然后在 Chrome 里打开 https://example.com"
         );
         assert_eq!(
             act(r#"scroll down until "Wi-Fi""#, Some("设置")),
             "在 设置 里向下滚动，直到出现「Wi-Fi」"
         );
-        assert_eq!(act(r#"toggle "Airplane mode""#, Some("设置")), "在 设置 里切换「Airplane mode」开关");
+        assert_eq!(
+            act(r#"toggle "Airplane mode""#, Some("设置")),
+            "在 设置 里切换「Airplane mode」开关"
+        );
         // A `then` inside quotes is text, not a step.
-        assert_eq!(act(r#"tap "then what""#, Some("QQ")), "在 QQ 里点「then what」");
+        assert_eq!(
+            act(r#"tap "then what""#, Some("QQ")),
+            "在 QQ 里点「then what」"
+        );
         assert_eq!(
             describe(READ_TOOL, "screen", Some("设置")),
             "读取手机上 设置 的屏幕内容"
         );
-        assert_eq!(describe(READ_TOOL, "page", None), "读取 Chrome 里当前网页的内容");
+        assert_eq!(
+            describe(READ_TOOL, "page", None),
+            "读取 Chrome 里当前网页的内容"
+        );
     }
 
     #[test]
     fn camera_microphone_and_recording_always_ask() {
         let args = |command: &str| json!({ "command": command }).to_string();
         assert!(always_asks(ACT_TOOL, &args("take rear camera photo")));
-        assert!(always_asks(ACT_TOOL, &args(r#"open app "Camera" then record screen for 5 seconds"#)));
+        assert!(always_asks(
+            ACT_TOOL,
+            &args(r#"open app "Camera" then record screen for 5 seconds"#)
+        ));
         assert!(!always_asks(ACT_TOOL, &args(r#"tap "Record""#)));
         assert!(!always_asks(READ_TOOL, &args("take rear camera photo")));
     }
@@ -1159,9 +1198,16 @@ mod tests {
     #[test]
     fn the_foreground_app_comes_from_the_resumed_activity() {
         let dumpsys = "  Stack #1:\n    mResumedActivity: ActivityRecord{1a2b u0 com.tencent.mm/.ui.LauncherUI t12}\n";
-        assert_eq!(parse_resumed_package(dumpsys).as_deref(), Some("com.tencent.mm"));
-        let newer = "  topResumedActivity=ActivityRecord{9f u0 com.android.settings/.Settings t7}\n";
-        assert_eq!(parse_resumed_package(newer).as_deref(), Some("com.android.settings"));
+        assert_eq!(
+            parse_resumed_package(dumpsys).as_deref(),
+            Some("com.tencent.mm")
+        );
+        let newer =
+            "  topResumedActivity=ActivityRecord{9f u0 com.android.settings/.Settings t7}\n";
+        assert_eq!(
+            parse_resumed_package(newer).as_deref(),
+            Some("com.android.settings")
+        );
         assert_eq!(parse_resumed_package("nothing here"), None);
         assert_eq!(app_label("com.tencent.mm"), "微信");
         assert_eq!(app_label("com.example.notes"), "com.example.notes");
@@ -1213,22 +1259,30 @@ mod tests {
             "isError": true,
             "structuredContent": { "status": "permission" }
         }));
-        assert!(permission["hint_for_user"].as_str().unwrap().contains("无障碍"));
+        assert!(permission["hint_for_user"]
+            .as_str()
+            .unwrap()
+            .contains("无障碍"));
     }
 
     #[test]
     fn the_tools_are_offered_with_one_command_string() {
         let definitions = definitions();
-        let names: Vec<_> = definitions.iter().map(|d| d["name"].as_str().unwrap()).collect();
+        let names: Vec<_> = definitions
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
         assert_eq!(names, [READ_TOOL, ACT_TOOL]);
         for definition in &definitions {
             assert_eq!(definition["parameters"]["required"], json!(["command"]));
         }
         assert!(is_tool(ACT_TOOL) && is_tool(READ_TOOL) && !is_tool("bash"));
-        assert!(run(ACT_TOOL, &json!({}), Path::new("/nonexistent/au"))["error"]
-            .as_str()
-            .unwrap()
-            .contains("missing command"));
+        assert!(
+            run(ACT_TOOL, &json!({}), Path::new("/nonexistent/au"))["error"]
+                .as_str()
+                .unwrap()
+                .contains("missing command")
+        );
         assert!(availability(false).unwrap_err().contains("off"));
     }
 }

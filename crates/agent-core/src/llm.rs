@@ -7335,6 +7335,81 @@ mod tests {
     }
 
     #[test]
+    fn phone_tools_are_offered_only_when_turned_on_and_installed() {
+        let client = test_client();
+        let names = definition_names(&client);
+        assert!(!names.contains(&crate::android::ACT_TOOL.to_string()));
+        assert!(!names.contains(&crate::android::READ_TOOL.to_string()));
+        client
+            .tool_state
+            .set_android(Ok(PathBuf::from("/opt/android-use/au")));
+        let names = definition_names(&client);
+        assert!(names.contains(&crate::android::ACT_TOOL.to_string()));
+        assert!(names.contains(&crate::android::READ_TOOL.to_string()));
+        client
+            .tool_state
+            .set_android(crate::android::availability(false));
+        assert!(client
+            .disabled_tool_error(crate::android::ACT_TOOL)
+            .unwrap()
+            .contains("off"));
+    }
+
+    #[test]
+    fn phone_actions_ask_like_commands_and_only_once() {
+        use crate::android::{ACT_TOOL, READ_TOOL};
+        let (tx, _rx) = mpsc::channel();
+        let cases = [
+            (ApprovalMode::Manual, ACT_TOOL, true),
+            (ApprovalMode::AutoEdit, ACT_TOOL, true),
+            (ApprovalMode::Auto, ACT_TOOL, true),
+            (ApprovalMode::FullAccess, ACT_TOOL, false),
+            (ApprovalMode::Manual, READ_TOOL, true),
+            (ApprovalMode::AutoEdit, READ_TOOL, false),
+            (ApprovalMode::Auto, READ_TOOL, false),
+            (ApprovalMode::FullAccess, READ_TOOL, false),
+        ];
+        for (mode, tool, expected) in cases {
+            let client = approval_test_client(mode, Some(tx.clone()));
+            assert_eq!(
+                client.needs_approval(tool),
+                expected,
+                "{tool} under {}",
+                mode.as_str()
+            );
+        }
+        // The auto classifier never sees a phone action.
+        assert!(!is_shell_tool(ACT_TOOL));
+        let client = approval_test_client(ApprovalMode::Manual, Some(tx));
+        let cwd = std::env::temp_dir();
+        let info = |command: &str| {
+            let request = ToolCallRequest {
+                call_id: "c".to_string(),
+                name: ACT_TOOL.to_string(),
+                arguments: json!({ "command": command }).to_string(),
+            };
+            let (gate, check) = client.gate(&request, &cwd);
+            client.approval_info(&request, &cwd, gate, check.as_ref())
+        };
+        let tap = info(r#"open app "Settings" then tap "Wi-Fi""#);
+        assert_eq!(tap.kind, ApprovalKind::Tool);
+        assert_eq!(tap.scopes, vec![ApprovalScope::Once]);
+        assert!(!tap.must_ask);
+        let photo = info("take rear camera photo");
+        assert!(photo.must_ask);
+        assert_eq!(
+            approval_summary(
+                ACT_TOOL,
+                &json!({ "command": r#"open app "微信" then tap "发送""# }).to_string()
+            ),
+            "打开「微信」，然后在 微信 里点「发送」"
+        );
+        // Plan mode lets the phone be read, not changed.
+        assert!(crate::plan_mode::refusal(READ_TOOL, "{}", None).is_none());
+        assert!(crate::plan_mode::refusal(ACT_TOOL, "{}", None).is_some());
+    }
+
+    #[test]
     fn mcp_tools_gate_by_read_only_hint() {
         let (tx, _rx) = mpsc::channel();
         let tools = json!([

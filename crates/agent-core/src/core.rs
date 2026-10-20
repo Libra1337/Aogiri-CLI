@@ -5818,7 +5818,10 @@ impl AgentCore {
                         .map(|d| {
                             format!(
                                 "{} ({})",
-                                d["model"].as_str().filter(|m| !m.is_empty()).unwrap_or_else(|| d["serial"].as_str().unwrap_or_default()),
+                                d["model"]
+                                    .as_str()
+                                    .filter(|m| !m.is_empty())
+                                    .unwrap_or_else(|| d["serial"].as_str().unwrap_or_default()),
                                 d["state"].as_str().unwrap_or_default()
                             )
                         })
@@ -5830,9 +5833,17 @@ impl AgentCore {
                 "安卓手机（Android-Use {}）：{}，{}\nadb：{}\n设备：{}\n{}",
                 android::VERSION,
                 if enabled { "已开启" } else { "已关闭" },
-                if status["installed"] == true { "已安装" } else { "未安装（/android install）" },
+                if status["installed"] == true {
+                    "已安装"
+                } else {
+                    "未安装（/android install）"
+                },
                 status["adb"].as_str().unwrap_or("未找到"),
-                if devices.is_empty() { "无".to_string() } else { devices },
+                if devices.is_empty() {
+                    "无".to_string()
+                } else {
+                    devices
+                },
                 status["hint"].as_str().unwrap_or_default()
             )
         };

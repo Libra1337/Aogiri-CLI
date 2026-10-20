@@ -6,6 +6,10 @@
 //
 //   node scripts/third-party-notices.mjs --cargo src-tauri/Cargo.toml --pnpm . --out static/third-party-notices.txt
 //
+// `--extra <file>` (repeatable) adds a component that is not a dependency
+// (a tool LynShen downloads on request): the file's first line names it,
+// the rest is its license text. A missing file is skipped.
+//
 // Needs `cargo` (crate sources are fetched first) and `pnpm` on PATH.
 
 import { execFileSync } from 'node:child_process';
@@ -15,12 +19,14 @@ import path from 'node:path';
 const args = process.argv.slice(2);
 const cargo = [];
 const pnpm = [];
+const extra = [];
 let out = '';
 let title = 'Third-party software';
 for (let i = 0; i < args.length; i += 1) {
 	const value = args[i + 1];
 	if (args[i] === '--cargo') cargo.push(value);
 	else if (args[i] === '--pnpm') pnpm.push(value);
+	else if (args[i] === '--extra') extra.push(value);
 	else if (args[i] === '--out') out = value;
 	else if (args[i] === '--title') title = value;
 	else throw new Error(`unknown argument: ${args[i]}`);
@@ -85,6 +91,12 @@ for (const dir of pnpm) {
 			});
 		}
 	}
+}
+
+for (const file of extra) {
+	if (!existsSync(file)) continue;
+	const [name, ...rest] = readFileSync(file, 'utf8').split('\n');
+	add(name.trim(), 'see text', [rest.join('\n').trim()]);
 }
 
 // Group packages by their exact license text.

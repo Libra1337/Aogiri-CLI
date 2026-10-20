@@ -119,7 +119,7 @@ jobs:
 
       - name: Write third-party notices
         run: |
-          node scripts/third-party-notices.mjs --cargo Cargo.toml --title "LynShen CLI: third-party software" --out lynshen-third-party-notices.txt
+          node scripts/third-party-notices.mjs --cargo Cargo.toml --extra docs/third-party/android-use.txt --title "LynShen CLI: third-party software" --out lynshen-third-party-notices.txt
 
       - name: Sync npm versions
         env:

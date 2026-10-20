@@ -5645,7 +5645,9 @@ mod tests {
                 "checkpoint",
                 "web_fetch",
                 "web_search",
-                "generate_image"
+                "generate_image",
+                "android_read",
+                "android_act"
             ]
         );
         assert!(tools

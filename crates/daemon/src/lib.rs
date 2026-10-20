@@ -406,7 +406,9 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     // waits on adb, au or the network.
     if name.starts_with("android_use_") {
         if !hub.is_local(client) {
-            reply(json!({ "type": "error", "message": "only the desktop can manage Android phone control" }));
+            reply(
+                json!({ "type": "error", "message": "only the desktop can manage Android phone control" }),
+            );
             return;
         }
         let hub = Arc::clone(hub);
