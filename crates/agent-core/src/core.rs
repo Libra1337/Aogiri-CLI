@@ -1138,6 +1138,7 @@ impl AgentCore {
             "/effort" => self.effort_command_events(args.trim()),
             "/subagents" => self.subagents_command_events(args.trim()),
             "/mcp" => self.mcp_command_events(args.trim()),
+            "/android" => self.android_command_events(args.trim()),
             "/context" => self.context_events(),
             "/stats" => self.stats_events(),
             "/goal" => self.goal_command_events(args.trim()),
@@ -2570,6 +2571,8 @@ impl AgentCore {
             &model_headers,
         );
         self.tool_state.set_images(images);
+        self.tool_state
+            .set_android(crate::android::availability(self.config.android_use));
         // Read the session from disk: Desktop or another engine may have
         // logged in or out since this engine last loaded auth.json.
         let signed_in = AuthStore::load_or_create(self.config.encrypt_secrets)
@@ -5800,6 +5803,79 @@ impl AgentCore {
 
     /// `/mcp` — list servers; `tools <server>`, `reload <server>`,
     /// `enable|disable <server>` subcommands.
+    /// `/android [on|off|install|setup]`: Android phone control (see
+    /// `crate::android`). Install downloads the pinned release only when
+    /// asked; on and off apply from the next turn.
+    fn android_command_events(&mut self, args: &str) -> Vec<AgentEvent> {
+        use crate::android;
+        let status_line = |enabled: bool| {
+            let status = android::status(enabled, false);
+            let devices = status["devices"]
+                .as_array()
+                .map(|devices| {
+                    devices
+                        .iter()
+                        .map(|d| {
+                            format!(
+                                "{} ({})",
+                                d["model"].as_str().filter(|m| !m.is_empty()).unwrap_or_else(|| d["serial"].as_str().unwrap_or_default()),
+                                d["state"].as_str().unwrap_or_default()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            format!(
+                "安卓手机（Android-Use {}）：{}，{}\nadb：{}\n设备：{}\n{}",
+                android::VERSION,
+                if enabled { "已开启" } else { "已关闭" },
+                if status["installed"] == true { "已安装" } else { "未安装（/android install）" },
+                status["adb"].as_str().unwrap_or("未找到"),
+                if devices.is_empty() { "无".to_string() } else { devices },
+                status["hint"].as_str().unwrap_or_default()
+            )
+        };
+        let enabled = || {
+            crate::config::Config::load_existing()
+                .map(|config| config.android_use)
+                .unwrap_or(false)
+        };
+        match args {
+            "" | "status" => vec![AgentEvent::Info(status_line(enabled()))],
+            "on" | "off" => {
+                let on = args == "on";
+                if let Err(error) = android::set_enabled(on) {
+                    return vec![AgentEvent::Error(error)];
+                }
+                self.config.android_use = on;
+                self.tool_state.set_android(android::availability(on));
+                vec![AgentEvent::Info(status_line(on))]
+            }
+            "install" => match android::install() {
+                Ok(au) => {
+                    self.tool_state
+                        .set_android(android::availability(self.config.android_use));
+                    vec![AgentEvent::Info(format!(
+                        "已安装 android-use {}（SHA-256 已校验）：{}\n下一步：连接手机后运行 /android setup，再用 /android on 开启。",
+                        android::VERSION,
+                        au.display()
+                    ))]
+                }
+                Err(error) => vec![AgentEvent::Error(format!("android-use 安装失败：{error}"))],
+            },
+            "setup" => match android::setup() {
+                Ok(report) => vec![AgentEvent::Info(
+                    report["hint"].as_str().unwrap_or_default().to_string(),
+                )],
+                Err(error) => vec![AgentEvent::Error(error)],
+            },
+            _ => vec![AgentEvent::Error(
+                "usage: /android [status|on|off|install|setup]".to_string(),
+            )],
+        }
+    }
+
     fn mcp_command_events(&mut self, args: &str) -> Vec<AgentEvent> {
         let mut parts = args.split_whitespace();
         match (parts.next(), parts.next()) {

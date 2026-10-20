@@ -322,6 +322,13 @@ impl McpClient {
         }
     }
 
+    /// `tools/call` with the server's raw result: a transport failure is an
+    /// error, a tool's own failure (`isError`) is part of the result.
+    pub fn call_tool_value(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        let params = json!({ "name": name, "arguments": arguments });
+        self.transport.request("tools/call", params, self.timeout)
+    }
+
     pub fn tools_snapshot(&self) -> Vec<McpToolInfo> {
         self.tools
             .lock()

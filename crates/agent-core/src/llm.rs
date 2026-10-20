@@ -745,6 +745,11 @@ fn disabled_tool_error(
             return Some(reason);
         }
     }
+    if crate::android::is_tool(name) {
+        if let Err(reason) = tool_state.android() {
+            return Some(reason);
+        }
+    }
     if name == "web_search" && !tool_state.web_search_enabled() {
         return Some(
             "web_search is set to the LynShen gateway's search (web_search_engine \"gateway\" in config.json), which needs a LynShen login. Run /login, or set web_search_engine to \"auto\"."
@@ -3354,7 +3359,10 @@ impl OpenAiClient {
         gate: SandboxGate,
         check: Option<&crate::sandbox::CommandCheck>,
     ) -> ApprovalInfo {
-        let must_ask = gate == SandboxGate::Ask;
+        // The phone's camera, microphone and screen recording: a person
+        // decides each time, in every mode.
+        let must_ask = gate == SandboxGate::Ask
+            || crate::android::always_asks(&request.name, &request.arguments);
         let mut info = ApprovalInfo {
             must_ask,
             cwd: cwd.to_path_buf(),
@@ -3493,10 +3501,12 @@ impl OpenAiClient {
             ApprovalKind::Tool
         };
         // "This session": the tool stops asking, as "always allow" did; not
-        // a host tool that always asks, nor a forced restore.
+        // a host tool that always asks, nor a forced restore, nor a phone
+        // action (each one is decided, as a command is).
         if !must_ask
             && self.host_gate(&request.name) != Some(HostGate::Ask)
             && !tools::is_forced_restore(&request.name, &request.arguments)
+            && request.name != crate::android::ACT_TOOL
         {
             info.scopes.push(ApprovalScope::Session);
         }
@@ -4348,6 +4358,7 @@ fn approval_summary(name: &str, arguments: &str) -> String {
                 None => prompt,
             }
         }
+        name if crate::android::is_tool(name) => crate::android::approval_summary(name, arguments),
         "checkpoint" => match field("id") {
             Some(id) if tools::is_forced_restore(name, arguments) => {
                 format!("restore {id}, overwriting changes made since")

@@ -310,13 +310,38 @@ impl StdioTransport {
         env: &BTreeMap<String, String>,
         cwd: &Path,
     ) -> Result<Self, String> {
-        let mut child = Command::new(command)
+        Self::spawn_with(server, command, args, env, cwd, true)
+    }
+
+    /// `spawn`; with `log_stderr` false the server's stderr is discarded
+    /// instead of logged (a server whose messages may carry what the user's
+    /// phone shows).
+    pub fn spawn_with(
+        server: &str,
+        command: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        cwd: &Path,
+        log_stderr: bool,
+    ) -> Result<Self, String> {
+        let mut command = Command::new(command);
+        command
             .args(args)
             .envs(env)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(if log_stderr {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let mut child = command
             .spawn()
             .map_err(|error| format!("failed to start MCP server {server}: {error}"))?;
         let stdin = child

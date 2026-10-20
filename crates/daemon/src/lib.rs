@@ -401,6 +401,22 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         });
         return;
     }
+    // Android phone control: installing runs a downloaded program and the
+    // tools reach the user's phone, so only the desktop manages it. Each op
+    // waits on adb, au or the network.
+    if name.starts_with("android_use_") {
+        if !hub.is_local(client) {
+            reply(json!({ "type": "error", "message": "only the desktop can manage Android phone control" }));
+            return;
+        }
+        let hub = Arc::clone(hub);
+        let name = name.to_string();
+        thread::spawn(move || {
+            let result = lynshen_agent_core::android_use_op(&name, &op);
+            respond(&hub, client, &request, result);
+        });
+        return;
+    }
     // A reply style is an instruction every later session reads, so only
     // the desktop lists, writes or deletes them.
     if matches!(name, "styles_list" | "style_save" | "style_delete") {

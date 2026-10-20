@@ -122,6 +122,8 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "web_fetch",
     "web_search",
     "get_goal",
+    // Looks at the user's phone; changes nothing there or here.
+    crate::android::READ_TOOL,
     // Subagents share the session's live mode, so they are in plan mode too.
     "spawn_agent",
     "wait_agent",

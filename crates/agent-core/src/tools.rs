@@ -224,7 +224,10 @@ pub fn definitions() -> Vec<Value> {
         crate::web_fetch::definition(),
         crate::web::search_definition(),
         crate::images::definition(),
-    ])
+    ]
+    .into_iter()
+    .chain(crate::android::definitions())
+    .collect())
 }
 
 fn with_function_tool_defaults(mut definitions: Vec<Value>) -> Vec<Value> {
@@ -337,6 +340,10 @@ fn run_tool_inner(
         "web_fetch" => crate::web::run_fetch(&args, state.web().as_ref()),
         "web_search" => crate::web::run_search(&args, state.web().as_ref()),
         crate::images::TOOL_NAME => crate::images::run(&args, cwd, state, &mut emit),
+        name if crate::android::is_tool(name) => match state.android() {
+            Ok(au) => crate::android::run(name, &args, &au),
+            Err(reason) => json!({ "error": reason }),
+        },
         _ => json!({ "error": format!("unknown tool: {name}") }),
     };
     if state.outside_writes.is_some() && result.get("error").is_none() {
@@ -354,8 +361,13 @@ fn tool_result(name: &str, value: Value, cwd: &Path) -> ToolExecutionResult {
     let output = value.to_string();
     let model_output = project_model_output(name, &output, cwd);
     // Log the tool name and a brief error only; arguments and file contents
-    // must never reach the log.
-    if let Some(error) = value.get("error").and_then(Value::as_str) {
+    // must never reach the log, nor what the phone shows (its errors quote
+    // the screen).
+    if let Some(error) = value
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|_| !crate::android::is_tool(name))
+    {
         let brief = error.chars().take(200).collect::<String>();
         crate::log_warn!("tools", "tool error", tool = name, error = brief);
     }
@@ -2135,7 +2147,7 @@ fn project_read_model_output_inner(name: &str, output: &str, cwd: &Path) -> Opti
 /// [`image_content_item`], so keeping the base64 in the function output would
 /// only waste tokens.
 fn project_image_model_output(name: &str, output: &str) -> Option<String> {
-    if name != "read" {
+    if name != "read" && !crate::android::is_tool(name) {
         return None;
     }
     let mut value = serde_json::from_str::<Value>(output).ok()?;
@@ -2882,6 +2894,9 @@ struct ToolStateInner {
     /// Endpoint and model for generate_image, or why it is unavailable;
     /// None until the engine configures it.
     images: Option<Result<crate::images::ImageTools, String>>,
+    /// The android-use binary the phone tools run, or why they are off;
+    /// None until the engine configures it.
+    android: Option<Result<PathBuf, String>>,
     /// Messages for the session from work that outlived its tool call (an
     /// interrupted generate_image saving its result), drained into Info events.
     notices: Vec<String>,
@@ -3028,6 +3043,21 @@ impl ToolState {
             .ok()
             .and_then(|inner| inner.images.clone())
             .unwrap_or_else(|| Err(crate::images::UNAVAILABLE.to_string()))
+    }
+
+    pub(crate) fn set_android(&self, android: Result<PathBuf, String>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.android = Some(android);
+        }
+    }
+
+    /// The au the phone tools run, or why they are not offered.
+    pub(crate) fn android(&self) -> Result<PathBuf, String> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.android.clone())
+            .unwrap_or_else(|| crate::android::availability(false))
     }
 
     pub(crate) fn push_notice(&self, notice: String) {
