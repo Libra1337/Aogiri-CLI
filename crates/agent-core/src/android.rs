@@ -549,7 +549,10 @@ pub fn status(enabled: bool, doctor: bool) -> Value {
     let adb = find_adb();
     let devices = adb_devices();
     let mut phase = device_phase(&devices);
-    if let (Some(au), true) = (&au, doctor) {
+    // Past the connection only au can tell (enrolled, helper, accessibility):
+    // ask it whenever one phone is there to check.
+    let connected = phase == "setup_host";
+    if let (Some(au), true) = (&au, doctor || connected) {
         if let Some(report) = run_au_json(au, &["doctor", "--json"], Duration::from_secs(30)) {
             if let Some(found) = report["phase"].as_str() {
                 phase = found.to_string();
@@ -775,10 +778,15 @@ fn describe_step(step: &[String], app: Option<&str>) -> (String, Option<String>)
         ("hold", _) => (in_app(format!("长按「{}」", word(1))), None),
         ("toggle", _) => (in_app(format!("切换「{}」开关", word(1))), None),
         ("set" | "turn", _) => (in_app(format!("设置「{}」", step[1..].join(" "))), None),
-        ("type", _) => (
-            in_app(format!("在「{}」里输入「{}」", word(3), word(1))),
-            None,
-        ),
+        ("type", _) => {
+            let place = match (app, word(3)) {
+                (Some(app), "") => format!("在 {app} 里"),
+                (Some(app), field) => format!("在 {app} 的「{field}」里"),
+                (None, "") => "在手机上".to_string(),
+                (None, field) => format!("在手机的「{field}」里"),
+            };
+            (format!("{place}输入「{}」", word(1)), None)
+        }
         ("scroll", direction) => {
             let way = match direction {
                 "up" => "向上",
@@ -1146,7 +1154,7 @@ mod tests {
                 r#"open app "微信" then type "晚上好" in "输入框" then tap "发送""#,
                 None
             ),
-            "打开「微信」，然后在 微信 里在「输入框」里输入「晚上好」，然后在 微信 里点「发送」"
+            "打开「微信」，然后在 微信 的「输入框」里输入「晚上好」，然后在 微信 里点「发送」"
         );
         assert_eq!(
             act(r#"tap "Save" number 2"#, Some("设置")),
