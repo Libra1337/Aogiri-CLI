@@ -139,6 +139,59 @@ pub struct PlanItem {
     pub files: Vec<String>,
 }
 
+/// One finished turn's figures: the model that answered, how long the turn
+/// took, the time to its first output and its tokens. The session keeps them
+/// (`SessionStore::record_turn_stats`), so a reopened conversation still says
+/// which model answered each turn and how long it took.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnStats {
+    pub model: String,
+    pub elapsed_ms: u64,
+    pub ttft_ms: Option<u64>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub tools: u64,
+    pub cost: f64,
+}
+
+impl TurnStats {
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "model": self.model,
+            "elapsed_ms": self.elapsed_ms,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "tools": self.tools,
+            "cost": self.cost,
+        });
+        if let Some(ttft) = self.ttft_ms {
+            value["ttft_ms"] = serde_json::json!(ttft);
+        }
+        value
+    }
+
+    pub fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let count = |key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        Some(Self {
+            model: value.get("model")?.as_str()?.to_string(),
+            elapsed_ms: value.get("elapsed_ms")?.as_u64()?,
+            ttft_ms: value.get("ttft_ms").and_then(serde_json::Value::as_u64),
+            input_tokens: count("input_tokens"),
+            output_tokens: count("output_tokens"),
+            tools: count("tools"),
+            cost: value
+                .get("cost")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum TranscriptItem {
     User(String),
@@ -164,6 +217,8 @@ pub enum TranscriptItem {
         content: String,
         status: String,
     },
+    /// The figures of the turn whose items come just before it.
+    TurnStats(TurnStats),
 }
 
 /// One category of the context (`ContextBreakdown`): its name (as Claude
@@ -201,6 +256,8 @@ pub enum AgentEvent {
         state: String,
     },
     PendingMessages(Vec<String>),
+    /// A turn finished (or was stopped): its figures, as the session keeps them.
+    TurnStats(TurnStats),
     /// A queued message was taken back (`unqueue`): its text, for the client
     /// to return to the message box.
     Unqueued(String),

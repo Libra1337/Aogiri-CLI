@@ -1,5 +1,6 @@
 //! One hosted session: an engine on its own thread, fed ops through a
-//! channel and polled every 30 ms, the same loop `lynshen serve` runs.
+//! channel and polled every 30 ms while it works, the same loop `lynshen
+//! serve` runs; idle, it waits for its next op (see `IDLE_POLL`).
 
 use crate::hub::Hub;
 use lynshen_agent_core::{
@@ -25,6 +26,17 @@ const IDLE_CLOSE: Duration = Duration::from_secs(10 * 60);
 /// How long a session that could not close yet waits before it asks again
 /// (`Hub::retire_idle` takes the sessions lock).
 const CLOSE_RETRY: Duration = Duration::from_secs(5);
+
+/// How often the engine is polled while it works (a turn, a tool, a
+/// subagent, a prompt): its events go out this soon.
+const BUSY_POLL: Duration = Duration::from_millis(30);
+
+/// How long an idle engine (`AgentCore::is_idle`) waits for an op before it
+/// is polled again. An op wakes it at once; what an idle engine can still
+/// report by itself (an MCP server's changed lists, an update found) waits
+/// this long at most. Polled every 30 ms instead, each open session cost
+/// the daemon about 0.15% of a core with nothing happening.
+const IDLE_POLL: Duration = Duration::from_millis(250);
 
 /// Opens an engine in `cwd` (resuming `resume` when given) on a new thread,
 /// set up for `agent` when the session belongs to one. Returns the session
@@ -215,7 +227,18 @@ fn run(hub: &Hub, mut core: AgentCore, id: &str, ops: Receiver<Value>, generatio
             }
             next_close_try = Instant::now() + CLOSE_RETRY;
         }
-        thread::sleep(Duration::from_millis(30));
+        if held.is_some() {
+            continue;
+        }
+        if ready && core.is_idle() {
+            match ops.recv_timeout(IDLE_POLL) {
+                Ok(op) => held = Some(op),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        } else {
+            thread::sleep(BUSY_POLL);
+        }
     }
 }
 

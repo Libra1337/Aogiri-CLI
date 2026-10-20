@@ -312,6 +312,8 @@ impl TuiState {
                 }
                 // The TUI sends no unqueue; pending_messages already redrew.
                 AgentEvent::Unqueued(_) => false,
+                // The TUI shows its own turn timer and usage.
+                AgentEvent::TurnStats(_) => false,
                 AgentEvent::UserMessage(message) => {
                     self.chat.push(ChatLine::PendingUser(message));
                     self.mark_history_dirty();
@@ -886,31 +888,35 @@ impl TuiState {
         self.reset_thinking();
         self.chat = items
             .into_iter()
-            .map(|item| match item {
-                TranscriptItem::User(text) => ChatLine::User(text),
-                TranscriptItem::UserWithImages { content, images } => {
-                    ChatLine::User(match images.len() {
-                        1 => format!("{content}\n[image attached]"),
-                        n => format!("{content}\n[{n} images attached]"),
-                    })
-                }
-                TranscriptItem::Assistant(text) => ChatLine::Assistant(text),
-                TranscriptItem::Tool { name, output } => ChatLine::Tool {
-                    call_id: None,
-                    name,
-                    output,
-                    running: false,
-                },
-                TranscriptItem::Branch(label) => ChatLine::System(label),
-                TranscriptItem::Compaction { .. } => {
-                    ChatLine::System("Context compacted.".to_string())
-                }
-                TranscriptItem::Plan {
-                    title,
-                    content,
-                    status,
-                    ..
-                } => ChatLine::System(format!("Plan ({status}): {title}\n{content}")),
+            .filter_map(|item| {
+                Some(match item {
+                    TranscriptItem::User(text) => ChatLine::User(text),
+                    TranscriptItem::UserWithImages { content, images } => {
+                        ChatLine::User(match images.len() {
+                            1 => format!("{content}\n[image attached]"),
+                            n => format!("{content}\n[{n} images attached]"),
+                        })
+                    }
+                    TranscriptItem::Assistant(text) => ChatLine::Assistant(text),
+                    TranscriptItem::Tool { name, output } => ChatLine::Tool {
+                        call_id: None,
+                        name,
+                        output,
+                        running: false,
+                    },
+                    TranscriptItem::Branch(label) => ChatLine::System(label),
+                    TranscriptItem::Compaction { .. } => {
+                        ChatLine::System("Context compacted.".to_string())
+                    }
+                    TranscriptItem::Plan {
+                        title,
+                        content,
+                        status,
+                        ..
+                    } => ChatLine::System(format!("Plan ({status}): {title}\n{content}")),
+                    // The TUI shows no per-turn figures.
+                    TranscriptItem::TurnStats(_) => return None,
+                })
             })
             .collect();
         self.reset_screen = true;

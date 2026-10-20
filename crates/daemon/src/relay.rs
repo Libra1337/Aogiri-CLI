@@ -234,16 +234,17 @@ impl Relay {
 }
 
 impl Relay {
-    /// Asks the relay to deliver a Web Push or Getui notification (see
-    /// `push`): signed with the host key, which the relay only accepts from
-    /// a host connected to it. A Web Push message is encrypted here for the
-    /// browser (RFC 8291), so the relay passes on ciphertext; Getui takes
-    /// the plaintext. Returns the relay's HTTP status (410: the
-    /// subscription is gone).
+    /// Asks the relay to deliver a notification (see `push`): signed with
+    /// the host key, which the relay only accepts from a host connected to
+    /// it. A Web Push message (`payload`) is encrypted here for the browser
+    /// (RFC 8291), so the relay passes on ciphertext; APNs, FCM and Getui
+    /// take `native`, generic text and ids only. Returns the relay's HTTP
+    /// status (410: the subscription is gone).
     pub fn push(
         &self,
         subscription: &Value,
         payload: &Value,
+        native: &Value,
         delivery: &Delivery,
     ) -> Result<u16, String> {
         let url = self.url.as_deref().ok_or("the relay is disabled")?;
@@ -260,24 +261,39 @@ impl Relay {
         if let Some(topic) = &delivery.topic {
             body["topic"] = json!(topic);
         }
-        if subscription["provider"] == "getui" {
-            body["subscription"] =
-                json!({ "provider": "getui", "client_id": subscription["client_id"] });
-            body["payload"] = payload.clone();
-        } else {
-            let key = |name: &str| {
-                subscription["keys"][name]
-                    .as_str()
-                    .and_then(|text| URL_SAFE_NO_PAD.decode(text.trim_end_matches('=')).ok())
-                    .ok_or_else(|| format!("the subscription has no {name} key"))
-            };
-            let message = crate::webpush::encrypt(
-                payload.to_string().as_bytes(),
-                &key("p256dh")?,
-                &key("auth")?,
-            )?;
-            body["subscription"] = json!({ "endpoint": subscription["endpoint"] });
-            body["encrypted"] = json!(URL_SAFE_NO_PAD.encode(message));
+        match subscription["provider"].as_str() {
+            Some("getui") => {
+                body["subscription"] =
+                    json!({ "provider": "getui", "client_id": subscription["client_id"] });
+                body["payload"] = native.clone();
+            }
+            Some("apns") => {
+                body["subscription"] = json!({
+                    "provider": "apns",
+                    "token": subscription["token"],
+                    "environment": subscription["environment"],
+                });
+                body["payload"] = native.clone();
+            }
+            Some("fcm") => {
+                body["subscription"] = json!({ "provider": "fcm", "token": subscription["token"] });
+                body["payload"] = native.clone();
+            }
+            _ => {
+                let key = |name: &str| {
+                    subscription["keys"][name]
+                        .as_str()
+                        .and_then(|text| URL_SAFE_NO_PAD.decode(text.trim_end_matches('=')).ok())
+                        .ok_or_else(|| format!("the subscription has no {name} key"))
+                };
+                let message = crate::webpush::encrypt(
+                    payload.to_string().as_bytes(),
+                    &key("p256dh")?,
+                    &key("auth")?,
+                )?;
+                body["subscription"] = json!({ "endpoint": subscription["endpoint"] });
+                body["encrypted"] = json!(URL_SAFE_NO_PAD.encode(message));
+            }
         }
         let body = body.to_string();
         let mut signed = PUSH_CONTEXT.to_vec();

@@ -347,6 +347,11 @@ pub fn event_json(event: AgentEvent) -> Value {
             "input_modalities": input_modalities,
             "state": state
         }),
+        AgentEvent::TurnStats(stats) => {
+            let mut event = stats.to_json();
+            event["type"] = json!("turn_stats");
+            event
+        }
         AgentEvent::PendingMessages(messages) => {
             json!({ "type": "pending_messages", "messages": messages })
         }
@@ -680,6 +685,11 @@ pub fn event_json(event: AgentEvent) -> Value {
                 crate::TranscriptItem::Plan { id, title, content, status } => json!({
                     "role": "plan", "id": id, "title": title, "content": content, "status": status,
                 }),
+                crate::TranscriptItem::TurnStats(stats) => {
+                    let mut item = stats.to_json();
+                    item["role"] = json!("turn_stats");
+                    item
+                }
             }).collect::<Vec<_>>()
         }),
         AgentEvent::Info(message) => json!({ "type": "info", "message": message }),

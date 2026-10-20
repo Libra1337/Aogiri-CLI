@@ -1,10 +1,11 @@
 //! Notifications on the paired phones. A phone's browser gives the daemon
-//! its Web Push subscription over the encrypted channel, the LynShen Android
-//! app its 个推 (Getui) client id; to notify it, the daemon asks the relay,
-//! which signs the request for the push service (VAPID) or sends it through
-//! Getui, and passes the title and text on without keeping them.
+//! its Web Push subscription over the encrypted channel, the Aogiri app its
+//! APNs or FCM device token; to notify it, the daemon asks the relay, which
+//! signs the request for the push service (VAPID, APNs, FCM) and passes it
+//! on without keeping it. A browser's message is encrypted here; APNs and
+//! FCM get generic text and ids only (`Outgoing::native_payload`).
 
-pub use crate::push_policy::{Kind, Level};
+pub use crate::push_policy::{Answer, Kind, Level};
 use crate::{
     hub::{lock, Hub},
     push_policy::{Clock, Outgoing, Policy, Rules},
@@ -27,8 +28,10 @@ const SETTING: &str = "push";
 
 pub struct Push {
     path: PathBuf,
-    /// `{device, endpoint, keys: {p256dh, auth}}`, one per browser, or
-    /// `{device, provider: "getui", client_id}`, one per Android app.
+    /// `{device, endpoint, keys: {p256dh, auth}}`, one per browser,
+    /// `{device, provider: "apns", token, environment}` or
+    /// `{device, provider: "fcm", token}`, one per Aogiri app, or
+    /// `{device, provider: "getui", client_id}`.
     subscriptions: Mutex<Vec<Value>>,
     policy: Mutex<Policy>,
     /// The session each connected device has on screen now and when it
@@ -52,11 +55,12 @@ impl Push {
         }
     }
 
-    /// Keeps `subscription` (a browser's `PushSubscription.toJSON()`, or
-    /// `{provider: "getui", client_id}` from the Android app) for `device`,
-    /// replacing an earlier one for the same endpoint or client id.
+    /// Keeps `subscription` (a browser's `PushSubscription.toJSON()`, the
+    /// Aogiri app's APNs or FCM device token, or a Getui client id) for
+    /// `device`, replacing an earlier one for the same endpoint or token.
     pub fn subscribe(&self, device: &str, subscription: &Value) -> Result<(), String> {
-        let entry = if subscription["provider"] == "getui" {
+        let provider = subscription["provider"].as_str();
+        let entry = if provider == Some("getui") {
             let client_id = subscription["client_id"].as_str().unwrap_or_default();
             if client_id.is_empty()
                 || client_id.len() > 64
@@ -65,6 +69,35 @@ impl Push {
                 return Err("push_subscribe requires a getui client_id".to_string());
             }
             json!({ "device": device, "provider": "getui", "client_id": client_id })
+        } else if provider == Some("apns") {
+            // iOS hands the token as bytes; the app sends them as hex.
+            let token = subscription["token"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let environment = subscription["environment"].as_str().unwrap_or("production");
+            if token.len() < 32
+                || token.len() > 200
+                || !token.len().is_multiple_of(2)
+                || !token.chars().all(|c| c.is_ascii_hexdigit())
+                || !matches!(environment, "production" | "sandbox")
+            {
+                return Err("push_subscribe requires an APNs device token (hex) and environment production or sandbox".to_string());
+            }
+            json!({ "device": device, "provider": "apns", "token": token, "environment": environment })
+        } else if provider == Some("fcm") {
+            let token = subscription["token"].as_str().unwrap_or_default();
+            if token.len() < 16
+                || token.len() > 512
+                || !token
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
+            {
+                return Err("push_subscribe requires an FCM registration token".to_string());
+            }
+            json!({ "device": device, "provider": "fcm", "token": token })
+        } else if let Some(other) = provider {
+            return Err(format!("push_subscribe: unknown provider {other}"));
         } else {
             let endpoint = subscription["endpoint"].as_str().unwrap_or_default();
             let keys = &subscription["keys"];
@@ -87,10 +120,14 @@ impl Push {
         self.save(&list)
     }
 
-    /// Drops the subscription with this endpoint or Getui client id.
+    /// Drops the subscription with this endpoint, device token or Getui
+    /// client id.
     pub fn unsubscribe(&self, id: &str) -> Result<(), String> {
         let mut list = lock(&self.subscriptions);
-        list.retain(|s| key(s) != id);
+        // An APNs token is kept in lower case; the app may send it in upper.
+        list.retain(|s| {
+            key(s) != id && !(s["provider"] == "apns" && key(s).eq_ignore_ascii_case(id))
+        });
         self.save(&list)
     }
 
@@ -107,20 +144,28 @@ impl Push {
     }
 }
 
-/// What identifies a subscription: its endpoint, or its Getui client id.
+/// What identifies a subscription: its endpoint, device token or Getui
+/// client id.
 fn key(subscription: &Value) -> &str {
     subscription["endpoint"]
         .as_str()
+        .or(subscription["token"].as_str())
         .or(subscription["client_id"].as_str())
         .unwrap_or_default()
 }
 
-/// The push service a subscription goes through, for `push_tested`.
-fn service(subscription: &Value) -> &str {
-    if subscription["provider"] == "getui" {
-        return "getui";
+/// The push service a subscription goes through, for `push_tested`:
+/// `apns`, `apns-sandbox`, `fcm`, `getui` or a browser push service's host.
+fn service(subscription: &Value) -> String {
+    match subscription["provider"].as_str() {
+        Some("apns") if subscription["environment"] == "sandbox" => "apns-sandbox".to_string(),
+        Some(provider) => provider.to_string(),
+        None => key(subscription)
+            .split('/')
+            .nth(2)
+            .unwrap_or_default()
+            .to_string(),
     }
-    key(subscription).split('/').nth(2).unwrap_or_default()
 }
 
 /// `push_test`: a test notification to `device`'s browsers, sent now, with
@@ -140,6 +185,8 @@ pub fn test(hub: &Arc<Hub>, device: &str) -> Value {
         "kind": "test",
         "level": "normal",
     });
+    // Generic already: the same for APNs and FCM.
+    let native = payload.clone();
     let delivery = Delivery {
         urgency: "normal",
         ttl: 60,
@@ -149,7 +196,7 @@ pub fn test(hub: &Arc<Hub>, device: &str) -> Value {
         .iter()
         .map(|subscription| {
             let service = service(subscription);
-            match hub.relay.push(subscription, &payload, &delivery) {
+            match hub.relay.push(subscription, &payload, &native, &delivery) {
                 Ok(status) => json!({ "service": service, "status": status }),
                 Err(error) => json!({ "service": service, "error": error }),
             }
@@ -171,6 +218,8 @@ pub struct Notice<'a> {
     pub url: Option<&'a str>,
     /// The session it is about: not sent to a device that looks at it now.
     pub session: Option<&'a str>,
+    /// The approval it is about, for the app's 允许/拒绝 buttons.
+    pub answer: Option<Answer>,
 }
 
 /// Notifies the paired phones: the rules decide whether and how, and each
@@ -205,6 +254,7 @@ fn outgoing(hub: &Hub, notice: Notice) -> Outgoing {
         body: clip(notice.body, 160),
         url,
         session: notice.session.map(str::to_string),
+        answer: notice.answer,
         count: 1,
     }
 }
@@ -306,6 +356,17 @@ pub fn observe(hub: &Arc<Hub>, session: &str, event: &Value, ended: bool, failed
         // the desk because nobody watched. A question from Claude Code
         // (questions) is asked the same way.
         let question = event["questions"].as_array().is_some_and(|q| !q.is_empty());
+        // What the notification's 允许/拒绝 answer; a question is answered
+        // in the app.
+        let answer = match (kind, question) {
+            (_, true) => None,
+            ("approval_request", _) => event["call_id"]
+                .as_str()
+                .map(|id| Answer::Call(id.to_string())),
+            _ => event["id"]
+                .as_str()
+                .map(|id| Answer::Action(id.to_string())),
+        };
         let body = if question {
             format!("「{name}」在等你回答")
         } else {
@@ -319,6 +380,7 @@ pub fn observe(hub: &Arc<Hub>, session: &str, event: &Value, ended: bool, failed
             body: &body,
             url: None,
             session: Some(session),
+            answer,
         };
         if kind == "approval_request" && crate::presence::at_computer() {
             hold(hub, notice, DESKTOP_FIRST_MS);
@@ -341,6 +403,7 @@ pub fn observe(hub: &Arc<Hub>, session: &str, event: &Value, ended: bool, failed
                     body: &body,
                     url: None,
                     session: Some(session),
+                    answer: None,
                 },
             );
         }
@@ -374,6 +437,7 @@ pub fn observe(hub: &Arc<Hub>, session: &str, event: &Value, ended: bool, failed
             body: &body,
             url: None,
             session: Some(session),
+            answer: None,
         },
     );
 }
@@ -385,6 +449,7 @@ fn deliver(hub: &Arc<Hub>, outgoing: Outgoing) {
         .map(|session| looking_at(hub, session))
         .unwrap_or_default();
     let payload = outgoing.payload();
+    let native = outgoing.native_payload(hub.relay.host_id().as_deref());
     let delivery = Delivery {
         urgency: outgoing.level.urgency(),
         // An approval is stale after a while; the rest keep a day.
@@ -405,10 +470,11 @@ fn deliver(hub: &Arc<Hub>, outgoing: Outgoing) {
         }
         let hub = Arc::clone(hub);
         let payload = payload.clone();
+        let native = native.clone();
         let delivery = delivery.clone();
         // 410: the relay says the push service dropped the subscription.
         thread::spawn(
-            move || match hub.relay.push(&subscription, &payload, &delivery) {
+            move || match hub.relay.push(&subscription, &payload, &native, &delivery) {
                 Ok(410) => {
                     let _ = hub.push.unsubscribe(key(&subscription));
                 }
@@ -503,6 +569,51 @@ mod tests {
         );
         assert_eq!(service(&list[0]), "web.push.apple.com");
         assert_eq!(service(&list[1]), "getui");
+
+        // The Aogiri app: an APNs token (hex, as sent: case does not
+        // matter) with its environment, or an FCM token.
+        let token = "A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F90";
+        let iphone = json!({ "provider": "apns", "token": token, "environment": "sandbox" });
+        let android =
+            json!({ "provider": "fcm", "token": "dXNlcjEyMzQ1Njc4OTA:APA91bH-test_token" });
+        push.subscribe("d3", &iphone).unwrap();
+        push.subscribe("d3", &android).unwrap();
+        push.subscribe("d3", &json!({ "provider": "apns", "token": token }))
+            .unwrap();
+        for bad in [
+            json!({ "provider": "apns", "token": "zz".repeat(32) }),
+            json!({ "provider": "apns", "token": format!("../{token}") }),
+            json!({ "provider": "apns", "token": token, "environment": "staging" }),
+            json!({ "provider": "fcm", "token": "short" }),
+            json!({ "provider": "fcm", "token": "a token with spaces in it" }),
+            json!({ "provider": "hms", "token": "abc" }),
+        ] {
+            assert!(push.subscribe("d3", &bad).is_err(), "{bad}");
+        }
+        let natives: Vec<Value> = lock(&push.subscriptions)
+            .iter()
+            .filter(|s| s["device"] == "d3")
+            .cloned()
+            .collect();
+        assert_eq!(
+            natives,
+            vec![
+                json!({ "device": "d3", "provider": "fcm", "token": "dXNlcjEyMzQ1Njc4OTA:APA91bH-test_token" }),
+                json!({ "device": "d3", "provider": "apns", "token": token.to_ascii_lowercase(), "environment": "production" }),
+            ]
+        );
+        assert_eq!(service(&natives[0]), "fcm");
+        assert_eq!(service(&natives[1]), "apns");
+        assert_eq!(service(&iphone), "apns-sandbox");
+        push.unsubscribe(token).unwrap();
+        assert_eq!(
+            lock(&push.subscriptions)
+                .iter()
+                .filter(|s| s["device"] == "d3")
+                .count(),
+            1
+        );
+        push.forget_device("d3");
 
         push.unsubscribe("abc123").unwrap();
         assert_eq!(lock(&push.subscriptions).len(), 1);

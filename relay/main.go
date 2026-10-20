@@ -330,7 +330,8 @@ func newRelay() *relay {
 	return &relay{hosts: map[string]*host{}, rate: &limiter{events: map[string][]time.Time{}}}
 }
 
-// routes are the relay's endpoints; push ones only with a VAPID key.
+// routes are the relay's endpoints; push ones only with a VAPID key or a
+// native provider.
 func routes(rl *relay, push *pusher) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/relay/v1/host", rl.serveHost)
@@ -345,14 +346,14 @@ func routes(rl *relay, push *pusher) *http.ServeMux {
 	return mux
 }
 
-// vapidPath is -vapid-file, else the `vapid` credential systemd passes in
-// (LoadCredential=vapid:…), else none: push is then not served.
-func vapidPath(flagValue string) string {
+// credentialPath is the flag's path, else the credential `name` systemd
+// passes in (LoadCredential=name:…), else none.
+func credentialPath(flagValue, name string) string {
 	if flagValue != "" {
 		return flagValue
 	}
 	if dir := os.Getenv("CREDENTIALS_DIRECTORY"); dir != "" {
-		path := filepath.Join(dir, "vapid")
+		path := filepath.Join(dir, name)
 		if _, err := os.Stat(path); err == nil {
 			return path
 		}
@@ -366,6 +367,11 @@ func main() {
 	subject := flag.String("vapid-subject", "https://app.lynshen.org", "contact the push services see in the VAPID token (mailto: or https:)")
 	generate := flag.String("gen-vapid", "", "write a new VAPID key file at this path (0600, never replaced) and exit")
 	testPush := flag.String("test-push-origin", "", "for local tests only: also post to this push service origin (https://host:port), trusting its certificate")
+	apnsKey := flag.String("apns-key", "", "APNs auth key (.p8) (default: the systemd credential `apns`); APNs is served only with one")
+	apnsKeyID := flag.String("apns-key-id", os.Getenv("LYNSHEN_RELAY_APNS_KEY_ID"), "the APNs key's Key ID (default $LYNSHEN_RELAY_APNS_KEY_ID)")
+	apnsTeamID := flag.String("apns-team-id", os.Getenv("LYNSHEN_RELAY_APNS_TEAM_ID"), "the Apple Team ID (default $LYNSHEN_RELAY_APNS_TEAM_ID)")
+	apnsTopic := flag.String("apns-topic", "com.lynshen.aogiri", "the app's bundle id (apns-topic)")
+	fcmAccount := flag.String("fcm-account", "", "FCM service account key JSON (default: the systemd credential `fcm`); FCM is served only with one")
 	flag.Parse()
 	if *generate != "" {
 		if err := generateVAPID(*generate); err != nil {
@@ -379,19 +385,43 @@ func main() {
 		return
 	}
 	rl := newRelay()
-	var push *pusher
-	if path := vapidPath(*vapidFlag); path != "" {
-		v, err := loadVAPID(path, *subject)
-		if err != nil {
+	var v *vapid
+	if path := credentialPath(*vapidFlag, "vapid"); path != "" {
+		var err error
+		if v, err = loadVAPID(path, *subject); err != nil {
 			log.Fatal(err)
-		}
-		push = newPusher(rl, v)
-		if *testPush != "" {
-			allowTestOrigin(push, *testPush)
 		}
 		log.Printf("web push on, VAPID key %s", b64.EncodeToString(v.public))
 	} else {
 		log.Printf("web push off: no VAPID key")
+	}
+	n := natives{}
+	if path := credentialPath(*apnsKey, "apns"); path != "" {
+		a, err := loadAPNs(path, apnsConfig{keyID: *apnsKeyID, teamID: *apnsTeamID, topic: *apnsTopic})
+		if err != nil {
+			log.Fatal(err)
+		}
+		n["apns"] = a
+		log.Printf("apns on, key %s, team %s, topic %s", *apnsKeyID, *apnsTeamID, *apnsTopic)
+	} else {
+		log.Printf("apns off: no key")
+	}
+	if path := credentialPath(*fcmAccount, "fcm"); path != "" {
+		f, err := loadFCM(path)
+		if err != nil {
+			log.Fatal(err)
+		}
+		n["fcm"] = f
+		log.Printf("fcm on, project %s", f.project)
+	} else {
+		log.Printf("fcm off: no service account")
+	}
+	var push *pusher
+	if v != nil || len(n) > 0 {
+		push = newPusher(rl, v, n)
+		if *testPush != "" {
+			allowTestOrigin(push, *testPush)
+		}
 	}
 	server := &http.Server{Addr: *listen, Handler: routes(rl, push), ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("lynshen-relay listening on %s", *listen)

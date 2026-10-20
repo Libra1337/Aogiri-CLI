@@ -52,6 +52,7 @@ fn default_tool_state() -> ToolState {
         fetch_engine: crate::web::DEFAULT_FETCH_ENGINE.to_string(),
         signed_in: true,
         search_model: Err("none in this test".to_string()),
+        gateway: Err("none in this test".to_string()),
     }));
     state.set_images(Ok(crate::images::ImageTools::for_test()));
     state

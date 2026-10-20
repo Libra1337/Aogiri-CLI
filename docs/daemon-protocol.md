@@ -205,6 +205,7 @@ every connected client.
 | `device_scopes` | `device`, `scopes` | `device_scopes`: the device's elevated scopes are exactly these (local clients only; see "Device scopes") |
 | `pair_cancel` | optional `code` | `pair_cancelled`: the code (or every open one) pairs nobody (local clients only) |
 | `plan_quota` | — | `plan_quota` with `plan` (the account's desktop plan name, or null) and `windows: [{kind, used_pct, resets_at}]`, from the gateway (cached a minute); an error when this computer is not signed in. The phone's 今天用量 |
+| `feedback_send` | `title`, `body`, `category` (`bug` \| `feature`), `app_version`, `os`, `attachments` (images as `{name, type, data_url}`, 2 at most), `with_logs` | `feedback_sent` with `ticket_no`: the report sent as a ticket of the account this computer's Aogiri is signed in with (`POST /api/desktop/feedback`, its device key), with the end of this computer's logs, redacted and gzipped, when `with_logs`. An error when Aogiri is not signed in. The phone page's 反馈问题 |
 | `device_me` | — | `device_me` with `device`, `name`, `scopes` (a local client: `local: true` and every scope) |
 | `device_forget_me` | — | `device_forgotten`, then the sending device is revoked (devices only) |
 | `device_revoke` | `device` | `device_revoked` (local clients only) |
@@ -899,7 +900,7 @@ whose main directory is the first path (or `null`).
 ## Messages between conversations
 
 Every LynShen session the daemon hosts (an agent's too, besides its own
-tools; not the dispatcher's) has three tools for the user's other
+tools; not the dispatcher's) has four tools for the user's other
 conversations on this daemon:
 
 | Tool | Arguments | Result |
@@ -907,6 +908,8 @@ conversations on this daemon:
 | `list_sessions` | optional `query` (matches title or directory) | `sessions: [{session, title, cwd, engine, state, updated_at}]`: the other sessions, not archived or hidden, most recently active first, at most 30. `state` is `idle`, `busy` or `closed`. |
 | `read_session` | `session`, optional `turns` (1–10, default 3) | `{session, title, state, turns: [{user, reply}]}`: the latest requests and the reply text to each (tool calls left out). A request keeps its first 1000 characters, a reply its last 3000, all turns together about 12000 (the oldest go first). |
 | `send_to_session` | `session`, `message`, optional `wait_reply` | `{id, session, title, status}` with `status` `delivered` (the receiver was idle and starts on it) or `queued` (it runs after the receiver's current work). With `wait_reply: true` the call waits until the receiver has handled the message and returns `status: "replied"` with `reply` (the last 4000 characters of its reply); it gives up after 10 minutes (the result then has a `note`) or when the sender's turn is stopped (an error; the message stays sent). |
+
+| `start_session` | `message`, optional `engine` (`lynshen`, `claude`, `codex`), `model`, `effort`, `approval_mode` (`plan`, `manual`, `auto-edit`, `auto`), `title`, `wait_reply` | as `send_to_session`, to a new conversation: started in the sender's project on that engine, model and effort, in the sender's approval mode or a stricter one (never full access), listed for the user; the message is its first. Aogiri ticket #48 |
 
 A closed receiver is opened first. The message is the receiver's next user
 message (it starts a run, or queues behind the running one), so a Claude
@@ -978,12 +981,18 @@ that turn's reply.
 ## Notifications
 
 A paired device's browser registers its Web Push subscription with
-`{"op":"push_subscribe","subscription":{"endpoint":"…","keys":{"p256dh":"…","auth":"…"}}}`,
-the LynShen Android app its 个推 (Getui) client id with
-`{"op":"push_subscribe","subscription":{"provider":"getui","client_id":"…"}}`
-(only paired devices; dropped when the device is revoked) and removes it with
-`{"op":"push_unsubscribe","endpoint":"…"}` or `{"op":"push_unsubscribe","client_id":"…"}`.
-A client id registered again by another device moves to that device.
+`{"op":"push_subscribe","subscription":{"endpoint":"…","keys":{"p256dh":"…","auth":"…"}}}`;
+the Aogiri app its APNs device token (hex, 32-200 characters) with
+`{"op":"push_subscribe","subscription":{"provider":"apns","token":"…","environment":"production"|"sandbox"}}`
+(`environment` defaults to `production`: TestFlight and App Store builds;
+development builds get `sandbox` tokens) or its FCM registration token with
+`{"op":"push_subscribe","subscription":{"provider":"fcm","token":"…"}}`
+(`{"provider":"getui","client_id":"…"}` is kept for 个推, which the relay does
+not serve yet). Only paired devices; dropped when the device is revoked.
+`{"op":"push_unsubscribe","endpoint":"…"}`, `{"op":"push_unsubscribe","token":"…"}`
+or `{"op":"push_unsubscribe","client_id":"…"}` removes one. A token or
+client id registered again by another device moves to that device. An
+unknown `provider` or a malformed token is an `error`.
 
 The daemon notifies, through the relay (relay-protocol.md, Web Push):
 
@@ -1012,16 +1021,25 @@ device disconnects. `{"op":"push_rules"}` replies `push_rules` with `rules:
 `{"op":"push_rules_set","rules":{…}}` changes any of the first four and
 replies the same. `LYNSHEN_AT_COMPUTER=0|1` overrides the presence check.
 
-A notification carries `{title, body, tag, url, kind, level, session?}`
+A browser's notification carries `{title, body, tag, url, kind, level, session?}`
 (`kind`: `approval`, `error`, `done`, `update`, `test`), encrypted for the
-browser before it leaves the daemon. Its text names the session and what it
+browser before it leaves the daemon. APNs and FCM cannot be encrypted for
+the app (the phone's system shows the text), so the Aogiri app's
+notification carries the same title and generic text, except that an
+`update`'s text (a reply, a summary, an error message) becomes
+「打开 Aogiri 查看」, plus ids only: `{title, body, kind, level, tag, session?,
+host?, call_id?, action_id?, url?, count?}` (relay-protocol.md, "Native push").
+`call_id` (an `approval_request`, answered with `approve`) or `action_id`
+(an `action_deferred`, answered with `decide_action`) lets the app answer
+from the notification's 允许/拒绝 buttons; a question has neither. Its text names the session and what it
 waits for, never a command, a path or a reply: the phone reads those over
 the encrypted channel once opened. `url` is `/remote?host=<host id>&session=<id>`
 for a session, `/remote?requirement=R-1` for a requirement, else `/remote`.
 `{"op":"push_test"}` (paired devices only) sends a test notification to that
-device's browsers now (not counted) and replies `push_tested` with `results:
-[{service, status}]` (or `error`): the push service's host (`getui` for the
-Android app) and its answer, as the relay passed it on.
+device's browsers and apps now (not counted) and replies `push_tested` with
+`results: [{service, status}]` (or `error`): the push service's host for a
+browser, `apns`, `apns-sandbox` or `fcm` for the app, and its answer as the
+relay passed it on (`501`: the relay has no credentials for it).
 
 ## Session ops
 

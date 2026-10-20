@@ -526,6 +526,17 @@ impl Snapshot {
                     item["output"] = event["output"].clone();
                 }
             }
+            // A finished turn's figures, as a reopened transcript has them.
+            "turn_stats" => {
+                self.in_reply = false;
+                let mut item = event.clone();
+                if let Some(map) = item.as_object_mut() {
+                    map.remove("type");
+                    map.remove("session");
+                    map.insert("role".to_string(), json!("turn_stats"));
+                }
+                self.transcript.push(item);
+            }
             "approval_request" => {
                 if let Some(call) = event["call_id"].as_str() {
                     self.approvals.push((call.to_string(), event.clone()));
@@ -1450,6 +1461,17 @@ mod tests {
             .events(false)
             .iter()
             .any(|e| e["type"] == "approval_request"));
+
+        // A finished turn's figures join the transcript as a reopened one has them.
+        snapshot.apply(
+            &json!({ "type": "turn_stats", "session": "s1", "model": "m", "elapsed_ms": 1200 }),
+        );
+        let events = snapshot.events(false);
+        let transcript = events.iter().find(|e| e["type"] == "transcript").unwrap();
+        assert_eq!(
+            transcript["items"].as_array().unwrap().last().unwrap(),
+            &json!({ "role": "turn_stats", "model": "m", "elapsed_ms": 1200 })
+        );
     }
 
     #[test]

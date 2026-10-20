@@ -18,6 +18,7 @@ pub mod logging;
 mod loop_guard;
 pub mod machine;
 mod mcp;
+pub mod network_proxy;
 mod nicknames;
 mod oauth;
 mod plan_mode;
@@ -55,7 +56,7 @@ pub use core::{title_completion, AgentCore, ApproveOptions, KeptState};
 pub use event::{
     AgentEvent, CommandView, ContextBreakdown, GoalView, LoginProviderView, McpServerView,
     McpToolView, ModelOptionView, PlanItem, ReplyStyleView, SandboxDirectoryView, SandboxView,
-    SessionListItemView, TranscriptItem, TreeNodeView,
+    SessionListItemView, TranscriptItem, TreeNodeView, TurnStats,
 };
 pub use hooks::HookStopper;
 pub use hunks::HunkView;
@@ -121,6 +122,22 @@ pub fn lynshen_signed_in() -> bool {
     config::Config::load_existing()
         .and_then(|config| config::AuthStore::load_or_create(config.encrypt_secrets))
         .is_ok_and(|auth| auth.lynshen_tokens().is_some())
+}
+
+/// The gateway's web base (`lynshen_web_url`, where `/api/desktop/*` is
+/// served) and the desktop device key Aogiri stored (`providers.monoize` in
+/// auth.json): what a request in the app's name needs, such as a bug report
+/// sent from the phone page.
+pub fn desktop_gateway_key() -> Result<(String, String), String> {
+    let config = config::Config::load_existing().map_err(|error| error.to_string())?;
+    let auth = config::AuthStore::load_or_create(config.encrypt_secrets)
+        .map_err(|error| error.to_string())?;
+    let key = auth
+        .key_for("monoize")
+        .map(str::trim)
+        .filter(|key| !key.is_empty() && !key.starts_with("jcenc1:"))
+        .ok_or("this computer's Aogiri is not signed in to LynShen")?;
+    Ok((config.lynshen_web_url, key.to_string()))
 }
 
 /// Signs this computer out of LynShen and revokes its device login.

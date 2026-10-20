@@ -286,7 +286,8 @@ pub struct Config {
     /// default). Context compaction asks `model` first: its request starts
     /// as the turns' do, so the provider serves it from the prompt cache.
     /// When that brings no summary, this model summarizes the conversation
-    /// as plain text.
+    /// as plain text. Empty: the conversation's current `model` (跟随当前模型),
+    /// the default of a new config.json.
     pub compact_model: String,
     pub compact_reasoning_effort: String,
     /// Model used by the `auto` approval mode's safety classifier. Absent or
@@ -354,11 +355,11 @@ pub struct Config {
     /// the workspace's path (see `project_key`). Read only: changes are
     /// written to the file (`edit_config_json`).
     pub projects: Value,
-    /// Engine behind `web_search`: `model` (the default) or `gateway`; see
+    /// Engine behind `web_search`: `auto` (the default) or `gateway`; see
     /// `crate::web`.
     pub web_search_engine: String,
-    /// Model `web_search` asks on the gateway (`web_search_model`). Empty:
-    /// search from this machine only.
+    /// Model that runs `web_search` natively (`web_search_model`). Empty
+    /// (the default): the conversation's own model.
     pub web_search_model: String,
     /// Engine behind `web_fetch`: `local` fetches from this machine, the
     /// others go through the LynShen gateway (`crate::web::FETCH_ENGINES`).
@@ -626,9 +627,9 @@ impl Config {
                 protocol: "responses".to_string(),
                 model: "gpt-5.5".to_string(),
                 reasoning_effort: "medium".to_string(),
-                compact_model: "gpt-5.5".to_string(),
+                compact_model: String::new(),
                 compact_reasoning_effort: DEFAULT_COMPACT_REASONING_EFFORT.to_string(),
-                safety_model: "gpt-5.5".to_string(),
+                safety_model: String::new(),
                 safety_reasoning_effort: DEFAULT_COMPACT_REASONING_EFFORT.to_string(),
                 title_model: String::new(),
                 image_model: String::new(),
@@ -719,12 +720,19 @@ impl Config {
         {
             reasoning_effort = DEFAULT_EFFORT.to_string();
         }
-        let compact_model = read_string(&value, "compact_model", &model);
+        // Empty or absent follows the current model (`compact`). Every engine
+        // writes the key when it saves config.json, so it is absent only from
+        // a file no engine has saved yet: a new user's.
+        let compact_model = read_string(&value, "compact_model", "");
         let compact_reasoning_effort = read_reasoning_effort(
             &value,
             "compact_reasoning_effort",
             DEFAULT_COMPACT_REASONING_EFFORT,
-            &compact_model,
+            if compact_model.is_empty() {
+                &model
+            } else {
+                &compact_model
+            },
             &models,
         );
         let safety_model = read_string(&value, "safety_model", &compact_model);
@@ -732,7 +740,11 @@ impl Config {
             &value,
             "safety_reasoning_effort",
             DEFAULT_COMPACT_REASONING_EFFORT,
-            &safety_model,
+            if safety_model.is_empty() {
+                &model
+            } else {
+                &safety_model
+            },
             &models,
         );
         let legacy_lynshen_url = read_string(&value, "lynshen_base_url", "");
@@ -814,11 +826,14 @@ impl Config {
                 crate::web::DEFAULT_SEARCH_ENGINE,
                 crate::web::SEARCH_ENGINES,
             )?),
-            // Empty is a choice here: no model, this machine's search only.
+            // Empty: the conversation's own model searches. The default
+            // earlier versions wrote was never the user's choice.
             web_search_model: value
                 .get("web_search_model")
                 .and_then(Value::as_str)
-                .map_or(crate::web::DEFAULT_SEARCH_MODEL, str::trim)
+                .map(str::trim)
+                .filter(|model| *model != crate::web::RETIRED_SEARCH_MODEL)
+                .unwrap_or(crate::web::DEFAULT_SEARCH_MODEL)
                 .to_string(),
             web_fetch_engine: read_web_engine(
                 &value,
@@ -956,11 +971,14 @@ impl Config {
     /// `compact_model` and its effort. A provider switch rewrites `model` and
     /// `models` but leaves `compact_model` naming the previous provider's
     /// model, which the new endpoint rejects; fall back to the chat model.
+    /// An empty `compact_model` follows the current model, at
+    /// `compact_reasoning_effort` where the model offers it.
     pub fn compact(&self) -> (String, String) {
         self.helper_model(&self.compact_model, &self.compact_reasoning_effort)
     }
 
-    /// Safety-classifier model and effort, with the same fallback as `compact`.
+    /// Safety-classifier model and effort, with the same fallback as `compact`
+    /// (empty: the current model).
     pub fn safety(&self) -> (String, String) {
         self.helper_model(&self.safety_model, &self.safety_reasoning_effort)
     }
@@ -992,10 +1010,22 @@ impl Config {
 
     fn helper_model(&self, model: &str, effort: &str) -> (String, String) {
         if self.models.iter().any(|m| m.name == model) {
-            (model.to_string(), effort.to_string())
-        } else {
-            (self.model.clone(), self.reasoning_effort.clone())
+            return (model.to_string(), effort.to_string());
         }
+        // Following the current model: at the helper's effort where the
+        // model offers it.
+        let offers = model.is_empty()
+            && self
+                .models
+                .iter()
+                .find(|m| m.name == self.model)
+                .is_some_and(|m| m.reasoning_efforts.iter().any(|e| e == effort));
+        let effort = if offers {
+            effort
+        } else {
+            &self.reasoning_effort
+        };
+        (self.model.clone(), effort.to_string())
     }
 
     pub fn model_config(&self, model: &str) -> ModelConfig {
@@ -2692,6 +2722,52 @@ mod tests {
         assert_eq!(request_effort(false, &[], "ultra"), "");
     }
 
+    /// Ticket #47: compaction can follow the conversation's current model.
+    #[test]
+    fn an_empty_compact_model_follows_the_current_model() {
+        let path = std::env::temp_dir().join("lynshen-compact-follow/config.json");
+        let config = |compact: &str| {
+            Config::from_value(
+                &format!(
+                    r#"{{
+                        "provider": "my-llm",
+                        "model": "big",
+                        "reasoning_effort": "high",
+                        {compact}
+                        "models": [
+                            {{ "name": "big", "context_window": 1000, "max_output_tokens": 100,
+                               "reasoning_efforts": ["low", "high"] }},
+                            {{ "name": "plain", "context_window": 500, "max_output_tokens": 50,
+                               "reasoning_efforts": ["none"] }},
+                            {{ "name": "small", "context_window": 200, "max_output_tokens": 20,
+                               "reasoning_efforts": ["low"] }}
+                        ]
+                    }}"#
+                ),
+                path.clone(),
+            )
+            .unwrap()
+        };
+        // Following: the current model, at the compact effort it offers.
+        let mut follow = config(r#""compact_model": "", "compact_reasoning_effort": "low","#);
+        assert_eq!(follow.compact(), ("big".to_string(), "low".to_string()));
+        assert_eq!(follow.compact_model_config().max_output_tokens, 100);
+        // ... and keeps following when the conversation switches model; one
+        // without that effort runs at its own.
+        follow.model = "plain".to_string();
+        follow.reasoning_effort = "none".to_string();
+        assert_eq!(follow.compact(), ("plain".to_string(), "none".to_string()));
+        // The empty choice is written back as it was.
+        assert_eq!(follow.compact_model, "");
+        // A fixed model stays fixed.
+        let fixed = config(r#""compact_model": "small", "compact_reasoning_effort": "low","#);
+        assert_eq!(fixed.compact(), ("small".to_string(), "low".to_string()));
+        // A config.json no engine has saved yet (a new user's) follows too.
+        assert_eq!(config("").compact_model, "");
+        // The safety classifier's default follows the same choice.
+        assert_eq!(follow.safety_model, "");
+    }
+
     #[test]
     fn a_retry_count_past_the_most_reads_as_the_most() {
         let path = std::env::temp_dir().join("lynshen-retry-cap/config.json");
@@ -3850,22 +3926,20 @@ mod tests {
     }
 
     #[test]
-    fn web_search_model_defaults_and_can_be_turned_off() {
+    fn web_search_model_defaults_to_the_conversation_model_and_can_be_pinned() {
         let dir = std::env::temp_dir().join(format!("lynshen-search-model-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
         let read = |text: &str| Config::from_value(text, path.clone()).unwrap();
-        assert_eq!(
-            read("{}").web_search_model,
-            crate::web::DEFAULT_SEARCH_MODEL
-        );
+        assert_eq!(read("{}").web_search_model, "");
         assert_eq!(
             read(r#"{"web_search_model":" claude-sonnet-5-5 "}"#).web_search_model,
             "claude-sonnet-5-5"
         );
-        let off = read(r#"{"web_search_model":""}"#);
-        assert_eq!(off.web_search_model, "");
-        off.save().unwrap();
+        // The default 0.7.7 and earlier wrote reads as unset, and is saved so.
+        let old = read(r#"{"web_search_model":"claude-haiku-5-5"}"#);
+        assert_eq!(old.web_search_model, "");
+        old.save().unwrap();
         let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["web_search_model"], "");
         let _ = fs::remove_dir_all(&dir);

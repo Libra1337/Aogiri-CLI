@@ -9,6 +9,7 @@ mod agents;
 mod connectors;
 mod dispatch;
 mod engines;
+mod feedback;
 mod files;
 mod gateway;
 mod http;
@@ -444,6 +445,13 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         });
         return;
     }
+    // A bug report from the phone page, sent with this computer's sign-in
+    // (Aogiri ticket #45).
+    if name == "feedback_send" {
+        let hub = Arc::clone(hub);
+        thread::spawn(move || respond(&hub, client, &request, feedback::send(&op)));
+        return;
+    }
     // 今天用量 on the phone: the account's plan, from the gateway.
     if name == "plan_quota" {
         let hub = Arc::clone(hub);
@@ -705,6 +713,7 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             .unsubscribe(
                 op["endpoint"]
                     .as_str()
+                    .or(op["token"].as_str().map(|t| t.trim()))
                     .or(op["client_id"].as_str())
                     .unwrap_or_default(),
             )

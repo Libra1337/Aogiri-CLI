@@ -1,4 +1,4 @@
-// Web Push for paired phones (docs/relay-protocol.md, "Web Push and Getui").
+// Web Push for paired phones (docs/relay-protocol.md, "Web Push and native push").
 // A daemon connected to this relay asks it to deliver one notification to a
 // browser subscription it holds; the relay signs the request for the push
 // service with its VAPID key (RFC 8292) and passes the message on. A daemon
@@ -248,8 +248,12 @@ type pushSubscription struct {
 		P256dh string `json:"p256dh"`
 		Auth   string `json:"auth"`
 	} `json:"keys"`
-	Provider string `json:"provider"`
-	ClientID string `json:"client_id"`
+	// Native push (native.go): apns, fcm or getui, with the device token
+	// (Getui: client_id) and, for APNs, its environment.
+	Provider    string `json:"provider"`
+	ClientID    string `json:"client_id"`
+	Token       string `json:"token"`
+	Environment string `json:"environment"`
 }
 
 type pushRequest struct {
@@ -269,10 +273,13 @@ type pushRequest struct {
 
 // pusher serves POST /relay/v1/push and GET /relay/v1/push/key.
 type pusher struct {
-	relay  *relay
-	vapid  *vapid
-	client *http.Client
-	now    func() time.Time
+	relay *relay
+	// nil: Web Push is not served (501, and no /push/key).
+	vapid *vapid
+	// The native providers configured (native.go); the others answer 501.
+	natives natives
+	client  *http.Client
+	now     func() time.Time
 	// Which endpoints may be posted to (allowedEndpoint; tests widen it).
 	allow func(endpoint string) (*url.URL, bool)
 
@@ -281,10 +288,14 @@ type pusher struct {
 	seen   map[[32]byte]time.Time
 }
 
-func newPusher(rl *relay, v *vapid) *pusher {
+func newPusher(rl *relay, v *vapid, n natives) *pusher {
+	if n == nil {
+		n = natives{}
+	}
 	return &pusher{
-		relay: rl,
-		vapid: v,
+		relay:   rl,
+		vapid:   v,
+		natives: n,
 		client: &http.Client{
 			Timeout: pushTimeout,
 			// A push service answers; it never sends us elsewhere.
@@ -297,6 +308,10 @@ func newPusher(rl *relay, v *vapid) *pusher {
 }
 
 func (p *pusher) serveKey(w http.ResponseWriter, r *http.Request) {
+	if p.vapid == nil {
+		http.NotFound(w, r)
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -371,8 +386,12 @@ func (p *pusher) servePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sub := req.Subscription
-	if sub.Provider == "getui" {
-		http.Error(w, "getui is not configured", http.StatusNotImplemented)
+	if sub.Provider != "" {
+		p.serveNative(w, r, id, req, now)
+		return
+	}
+	if p.vapid == nil {
+		http.Error(w, "web push is not configured", http.StatusNotImplemented)
 		return
 	}
 	endpoint, ok := p.allow(sub.Endpoint)
@@ -463,6 +482,64 @@ func (p *pusher) deliver(ctx context.Context, endpoint *url.URL, message []byte,
 	io.Copy(io.Discard, io.LimitReader(res.Body, 4096))
 	res.Body.Close()
 	return res.StatusCode, nil
+}
+
+// serveNative delivers a daemon's notice through APNs, FCM (or, later,
+// Getui): a plaintext notice of generic text and ids, never `encrypted`.
+func (p *pusher) serveNative(w http.ResponseWriter, r *http.Request, id string, req pushRequest, now time.Time) {
+	provider := req.Subscription.Provider
+	sender, configured := p.natives[provider]
+	switch provider {
+	case "apns", "fcm", "getui":
+	default:
+		http.Error(w, "unknown provider", http.StatusBadRequest)
+		return
+	}
+	if !configured {
+		http.Error(w, provider+" is not configured", http.StatusNotImplemented)
+		return
+	}
+	target, ok := nativeTargetOf(req.Subscription)
+	if !ok {
+		http.Error(w, "bad device token", http.StatusBadRequest)
+		return
+	}
+	if req.Encrypted != "" {
+		http.Error(w, "a native notice is not encrypted", http.StatusBadRequest)
+		return
+	}
+	n, err := parseNotice(req.Payload)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	ttl := defaultTTL
+	if req.TTL != nil && *req.TTL >= 0 && *req.TTL <= 28*24*60*60 {
+		ttl = *req.TTL
+	}
+	topic := ""
+	if req.Topic != "" && len(req.Topic) <= 32 && validTopic(req.Topic) {
+		topic = req.Topic
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), pushTimeout)
+	defer cancel()
+	result, err := sender.send(ctx, target, n, nativeDelivery{ttl: ttl, topic: topic, now: now})
+	if err != nil {
+		log.Printf("push for host %s via %s failed: %v", id, provider, err)
+		http.Error(w, "push service unreachable", http.StatusBadGateway)
+		return
+	}
+	log.Printf("push for host %s via %s: %d %s", id, provider, result.Status, result.Reason)
+	status := result.relayStatus(provider)
+	if status == http.StatusNoContent {
+		w.WriteHeader(status)
+		return
+	}
+	message := fmt.Sprintf("%s answered %d", provider, result.Status)
+	if result.Reason != "" {
+		message += " " + result.Reason
+	}
+	http.Error(w, message, status)
 }
 
 func validTopic(topic string) bool {

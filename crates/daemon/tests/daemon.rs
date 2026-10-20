@@ -4594,6 +4594,108 @@ fn a_phone_is_told_when_a_session_waits_and_not_while_it_looks_at_it() {
 }
 
 #[test]
+fn the_aogiri_app_is_told_through_apns_with_ids_and_generic_text_only() {
+    let _guard = setup();
+    std::env::set_var("LYNSHEN_AT_COMPUTER", "0");
+    let (address, pushes) = fake_push_relay();
+    let root = temp_dir("native-push-state");
+    let daemon = start_daemon_with(
+        root.join("daemon"),
+        root.join("agents"),
+        Some(format!("ws://{address}/relay/v1")),
+    );
+    let mut desktop = Client::connect(&daemon);
+    desktop.send(json!({ "op": "pair_start", "id": 1 }));
+    let code = desktop.until(|frame| frame["id"] == 1).pop().unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, response) = http(&daemon, &pair_request(&code));
+    assert_eq!(status, 200, "{response}");
+    let paired = serde_json::from_str::<Value>(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let token = paired["token"].as_str().unwrap().to_string();
+    desktop.send(json!({ "op": "device_confirm", "device": paired["device"], "id": 91 }));
+    desktop.until(|frame| frame["id"] == 91);
+    let mut phone = Client::connect_with(&daemon, &token);
+    let apns = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+    let reply = request(
+        &mut phone,
+        json!({ "op": "push_subscribe", "subscription": {
+            "provider": "apns", "token": apns, "environment": "sandbox",
+        }}),
+    );
+    assert_eq!(reply["type"], "push_subscribed", "{reply}");
+    let reply = request(
+        &mut phone,
+        json!({ "op": "push_subscribe", "subscription": { "provider": "apns", "token": "nothex" }}),
+    );
+    assert_eq!(reply["type"], "error", "{reply}");
+
+    let dir = temp_dir("native-push-session");
+    let session = desktop.create_session(&dir);
+    desktop.send(json!({ "op": "session_meta", "session": session, "title": "缓存分片" }));
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "RUN: printf secret-token > marker.txt" }));
+    desktop.until(ready(&session));
+    let (body, _) = pushes
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a push");
+    assert_eq!(
+        body["subscription"],
+        json!({ "provider": "apns", "token": apns, "environment": "sandbox" })
+    );
+    assert!(body.get("encrypted").is_none(), "{body}");
+    let payload = &body["payload"];
+    assert_eq!(payload["title"], "等你处理");
+    assert_eq!(payload["body"], "「缓存分片」等你批准");
+    assert_eq!(payload["kind"], "approval");
+    assert_eq!(payload["level"], "urgent");
+    assert_eq!(payload["session"], session.as_str());
+    // The deferred call's id, as the desk lists it.
+    desktop.send(json!({ "op": "actions_list", "id": 92 }));
+    let actions = desktop.until(|frame| frame["id"] == 92).pop().unwrap();
+    let listed = actions.to_string();
+    let action_id = payload["action_id"]
+        .as_str()
+        .expect("an action id")
+        .to_string();
+    assert!(listed.contains(&action_id), "{action_id} not in {listed}");
+    assert!(
+        payload["host"].as_str().is_some_and(|h| !h.is_empty()),
+        "{payload}"
+    );
+    assert!(!body.to_string().contains("secret-token"), "{body}");
+    assert!(!body.to_string().contains("printf"), "{body}");
+
+    // A phone can answer from the notification: decide_action with that id.
+    phone.send(json!({ "op": "decide_action", "session": session, "action": action_id, "decision": "deny" }));
+    desktop.until(|frame| frame["type"] == "action_decided" && frame["id"] == action_id.as_str());
+    desktop.until(ready(&session));
+
+    // push_test names the service.
+    let reply = request(&mut phone, json!({ "op": "push_test" }));
+    assert_eq!(reply["results"][0]["service"], "apns-sandbox", "{reply}");
+    // (The turn that ended after the denial may be told too: nobody is at
+    // the computer.)
+    let test_push = std::iter::from_fn(|| pushes.recv_timeout(Duration::from_secs(10)).ok())
+        .find(|(body, _)| body["payload"]["kind"] == "test")
+        .expect("a test push");
+    assert_eq!(
+        test_push.0["payload"]["body"],
+        "测试通知：这台手机能收到电脑发来的通知。"
+    );
+
+    // push_unsubscribe takes the token.
+    let reply = request(
+        &mut phone,
+        json!({ "op": "push_unsubscribe", "token": apns }),
+    );
+    assert_eq!(reply["type"], "push_unsubscribed");
+    let reply = request(&mut phone, json!({ "op": "push_test" }));
+    assert_eq!(reply["results"], json!([]), "{reply}");
+    std::env::remove_var("LYNSHEN_AT_COMPUTER");
+}
+
+#[test]
 fn a_phone_does_more_than_look_send_and_approve_only_once_the_desktop_grants_it() {
     let _guard = setup();
     let daemon = start_daemon();

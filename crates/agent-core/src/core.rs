@@ -200,6 +200,45 @@ enum WorkerEvent {
     Error(String),
 }
 
+/// A running turn's figures, for its `TurnStats` record.
+#[derive(Debug)]
+struct TurnFigures {
+    started: std::time::Instant,
+    first_output: Option<std::time::Instant>,
+    input_tokens: u64,
+    output_tokens: u64,
+    tools: u64,
+    cost: f64,
+}
+
+impl TurnFigures {
+    fn start() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            first_output: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            tools: 0,
+            cost: 0.0,
+        }
+    }
+
+    fn finish(self, model: String) -> crate::TurnStats {
+        let ms = |since: std::time::Duration| u64::try_from(since.as_millis()).unwrap_or(u64::MAX);
+        crate::TurnStats {
+            model,
+            elapsed_ms: ms(self.started.elapsed()),
+            ttft_ms: self
+                .first_output
+                .map(|at| ms(at.saturating_duration_since(self.started))),
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            tools: self.tools,
+            cost: self.cost,
+        }
+    }
+}
+
 pub struct AgentCore {
     config: Config,
     auth: AuthStore,
@@ -262,6 +301,9 @@ pub struct AgentCore {
     total_cost: f64,
     turn_started_at: Option<SystemTime>,
     turn_goal_tokens: u64,
+    /// The running turn's figures for its `TurnStats` record, from its first
+    /// request to its end; carried over a compact-and-retry.
+    turn_figures: Option<TurnFigures>,
     goal_continuation_running: bool,
     /// Set when the upstream rejected a turn as over the context window: the
     /// next spawn compacts first (`force_compaction`) and the turn is retried
@@ -434,6 +476,7 @@ impl AgentCore {
             total_cost: 0.0,
             turn_started_at: None,
             turn_goal_tokens: 0,
+            turn_figures: None,
             goal_continuation_running: false,
             force_compaction: false,
             overflow_retry_pending: false,
@@ -878,15 +921,15 @@ impl AgentCore {
                 AgentEvent::PendingMessages(self.pending_texts()),
             ];
         }
-        self.stop_current_turn();
+        let mut events = self.stop_current_turn();
         let Some((next, images)) = self.queued.pop_front() else {
-            return Vec::new();
+            return events;
         };
-        let mut events = vec![
+        events.extend([
             AgentEvent::Status("steering".to_string()),
             AgentEvent::PendingMessages(self.pending_texts()),
             AgentEvent::UserMessage(next.clone()),
-        ];
+        ]);
         events.extend(self.start_hooked_turn(next, images));
         events
     }
@@ -894,7 +937,9 @@ impl AgentCore {
     /// Stops the in-flight turn: signals the worker to abort, closes subagents,
     /// and clears all per-turn channels and state. Shared by interrupt and steer
     /// so the old turn's tools never run concurrently with a new one.
-    fn stop_current_turn(&mut self) {
+    fn stop_current_turn(&mut self) -> Vec<AgentEvent> {
+        // What the stopped turn did so far still counts.
+        let stats = self.record_turn_stats();
         self.interrupt_flag.store(true, Ordering::SeqCst);
         self.subagent_manager.close_all();
         self.receiver = None;
@@ -904,6 +949,7 @@ impl AgentCore {
         self.goal_continuation_running = false;
         self.turn_started_at = None;
         self.turn_goal_tokens = 0;
+        stats
     }
 
     /// The approval channel's sending end, made on first use.
@@ -960,8 +1006,8 @@ impl AgentCore {
         if !self.running {
             return Vec::new();
         }
-        self.stop_current_turn();
-        let mut events = vec![AgentEvent::Info("request interrupted".to_string())];
+        let mut events = self.stop_current_turn();
+        events.push(AgentEvent::Info("request interrupted".to_string()));
         // Else goal continuation starts the next turn at the next poll, and
         // Stop seems not to work.
         events.extend(self.pause_goal("the turn was stopped"));
@@ -1455,7 +1501,7 @@ impl AgentCore {
                 .chain([
                     config.model.clone(),
                     config.compact().0,
-                    config.safety_model.clone(),
+                    config.safety().0,
                     config.image_model.clone(),
                 ]);
             for name in names {
@@ -1808,9 +1854,13 @@ impl AgentCore {
                     WorkerEvent::CallStart => events.push(AgentEvent::Connecting),
                     WorkerEvent::Connected => events.push(AgentEvent::ThinkingStart),
                     WorkerEvent::ReasoningDelta(delta) => {
+                        self.turn_output_started();
                         events.push(AgentEvent::ReasoningDelta(delta))
                     }
-                    WorkerEvent::Delta(delta) => events.push(AgentEvent::AssistantDelta(delta)),
+                    WorkerEvent::Delta(delta) => {
+                        self.turn_output_started();
+                        events.push(AgentEvent::AssistantDelta(delta))
+                    }
                     WorkerEvent::Retrying {
                         attempt,
                         max_attempts,
@@ -1851,6 +1901,10 @@ impl AgentCore {
                         events.push(self.context_usage_event());
                     }
                     WorkerEvent::ToolStart { call_id, name } => {
+                        self.turn_output_started();
+                        if let Some(figures) = self.turn_figures.as_mut() {
+                            figures.tools += 1;
+                        }
                         events.push(AgentEvent::ToolStart { call_id, name });
                     }
                     WorkerEvent::ToolUpdate {
@@ -1904,11 +1958,17 @@ impl AgentCore {
                         self.total_input_tokens += input_tokens;
                         self.total_cached_input_tokens += cached_input_tokens;
                         self.total_output_tokens += output_tokens;
-                        self.total_cost += self.config.current_model_config().cost_for(
+                        let cost = self.config.current_model_config().cost_for(
                             input_tokens,
                             cached_input_tokens,
                             output_tokens,
                         );
+                        self.total_cost += cost;
+                        if let Some(figures) = self.turn_figures.as_mut() {
+                            figures.input_tokens += input_tokens;
+                            figures.output_tokens += output_tokens;
+                            figures.cost += cost;
+                        }
                         let non_cached_input_tokens =
                             input_tokens.saturating_sub(cached_input_tokens);
                         self.turn_goal_tokens = self
@@ -1925,6 +1985,7 @@ impl AgentCore {
                         self.subagent_manager
                             .close_all_with_message("parent turn finished");
                         events.extend(self.drain_subagent_events());
+                        events.extend(self.record_turn_stats());
                         // Steered after the model's last request: run next.
                         self.requeue_unread_steers();
                         events.extend(self.finish_goal_turn());
@@ -1980,6 +2041,7 @@ impl AgentCore {
                     WorkerEvent::Error(error) => {
                         self.subagent_manager
                             .close_all_with_message("parent turn failed");
+                        events.extend(self.record_turn_stats());
                         events.extend(self.finish_goal_turn());
                         if error.starts_with(crate::loop_guard::STOP_PREFIX) {
                             events.extend(self.pause_goal("the loop guard stopped the turn"));
@@ -2460,6 +2522,7 @@ impl AgentCore {
             self.session.append(EntryKind::UserImage { paths: images });
         }
         self.turn_started_at = Some(SystemTime::now());
+        self.turn_figures = Some(TurnFigures::start());
         self.new_turn_tag();
         self.turn_goal_tokens = 0;
         let save_event = self.save_session_event();
@@ -2522,6 +2585,7 @@ impl AgentCore {
                 self.provider_api_key(),
                 &model_headers,
             ),
+            gateway: crate::web::GatewaySearch::from_config(&self.config, self.provider_api_key()),
         }));
         let context = PromptContext {
             date: current_utc_date(),
@@ -3116,11 +3180,36 @@ impl AgentCore {
 
     fn start_turn_from_existing_context(&mut self) -> Vec<AgentEvent> {
         self.turn_started_at = Some(SystemTime::now());
+        self.turn_figures = Some(TurnFigures::start());
         self.new_turn_tag();
         self.turn_goal_tokens = 0;
         let save_event = self.save_session_event();
 
         self.spawn_current_context_turn(save_event)
+    }
+
+    /// The running turn produced its first output (text, reasoning or a
+    /// tool call).
+    fn turn_output_started(&mut self) {
+        if let Some(figures) = self.turn_figures.as_mut() {
+            figures
+                .first_output
+                .get_or_insert_with(std::time::Instant::now);
+        }
+    }
+
+    /// Ends the running turn's figures: the session keeps them after the
+    /// turn's items (`EntryKind::TurnStats`), and clients get them live.
+    /// Nothing when no turn is counting (a compaction, a turn already ended).
+    fn record_turn_stats(&mut self) -> Vec<AgentEvent> {
+        let Some(figures) = self.turn_figures.take() else {
+            return Vec::new();
+        };
+        let stats = figures.finish(self.config.model.clone());
+        self.session.append(EntryKind::TurnStats(stats.clone()));
+        let mut events = self.save_session_event();
+        events.push(AgentEvent::TurnStats(stats));
+        events
     }
 
     fn finish_goal_turn(&mut self) -> Vec<AgentEvent> {
@@ -4987,6 +5076,7 @@ impl AgentCore {
         self.resume_summary_receiver = None;
         self.resume_summary_running = false;
         self.resume_summary_retry_at = None;
+        self.turn_figures = None;
         self.session = SessionStore::new();
         self.tool_state.set_session_id(self.session.session_id());
         self.reset_team();
@@ -5583,6 +5673,7 @@ impl AgentCore {
                 self.goal_continuation_running = false;
                 self.turn_started_at = None;
                 self.turn_goal_tokens = 0;
+                self.turn_figures = None;
                 self.session = session;
                 self.tool_state.set_session_id(self.session.session_id());
                 // Release the previous session's lock only after the switch.

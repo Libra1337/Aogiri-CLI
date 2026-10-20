@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "lynshen-agent-core"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "base64",
  "chacha20poly1305 0.11.0",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "lynshen-cli"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "libc",
  "lynshen-agent-core",
@@ -1045,14 +1045,16 @@ dependencies = [
 
 [[package]]
 name = "lynshen-daemon"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "base64",
  "chrono",
  "ed25519-dalek",
+ "flate2",
  "getrandom 0.2.17",
  "lynshen-agent-core",
  "portable-pty",
+ "regex",
  "ring",
  "rustls",
  "serde",
@@ -1066,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "lynshen-sandbox"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "libc",
  "serde_json",
@@ -1075,7 +1077,7 @@ dependencies = [
 
 [[package]]
 name = "lynshen-software-release"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -1087,7 +1089,7 @@ dependencies = [
 
 [[package]]
 name = "lynshen-tui"
-version = "0.7.7"
+version = "0.7.8"
 dependencies = [
  "base64",
  "lynshen-agent-core",
