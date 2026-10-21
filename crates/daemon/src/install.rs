@@ -287,9 +287,9 @@ mod tests {
     #[test]
     fn systemd_unit_quotes_paths_with_spaces() {
         let unit = systemd_unit(&spec());
-        assert!(
-            unit.contains("ExecStart=\"/opt/LynShen Desktop/bin/lynshen\" daemon --listen 127.0.0.1:7788")
-        );
+        assert!(unit.contains(
+            "ExecStart=\"/opt/LynShen Desktop/bin/lynshen\" daemon --listen 127.0.0.1:7788"
+        ));
         assert!(unit.contains("Environment=\"PATH=/opt/homebrew/bin:/usr/bin\""));
         assert!(unit.contains("WantedBy=default.target"));
     }
