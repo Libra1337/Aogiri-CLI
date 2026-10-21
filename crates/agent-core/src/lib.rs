@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod android;
 pub mod approval;
 mod board;
 pub mod chat;
@@ -227,6 +228,39 @@ pub fn change_mcp_config(op: &serde_json::Value) -> Result<(), String> {
     config
         .save()
         .map_err(|error| format!("failed to save config: {error}"))
+}
+
+/// The desktop's Android phone ops (see `android`): `android_use_status`
+/// (`doctor: true` runs au's own check), `android_use_install`,
+/// `android_use_setup`, `android_use_enable` (`enabled`). Each answers with
+/// the status after it.
+pub fn android_use_op(name: &str, op: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let enabled = || {
+        config::Config::load_existing()
+            .map(|config| config.android_use)
+            .unwrap_or(false)
+    };
+    match name {
+        "android_use_status" => Ok(android::status(enabled(), op["doctor"] == true)),
+        "android_use_install" => {
+            android::install()?;
+            Ok(android::status(enabled(), false))
+        }
+        "android_use_setup" => {
+            let report = android::setup()?;
+            let mut status = android::status(enabled(), true);
+            status["setup"] = report;
+            Ok(status)
+        }
+        "android_use_enable" => {
+            let on = op["enabled"]
+                .as_bool()
+                .ok_or("android_use_enable requires enabled")?;
+            android::set_enabled(on)?;
+            Ok(android::status(on, false))
+        }
+        other => Err(format!("unknown op {other}")),
+    }
 }
 
 /// Sessions saved for `cwd`, most recently updated first (`updated_at` in

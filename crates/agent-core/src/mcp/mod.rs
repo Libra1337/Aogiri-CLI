@@ -5,13 +5,12 @@
 mod client;
 mod transport;
 
+pub use client::McpClient;
+
 use crate::{
     config::{McpServerConfig, McpTransportKind},
     event::{McpServerView, McpToolView},
-    mcp::{
-        client::McpClient,
-        transport::{HttpTransport, McpTransport, StdioTransport},
-    },
+    mcp::transport::{HttpTransport, McpTransport, StdioTransport},
 };
 use serde_json::{json, Value};
 use std::{
@@ -511,6 +510,22 @@ impl McpManager {
         );
         state.dirty = true;
     }
+}
+
+/// A connected stdio client outside the configured servers (a built-in
+/// tool's own server): spawned in `cwd`, initialized, its stderr discarded.
+pub fn spawn_stdio_client(
+    name: &str,
+    command: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<McpClient, String> {
+    let transport = StdioTransport::spawn_with(name, command, args, env, cwd, false)?;
+    let client = McpClient::new(name, Box::new(transport), timeout, cwd);
+    client.initialize()?;
+    Ok(client)
 }
 
 pub fn mcp_tool_name(server: &str, tool: &str) -> String {

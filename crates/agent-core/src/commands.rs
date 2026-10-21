@@ -228,6 +228,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         advanced: false,
     },
     CommandSpec {
+        name: "/android",
+        aliases: &[],
+        args: "[status|on|off|install|setup]",
+        description: "Control an Android phone (android-use)",
+        advanced: true,
+    },
+    CommandSpec {
         name: "/stats",
         aliases: &[],
         args: "",
