@@ -263,7 +263,7 @@ mod tests {
 
     fn spec() -> ServiceSpec {
         ServiceSpec {
-            program: PathBuf::from("/opt/Ju Code/bin/lynshen"),
+            program: PathBuf::from("/opt/LynShen Desktop/bin/lynshen"),
             listen: "127.0.0.1:7788".to_string(),
             relay_args: Vec::new(),
             path_env: "/opt/homebrew/bin:/usr/bin".to_string(),
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn launchd_plist_runs_the_daemon_with_the_install_path() {
         let plist = launchd_plist(&spec());
-        assert!(plist.contains("<string>/opt/Ju Code/bin/lynshen</string>"));
+        assert!(plist.contains("<string>/opt/LynShen Desktop/bin/lynshen</string>"));
         assert!(plist.contains("<string>daemon</string>"));
         assert!(plist.contains("<string>127.0.0.1:7788</string>"));
         assert!(plist.contains("<string>/opt/homebrew/bin:/usr/bin</string>"));
@@ -287,9 +287,9 @@ mod tests {
     #[test]
     fn systemd_unit_quotes_paths_with_spaces() {
         let unit = systemd_unit(&spec());
-        assert!(
-            unit.contains("ExecStart=\"/opt/Ju Code/bin/lynshen\" daemon --listen 127.0.0.1:7788")
-        );
+        assert!(unit.contains(
+            "ExecStart=\"/opt/LynShen Desktop/bin/lynshen\" daemon --listen 127.0.0.1:7788"
+        ));
         assert!(unit.contains("Environment=\"PATH=/opt/homebrew/bin:/usr/bin\""));
         assert!(unit.contains("WantedBy=default.target"));
     }
