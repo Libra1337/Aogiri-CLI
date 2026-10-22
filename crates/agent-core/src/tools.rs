@@ -19,6 +19,10 @@ use std::{
 
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 60;
 const MAX_IMAGE_READ_BYTES: u64 = 1024 * 1024;
+/// Largest image a user can attach to a message: 3.75 MB of file is 5 MB of
+/// base64, the per-image limit of the Messages API (the Claude Code engine
+/// uses the same cap). Larger files are refused with a note to the model.
+pub const MAX_IMAGE_ATTACH_BYTES: u64 = 3_750_000;
 const LARGE_TEXT_READ_SOFT_BYTES: u64 = 256 * 1024;
 const LARGE_RIPGREP_OUTPUT_SOFT_LINES: usize = 200;
 const LARGE_RIPGREP_OUTPUT_SOFT_BYTES: usize = 128 * 1024;
@@ -2189,8 +2193,8 @@ pub fn image_attachment_part(path: &Path) -> Result<Value, String> {
         return Err(format!("{}: not a supported image", path.display()));
     };
     let metadata = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    if metadata.len() > MAX_IMAGE_READ_BYTES {
-        return Err(format!("{}: image is too large to attach", path.display()));
+    if metadata.len() > MAX_IMAGE_ATTACH_BYTES {
+        return Err(too_large_to_attach(path, metadata.len()));
     }
     let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
     Ok(json!({
@@ -2207,11 +2211,39 @@ pub fn image_attachment_error(path: &Path) -> Option<String> {
     }
     match fs::metadata(path) {
         Err(error) => Some(format!("{}: {error}", path.display())),
-        Ok(metadata) if metadata.len() > MAX_IMAGE_READ_BYTES => {
-            Some(format!("{}: image is too large to attach", path.display()))
+        Ok(metadata) if metadata.len() > MAX_IMAGE_ATTACH_BYTES => {
+            Some(too_large_to_attach(path, metadata.len()))
         }
         Ok(_) => None,
     }
+}
+
+fn too_large_to_attach(path: &Path, bytes: u64) -> String {
+    format!(
+        "{}: image is too large to attach ({:.1} MB; the limit is {:.2} MB)",
+        path.display(),
+        bytes as f64 / 1_000_000.0,
+        MAX_IMAGE_ATTACH_BYTES as f64 / 1_000_000.0
+    )
+}
+
+/// The note the model reads in place of an image that could not be attached,
+/// so it can tell the user what happened instead of answering as if the
+/// message had no image.
+pub fn unattached_image_note(errors: &[String]) -> Option<String> {
+    if errors.is_empty() {
+        return None;
+    }
+    let mut note = String::from(
+        "[Note from the client: the user attached image(s) that were NOT sent to you. \
+         Tell the user, and ask them to send a smaller PNG/JPEG/GIF/WebP image:",
+    );
+    for error in errors {
+        note.push_str("\n- ");
+        note.push_str(error);
+    }
+    note.push(']');
+    Some(note)
 }
 
 fn project_diff_model_output(name: &str, output: &str, cwd: &Path) -> Option<String> {

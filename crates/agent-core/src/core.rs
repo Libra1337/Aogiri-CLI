@@ -824,7 +824,14 @@ impl AgentCore {
         // front-end (TUI, serve, acp), merged before explicit attachments.
         let mut merged = std::mem::take(&mut self.pending_images);
         merged.extend(images);
-        let (images, mut events) = self.validate_image_attachments(merged);
+        let (images, skipped, mut events) = self.validate_image_attachments(merged);
+        // An image that cannot be sent is named to the model in the message
+        // itself, so the reply says so instead of "there is no image".
+        let message = match crate::tools::unattached_image_note(&skipped) {
+            Some(note) if message.trim().is_empty() => note,
+            Some(note) => format!("{message}\n\n{note}"),
+            None => message,
+        };
         if self.running {
             self.queued.push_back((message, images));
             events.push(AgentEvent::PendingMessages(self.pending_texts()));
@@ -853,16 +860,23 @@ impl AgentCore {
 
     /// Splits attachment paths into valid ones (kept) and a warning event per
     /// unattachable path. Reads no file contents.
-    fn validate_image_attachments(&self, images: Vec<String>) -> (Vec<String>, Vec<AgentEvent>) {
+    fn validate_image_attachments(
+        &self,
+        images: Vec<String>,
+    ) -> (Vec<String>, Vec<String>, Vec<AgentEvent>) {
         let mut valid = Vec::new();
+        let mut skipped = Vec::new();
         let mut events = Vec::new();
         for path in images {
             match crate::tools::image_attachment_error(std::path::Path::new(&path)) {
-                Some(error) => events.push(AgentEvent::Info(format!("skipped attachment {error}"))),
+                Some(error) => {
+                    events.push(AgentEvent::Info(format!("skipped attachment {error}")));
+                    skipped.push(error);
+                }
                 None => valid.push(path),
             }
         }
-        (valid, events)
+        (valid, skipped, events)
     }
 
     fn pending_texts(&self) -> Vec<String> {
