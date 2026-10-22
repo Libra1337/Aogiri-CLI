@@ -2577,6 +2577,10 @@ fn turn_allowable(kind: &str, frame: &Value) -> bool {
     if frame["must_ask"].as_bool() == Some(true) {
         return false;
     }
+    // Each phone action is decided on its own (approved once at most).
+    if frame["name"] == lynshen_agent_core::android::ACT_TOOL {
+        return false;
+    }
     matches!(kind, "command" | "edit" | "tool")
 }
 
@@ -2707,6 +2711,13 @@ fn failed(lang: Lang, error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allow_for_the_turn_never_covers_a_phone_action() {
+        let call = |name: &str| json!({ "name": name, "kind": "tool", "must_ask": false });
+        assert!(turn_allowable("tool", &call("mcp__files__read")));
+        assert!(!turn_allowable("tool", &call("android_act")));
+    }
 
     #[test]
     fn commands_need_a_slash_or_a_whole_chinese_word() {

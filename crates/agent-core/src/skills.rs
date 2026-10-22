@@ -1180,7 +1180,7 @@ fn infer_package_type(url: &str) -> &str {
     }
 }
 
-fn extract_zip(bytes: &[u8], dest: &Path) -> io::Result<()> {
+pub(crate) fn extract_zip(bytes: &[u8], dest: &Path) -> io::Result<()> {
     extract_zip_within(bytes, dest, MAX_EXTRACTED_BYTES)
 }
 
@@ -1263,7 +1263,7 @@ fn set_mode(_path: &Path, _mode: Option<u32>) -> io::Result<()> {
     Ok(())
 }
 
-fn extract_tar_gz(bytes: &[u8], dest: &Path) -> io::Result<()> {
+pub(crate) fn extract_tar_gz(bytes: &[u8], dest: &Path) -> io::Result<()> {
     extract_tar_gz_within(bytes, dest, MAX_EXTRACTED_BYTES)
 }
 

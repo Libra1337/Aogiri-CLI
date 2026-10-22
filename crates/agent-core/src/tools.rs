@@ -19,6 +19,10 @@ use std::{
 
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 60;
 const MAX_IMAGE_READ_BYTES: u64 = 1024 * 1024;
+/// Largest image a user can attach to a message: 3.75 MB of file is 5 MB of
+/// base64, the per-image limit of the Messages API (the Claude Code engine
+/// uses the same cap). Larger files are refused with a note to the model.
+pub const MAX_IMAGE_ATTACH_BYTES: u64 = 3_750_000;
 const LARGE_TEXT_READ_SOFT_BYTES: u64 = 256 * 1024;
 const LARGE_RIPGREP_OUTPUT_SOFT_LINES: usize = 200;
 const LARGE_RIPGREP_OUTPUT_SOFT_BYTES: usize = 128 * 1024;
@@ -224,7 +228,10 @@ pub fn definitions() -> Vec<Value> {
         crate::web_fetch::definition(),
         crate::web::search_definition(),
         crate::images::definition(),
-    ])
+    ]
+    .into_iter()
+    .chain(crate::android::definitions())
+    .collect())
 }
 
 fn with_function_tool_defaults(mut definitions: Vec<Value>) -> Vec<Value> {
@@ -337,6 +344,10 @@ fn run_tool_inner(
         "web_fetch" => crate::web::run_fetch(&args, state.web().as_ref()),
         "web_search" => crate::web::run_search(&args, state.web().as_ref()),
         crate::images::TOOL_NAME => crate::images::run(&args, cwd, state, &mut emit),
+        name if crate::android::is_tool(name) => match state.android() {
+            Ok(au) => crate::android::run(name, &args, &au),
+            Err(reason) => json!({ "error": reason }),
+        },
         _ => json!({ "error": format!("unknown tool: {name}") }),
     };
     if state.outside_writes.is_some() && result.get("error").is_none() {
@@ -354,8 +365,13 @@ fn tool_result(name: &str, value: Value, cwd: &Path) -> ToolExecutionResult {
     let output = value.to_string();
     let model_output = project_model_output(name, &output, cwd);
     // Log the tool name and a brief error only; arguments and file contents
-    // must never reach the log.
-    if let Some(error) = value.get("error").and_then(Value::as_str) {
+    // must never reach the log, nor what the phone shows (its errors quote
+    // the screen).
+    if let Some(error) = value
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|_| !crate::android::is_tool(name))
+    {
         let brief = error.chars().take(200).collect::<String>();
         crate::log_warn!("tools", "tool error", tool = name, error = brief);
     }
@@ -2135,7 +2151,7 @@ fn project_read_model_output_inner(name: &str, output: &str, cwd: &Path) -> Opti
 /// [`image_content_item`], so keeping the base64 in the function output would
 /// only waste tokens.
 fn project_image_model_output(name: &str, output: &str) -> Option<String> {
-    if name != "read" {
+    if name != "read" && !crate::android::is_tool(name) {
         return None;
     }
     let mut value = serde_json::from_str::<Value>(output).ok()?;
@@ -2177,8 +2193,8 @@ pub fn image_attachment_part(path: &Path) -> Result<Value, String> {
         return Err(format!("{}: not a supported image", path.display()));
     };
     let metadata = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    if metadata.len() > MAX_IMAGE_READ_BYTES {
-        return Err(format!("{}: image is too large to attach", path.display()));
+    if metadata.len() > MAX_IMAGE_ATTACH_BYTES {
+        return Err(too_large_to_attach(path, metadata.len()));
     }
     let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
     Ok(json!({
@@ -2195,11 +2211,39 @@ pub fn image_attachment_error(path: &Path) -> Option<String> {
     }
     match fs::metadata(path) {
         Err(error) => Some(format!("{}: {error}", path.display())),
-        Ok(metadata) if metadata.len() > MAX_IMAGE_READ_BYTES => {
-            Some(format!("{}: image is too large to attach", path.display()))
+        Ok(metadata) if metadata.len() > MAX_IMAGE_ATTACH_BYTES => {
+            Some(too_large_to_attach(path, metadata.len()))
         }
         Ok(_) => None,
     }
+}
+
+fn too_large_to_attach(path: &Path, bytes: u64) -> String {
+    format!(
+        "{}: image is too large to attach ({:.1} MB; the limit is {:.2} MB)",
+        path.display(),
+        bytes as f64 / 1_000_000.0,
+        MAX_IMAGE_ATTACH_BYTES as f64 / 1_000_000.0
+    )
+}
+
+/// The note the model reads in place of an image that could not be attached,
+/// so it can tell the user what happened instead of answering as if the
+/// message had no image.
+pub fn unattached_image_note(errors: &[String]) -> Option<String> {
+    if errors.is_empty() {
+        return None;
+    }
+    let mut note = String::from(
+        "[Note from the client: the user attached image(s) that were NOT sent to you. \
+         Tell the user, and ask them to send a smaller PNG/JPEG/GIF/WebP image:",
+    );
+    for error in errors {
+        note.push_str("\n- ");
+        note.push_str(error);
+    }
+    note.push(']');
+    Some(note)
 }
 
 fn project_diff_model_output(name: &str, output: &str, cwd: &Path) -> Option<String> {
@@ -2882,6 +2926,9 @@ struct ToolStateInner {
     /// Endpoint and model for generate_image, or why it is unavailable;
     /// None until the engine configures it.
     images: Option<Result<crate::images::ImageTools, String>>,
+    /// The android-use binary the phone tools run, or why they are off;
+    /// None until the engine configures it.
+    android: Option<Result<PathBuf, String>>,
     /// Messages for the session from work that outlived its tool call (an
     /// interrupted generate_image saving its result), drained into Info events.
     notices: Vec<String>,
@@ -3028,6 +3075,21 @@ impl ToolState {
             .ok()
             .and_then(|inner| inner.images.clone())
             .unwrap_or_else(|| Err(crate::images::UNAVAILABLE.to_string()))
+    }
+
+    pub(crate) fn set_android(&self, android: Result<PathBuf, String>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.android = Some(android);
+        }
+    }
+
+    /// The au the phone tools run, or why they are not offered.
+    pub(crate) fn android(&self) -> Result<PathBuf, String> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.android.clone())
+            .unwrap_or_else(|| crate::android::availability(false))
     }
 
     pub(crate) fn push_notice(&self, notice: String) {
@@ -5615,7 +5677,9 @@ mod tests {
                 "checkpoint",
                 "web_fetch",
                 "web_search",
-                "generate_image"
+                "generate_image",
+                "android_read",
+                "android_act"
             ]
         );
         assert!(tools

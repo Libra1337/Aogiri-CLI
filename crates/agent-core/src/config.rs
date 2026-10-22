@@ -137,6 +137,16 @@ impl ApprovalMode {
         if is_shell_tool(tool_name) {
             return *self != Self::FullAccess;
         }
+        // A phone action asks as a command does, without the classifier:
+        // every mode but full access.
+        if tool_name == crate::android::ACT_TOOL {
+            return *self != Self::FullAccess;
+        }
+        // Reading the phone sends what it shows to the model: the strictest
+        // mode asks, as for the network tools.
+        if tool_name == crate::android::READ_TOOL {
+            return self.is_strict();
+        }
         // generate_image writes files into the workspace like `write`,
         // merge_agent (apply) and pick_attempt bring a subagent's changes
         // into it, and checkpoint (restore) puts files back.
@@ -300,6 +310,10 @@ pub struct Config {
     /// Model behind `generate_image`. Empty: the first of `models` whose
     /// name contains "image" (see `images::resolve_model`).
     pub image_model: String,
+    /// Android phone control (`android_use`, off by default; see
+    /// `crate::android`). Read with the live settings, never written back:
+    /// Desktop and `/android` change it in the file.
+    pub android_use: bool,
     pub models: Vec<ModelConfig>,
     /// Models the main agent may pick for `spawn_agent` (`subagent_models`),
     /// each with a note on when to use it. Empty: subagents run on the main
@@ -633,6 +647,7 @@ impl Config {
                 safety_reasoning_effort: DEFAULT_COMPACT_REASONING_EFFORT.to_string(),
                 title_model: String::new(),
                 image_model: String::new(),
+                android_use: false,
                 models: models_for_provider("lynshen"),
                 subagent_models: Vec::new(),
                 lynshen_models: Vec::new(),
@@ -771,6 +786,7 @@ impl Config {
             safety_reasoning_effort,
             title_model: read_string(&value, "title_model", ""),
             image_model: read_string(&value, "image_model", ""),
+            android_use: read_bool(&value, crate::android::CONFIG_KEY, false),
             subagent_models: read_subagent_models(&value),
             models,
             lynshen_models: value
@@ -946,6 +962,7 @@ impl Config {
         let value = serde_json::from_str::<Value>(&content)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         self.image_model = read_string(&value, "image_model", "");
+        self.android_use = read_bool(&value, crate::android::CONFIG_KEY, false);
         self.subagent_models = read_subagent_models(&value);
         self.context_window_overrides = read_context_window_overrides(&value);
         self.lynshen_groups = read_lynshen_groups(&value);
@@ -3358,6 +3375,7 @@ mod tests {
             safety_reasoning_effort: "low".to_string(),
             title_model: String::new(),
             image_model: String::new(),
+            android_use: false,
             subagent_models: Vec::new(),
             models: vec![
                 ModelConfig {
