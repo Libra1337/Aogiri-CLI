@@ -331,6 +331,81 @@ fn edit_hunks(name: &str, input: &Value) -> Value {
     json!(hunks)
 }
 
+/// The tool-card JSON of a call's result (`structured`: a live frame's
+/// `tool_use_result`, a saved row's `toolUseResult`).
+fn result_card(meta: &ToolMeta, block: &Value, structured: &Value) -> String {
+    let is_error = block["is_error"] == true;
+    let body = result_text(&block["content"]);
+    let failed = || {
+        if body.is_empty() {
+            "failed".to_string()
+        } else {
+            body.clone()
+        }
+    };
+    match meta.name.as_str() {
+        "bash" => {
+            let mut card = json!({ "command": text(&meta.input["command"]) });
+            if is_error {
+                let stderr = text(&structured["stderr"]);
+                card["error"] = json!(if !body.is_empty() {
+                    body.clone()
+                } else if !stderr.is_empty() {
+                    stderr.to_string()
+                } else {
+                    "failed".to_string()
+                });
+            } else {
+                card["stdout"] = match structured["stdout"].as_str() {
+                    Some(stdout) => json!(stdout),
+                    None => json!(body),
+                };
+                if !text(&structured["stderr"]).is_empty() {
+                    card["stderr"] = structured["stderr"].clone();
+                }
+            }
+            card.to_string()
+        }
+        "write" | "str_replace" => {
+            let path = edit_path(&meta.input);
+            if is_error {
+                json!({ "path": path, "error": failed() }).to_string()
+            } else {
+                let paths: Vec<&str> = if path.is_empty() { vec![] } else { vec![path] };
+                json!({ "path": path, "paths": paths, "diff": edit_diff(&meta.claude_name, &meta.input) }).to_string()
+            }
+        }
+        "read" => {
+            if is_error {
+                let path = text(&meta.input["file_path"]);
+                json!({ "path": path, "error": failed() }).to_string()
+            } else {
+                read_card(&meta.input).to_string()
+            }
+        }
+        "ripgrep" => {
+            let mut card = json!({ "pattern": text(&meta.input["pattern"]) });
+            if is_error {
+                card["error"] = json!(failed());
+            } else {
+                card["stdout"] = json!(body);
+            }
+            card.to_string()
+        }
+        _ => body.clone(),
+    }
+}
+
+/// A Read card: the file, and the line the reading started at (`offset`,
+/// 1-based) when it is not the first, so a client opens the file there.
+fn read_card(input: &Value) -> Value {
+    let mut card = json!({ "path": text(&input["file_path"]) });
+    if let Some(line) = input["offset"].as_u64().filter(|line| *line > 1) {
+        card["line"] = json!(line);
+    }
+    card
+}
+
 /// The tool-card JSON Desktop's cards understand, from a tool input.
 fn card_json(name: &str, input: &Value) -> String {
     let card = match tool_name(name) {
@@ -340,7 +415,7 @@ fn card_json(name: &str, input: &Value) -> String {
             let paths: Vec<&str> = if path.is_empty() { vec![] } else { vec![path] };
             json!({ "path": path, "paths": paths, "diff": edit_diff(name, input) })
         }
-        "read" => json!({ "path": text(&input["file_path"]) }),
+        "read" => read_card(input),
         "ripgrep" => {
             let mut card = json!({ "pattern": text(&input["pattern"]) });
             if !text(&input["path"]).is_empty() {
@@ -992,65 +1067,7 @@ impl Claude {
             return vec![];
         }
         let is_error = block["is_error"] == true;
-        let body = result_text(&block["content"]);
-        let failed = || {
-            if body.is_empty() {
-                "failed".to_string()
-            } else {
-                body.clone()
-            }
-        };
-        let output = match meta.name.as_str() {
-            "bash" => {
-                let mut card = json!({ "command": text(&meta.input["command"]) });
-                if is_error {
-                    let stderr = text(&structured["stderr"]);
-                    card["error"] = json!(if !body.is_empty() {
-                        body.clone()
-                    } else if !stderr.is_empty() {
-                        stderr.to_string()
-                    } else {
-                        "failed".to_string()
-                    });
-                } else {
-                    card["stdout"] = match structured["stdout"].as_str() {
-                        Some(stdout) => json!(stdout),
-                        None => json!(body),
-                    };
-                    if !text(&structured["stderr"]).is_empty() {
-                        card["stderr"] = structured["stderr"].clone();
-                    }
-                }
-                card.to_string()
-            }
-            "write" | "str_replace" => {
-                let path = edit_path(&meta.input);
-                if is_error {
-                    json!({ "path": path, "error": failed() }).to_string()
-                } else {
-                    let paths: Vec<&str> = if path.is_empty() { vec![] } else { vec![path] };
-                    json!({ "path": path, "paths": paths, "diff": edit_diff(&meta.claude_name, &meta.input) }).to_string()
-                }
-            }
-            "read" => {
-                let path = text(&meta.input["file_path"]);
-                if is_error {
-                    json!({ "path": path, "error": failed() }).to_string()
-                } else {
-                    json!({ "path": path }).to_string()
-                }
-            }
-            "ripgrep" => {
-                let mut card = json!({ "pattern": text(&meta.input["pattern"]) });
-                if is_error {
-                    card["error"] = json!(failed());
-                } else {
-                    card["stdout"] = json!(body);
-                }
-                card.to_string()
-            }
-            _ => body.clone(),
-        };
+        let output = result_card(&meta, block, structured);
         vec![
             json!({ "type": "tool_output", "call_id": id, "name": meta.name, "output": output, "is_error": is_error }),
         ]
@@ -3472,6 +3489,33 @@ mod tests {
             json!({ "type": "user", "isReplay": true, "message": { "content": "/effort high" } })
         )
         .is_empty());
+    }
+
+    #[test]
+    fn a_read_card_names_the_line_the_reading_started_at() {
+        assert_eq!(
+            read_card(&json!({ "file_path": "/a.rs" })),
+            json!({ "path": "/a.rs" })
+        );
+        assert_eq!(
+            read_card(&json!({ "file_path": "/a.rs", "offset": 1 })),
+            json!({ "path": "/a.rs" })
+        );
+        assert_eq!(
+            read_card(&json!({ "file_path": "/a.rs", "offset": 120, "limit": 40 })),
+            json!({ "path": "/a.rs", "line": 120 })
+        );
+        // The finished call's card keeps it; a failed read names no line.
+        let mut c = claude();
+        frame(
+            &mut c,
+            json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": "r1", "name": "Read", "input": { "file_path": "/a.rs", "offset": 120 } }] } }),
+        );
+        let done = frame(
+            &mut c,
+            json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": "r1", "content": "fn main() {}" }] } }),
+        );
+        assert_eq!(done[0]["output"], json!({ "path": "/a.rs", "line": 120 }).to_string());
     }
 
     #[test]
