@@ -41,11 +41,14 @@ use std::{
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 
 pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const DEFAULT_EFFORT: &str = "medium";
 const SUMMARY_CAP: usize = 4000;
+/// How often an edit whose input is still streaming reports its line counts.
+const EDIT_PREVIEW_EVERY: Duration = Duration::from_millis(200);
 /// The API takes an image of at most 5 MB base64 (3.75 MB raw); larger ones
 /// stay files the model opens with Read, which downsizes them.
 const IMAGE_CAP: u64 = 3_750_000;
@@ -282,6 +285,73 @@ fn pair(old: &str, new: &str) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The lines a diff adds and removes.
+fn diff_stat(diff: &str) -> (usize, usize) {
+    diff.split('\n')
+        .fold((0, 0), |(add, del), line| match line.as_bytes().first() {
+            Some(b'+') => (add + 1, del),
+            Some(b'-') => (add, del + 1),
+            _ => (add, del),
+        })
+}
+
+/// A streamed JSON prefix, closed so it parses: the open string first, then
+/// the open objects and arrays. None when the prefix stops where no value
+/// can end (inside a key).
+fn close_partial_json(partial: &str) -> Option<Value> {
+    let mut open = Vec::new();
+    let (mut in_string, mut escaped) = (false, false);
+    for c in partial.chars() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => open.push('}'),
+            '[' => open.push(']'),
+            '}' | ']' => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    let mut closed = partial.trim_end().to_string();
+    if in_string {
+        if escaped {
+            closed.pop();
+        }
+        // A \uXXXX escape cut short (not a `\\` before a plain `u`).
+        let tail = closed.len().saturating_sub(5);
+        if let Some(at) = closed.as_bytes()[tail..]
+            .windows(2)
+            .rposition(|w| w == b"\\u")
+            .map(|i| tail + i)
+        {
+            let slashes = closed.as_bytes()[..=at]
+                .iter()
+                .rev()
+                .take_while(|b| **b == b'\\')
+                .count();
+            if slashes % 2 == 1 {
+                closed.truncate(at);
+            }
+        }
+        closed.push('"');
+    } else if closed.ends_with(',') {
+        closed.pop();
+    } else if closed.ends_with(':') {
+        closed.push_str("null");
+    }
+    closed.extend(open.iter().rev());
+    serde_json::from_str(&closed).ok()
 }
 
 /// Unified-diff-ish rendering of an edit tool's input.
@@ -652,6 +722,8 @@ struct Block {
     streamed: usize,
     tool: Option<String>,
     partial: String,
+    /// When the edit whose input streams here last reported its line counts.
+    previewed: Option<Instant>,
 }
 
 pub struct Claude {
@@ -1029,6 +1101,7 @@ impl Claude {
                 streamed: 0,
                 tool: Some(text(&block["id"]).to_string()),
                 partial: String::new(),
+                previewed: None,
             },
         );
         self.tool_use_events(block, false)
@@ -1042,11 +1115,30 @@ impl Claude {
             return vec![];
         };
         track.partial.push_str(partial);
-        let Ok(input @ Value::Object(_)) = serde_json::from_str::<Value>(&track.partial) else {
-            return vec![];
-        };
         let Some(meta) = self.tools.get_mut(&tool) else {
             return vec![];
+        };
+        let Ok(input @ Value::Object(_)) = serde_json::from_str::<Value>(&track.partial) else {
+            // An edit still streaming its input (a long Write can take a
+            // minute): its file and line counts so far, without the diff.
+            if !matches!(meta.name.as_str(), "write" | "str_replace")
+                || track
+                    .previewed
+                    .is_some_and(|at| at.elapsed() < EDIT_PREVIEW_EVERY)
+            {
+                return vec![];
+            }
+            let Some(input) = close_partial_json(&track.partial) else {
+                return vec![];
+            };
+            track.previewed = Some(Instant::now());
+            let path = edit_path(&input);
+            let (add, del) = diff_stat(&edit_diff(&meta.claude_name, &input));
+            let paths: Vec<&str> = if path.is_empty() { vec![] } else { vec![path] };
+            let card = json!({ "path": path, "paths": paths, "add": add, "del": del });
+            return vec![
+                json!({ "type": "tool_update", "call_id": tool, "output": card.to_string() }),
+            ];
         };
         meta.input = input.clone();
         match meta.claude_name.as_str() {
@@ -3489,6 +3581,66 @@ mod tests {
             json!({ "type": "user", "isReplay": true, "message": { "content": "/effort high" } })
         )
         .is_empty());
+    }
+
+    #[test]
+    fn a_streaming_edit_reports_its_line_counts() {
+        let delta = |index: u64, partial: &str| json!({ "type": "stream_event", "event": { "type": "content_block_delta", "index": index, "delta": { "type": "input_json_delta", "partial_json": partial } } });
+        let start = |index: u64, id: &str, name: &str| json!({ "type": "stream_event", "event": { "type": "content_block_start", "index": index, "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} } } });
+        let card =
+            |events: &[Value]| serde_json::from_str::<Value>(text(&events[0]["output"])).unwrap();
+        let mut c = claude();
+        frame(&mut c, start(0, "w1", "Write"));
+        let preview = card(&frame(
+            &mut c,
+            delta(0, "{\"file_path\":\"/a/b.rs\",\"content\":\"one\\ntwo\\nth"),
+        ));
+        assert_eq!(
+            preview,
+            json!({ "path": "/a/b.rs", "paths": ["/a/b.rs"], "add": 3, "del": 0 })
+        );
+        // Quiet until the next tick; the whole input sends the diff.
+        assert!(frame(&mut c, delta(0, "ree\\nfour")).is_empty());
+        let done = card(&frame(&mut c, delta(0, "\"}")));
+        assert_eq!(done["diff"], "+one\n+two\n+three\n+four");
+
+        frame(&mut c, start(1, "e1", "Edit"));
+        let preview = card(&frame(
+            &mut c,
+            delta(
+                1,
+                "{\"file_path\":\"x\",\"old_string\":\"a\\nb\",\"new_string\":\"c",
+            ),
+        ));
+        assert_eq!((&preview["add"], &preview["del"]), (&json!(1), &json!(2)));
+
+        // Other tools wait for their whole input.
+        frame(&mut c, start(2, "b1", "Bash"));
+        assert!(frame(&mut c, delta(2, "{\"command\":\"l")).is_empty());
+    }
+
+    #[test]
+    fn a_streamed_json_prefix_closes() {
+        assert_eq!(
+            close_partial_json("{\"a\":\"x\\"),
+            Some(json!({ "a": "x" }))
+        );
+        assert_eq!(
+            close_partial_json("{\"a\":\"x\\u00"),
+            Some(json!({ "a": "x" }))
+        );
+        assert_eq!(close_partial_json("{\"a\":\"é"), Some(json!({ "a": "é" })));
+        assert_eq!(
+            close_partial_json("{\"a\":[{\"b\":1},"),
+            Some(json!({ "a": [{ "b": 1 }] }))
+        );
+        assert_eq!(close_partial_json("{\"a\": "), Some(json!({ "a": null })));
+        assert_eq!(close_partial_json("{\"a\":1,\"conte"), None);
+        // An escaped backslash before a `u` is no escape cut short.
+        assert_eq!(
+            close_partial_json("{\"a\":\"C:\\\\us"),
+            Some(json!({ "a": "C:\\us" }))
+        );
     }
 
     #[test]
