@@ -1305,7 +1305,12 @@ impl Claude {
                 self.completed_blocks = 0;
                 self.start_usage = event["message"]["usage"].clone();
                 self.last_context = context_tokens(&self.start_usage);
-                vec![json!({ "type": "context_usage", "tokens": self.last_context })]
+                // The model answered the request: clients go from "connecting"
+                // to waiting for the first token, as for the LynShen engine.
+                vec![
+                    json!({ "type": "thinking_start" }),
+                    json!({ "type": "context_usage", "tokens": self.last_context }),
+                ]
             }
             "content_block_start" => {
                 let block = &event["content_block"];
@@ -2843,9 +2848,13 @@ mod tests {
             ["connecting"]
         );
         assert!(c.busy());
-        frame(
-            &mut c,
-            json!({ "type": "stream_event", "event": { "type": "message_start", "message": { "usage": { "input_tokens": 10 } } } }),
+        // The model answered: the first token is on its way.
+        assert_eq!(
+            types(&frame(
+                &mut c,
+                json!({ "type": "stream_event", "event": { "type": "message_start", "message": { "usage": { "input_tokens": 10 } } } }),
+            )),
+            ["thinking_start", "context_usage"]
         );
         let usage = frame(
             &mut c,
