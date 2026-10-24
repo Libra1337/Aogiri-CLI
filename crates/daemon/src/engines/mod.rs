@@ -751,6 +751,9 @@ impl Session<'_> {
     fn run(&mut self, mut process: Process, options: Options, ops: Receiver<Value>) {
         let mut adapter = adapter(self.kind, &self.cwd, &options);
         process.write(adapter.start());
+        // A new process runs no background task yet (the last one's went with
+        // it); Claude Code reports none at startup.
+        self.publish(vec![json!({ "type": "background_tasks", "tasks": [] })]);
         // What the process runs as now (a restart changes it).
         let mut current = options.clone();
         loop {
@@ -854,7 +857,10 @@ impl Session<'_> {
                             process = started;
                             adapter = self::adapter(self.kind, &self.cwd, &next);
                             process.write(adapter.start());
-                            self.publish(notices(said));
+                            // The new process runs nothing yet.
+                            let mut events = notices(said);
+                            events.push(json!({ "type": "background_tasks", "tasks": [] }));
+                            self.publish(events);
                         }
                         Err(error) => {
                             self.publish(vec![json!({ "type": "error", "message": error })]);
