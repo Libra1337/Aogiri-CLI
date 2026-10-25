@@ -64,6 +64,11 @@ fn phases_and_agents(progress: &Value) -> (Vec<Value>, Vec<Value>) {
     (phases, agents)
 }
 
+/// A task status after which it runs no more.
+pub(super) fn is_final(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "killed" | "stopped")
+}
+
 fn find<'a>(list: &'a mut [Value], id: &str) -> Option<&'a mut Value> {
     list.iter_mut().find(|e| e["id"] == id)
 }
@@ -134,6 +139,20 @@ impl Runs {
         false
     }
 
+    /// `task_updated` with a final status: a stop may say so only here.
+    pub fn updated(&mut self, frame: &Value) -> bool {
+        let status = &frame["patch"]["status"];
+        if !is_final(text(status)) {
+            return false;
+        }
+        let id = text(&frame["task_id"]);
+        let Some(run) = find(&mut self.workflows, id).or_else(|| find(&mut self.agents, id)) else {
+            return false;
+        };
+        run["status"] = status.clone();
+        true
+    }
+
     /// `task_notification`: the run ended.
     pub fn finished(&mut self, frame: &Value) -> bool {
         let id = text(&frame["task_id"]);
@@ -180,11 +199,17 @@ impl Runs {
             .filter_map(|p| serde_json::from_slice::<Value>(&fs::read(p).ok()?).ok())
             .map(|w| {
                 let (phases, agents) = phases_and_agents(&w["workflowProgress"]);
+                // Saved by a process that is gone: one it left running runs
+                // no more.
+                let status = match text(&w["status"]) {
+                    status if is_final(status) => w["status"].clone(),
+                    _ => json!("stopped"),
+                };
                 json!({
                     "id": w["taskId"],
                     "name": w["workflowName"],
                     "description": w["summary"],
-                    "status": w["status"],
+                    "status": status,
                     "started_at": w["startTime"],
                     "duration_ms": w["durationMs"],
                     "tokens": w["totalTokens"],
@@ -445,10 +470,19 @@ mod tests {
                 .collect::<String>(),
         )
         .unwrap();
+        // One a process that is gone left running.
+        fs::write(
+            session.join("workflows/wf_2.json"),
+            json!({ "taskId": "w2", "workflowName": "left", "status": "running", "startTime": 200 })
+                .to_string(),
+        )
+        .unwrap();
         let mut runs = Runs::default();
         runs.seed(&session);
         let event = runs.event();
         assert_eq!(event["workflows"][0]["name"], "two-hi");
+        assert_eq!(event["workflows"][0]["status"], "completed");
+        assert_eq!(event["workflows"][1]["status"], "stopped");
         assert_eq!(event["workflows"][0]["agents"][0]["id"], "a1");
         assert_eq!(event["workflows"][0]["tool_use_id"], "t0");
         let agent = &event["agents"][0];

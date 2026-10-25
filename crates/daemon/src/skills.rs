@@ -57,21 +57,18 @@ pub fn handle(name: &str, op: &Value) -> Result<Value, String> {
     }
 }
 
-/// Claude Code reads `~/.claude/skills`; every other engine runs with the
-/// LynShen profile's skills.
+/// Claude Code reads the `skills` of its config directory (`~/.claude`
+/// unless `CLAUDE_CONFIG_DIR` says otherwise); every other engine runs with
+/// the LynShen profile's skills.
 fn install_dir(backend: &str) -> Result<PathBuf, String> {
     if backend != "claude" {
         return skills::profile_skills_dir().map_err(|error| error.to_string());
     }
-    Ok(claude_dir()?.join("skills"))
-}
-
-fn claude_dir() -> Result<PathBuf, String> {
-    let home = engines::home();
-    if home.as_os_str().is_empty() {
+    let config = engines::claude::config_dir();
+    if !config.is_absolute() {
         return Err("home directory not found".to_string());
     }
-    Ok(home.join(".claude"))
+    Ok(config.join("skills"))
 }
 
 /// A catalog id names one folder in the install directory.

@@ -21,7 +21,10 @@
 //!   subagents report through `system/task_*` and
 //!   `background_tasks_changed`; a finished background task also comes back
 //!   as a `<task-notification>` user message that starts a turn.
-//! - Mid-turn user messages queue in the CLI and run as the next turn.
+//! - A user message sent mid-turn is taken into the running turn at the
+//!   next tool boundary (or starts the next turn) and replayed then; until
+//!   that replay it shows as queued (`pending_messages`). Claude Code saves
+//!   it only as a `queued_command` attachment row.
 //! - Full access (`bypassPermissions`) is only honored when the CLI starts
 //!   with `--dangerously-skip-permissions`, so switching into or out of it
 //!   restarts the engine on the same conversation.
@@ -41,11 +44,14 @@ use std::{
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 
 pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const DEFAULT_EFFORT: &str = "medium";
 const SUMMARY_CAP: usize = 4000;
+/// How often an edit whose input is still streaming reports its line counts.
+const EDIT_PREVIEW_EVERY: Duration = Duration::from_millis(200);
 /// The API takes an image of at most 5 MB base64 (3.75 MB raw); larger ones
 /// stay files the model opens with Read, which downsizes them.
 const IMAGE_CAP: u64 = 3_750_000;
@@ -284,6 +290,73 @@ fn pair(old: &str, new: &str) -> String {
         .join("\n")
 }
 
+/// The lines a diff adds and removes.
+fn diff_stat(diff: &str) -> (usize, usize) {
+    diff.split('\n')
+        .fold((0, 0), |(add, del), line| match line.as_bytes().first() {
+            Some(b'+') => (add + 1, del),
+            Some(b'-') => (add, del + 1),
+            _ => (add, del),
+        })
+}
+
+/// A streamed JSON prefix, closed so it parses: the open string first, then
+/// the open objects and arrays. None when the prefix stops where no value
+/// can end (inside a key).
+fn close_partial_json(partial: &str) -> Option<Value> {
+    let mut open = Vec::new();
+    let (mut in_string, mut escaped) = (false, false);
+    for c in partial.chars() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => open.push('}'),
+            '[' => open.push(']'),
+            '}' | ']' => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    let mut closed = partial.trim_end().to_string();
+    if in_string {
+        if escaped {
+            closed.pop();
+        }
+        // A \uXXXX escape cut short (not a `\\` before a plain `u`).
+        let tail = closed.len().saturating_sub(5);
+        if let Some(at) = closed.as_bytes()[tail..]
+            .windows(2)
+            .rposition(|w| w == b"\\u")
+            .map(|i| tail + i)
+        {
+            let slashes = closed.as_bytes()[..=at]
+                .iter()
+                .rev()
+                .take_while(|b| **b == b'\\')
+                .count();
+            if slashes % 2 == 1 {
+                closed.truncate(at);
+            }
+        }
+        closed.push('"');
+    } else if closed.ends_with(',') {
+        closed.pop();
+    } else if closed.ends_with(':') {
+        closed.push_str("null");
+    }
+    closed.extend(open.iter().rev());
+    serde_json::from_str(&closed).ok()
+}
+
 /// Unified-diff-ish rendering of an edit tool's input.
 fn edit_diff(name: &str, input: &Value) -> String {
     match name {
@@ -331,6 +404,81 @@ fn edit_hunks(name: &str, input: &Value) -> Value {
     json!(hunks)
 }
 
+/// The tool-card JSON of a call's result (`structured`: a live frame's
+/// `tool_use_result`, a saved row's `toolUseResult`).
+fn result_card(meta: &ToolMeta, block: &Value, structured: &Value) -> String {
+    let is_error = block["is_error"] == true;
+    let body = result_text(&block["content"]);
+    let failed = || {
+        if body.is_empty() {
+            "failed".to_string()
+        } else {
+            body.clone()
+        }
+    };
+    match meta.name.as_str() {
+        "bash" => {
+            let mut card = json!({ "command": text(&meta.input["command"]) });
+            if is_error {
+                let stderr = text(&structured["stderr"]);
+                card["error"] = json!(if !body.is_empty() {
+                    body.clone()
+                } else if !stderr.is_empty() {
+                    stderr.to_string()
+                } else {
+                    "failed".to_string()
+                });
+            } else {
+                card["stdout"] = match structured["stdout"].as_str() {
+                    Some(stdout) => json!(stdout),
+                    None => json!(body),
+                };
+                if !text(&structured["stderr"]).is_empty() {
+                    card["stderr"] = structured["stderr"].clone();
+                }
+            }
+            card.to_string()
+        }
+        "write" | "str_replace" => {
+            let path = edit_path(&meta.input);
+            if is_error {
+                json!({ "path": path, "error": failed() }).to_string()
+            } else {
+                let paths: Vec<&str> = if path.is_empty() { vec![] } else { vec![path] };
+                json!({ "path": path, "paths": paths, "diff": edit_diff(&meta.claude_name, &meta.input) }).to_string()
+            }
+        }
+        "read" => {
+            if is_error {
+                let path = text(&meta.input["file_path"]);
+                json!({ "path": path, "error": failed() }).to_string()
+            } else {
+                read_card(&meta.input).to_string()
+            }
+        }
+        "ripgrep" => {
+            let mut card = json!({ "pattern": text(&meta.input["pattern"]) });
+            if is_error {
+                card["error"] = json!(failed());
+            } else {
+                card["stdout"] = json!(body);
+            }
+            card.to_string()
+        }
+        _ => body.clone(),
+    }
+}
+
+/// A Read card: the file, and the line the reading started at (`offset`,
+/// 1-based) when it is not the first, so a client opens the file there.
+fn read_card(input: &Value) -> Value {
+    let mut card = json!({ "path": text(&input["file_path"]) });
+    if let Some(line) = input["offset"].as_u64().filter(|line| *line > 1) {
+        card["line"] = json!(line);
+    }
+    card
+}
+
 /// The tool-card JSON Desktop's cards understand, from a tool input.
 fn card_json(name: &str, input: &Value) -> String {
     let card = match tool_name(name) {
@@ -340,7 +488,7 @@ fn card_json(name: &str, input: &Value) -> String {
             let paths: Vec<&str> = if path.is_empty() { vec![] } else { vec![path] };
             json!({ "path": path, "paths": paths, "diff": edit_diff(name, input) })
         }
-        "read" => json!({ "path": text(&input["file_path"]) }),
+        "read" => read_card(input),
         "ripgrep" => {
             let mut card = json!({ "pattern": text(&input["pattern"]) });
             if !text(&input["path"]).is_empty() {
@@ -577,6 +725,8 @@ struct Block {
     streamed: usize,
     tool: Option<String>,
     partial: String,
+    /// When the edit whose input streams here last reported its line counts.
+    previewed: Option<Instant>,
 }
 
 pub struct Claude {
@@ -603,6 +753,11 @@ pub struct Claude {
     thinking: bool,
     /// Running tasks (subagents, background work) by task id.
     tasks: HashMap<String, Task>,
+    /// The last usage-limit notice that was not "ok" (a `rate_limit`
+    /// event): what a turn stopped by the limit reports.
+    limit: Value,
+    /// This turn was stopped by a usage limit: its error is that notice.
+    limit_hit: bool,
     /// Workflows and Task subagents, for the agent trace.
     runs: runs::Runs,
     /// The project directory, where Claude Code keeps the conversation.
@@ -622,11 +777,25 @@ pub struct Claude {
     /// The input counts of the message streaming now, from its start: a
     /// `message_delta` may leave them out.
     start_usage: Value,
+    /// Claude Code's running per-model totals (`modelUsage`) as of the last
+    /// result; unknown for a resumed conversation until `get_usage` says.
+    model_totals: Option<HashMap<String, Tokens>>,
+    /// Main-loop usage reported since the last result, by model.
+    streamed_usage: HashMap<String, Tokens>,
     active_turn: bool,
     interrupting: bool,
+    /// Messages sent mid-turn that Claude Code has not taken in (replayed)
+    /// yet, trimmed.
+    queued: Vec<String>,
     /// The composer's slash commands: the CLI's `initialize` reply (with
     /// descriptions and argument hints), plus names only `system/init` lists.
     commands: Vec<Value>,
+    /// Claude Code's config directory, where it keeps the conversation
+    /// (`known_config`; corrected by its `initialize` reply).
+    config: PathBuf,
+    /// The user's program and its environment (`ProbeKey`), which the
+    /// directory Claude Code reports is remembered for.
+    program: Option<ProbeKey>,
 }
 
 impl Claude {
@@ -651,6 +820,8 @@ impl Claude {
             fast_blocked: String::new(),
             thinking: options.thinking.unwrap_or(true),
             tasks: HashMap::new(),
+            limit: Value::Null,
+            limit_hit: false,
             runs: runs::Runs::default(),
             cwd: PathBuf::new(),
             engine_mode: String::new(),
@@ -665,9 +836,14 @@ impl Claude {
             completed_blocks: 0,
             last_context: 0,
             start_usage: Value::Null,
+            model_totals: options.resume.is_none().then(HashMap::new),
+            streamed_usage: HashMap::new(),
             active_turn: false,
             interrupting: false,
+            queued: Vec::new(),
             commands: Vec::new(),
+            config: known_config(options).unwrap_or_else(|| config_dir_in(&options.env)),
+            program: options.bin.clone().map(|bin| (bin, options.env.clone())),
         }
     }
 
@@ -678,7 +854,7 @@ impl Claude {
 
     /// Where Claude Code keeps this conversation's Workflows and subagents.
     fn session_dir(&self) -> PathBuf {
-        project_dir(&home(), &self.cwd).join(&self.conversation)
+        project_dir(&self.config, &self.cwd).join(&self.conversation)
     }
 
     fn control_request(&mut self, request: Value, tag: &str) -> String {
@@ -751,6 +927,10 @@ impl Claude {
             });
         }
         content
+    }
+
+    fn queued_event(&self) -> Value {
+        json!({ "type": "pending_messages", "messages": self.queued })
     }
 
     fn user_text(text: &str) -> String {
@@ -954,6 +1134,7 @@ impl Claude {
                 streamed: 0,
                 tool: Some(text(&block["id"]).to_string()),
                 partial: String::new(),
+                previewed: None,
             },
         );
         self.tool_use_events(block, false)
@@ -967,11 +1148,30 @@ impl Claude {
             return vec![];
         };
         track.partial.push_str(partial);
-        let Ok(input @ Value::Object(_)) = serde_json::from_str::<Value>(&track.partial) else {
-            return vec![];
-        };
         let Some(meta) = self.tools.get_mut(&tool) else {
             return vec![];
+        };
+        let Ok(input @ Value::Object(_)) = serde_json::from_str::<Value>(&track.partial) else {
+            // An edit still streaming its input (a long Write can take a
+            // minute): its file and line counts so far, without the diff.
+            if !matches!(meta.name.as_str(), "write" | "str_replace")
+                || track
+                    .previewed
+                    .is_some_and(|at| at.elapsed() < EDIT_PREVIEW_EVERY)
+            {
+                return vec![];
+            }
+            let Some(input) = close_partial_json(&track.partial) else {
+                return vec![];
+            };
+            track.previewed = Some(Instant::now());
+            let path = edit_path(&input);
+            let (add, del) = diff_stat(&edit_diff(&meta.claude_name, &input));
+            let paths: Vec<&str> = if path.is_empty() { vec![] } else { vec![path] };
+            let card = json!({ "path": path, "paths": paths, "add": add, "del": del });
+            return vec![
+                json!({ "type": "tool_update", "call_id": tool, "output": card.to_string() }),
+            ];
         };
         meta.input = input.clone();
         match meta.claude_name.as_str() {
@@ -992,65 +1192,7 @@ impl Claude {
             return vec![];
         }
         let is_error = block["is_error"] == true;
-        let body = result_text(&block["content"]);
-        let failed = || {
-            if body.is_empty() {
-                "failed".to_string()
-            } else {
-                body.clone()
-            }
-        };
-        let output = match meta.name.as_str() {
-            "bash" => {
-                let mut card = json!({ "command": text(&meta.input["command"]) });
-                if is_error {
-                    let stderr = text(&structured["stderr"]);
-                    card["error"] = json!(if !body.is_empty() {
-                        body.clone()
-                    } else if !stderr.is_empty() {
-                        stderr.to_string()
-                    } else {
-                        "failed".to_string()
-                    });
-                } else {
-                    card["stdout"] = match structured["stdout"].as_str() {
-                        Some(stdout) => json!(stdout),
-                        None => json!(body),
-                    };
-                    if !text(&structured["stderr"]).is_empty() {
-                        card["stderr"] = structured["stderr"].clone();
-                    }
-                }
-                card.to_string()
-            }
-            "write" | "str_replace" => {
-                let path = edit_path(&meta.input);
-                if is_error {
-                    json!({ "path": path, "error": failed() }).to_string()
-                } else {
-                    let paths: Vec<&str> = if path.is_empty() { vec![] } else { vec![path] };
-                    json!({ "path": path, "paths": paths, "diff": edit_diff(&meta.claude_name, &meta.input) }).to_string()
-                }
-            }
-            "read" => {
-                let path = text(&meta.input["file_path"]);
-                if is_error {
-                    json!({ "path": path, "error": failed() }).to_string()
-                } else {
-                    json!({ "path": path }).to_string()
-                }
-            }
-            "ripgrep" => {
-                let mut card = json!({ "pattern": text(&meta.input["pattern"]) });
-                if is_error {
-                    card["error"] = json!(failed());
-                } else {
-                    card["stdout"] = json!(body);
-                }
-                card.to_string()
-            }
-            _ => body.clone(),
-        };
+        let output = result_card(&meta, block, structured);
         vec![
             json!({ "type": "tool_output", "call_id": id, "name": meta.name, "output": output, "is_error": is_error }),
         ]
@@ -1196,7 +1338,12 @@ impl Claude {
                 self.completed_blocks = 0;
                 self.start_usage = event["message"]["usage"].clone();
                 self.last_context = context_tokens(&self.start_usage);
-                vec![json!({ "type": "context_usage", "tokens": self.last_context })]
+                // The model answered the request: clients go from "connecting"
+                // to waiting for the first token, as for the LynShen engine.
+                vec![
+                    json!({ "type": "thinking_start" }),
+                    json!({ "type": "context_usage", "tokens": self.last_context }),
+                ]
             }
             "content_block_start" => {
                 let block = &event["content_block"];
@@ -1254,6 +1401,15 @@ impl Claude {
                 };
                 let count = |key: &str| input[key].as_u64().unwrap_or(0);
                 self.last_context = context_tokens(input) + output;
+                let streamed = self.streamed_usage.entry(self.model.clone()).or_default();
+                for (sum, n) in streamed.iter_mut().zip([
+                    count("input_tokens"),
+                    count("cache_read_input_tokens"),
+                    count("cache_creation_input_tokens"),
+                    output,
+                ]) {
+                    *sum += n;
+                }
                 vec![
                     json!({
                         "type": "usage",
@@ -1270,6 +1426,21 @@ impl Claude {
     }
 
     fn on_assistant(&mut self, frame: &Value) -> Vec<Value> {
+        // Claude Code's own "You've hit your limit · resets …" is no reply:
+        // it is the usage limit, with what the last rate-limit event said.
+        if frame["error"] == "rate_limit" {
+            self.limit_hit = true;
+            let mut limit = match &self.limit {
+                Value::Null => {
+                    json!({ "type": "rate_limit", "resets_at": null, "window": null, "used": null })
+                }
+                known => known.clone(),
+            };
+            limit["level"] = json!("limited");
+            limit["message"] =
+                json!(content_text(&frame["message"]["content"]).unwrap_or_default());
+            return vec![limit];
+        }
         let mut events = Vec::new();
         for block in frame["message"]["content"]
             .as_array()
@@ -1314,27 +1485,7 @@ impl Claude {
     fn on_user(&mut self, frame: &Value) -> Vec<Value> {
         let content = &frame["message"]["content"];
         if frame["isReplay"] == true {
-            let message = match content.as_str() {
-                Some(message) => message.to_string(),
-                None => content
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|block| block["type"] == "text")
-                    .map(|block| text(&block["text"]).to_string())
-                    .unwrap_or_default(),
-            };
-            let trimmed = message.trim();
-            // A finished background task comes back as `task_done`.
-            if trimmed.starts_with("<command-")
-                || trimmed.starts_with("<local-command-")
-                || trimmed.starts_with("<task-notification>")
-                || is_effort_echo(&message)
-                || message.is_empty()
-            {
-                return vec![];
-            }
-            return vec![json!({ "type": "user_message", "content": message })];
+            return self.replayed(content);
         }
         let mut events: Vec<Value> = content
             .as_array()
@@ -1350,10 +1501,115 @@ impl Claude {
         events
     }
 
+    /// The echo of a message written to Claude Code's stdin: the user's own
+    /// message, unless it is bookkeeping. A message sent mid-turn leaves the
+    /// queue here, where Claude Code took it in.
+    fn replayed(&mut self, content: &Value) -> Vec<Value> {
+        // Messages queued during a turn may be taken in together, one text
+        // block each: each is a message of its own.
+        // (As sent: a client matches the echo to the message it showed.)
+        let texts: Vec<&str> = content
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|block| block["type"] == "text")
+            .map(|block| text(&block["text"]))
+            .collect();
+        let queued = |t: &str| self.queued.iter().any(|q| q == t.trim());
+        if texts.len() > 1 && texts.iter().all(|t| queued(t)) {
+            let mut events = vec![];
+            for t in &texts {
+                if let Some(i) = self.queued.iter().position(|q| q == t.trim()) {
+                    self.queued.remove(i);
+                }
+                events.push(json!({ "type": "user_message", "content": t }));
+            }
+            events.insert(0, self.queued_event());
+            return events;
+        }
+        let message = match content.as_str() {
+            Some(message) => message.to_string(),
+            None => texts.first().copied().unwrap_or_default().to_string(),
+        };
+        let trimmed = message.trim();
+        let mut events = Vec::new();
+        if let Some(i) = self.queued.iter().position(|q| q == trimmed) {
+            self.queued.remove(i);
+            events.push(self.queued_event());
+        }
+        if let Some(command) = shown_command(trimmed) {
+            events.push(json!({ "type": "user_message", "content": command }));
+            return events;
+        }
+        // A finished background task comes back as `task_done`. A message of
+        // images alone has no text but is the user's.
+        if trimmed.starts_with("<command-")
+            || trimmed.starts_with("<local-command-")
+            || trimmed.starts_with("<task-notification>")
+            || is_effort_echo(&message)
+            || (trimmed.is_empty() && !has_image(content))
+        {
+            return events;
+        }
+        events.push(json!({ "type": "user_message", "content": message }));
+        events
+    }
+
+    /// What the main loop's stream did not show: Task subagents, Workflow
+    /// agents, compaction, side questions. A result's `modelUsage` holds
+    /// running totals of them all; what grew since the last result, less the
+    /// main loop's own usage, is reported per model as one `aggregate` usage
+    /// each (a sum over several requests). Background work that ends after
+    /// a result lands in the next one.
+    fn other_usage(&mut self, usage: &Value) -> Vec<Value> {
+        let streamed = std::mem::take(&mut self.streamed_usage);
+        let current = model_totals(usage);
+        // Crash and startup-error results carry zeroed totals.
+        if current.values().all(|t| t.iter().all(|n| *n == 0)) {
+            return vec![];
+        }
+        let Some(mut before) = self.model_totals.replace(current.clone()) else {
+            return vec![];
+        };
+        // /clear starts the totals over.
+        if before.iter().any(|(model, b)| {
+            current
+                .get(model)
+                .is_none_or(|c| c.iter().zip(b).any(|(c, b)| c < b))
+        }) {
+            before.clear();
+        }
+        let mut events = Vec::new();
+        for (model, now) in &current {
+            let was = before.get(model).copied().unwrap_or_default();
+            let main = streamed.get(model).copied().unwrap_or_default();
+            let [input, read, write, output] =
+                std::array::from_fn(|i| now[i].saturating_sub(was[i]).saturating_sub(main[i]));
+            if input + read + write + output > 0 {
+                events.push(json!({
+                    "type": "usage",
+                    "aggregate": true,
+                    "model": model,
+                    "input_tokens": input + read + write,
+                    "cached_input_tokens": read,
+                    "cache_write_tokens": write,
+                    "output_tokens": output,
+                }));
+            }
+        }
+        events
+    }
+
     fn on_result(&mut self, frame: &Value) -> Vec<Value> {
         self.active_turn = false;
         let was_interrupting = std::mem::take(&mut self.interrupting);
         let mut events = Vec::new();
+        // Stopped: what waited is not known to run; if it does, its replay
+        // still shows it.
+        if was_interrupting && !self.queued.is_empty() {
+            self.queued.clear();
+            events.push(self.queued_event());
+        }
         if let Some(usage) = frame["modelUsage"].as_object() {
             for (name, usage) in usage {
                 if let Some(window) = usage["contextWindow"].as_u64().filter(|w| *w > 0) {
@@ -1361,6 +1617,7 @@ impl Claude {
                 }
             }
         }
+        events.extend(self.other_usage(&frame["modelUsage"]));
         if let Some(window) = self.model_windows.get(&self.model).copied() {
             if window != self.context_window {
                 self.context_window = window;
@@ -1390,10 +1647,11 @@ impl Claude {
                 .to_string();
             if detail.contains("No conversation found with session ID") {
                 events.push(json!({ "type": "resume_failed" }));
-            } else {
+            } else if !self.limit_hit {
                 events.push(error_event(&detail));
             }
         }
+        self.limit_hit = false;
         events.extend(self.fast_state(frame));
         events.push(json!({ "type": "status", "message": "ready" }));
         events
@@ -1491,8 +1749,9 @@ impl Claude {
                 error => error.to_string(),
             };
             return match subtype.as_str() {
-                // A CLI without get_settings has no ultracode: nothing to offer.
-                "get_settings" => vec![],
+                // A CLI without get_settings has no ultracode: nothing to
+                // offer. One without get_usage counts from its first result.
+                "get_settings" | "get_usage" => vec![],
                 "side_question" => {
                     vec![json!({ "type": "side_answer", "question": tag, "error": message })]
                 }
@@ -1516,6 +1775,14 @@ impl Claude {
             };
         }
         match subtype.as_str() {
+            "get_usage" => {
+                if self.model_totals.is_none() {
+                    self.model_totals = Some(model_totals(
+                        &response["response"]["session"]["model_usage"],
+                    ));
+                }
+                vec![]
+            }
             "set_permission_mode" => {
                 if self.started {
                     return vec![];
@@ -1580,6 +1847,16 @@ impl Claude {
             }
             "initialize" => {
                 let reply = &response["response"];
+                // The config directory as Claude Code resolved it (a program
+                // or settings file may set CLAUDE_CONFIG_DIR).
+                if let Some(dir) = reported_config(reply) {
+                    if let Some(program) = self.program.clone() {
+                        probed()
+                            .get_or_insert_with(HashMap::new)
+                            .insert(program, dir.clone());
+                    }
+                    self.config = dir;
+                }
                 self.set_commands(reply["commands"].as_array().map_or(&[], Vec::as_slice));
                 let mut events = vec![self.command_list()];
                 events.extend(self.fast_state(reply));
@@ -1670,11 +1947,18 @@ impl Claude {
         let traced = match text(&frame["subtype"]) {
             "task_started" => self.runs.started(frame),
             "task_progress" => self.runs.progress(frame),
+            "task_updated" => self.runs.updated(frame),
             "task_notification" => self.runs.finished(frame),
             _ => false,
         };
         let mut events = self.task_events(frame);
         if traced {
+            // The list replaces the client's: with the runs saved before
+            // this process, or a restarted engine would drop them.
+            if !self.conversation.is_empty() {
+                let session = self.session_dir();
+                self.runs.seed(&session);
+            }
             events.push(self.runs.event());
         }
         events
@@ -1717,20 +2001,38 @@ impl Claude {
                 }
             }
             "task_updated" => {
-                if let (Some(task), true) = (
-                    self.tasks.get_mut(&id),
-                    frame["patch"]["is_backgrounded"] == true,
-                ) {
+                let Some(task) = self.tasks.get_mut(&id) else {
+                    return vec![];
+                };
+                if frame["patch"]["is_backgrounded"] == true {
                     task.background = true;
                 }
-                vec![]
+                // A stopped subagent may say so only here; its notification,
+                // if one comes, still announces it.
+                let status = text(&frame["patch"]["status"]);
+                if task.kind == "local_agent" && runs::is_final(status) {
+                    vec![agent(
+                        status,
+                        text(&frame["patch"]["error"]),
+                        &task.description,
+                    )]
+                } else {
+                    vec![]
+                }
             }
             "task_notification" => {
                 let task = self.tasks.remove(&id);
                 let status = text(&frame["status"]);
                 let mut events = Vec::new();
-                if let Some(task) = task.as_ref().filter(|t| t.kind == "local_agent") {
-                    events.push(agent(status, text(&frame["summary"]), &task.description));
+                match &task {
+                    Some(task) if task.kind == "local_agent" => {
+                        events.push(agent(status, text(&frame["summary"]), &task.description));
+                    }
+                    Some(_) => {}
+                    // Started before this process (a restart, a TUI handoff):
+                    // a subagent the client shows still ends. It has no label,
+                    // so a client starts no row for one it does not show.
+                    None => events.push(agent(status, text(&frame["summary"]), "")),
                 }
                 let background = task.as_ref().is_none_or(|t| t.background);
                 if background && frame["skip_transcript"] != true && frame["ambient"] != true {
@@ -1895,6 +2197,29 @@ pub(super) fn elicitation_content(schema: &Value, answers: &Value) -> Value {
     Value::Object(content)
 }
 
+/// Uncached input, cache reads, cache writes, output.
+type Tokens = [u64; 4];
+
+/// `modelUsage` by model, in `Tokens` order.
+fn model_totals(usage: &Value) -> HashMap<String, Tokens> {
+    let Some(models) = usage.as_object() else {
+        return HashMap::new();
+    };
+    models
+        .iter()
+        .map(|(model, u)| {
+            let n = |key: &str| u[key].as_u64().unwrap_or(0);
+            let tokens = [
+                n("inputTokens"),
+                n("cacheReadInputTokens"),
+                n("cacheCreationInputTokens"),
+                n("outputTokens"),
+            ];
+            (model.clone(), tokens)
+        })
+        .collect()
+}
+
 fn command_entry(name: &str, args: &str, description: &str) -> Value {
     json!({ "command": format!("/{name}"), "marker": null, "args": args, "description": description })
 }
@@ -1938,6 +2263,13 @@ impl Adapter for Claude {
         }
         frames.push(self.control_request(json!({ "subtype": "get_settings" }), ""));
         frames.push(self.control_request(json!({ "subtype": "mcp_status" }), ""));
+        // A resumed conversation's totals start from what it spent before.
+        if self.model_totals.is_none() {
+            frames.push(self.control_request(
+                json!({ "subtype": "get_usage", "skip_behaviors": true }),
+                "",
+            ));
+        }
         frames
     }
 
@@ -2083,7 +2415,17 @@ impl Adapter for Claude {
             "result" => self.on_result(&frame),
             "control_request" => return self.on_control_request(&frame),
             "control_response" => self.on_control_response(&frame),
-            "rate_limit_event" => rate_limit_events(&frame),
+            "rate_limit_event" => {
+                let events = rate_limit_events(&frame);
+                if let Some(limit) = events.iter().find(|e| e["type"] == "rate_limit") {
+                    self.limit = if limit["level"] == "ok" {
+                        Value::Null
+                    } else {
+                        limit.clone()
+                    };
+                }
+                events
+            }
             "prompt_suggestion" => {
                 vec![json!({ "type": "prompt_suggestion", "text": frame["suggestion"] })]
             }
@@ -2094,7 +2436,17 @@ impl Adapter for Claude {
 
     fn encode(&mut self, op: &Value) -> Result<Output, String> {
         let frames = match text(&op["op"]) {
-            "user_message" => vec![json!({ "type": "user", "message": { "role": "user", "content": Self::user_content(op) } }).to_string()],
+            "user_message" => {
+                let frames = vec![json!({ "type": "user", "message": { "role": "user", "content": Self::user_content(op) } }).to_string()];
+                // Mid-turn: queued until Claude Code takes it in.
+                let events = if self.active_turn {
+                    self.queued.push(text(&op["content"]).trim().to_string());
+                    vec![self.queued_event()]
+                } else {
+                    Vec::new()
+                };
+                return Ok(Output { events, frames });
+            }
             "approve" => {
                 let call = text(&op["call_id"]);
                 let Some((request_id, request)) = self.approvals.remove(call) else {
@@ -2252,7 +2604,9 @@ impl Adapter for Claude {
             )],
             "mcp_list" => vec![self.control_request(json!({ "subtype": "mcp_status" }), "")],
             // What the context holds, by kind (Claude Code's /context).
-            "context_usage" => vec![self.control_request(json!({ "subtype": "get_context_usage" }), "")],
+            "context_usage" => {
+                vec![self.control_request(json!({ "subtype": "get_context_usage" }), "")]
+            }
             "mcp_toggle" | "mcp_reconnect" => {
                 let request = if op["op"] == "mcp_toggle" {
                     json!({ "subtype": "mcp_toggle", "serverName": op["name"], "enabled": op["enabled"] == true })
@@ -2276,15 +2630,18 @@ impl Adapter for Claude {
             "subagent_transcript" => {
                 let id = text(&op["agent_id"]);
                 let event = match runs::transcript(&self.session_dir(), id) {
-                    Ok(items) => json!({ "type": "subagent_transcript", "agent_id": id, "items": items }),
-                    Err(error) => json!({ "type": "subagent_transcript", "agent_id": id, "error": error }),
+                    Ok(items) => {
+                        json!({ "type": "subagent_transcript", "agent_id": id, "items": items })
+                    }
+                    Err(error) => {
+                        json!({ "type": "subagent_transcript", "agent_id": id, "error": error })
+                    }
                 };
                 return Ok(Output::events(vec![event]));
             }
-            "permission_rules" => vec![self.control_request(
-                json!({ "subtype": "list_permission_rules" }),
-                "",
-            )],
+            "permission_rules" => {
+                vec![self.control_request(json!({ "subtype": "list_permission_rules" }), "")]
+            }
             // The user's name for the session, so `claude --resume` shows it too.
             "rename" => vec![self.control_request(
                 json!({ "subtype": "rename_session", "title": op["title"], "source": "host" }),
@@ -2326,6 +2683,7 @@ impl Adapter for Claude {
             effort: Some(self.effort.clone()),
             fast: self.fast == "on",
             thinking: Some(self.thinking),
+            claude_config: options.claude_config.or(Some(self.config.clone())),
             ..options
         }
     }
@@ -2405,24 +2763,29 @@ fn limit_banner(frame: &Value, info: &Value) -> Vec<Value> {
     } else {
         Value::Null
     };
-    let message = [
-        text(&info["message"]),
-        text(&frame["message"]),
-        status.as_str(),
-    ]
-    .into_iter()
-    .find(|m| !m.is_empty())
-    .unwrap_or_default()
-    .to_string();
+    // Words for the user, if the engine sent any (the status is a code).
+    let message = [text(&info["message"]), text(&frame["message"])]
+        .into_iter()
+        .find(|m| !m.is_empty())
+        .unwrap_or_default();
+    // Which limit (`five_hour`, `seven_day`, `seven_day_opus`, `overage`…),
+    // how much of it is used in percent, and whether extra usage is on.
+    let notice = |level: &str| {
+        json!({
+            "type": "rate_limit",
+            "level": level,
+            "message": message,
+            "resets_at": resets_at,
+            "window": info["rateLimitType"].as_str(),
+            "used": info["utilization"].as_f64().map(|u| (u * 1000.0).round() / 10.0),
+            "overage": info["isUsingOverage"] == true,
+        })
+    };
     let has = |words: &[&str]| words.iter().any(|word| status.contains(word));
     if has(&["reject", "exceed", "limit_reached", "throttl"]) {
-        vec![
-            json!({ "type": "rate_limit", "level": "limited", "message": message, "resets_at": resets_at }),
-        ]
+        vec![notice("limited")]
     } else if has(&["warn", "approaching"]) {
-        vec![
-            json!({ "type": "rate_limit", "level": "warning", "message": message, "resets_at": resets_at }),
-        ]
+        vec![notice("warning")]
     } else if has(&["allow", "ok", "normal"]) {
         vec![json!({ "type": "rate_limit", "level": "ok", "message": "", "resets_at": null })]
     } else {
@@ -2432,17 +2795,158 @@ fn limit_banner(frame: &Value, info: &Value) -> Vec<Value> {
 
 // --- saved conversations ---
 
+/// Where Claude Code keeps its state when nothing else says:
+/// `CLAUDE_CONFIG_DIR` of the daemon's environment (the engine inherits it),
+/// else `~/.claude`.
+pub fn config_dir() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".claude"))
+}
+
+/// `config_dir` of a Claude Code run with `env` (a session's `Options::env`)
+/// on top of the daemon's environment: the desktop's per-engine variables
+/// may set `CLAUDE_CONFIG_DIR` where the daemon's own environment does not.
+pub fn config_dir_in(env: &[(String, String)]) -> PathBuf {
+    match env
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+    {
+        Some((_, dir)) if !dir.is_empty() => PathBuf::from(dir),
+        Some(_) => home().join(".claude"),
+        None => config_dir(),
+    }
+}
+
+/// The config directories programs were seen to use (`probe`), by the
+/// program and the environment it runs with.
+type ProbeKey = (String, Vec<(String, String)>);
+static PROBED: std::sync::Mutex<Option<HashMap<ProbeKey, PathBuf>>> = std::sync::Mutex::new(None);
+
+fn probed() -> std::sync::MutexGuard<'static, Option<HashMap<ProbeKey, PathBuf>>> {
+    PROBED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// `config_dir_in` a Claude Code run with `options`, unless a better one is
+/// known: the one found for the session, or the one a program of the
+/// user's (`bin`) was seen to use.
+fn known_config(options: &Options) -> Option<PathBuf> {
+    if let Some(dir) = &options.claude_config {
+        return Some(dir.clone());
+    }
+    let key = (options.bin.clone()?, options.env.clone());
+    probed().get_or_insert_with(HashMap::new).get(&key).cloned()
+}
+
+/// The config directory where a Claude Code run with `options` keeps
+/// conversation `id` of `cwd`: the one found for the session; else, for a
+/// program of the user's (`bin`, e.g. an account switcher that sets
+/// `CLAUDE_CONFIG_DIR` before it runs Claude Code), the one it was seen to
+/// keep it in, or the session's environment's, or else the program is
+/// asked where (an account switched since it was seen); else
+/// `config_dir_in` the session's environment.
+pub fn config_with(options: &Options, cwd: &Path, id: &str) -> PathBuf {
+    if let Some(dir) = &options.claude_config {
+        return dir.clone();
+    }
+    let plain = config_dir_in(&options.env);
+    let Some(bin) = &options.bin else {
+        return plain;
+    };
+    let seen = known_config(options);
+    if let Some(dir) = seen.as_ref().filter(|dir| is_saved(dir, cwd, id)) {
+        return dir.clone();
+    }
+    if is_saved(&plain, cwd, id) {
+        return plain;
+    }
+    reprobe(bin.clone(), &options.env).or(seen).unwrap_or(plain)
+}
+
+/// Runs `probe` for `bin` with `env` and remembers what it found.
+fn reprobe(bin: String, env: &[(String, String)]) -> Option<PathBuf> {
+    let dir = probe(&bin, env)?;
+    probed()
+        .get_or_insert_with(HashMap::new)
+        .insert((bin, env.to_vec()), dir.clone());
+    Some(dir)
+}
+
+/// The config directory an `initialize` reply names: the parent of its
+/// `user_output_styles_dir` (`<config>/output-styles`, as Claude Code
+/// resolves it after its settings; claude 2.1.302 and later).
+fn reported_config(reply: &Value) -> Option<PathBuf> {
+    let styles = Path::new(reply["user_output_styles_dir"].as_str()?);
+    if !styles.is_absolute() || styles.file_name()? != "output-styles" {
+        return None;
+    }
+    styles.parent().map(Path::to_path_buf)
+}
+
+/// Where program `bin` run with `env` has Claude Code keep its state: it
+/// runs once, without a conversation, and its `initialize` reply names the
+/// directory. None when it does not say within 30 s.
+fn probe(bin: &str, env: &[(String, String)]) -> Option<PathBuf> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(bin)
+        .args([
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ])
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .current_dir(home())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+    let request = json!({ "type": "control_request", "request_id": "probe", "request": { "subtype": "initialize" } });
+    let _ = writeln!(stdin, "{request}");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if frame["type"] == "control_response" {
+                let _ = sender.send(reported_config(&frame["response"]["response"]));
+                return;
+            }
+        }
+    });
+    let dir = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .ok()
+        .flatten();
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    dir
+}
+
 /// Claude Code's project directory for `cwd`: every character of the real
 /// path (Claude Code resolves symlinks, e.g. macOS `/tmp` → `/private/tmp`)
 /// that is not ASCII alphanumeric becomes `-`.
-fn project_dir(home: &Path, cwd: &Path) -> PathBuf {
+fn project_dir(config: &Path, cwd: &Path) -> PathBuf {
     let real = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let munged: String = real
         .to_string_lossy()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    home.join(".claude").join("projects").join(munged)
+    config.join("projects").join(munged)
 }
 
 fn is_conversation_id(id: &str) -> bool {
@@ -2465,21 +2969,123 @@ fn is_synthetic(row: &Value) -> bool {
     .any(|key| row[*key] == true)
 }
 
-fn row_text(row: &Value) -> Option<String> {
-    let content = &row["message"]["content"];
-    if let Some(text) = content.as_str() {
+/// Slash commands that show in the conversation as the user wrote them.
+/// Claude Code echoes a command as `<command-name>/goal</command-name>
+/// <command-message>…</command-message><command-args>…</command-args>`;
+/// other commands (settings, /compact) stay out of the conversation.
+const SHOWN_COMMANDS: &[&str] = &["/goal"];
+
+/// `/goal <its condition>` for an echoed command that shows.
+fn shown_command(text: &str) -> Option<String> {
+    let between = |open: &str, close: &str| {
+        let start = text.find(open)? + open.len();
+        let end = start + text[start..].find(close)?;
+        Some(text[start..end].trim())
+    };
+    let name = between("<command-name>", "</command-name>")?;
+    if !SHOWN_COMMANDS.contains(&name) {
+        return None;
+    }
+    let args = between("<command-args>", "</command-args>").unwrap_or_default();
+    Some(if args.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} {args}")
+    })
+}
+
+/// The user's or the model's text in a saved message: its text blocks,
+/// without the markup Claude Code adds (`<system-reminder>`, command echoes)
+/// except a command that shows.
+fn content_text(content: &Value) -> Option<String> {
+    let keep = |text: &str| {
         let text = text.trim();
-        return (!text.is_empty() && !text.starts_with('<')).then(|| text.to_string());
+        if text.starts_with('<') {
+            shown_command(text)
+        } else {
+            (!text.is_empty()).then(|| text.to_string())
+        }
+    };
+    if let Some(text) = content.as_str() {
+        return keep(text);
     }
     let text = content
         .as_array()?
         .iter()
         .filter(|block| block["type"] == "text")
         .filter_map(|block| block["text"].as_str())
-        .filter(|text| !text.trim().is_empty() && !text.trim_start().starts_with('<'))
+        .filter_map(keep)
         .collect::<Vec<_>>()
         .join("\n");
     (!text.is_empty()).then_some(text)
+}
+
+fn row_text(row: &Value) -> Option<String> {
+    content_text(&row["message"]["content"])
+}
+
+fn has_image(content: &Value) -> bool {
+    content
+        .as_array()
+        .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
+}
+
+/// A saved user message as a transcript item: its text and its images,
+/// which Claude Code keeps inline. They are written to `images` once (a
+/// file is named after its data), so the item names them by path, as a
+/// live echo does. A message of images alone shows too.
+fn user_item(content: &Value, images: &Path) -> Option<Value> {
+    let text = content_text(content);
+    let paths: Vec<String> = content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block["type"] == "image")
+        .filter_map(|block| saved_image(&block["source"], images))
+        .collect();
+    if text.is_none() && paths.is_empty() {
+        return None;
+    }
+    let mut item = json!({ "role": "user", "content": text.unwrap_or_default() });
+    if !paths.is_empty() {
+        item["images"] = json!(paths);
+    }
+    Some(item)
+}
+
+/// An inline image (`source`) as a file in `dir`, named after its data.
+fn saved_image(source: &Value, dir: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let ext = match text(&source["media_type"]) {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => return None,
+    };
+    let data = source["data"].as_str()?;
+    let digest = Sha256::digest(data.as_bytes());
+    let name: String = digest[..12].iter().map(|b| format!("{b:02x}")).collect();
+    let path = dir.join(format!("{name}.{ext}"));
+    if !path.is_file() {
+        let bytes = STANDARD.decode(data).ok()?;
+        fs::create_dir_all(dir).ok()?;
+        let part = dir.join(format!("{name}.{ext}.part"));
+        fs::write(&part, bytes).ok()?;
+        fs::rename(&part, &path).ok()?;
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// A message the user sent while a turn ran: Claude Code takes it in at the
+/// next tool boundary and saves it only as a `queued_command` attachment
+/// row (a finished background task's notification is one too, not shown).
+fn queued_prompt(row: &Value) -> Option<&Value> {
+    let attachment = &row["attachment"];
+    (row["type"] == "attachment"
+        && attachment["type"] == "queued_command"
+        && attachment["commandMode"] == "prompt")
+        .then_some(&attachment["prompt"])
 }
 
 fn rows(path: &Path, limit: u64) -> impl Iterator<Item = Value> {
@@ -2492,23 +3098,44 @@ fn rows(path: &Path, limit: u64) -> impl Iterator<Item = Value> {
         .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
 }
 
-/// The user and assistant text of a saved conversation, as transcript items
-/// (the newest 500).
-pub fn transcript(cwd: &Path, id: &str) -> Vec<Value> {
-    transcript_in(&home(), cwd, id)
+/// A saved conversation as transcript items (the newest 500): the user's
+/// and the model's text and the tool calls as the cards a live turn showed,
+/// each with when it was written (`at`, ms), from config directory
+/// `config`. The user's images are written under `uploads`.
+pub fn transcript(config: &Path, cwd: &Path, id: &str, uploads: &Path) -> Vec<Value> {
+    transcript_in(config, cwd, id, &uploads.join("claude"))
 }
 
-fn transcript_in(home: &Path, cwd: &Path, id: &str) -> Vec<Value> {
+fn transcript_in(config: &Path, cwd: &Path, id: &str, images: &Path) -> Vec<Value> {
     if !is_conversation_id(id) {
         return vec![];
     }
+    let mut calls = HashMap::new();
     let mut items: Vec<Value> = rows(
-        &project_dir(home, cwd).join(format!("{id}.jsonl")),
+        &project_dir(config, cwd).join(format!("{id}.jsonl")),
         64 * 1024 * 1024,
     )
-    .filter(|row| matches!(text(&row["type"]), "user" | "assistant") && !is_synthetic(row))
-    .filter_map(|row| {
-        row_text(&row).map(|content| json!({ "role": row["type"], "content": content }))
+    .filter(|row| !is_synthetic(row))
+    .flat_map(|row| {
+        // A user row's tool results come before any text it holds.
+        let mut items = tool_rows(&row, &mut calls);
+        items.extend(match text(&row["type"]) {
+            "user" => user_item(&row["message"]["content"], images),
+            // The usage-limit notice Claude Code saves as a reply is none.
+            "assistant" if row["error"] == "rate_limit" => None,
+            "assistant" => {
+                row_text(&row).map(|content| json!({ "role": "assistant", "content": content }))
+            }
+            "attachment" => queued_prompt(&row).and_then(|prompt| user_item(prompt, images)),
+            _ => None,
+        });
+        // When each was said or ran: the time its row was written.
+        if let Some(at) = row_time(&row) {
+            for item in &mut items {
+                item["at"] = json!(at);
+            }
+        }
+        items
     })
     .collect();
     let excess = items.len().saturating_sub(500);
@@ -2516,22 +3143,73 @@ fn transcript_in(home: &Path, cwd: &Path, id: &str) -> Vec<Value> {
     items
 }
 
-/// Conversations saved for `cwd`, newest first: (id, title, updated ms).
-pub fn saved(cwd: &Path) -> Vec<(String, String, u64)> {
-    saved_in(&home(), cwd)
+/// The tool calls in a saved row, as the cards a live turn showed: an
+/// assistant row's calls are noted in `calls`, a user row's results to them
+/// become tool items (with `is_error` when the call failed). The todo list
+/// and the plan were not cards.
+fn tool_rows(row: &Value, calls: &mut HashMap<String, ToolMeta>) -> Vec<Value> {
+    let blocks = row["message"]["content"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut items = Vec::new();
+    for block in blocks {
+        match text(&block["type"]) {
+            _ if is_tool_use(block) => {
+                let claude_name = text(&block["name"]);
+                if !matches!(claude_name, "TodoWrite" | "ExitPlanMode") {
+                    calls.insert(
+                        text(&block["id"]).to_string(),
+                        ToolMeta {
+                            claude_name: claude_name.to_string(),
+                            name: tool_name(claude_name).to_string(),
+                            input: object(&block["input"]),
+                        },
+                    );
+                }
+            }
+            "tool_result" => {
+                let id = text(&block["tool_use_id"]);
+                if let Some(meta) = calls.remove(id) {
+                    let output = result_card(&meta, block, &row["toolUseResult"]);
+                    let mut item = json!({ "role": "tool", "name": meta.name, "output": output, "call_id": id });
+                    if block["is_error"] == true {
+                        item["is_error"] = json!(true);
+                    }
+                    items.push(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    items
 }
 
-/// Whether Claude Code saved conversation `id` for `cwd` (it has at least one
-/// turn and can be resumed). Unlike `saved`, not limited to the newest ones.
-pub fn is_saved(cwd: &Path, id: &str) -> bool {
+/// When a saved row was written, ms since the epoch.
+fn row_time(row: &Value) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(text(&row["timestamp"]))
+        .ok()
+        .map(|t| t.timestamp_millis())
+}
+
+/// Conversations saved for `cwd` in config directory `config`, newest
+/// first: (id, title, updated ms).
+pub fn saved(config: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
+    saved_in(config, cwd)
+}
+
+/// Whether Claude Code saved conversation `id` for `cwd` in config directory
+/// `config` (it has at least one turn and can be resumed). Unlike `saved`,
+/// not limited to the newest ones.
+pub fn is_saved(config: &Path, cwd: &Path, id: &str) -> bool {
     is_conversation_id(id)
-        && project_dir(&home(), cwd)
+        && project_dir(config, cwd)
             .join(format!("{id}.jsonl"))
             .is_file()
 }
 
-fn saved_in(home: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
-    let Ok(entries) = fs::read_dir(project_dir(home, cwd)) else {
+fn saved_in(config: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
+    let Ok(entries) = fs::read_dir(project_dir(config, cwd)) else {
         return vec![];
     };
     let mut found: Vec<(String, u64, PathBuf)> = entries
@@ -2643,6 +3321,10 @@ mod tests {
         );
         assert_eq!(types(&events), ["rate_limit", "plan_usage"]);
         assert_eq!(events[0]["level"], "warning");
+        assert_eq!(events[0]["window"], "five_hour");
+        assert_eq!(events[0]["used"], 83.0);
+        // The status is a code, not words for the user.
+        assert_eq!(events[0]["message"], "");
         assert_eq!(events[0]["resets_at"], 1_790_800_000_000u64);
         let windows = events[1]["windows"].as_array().unwrap();
         assert_eq!(windows.len(), 2);
@@ -2664,6 +3346,72 @@ mod tests {
             json!({ "type": "rate_limit_event", "rate_limit_info": { "status": "allowed" } }),
         );
         assert_eq!(types(&events), ["rate_limit"]);
+    }
+
+    #[test]
+    fn a_turn_stopped_by_the_usage_limit_reports_the_limit_not_a_reply() {
+        let mut c = claude();
+        frame(
+            &mut c,
+            json!({ "type": "rate_limit_event", "rate_limit_info": {
+                "status": "rejected", "resetsAt": 1790800000, "rateLimitType": "five_hour", "utilization": 1.0, "isUsingOverage": false } }),
+        );
+        let hit = frame(
+            &mut c,
+            json!({ "type": "assistant", "error": "rate_limit", "message": { "model": "<synthetic>", "content": [
+                { "type": "text", "text": "You've hit your session limit · resets 12:40pm" } ] } }),
+        );
+        assert_eq!(types(&hit), ["rate_limit"]);
+        assert_eq!(hit[0]["level"], "limited");
+        assert_eq!(hit[0]["window"], "five_hour");
+        assert_eq!(hit[0]["used"], 100.0);
+        assert_eq!(hit[0]["resets_at"], 1_790_800_000_000u64);
+        assert_eq!(
+            hit[0]["message"],
+            "You've hit your session limit · resets 12:40pm"
+        );
+        let end = frame(
+            &mut c,
+            json!({ "type": "result", "subtype": "success", "is_error": true, "result": "You've hit your session limit · resets 12:40pm" }),
+        );
+        assert!(!end.iter().any(|e| e["type"] == "error"));
+        // The next failure is an error again.
+        let end = frame(
+            &mut c,
+            json!({ "type": "result", "subtype": "error_during_execution", "is_error": true, "result": "boom" }),
+        );
+        assert!(end.iter().any(|e| e["type"] == "error"));
+        // Without a rate-limit event first: the limit, from its words alone.
+        let mut c = claude();
+        let hit = frame(
+            &mut c,
+            json!({ "type": "assistant", "error": "rate_limit", "message": { "content": [{ "type": "text", "text": "limit" }] } }),
+        );
+        assert_eq!(
+            hit[0],
+            json!({ "type": "rate_limit", "level": "limited", "message": "limit", "resets_at": null, "window": null, "used": null })
+        );
+        // A reopened conversation leaves the notice out.
+        let home = std::env::temp_dir().join(format!("claude-limit-{}", std::process::id()));
+        let cwd = Path::new("/work/limit");
+        let dir = home.join("projects/-work-limit");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("55-66.jsonl"),
+            [
+                json!({ "type": "user", "message": { "content": "go" } }),
+                json!({ "type": "assistant", "error": "rate_limit", "message": { "content": [{ "type": "text", "text": "You've hit your limit" }] } }),
+            ]
+            .iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>(),
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_in(&home, cwd, "55-66", &home.join("images")),
+            vec![json!({ "role": "user", "content": "go" })]
+        );
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -2734,9 +3482,13 @@ mod tests {
             ["connecting"]
         );
         assert!(c.busy());
-        frame(
-            &mut c,
-            json!({ "type": "stream_event", "event": { "type": "message_start", "message": { "usage": { "input_tokens": 10 } } } }),
+        // The model answered: the first token is on its way.
+        assert_eq!(
+            types(&frame(
+                &mut c,
+                json!({ "type": "stream_event", "event": { "type": "message_start", "message": { "usage": { "input_tokens": 10 } } } }),
+            )),
+            ["thinking_start", "context_usage"]
         );
         let usage = frame(
             &mut c,
@@ -2803,6 +3555,103 @@ mod tests {
         );
         assert_eq!(types(&end), ["model_status", "context_usage", "status"]);
         assert!(!c.busy());
+    }
+
+    #[test]
+    fn usage_beyond_the_main_loop_is_reported_from_the_running_totals() {
+        let totals = |opus: [u64; 4], haiku: [u64; 4]| {
+            let model = |[i, r, w, o]: [u64; 4]| json!({ "inputTokens": i, "cacheReadInputTokens": r, "cacheCreationInputTokens": w, "outputTokens": o, "costUSD": 0.1 });
+            json!({ "claude-opus-5-5": model(opus), "claude-haiku-5-5": model(haiku) })
+        };
+        let result =
+            |usage: Value| json!({ "type": "result", "subtype": "success", "modelUsage": usage });
+        let usage_of = |events: &[Value]| -> Vec<Value> {
+            events
+                .iter()
+                .filter(|e| e["type"] == "usage")
+                .cloned()
+                .collect()
+        };
+        let main_request = |c: &mut Claude| {
+            frame(
+                c,
+                json!({ "type": "stream_event", "event": { "type": "message_start", "message": { "usage": { "input_tokens": 10, "cache_read_input_tokens": 1000 } } } }),
+            );
+            frame(
+                c,
+                json!({ "type": "stream_event", "event": { "type": "message_delta", "usage": { "output_tokens": 5 } } }),
+            );
+        };
+
+        let mut c = claude();
+        frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "init", "session_id": "s", "model": "claude-opus-5-5" }),
+        );
+        main_request(&mut c);
+        // A subagent on haiku ran beside the main loop's one request.
+        let end = frame(&mut c, result(totals([10, 1000, 0, 5], [3, 0, 200, 50])));
+        assert_eq!(
+            usage_of(&end),
+            [
+                json!({ "type": "usage", "aggregate": true, "model": "claude-haiku-5-5", "input_tokens": 203, "cached_input_tokens": 0, "cache_write_tokens": 200, "output_tokens": 50 })
+            ]
+        );
+        assert_eq!(end.last().unwrap()["message"], "ready");
+        // A background agent finished after that result; the next turn's
+        // result carries it, and a compaction on opus besides.
+        main_request(&mut c);
+        let end = frame(
+            &mut c,
+            result(totals([30, 2000, 100, 10], [4, 200, 200, 60])),
+        );
+        let usage = usage_of(&end);
+        assert_eq!(usage.len(), 2);
+        let of = |model: &str| usage.iter().find(|e| e["model"] == model).unwrap().clone();
+        assert_eq!(
+            (
+                of("claude-opus-5-5")["input_tokens"].as_u64(),
+                of("claude-opus-5-5")["output_tokens"].as_u64()
+            ),
+            (Some(110), Some(0))
+        );
+        assert_eq!(
+            (
+                of("claude-haiku-5-5")["input_tokens"].as_u64(),
+                of("claude-haiku-5-5")["output_tokens"].as_u64()
+            ),
+            (Some(201), Some(10))
+        );
+        // A zeroed result changes nothing; /clear starts the totals over.
+        assert!(usage_of(&frame(&mut c, result(totals([0; 4], [0; 4])))).is_empty());
+        main_request(&mut c);
+        assert!(usage_of(&frame(&mut c, result(totals([10, 1000, 0, 5], [0; 4])))).is_empty());
+
+        // Resumed: the totals already hold earlier turns.
+        let mut c = Claude::new(&Options {
+            resume: Some("s".into()),
+            ..Options::default()
+        });
+        let boot = c.start();
+        frame(
+            &mut c,
+            reply(
+                request_id(&boot, "get_usage"),
+                json!({ "session": { "model_usage": totals([100, 9000, 50, 70], [5, 0, 0, 5]) } }),
+            ),
+        );
+        frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "init", "session_id": "s", "model": "claude-opus-5-5" }),
+        );
+        main_request(&mut c);
+        assert!(usage_of(&frame(
+            &mut c,
+            result(totals([110, 10000, 50, 75], [5, 0, 0, 5]))
+        ))
+        .is_empty());
+        // A new conversation asks for nothing.
+        assert!(!claude().start().iter().any(|f| f.contains("get_usage")));
     }
 
     #[test]
@@ -3025,6 +3874,60 @@ mod tests {
             json!({ "type": "control_response", "response": { "subtype": "error", "request_id": request_id(&boot, "get_settings"), "error": "unknown subtype" } }),
         );
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_subagent_stopped_by_an_update_or_from_before_this_process_ends() {
+        let mut c = claude();
+        let system = |extra: Value| {
+            let mut frame = json!({ "type": "system" });
+            frame
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            frame
+        };
+        frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_started", "task_id": "a1", "task_type": "local_agent", "description": "Scan" }),
+            ),
+        );
+        let killed = frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_updated", "task_id": "a1", "patch": { "status": "killed" } }),
+            ),
+        );
+        assert_eq!(killed[0]["type"], "subagent_lifecycle");
+        assert_eq!(killed[0]["status"], "killed");
+        assert_eq!(killed[0]["label"], "Scan");
+        assert_eq!(killed.last().unwrap()["agents"][0]["status"], "killed");
+        // Still running: nothing to report.
+        frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_started", "task_id": "a2", "task_type": "local_agent", "description": "Watch" }),
+            ),
+        );
+        let paused = frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_updated", "task_id": "a2", "patch": { "status": "paused" } }),
+            ),
+        );
+        assert!(paused.is_empty());
+        // Started under another process: its end still reaches the client.
+        let ended = frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_notification", "task_id": "old", "status": "stopped", "summary": "" }),
+            ),
+        );
+        assert_eq!(ended[0]["type"], "subagent_lifecycle");
+        assert_eq!(ended[0]["path"], "old");
+        assert_eq!(ended[0]["status"], "stopped");
+        assert_eq!(ended[0]["label"], "");
     }
 
     #[test]
@@ -3472,6 +4375,259 @@ mod tests {
             json!({ "type": "user", "isReplay": true, "message": { "content": "/effort high" } })
         )
         .is_empty());
+        // A goal is what the user asked for: it shows.
+        let goal = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": "<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>tests pass</command-args>" } }),
+        );
+        assert_eq!(
+            goal,
+            vec![json!({ "type": "user_message", "content": "/goal tests pass" })]
+        );
+    }
+
+    /// A Claude Code session with a turn running.
+    fn mid_turn() -> Claude {
+        let mut c = claude();
+        assert!(c
+            .encode(&json!({ "op": "user_message", "content": "first" }))
+            .unwrap()
+            .events
+            .is_empty());
+        frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "status", "status": "requesting" }),
+        );
+        c
+    }
+
+    #[test]
+    fn a_message_sent_mid_turn_shows_as_queued_until_claude_takes_it_in() {
+        let mut c = mid_turn();
+        let queued = c
+            .encode(&json!({ "op": "user_message", "content": "also this " }))
+            .unwrap();
+        assert_eq!(queued.frames.len(), 1);
+        assert_eq!(
+            queued.events,
+            vec![json!({ "type": "pending_messages", "messages": ["also this"] })]
+        );
+        let taken = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "also this " }] } }),
+        );
+        assert_eq!(
+            taken,
+            vec![
+                json!({ "type": "pending_messages", "messages": [] }),
+                json!({ "type": "user_message", "content": "also this " })
+            ]
+        );
+        // Stopped with one waiting: the queue empties.
+        c.encode(&json!({ "op": "user_message", "content": "later" }))
+            .unwrap();
+        c.encode(&json!({ "op": "interrupt" })).unwrap();
+        let ended = frame(
+            &mut c,
+            json!({ "type": "result", "subtype": "error_during_execution", "is_error": true }),
+        );
+        assert_eq!(
+            ended[0],
+            json!({ "type": "pending_messages", "messages": [] })
+        );
+    }
+
+    #[test]
+    fn queued_messages_taken_in_together_each_show_as_sent() {
+        let mut c = mid_turn();
+        for text in ["apple", "banana"] {
+            c.encode(&json!({ "op": "user_message", "content": text }))
+                .unwrap();
+        }
+        let taken = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "apple" }, { "type": "text", "text": "banana" }] } }),
+        );
+        assert_eq!(
+            taken,
+            vec![
+                json!({ "type": "pending_messages", "messages": [] }),
+                json!({ "type": "user_message", "content": "apple" }),
+                json!({ "type": "user_message", "content": "banana" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_message_of_images_alone_is_echoed() {
+        let mut c = mid_turn();
+        let image = json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AA==" } });
+        let queued = c
+            .encode(&json!({ "op": "user_message", "content": "", "images": ["/no/such.png"] }))
+            .unwrap();
+        assert_eq!(
+            queued.events,
+            vec![json!({ "type": "pending_messages", "messages": [""] })]
+        );
+        let taken = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "" }, image] } }),
+        );
+        assert_eq!(
+            taken,
+            vec![
+                json!({ "type": "pending_messages", "messages": [] }),
+                json!({ "type": "user_message", "content": "" })
+            ]
+        );
+        // Nothing to show without text or image.
+        assert!(frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "" }] } })
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn saved_messages_keep_their_images_and_queued_messages() {
+        let home = std::env::temp_dir().join(format!("claude-images-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let cwd = Path::new("/work/pics");
+        let dir = home.join(".claude/projects/-work-pics");
+        fs::create_dir_all(&dir).unwrap();
+        let png = STANDARD.encode(b"png bytes");
+        let image = json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": png } });
+        fs::write(
+            dir.join("33-44.jsonl"),
+            [
+                json!({ "type": "user", "message": { "content": [{ "type": "text", "text": "" }, image] } }),
+                json!({ "type": "user", "isMeta": true, "message": { "content": [{ "type": "text", "text": "[Image: source: /tmp/1.png]" }] } }),
+                json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "red" }] } }),
+                json!({ "type": "user", "message": { "content": [{ "type": "text", "text": "and this" }, image] } }),
+                // As claude 2.1.302 saves messages sent mid-turn.
+                json!({ "type": "attachment", "attachment": { "type": "queued_command", "prompt": [{ "type": "text", "text": "apple" }], "commandMode": "prompt" } }),
+                json!({ "type": "attachment", "attachment": { "type": "queued_command", "prompt": [image], "commandMode": "prompt" } }),
+                json!({ "type": "attachment", "attachment": { "type": "queued_command", "prompt": "<task-notification>", "commandMode": "task-notification" } }),
+                json!({ "type": "user", "message": { "content": "<command-name>/goal</command-name><command-args>done</command-args>" } }),
+            ]
+            .iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>(),
+        )
+        .unwrap();
+        let images = home.join("images");
+        let items = transcript_in(&home.join(".claude"), cwd, "33-44", &images);
+        let path = items[0]["images"][0].as_str().unwrap().to_string();
+        assert!(path.starts_with(images.to_str().unwrap()) && path.ends_with(".png"));
+        assert_eq!(fs::read(&path).unwrap(), b"png bytes");
+        assert_eq!(
+            items,
+            vec![
+                json!({ "role": "user", "content": "", "images": [path] }),
+                json!({ "role": "assistant", "content": "red" }),
+                json!({ "role": "user", "content": "and this", "images": [path] }),
+                json!({ "role": "user", "content": "apple" }),
+                json!({ "role": "user", "content": "", "images": [path] }),
+                json!({ "role": "user", "content": "/goal done" }),
+            ]
+        );
+        // Read again: the same file.
+        assert_eq!(
+            transcript_in(&home.join(".claude"), cwd, "33-44", &images),
+            items
+        );
+        assert_eq!(fs::read_dir(&images).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_streaming_edit_reports_its_line_counts() {
+        let delta = |index: u64, partial: &str| json!({ "type": "stream_event", "event": { "type": "content_block_delta", "index": index, "delta": { "type": "input_json_delta", "partial_json": partial } } });
+        let start = |index: u64, id: &str, name: &str| json!({ "type": "stream_event", "event": { "type": "content_block_start", "index": index, "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} } } });
+        let card =
+            |events: &[Value]| serde_json::from_str::<Value>(text(&events[0]["output"])).unwrap();
+        let mut c = claude();
+        frame(&mut c, start(0, "w1", "Write"));
+        let preview = card(&frame(
+            &mut c,
+            delta(0, "{\"file_path\":\"/a/b.rs\",\"content\":\"one\\ntwo\\nth"),
+        ));
+        assert_eq!(
+            preview,
+            json!({ "path": "/a/b.rs", "paths": ["/a/b.rs"], "add": 3, "del": 0 })
+        );
+        // Quiet until the next tick; the whole input sends the diff.
+        assert!(frame(&mut c, delta(0, "ree\\nfour")).is_empty());
+        let done = card(&frame(&mut c, delta(0, "\"}")));
+        assert_eq!(done["diff"], "+one\n+two\n+three\n+four");
+
+        frame(&mut c, start(1, "e1", "Edit"));
+        let preview = card(&frame(
+            &mut c,
+            delta(
+                1,
+                "{\"file_path\":\"x\",\"old_string\":\"a\\nb\",\"new_string\":\"c",
+            ),
+        ));
+        assert_eq!((&preview["add"], &preview["del"]), (&json!(1), &json!(2)));
+
+        // Other tools wait for their whole input.
+        frame(&mut c, start(2, "b1", "Bash"));
+        assert!(frame(&mut c, delta(2, "{\"command\":\"l")).is_empty());
+    }
+
+    #[test]
+    fn a_streamed_json_prefix_closes() {
+        assert_eq!(
+            close_partial_json("{\"a\":\"x\\"),
+            Some(json!({ "a": "x" }))
+        );
+        assert_eq!(
+            close_partial_json("{\"a\":\"x\\u00"),
+            Some(json!({ "a": "x" }))
+        );
+        assert_eq!(close_partial_json("{\"a\":\"é"), Some(json!({ "a": "é" })));
+        assert_eq!(
+            close_partial_json("{\"a\":[{\"b\":1},"),
+            Some(json!({ "a": [{ "b": 1 }] }))
+        );
+        assert_eq!(close_partial_json("{\"a\": "), Some(json!({ "a": null })));
+        assert_eq!(close_partial_json("{\"a\":1,\"conte"), None);
+        // An escaped backslash before a `u` is no escape cut short.
+        assert_eq!(
+            close_partial_json("{\"a\":\"C:\\\\us"),
+            Some(json!({ "a": "C:\\us" }))
+        );
+    }
+
+    #[test]
+    fn a_read_card_names_the_line_the_reading_started_at() {
+        assert_eq!(
+            read_card(&json!({ "file_path": "/a.rs" })),
+            json!({ "path": "/a.rs" })
+        );
+        assert_eq!(
+            read_card(&json!({ "file_path": "/a.rs", "offset": 1 })),
+            json!({ "path": "/a.rs" })
+        );
+        assert_eq!(
+            read_card(&json!({ "file_path": "/a.rs", "offset": 120, "limit": 40 })),
+            json!({ "path": "/a.rs", "line": 120 })
+        );
+        // The finished call's card keeps it; a failed read names no line.
+        let mut c = claude();
+        frame(
+            &mut c,
+            json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": "r1", "name": "Read", "input": { "file_path": "/a.rs", "offset": 120 } }] } }),
+        );
+        let done = frame(
+            &mut c,
+            json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": "r1", "content": "fn main() {}" }] } }),
+        );
+        assert_eq!(
+            done[0]["output"],
+            json!({ "path": "/a.rs", "line": 120 }).to_string()
+        );
     }
 
     #[test]
@@ -3506,8 +4662,8 @@ mod tests {
             .collect::<String>(),
         )
         .unwrap();
-        let items = transcript_in(&home, cwd, "11-22");
-        let listed = saved_in(&home, cwd);
+        let items = transcript_in(&home.join(".claude"), cwd, "11-22", &home.join("images"));
+        let listed = saved_in(&home.join(".claude"), cwd);
         assert_eq!(
             items,
             vec![
@@ -3517,7 +4673,9 @@ mod tests {
         );
         assert_eq!(listed[0].0, "11-22");
         assert_eq!(listed[0].1, "hello there");
-        assert!(transcript_in(&home, cwd, "../etc").is_empty());
+        assert!(
+            transcript_in(&home.join(".claude"), cwd, "../etc", &home.join("images")).is_empty()
+        );
 
         // A symlinked directory is saved under its real path.
         let real = home.join("real-dir");
@@ -3528,6 +4686,121 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         #[cfg(unix)]
         assert_eq!(project_dir(&home, &link), project_dir(&home, &real));
+    }
+
+    #[test]
+    fn replay_keeps_every_tool_card_and_when_each_row_was_written() {
+        let mut calls = HashMap::new();
+        let call = json!({ "type": "assistant", "message": { "content": [
+            { "type": "tool_use", "id": "t2", "name": "Bash", "input": { "command": "ls" } },
+            { "type": "tool_use", "id": "t3", "name": "Edit", "input": { "file_path": "/a.rs", "old_string": "x", "new_string": "y" } },
+            { "type": "tool_use", "id": "t4", "name": "TodoWrite", "input": { "todos": [] } },
+            { "type": "tool_use", "id": "t5", "name": "Read", "input": { "file_path": "/b.rs", "offset": 40 } },
+        ] } });
+        assert!(tool_rows(&call, &mut calls).is_empty());
+        let result = json!({ "type": "user", "toolUseResult": { "stdout": "a\n", "stderr": "" }, "message": { "content": [
+            { "type": "tool_result", "tool_use_id": "t2", "content": "a" },
+            { "type": "tool_result", "tool_use_id": "t3", "content": "String not found", "is_error": true },
+            { "type": "tool_result", "tool_use_id": "t4", "content": "ok" },
+            { "type": "tool_result", "tool_use_id": "t5", "content": "fn b() {}" },
+        ] } });
+        assert_eq!(
+            tool_rows(&result, &mut calls),
+            vec![
+                json!({ "role": "tool", "name": "bash", "output": "{\"command\":\"ls\",\"stdout\":\"a\\n\"}", "call_id": "t2" }),
+                json!({ "role": "tool", "name": "str_replace", "output": "{\"error\":\"String not found\",\"path\":\"/a.rs\"}", "call_id": "t3", "is_error": true }),
+                json!({ "role": "tool", "name": "read", "output": "{\"line\":40,\"path\":\"/b.rs\"}", "call_id": "t5" }),
+            ]
+        );
+        let row = json!({ "timestamp": "2026-10-23T12:00:00.250Z" });
+        assert_eq!(row_time(&row), Some(1_792_756_800_250));
+        assert_eq!(row_time(&json!({})), None);
+    }
+
+    #[test]
+    fn the_config_directory_comes_from_the_session_or_what_claude_reports() {
+        let env = |dir: &str| vec![("CLAUDE_CONFIG_DIR".to_string(), dir.to_string())];
+        assert_eq!(config_dir_in(&env("/tmp/c")), PathBuf::from("/tmp/c"));
+        assert_eq!(config_dir_in(&env("")), home().join(".claude"));
+        assert_eq!(config_dir_in(&[]), config_dir());
+        // Found once, it stays with the session (a restart, the TUI).
+        let options = Options {
+            env: env("/tmp/c"),
+            claude_config: Some(PathBuf::from("/tmp/found")),
+            ..Options::default()
+        };
+        assert_eq!(
+            config_with(&options, Path::new("/w"), "1-2"),
+            PathBuf::from("/tmp/found")
+        );
+        // What Claude Code resolved wins over what the daemon guessed.
+        assert_eq!(
+            reported_config(&json!({ "user_output_styles_dir": "/u/alt/output-styles" })),
+            Some(PathBuf::from("/u/alt"))
+        );
+        assert_eq!(
+            reported_config(&json!({ "user_output_styles_dir": "rel/output-styles" })),
+            None
+        );
+        assert_eq!(reported_config(&json!({})), None);
+        let mut c = Claude::new(&Options {
+            env: env("/tmp/c"),
+            ..Options::default()
+        });
+        assert_eq!(c.config, PathBuf::from("/tmp/c"));
+        let boot = c.start();
+        frame(
+            &mut c,
+            reply(
+                request_id(&boot, "initialize"),
+                json!({ "commands": [], "user_output_styles_dir": "/u/alt/output-styles" }),
+            ),
+        );
+        assert_eq!(c.config, PathBuf::from("/u/alt"));
+        assert_eq!(
+            c.keep(Options::default()).claude_config,
+            Some(PathBuf::from("/u/alt"))
+        );
+    }
+
+    /// A program of the user's that sets the config directory itself is
+    /// asked where it is, once, and remembered for that program.
+    #[cfg(unix)]
+    #[test]
+    fn a_users_program_is_asked_for_its_config_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("claude-probe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("claude-switch");
+        let config = dir.join("account-b");
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nread line\nprintf '%s\\n' '{}'\n",
+                json!({ "type": "control_response", "response": { "subtype": "success", "request_id": "probe", "response": { "user_output_styles_dir": config.join("output-styles") } } })
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let options = Options {
+            bin: Some(program.to_string_lossy().into_owned()),
+            ..Options::default()
+        };
+        let cwd = dir.join("work");
+        assert_eq!(config_with(&options, &cwd, "1-2"), config);
+        assert_eq!(known_config(&options), Some(config.clone()));
+        // Saved where the session's environment says: nothing to ask.
+        let plain = dir.join("plain");
+        let saved = Options {
+            env: vec![("CLAUDE_CONFIG_DIR".into(), plain.to_string_lossy().into())],
+            ..options.clone()
+        };
+        fs::create_dir_all(project_dir(&plain, &cwd)).unwrap();
+        fs::write(project_dir(&plain, &cwd).join("1-2.jsonl"), "{}\n").unwrap();
+        fs::remove_file(&program).unwrap();
+        assert_eq!(config_with(&saved, &cwd, "1-2"), plain);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

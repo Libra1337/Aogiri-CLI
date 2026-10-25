@@ -574,9 +574,12 @@ impl Hub {
                         .map_err(|error| error.to_string())?
                         .iter()
                         .any(|summary| summary.id == id),
-                    Some(engines::Kind::Claude) => engines::claude::saved(&cwd)
-                        .iter()
-                        .any(|(saved, _, _)| saved == id),
+                    Some(engines::Kind::Claude) => engines::claude::saved(
+                        &engines::claude::config_with(&options, &cwd, id),
+                        &cwd,
+                    )
+                    .iter()
+                    .any(|(saved, _, _)| saved == id),
                     Some(engines::Kind::Codex) => engines::codex::saved(&cwd)
                         .iter()
                         .any(|(saved, _, _)| saved == id),
@@ -625,15 +628,23 @@ impl Hub {
                 // Codex resumes through its protocol, which also sends the
                 // history back. An ACP agent reopens the conversation it
                 // opened (its own session id, kept with the record).
+                // Where Claude Code saves its conversations (the session's
+                // environment or a program of the user's may set that).
+                let claude_config = (kind == engines::Kind::Claude)
+                    .then(|| engines::claude::config_with(&options, &record.cwd, id));
                 let saved = match kind {
-                    engines::Kind::Claude => engines::claude::is_saved(&record.cwd, id),
+                    engines::Kind::Claude => claude_config
+                        .as_deref()
+                        .is_some_and(|config| engines::claude::is_saved(config, &record.cwd, id)),
                     engines::Kind::Codex => true,
                     engines::Kind::Acp => record.conversation.is_some(),
                 };
-                let transcript = match kind {
-                    engines::Kind::Claude => engines::claude::transcript(&record.cwd, id),
-                    engines::Kind::Codex | engines::Kind::Acp => Vec::new(),
-                };
+                let transcript = claude_config
+                    .as_deref()
+                    .map(|config| {
+                        engines::claude::transcript(config, &record.cwd, id, self.uploads.dir())
+                    })
+                    .unwrap_or_default();
                 // A client that does not say (a phone) keeps how it last ran.
                 let options = engines::Options {
                     resume: match kind {
@@ -643,6 +654,7 @@ impl Hub {
                     gateway: Some(options.gateway.unwrap_or(record.gateway)),
                     // A copy is made once, when the session is created.
                     fork: None,
+                    claude_config,
                     ..options
                 };
                 gateway = options.gateway == Some(true);
@@ -817,6 +829,7 @@ impl Hub {
         lock(&self.busy).remove(id);
         lock(&self.claims).remove(id);
         self.usage.close(id);
+        self.usage.forget(id);
         self.broadcast(&json!({ "type": "session_closed", "session": id }));
     }
 
@@ -1939,7 +1952,7 @@ impl Hub {
                 )
             })
             .chain(
-                engines::claude::saved(cwd)
+                engines::claude::saved(&engines::claude::config_dir(), cwd)
                     .into_iter()
                     .map(|(id, title, updated_at)| {
                         item(id, title, updated_at, Value::Null, "claude")

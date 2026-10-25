@@ -175,6 +175,10 @@ fn sandbox_mode(sandbox: &Value) -> &'static str {
 }
 
 fn error_event(message: &str, info: &Value) -> Value {
+    // Out of plan usage: the usage-limit notice, not an error.
+    if info == "usageLimitExceeded" || info.get("usageLimitExceeded").is_some() {
+        return json!({ "type": "rate_limit", "level": "limited", "message": message, "resets_at": null, "window": null, "used": null });
+    }
     let lower = message.to_lowercase();
     let unauthorized = info == "unauthorized"
         || info
@@ -210,6 +214,53 @@ fn plan_usage(snapshot: &Value) -> Option<Value> {
         .collect();
     let plan = snapshot["planType"].as_str();
     (!windows.is_empty()).then(|| json!({ "type": "plan_usage", "plan": plan, "windows": windows }))
+}
+
+/// Codex sends no warning before a limit: from this much of a window on, its
+/// usage is one (the fullest window); at 100% the limit is hit.
+const LIMIT_WARNING: f64 = 90.0;
+
+/// The usage-limit notice of a rate-limit snapshot (`plan_usage`'s windows).
+fn limit_notice(usage: &Value) -> Option<Value> {
+    let fullest = usage["windows"].as_array()?.iter().max_by(|a, b| {
+        a["used"]
+            .as_f64()
+            .unwrap_or(0.0)
+            .total_cmp(&b["used"].as_f64().unwrap_or(0.0))
+    })?;
+    let used = fullest["used"].as_f64().unwrap_or(0.0);
+    let level = if used >= 100.0 {
+        "limited"
+    } else if used >= LIMIT_WARNING {
+        "warning"
+    } else {
+        return Some(
+            json!({ "type": "rate_limit", "level": "ok", "message": "", "resets_at": null }),
+        );
+    };
+    // Codex names windows primary/secondary: by their length instead.
+    let window = match fullest["minutes"].as_u64() {
+        Some(300) => json!("five_hour"),
+        Some(10_080) => json!("seven_day"),
+        _ => fullest["key"].clone(),
+    };
+    Some(json!({
+        "type": "rate_limit",
+        "level": level,
+        "message": "",
+        "resets_at": fullest["resets_at"],
+        "window": window,
+        "used": used,
+    }))
+}
+
+/// `plan_usage` and the usage-limit notice of a rate-limit snapshot.
+fn usage_events(snapshot: &Value) -> Vec<Value> {
+    let Some(usage) = plan_usage(snapshot) else {
+        return vec![];
+    };
+    let notice = limit_notice(&usage);
+    std::iter::once(usage).chain(notice).collect()
 }
 
 fn file_change_output(changes: &[Value], error: Option<&str>) -> String {
@@ -282,24 +333,67 @@ fn transcript(turns: &Value) -> Vec<Value> {
                 rows.push(json!({ "role": "assistant", "content": item["text"] }));
             }
             "reasoning" => {
-                let summary = item["summary"].as_array().into_iter().flatten().map(text).collect::<Vec<_>>().join("\n\n");
+                let summary = item["summary"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(text)
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
                 if !summary.is_empty() {
                     rows.push(json!({ "role": "reasoning", "content": summary }));
                 }
             }
-            "commandExecution" => rows.push(json!({ "role": "tool", "name": "bash", "output": command_output(item, "", "").to_string() })),
-            "fileChange" => rows.push(json!({
-                "role": "tool", "name": "apply_patch",
-                "output": file_change_output(item["changes"].as_array().map(Vec::as_slice).unwrap_or_default(), None),
-            })),
-            "mcpToolCall" => rows.push(json!({
-                "role": "tool", "name": format!("{}.{}", text(&item["server"]), text(&item["tool"])), "output": mcp_body(item),
-            })),
-            "webSearch" => rows.push(json!({ "role": "tool", "name": "web_search", "output": json!({ "query": item["query"] }).to_string() })),
+            "commandExecution" | "fileChange" | "mcpToolCall" | "webSearch" => {
+                rows.push(tool_row(item));
+            }
             _ => {}
         }
     }
     rows
+}
+
+/// A finished tool item of a resumed thread as the card its live
+/// `tool_output` showed, failed (`is_error`) the same way.
+fn tool_row(item: &Value) -> Value {
+    // An item saved before it finished has no status: not a failure.
+    let status = text(&item["status"]);
+    let unfinished = !matches!(status, "" | "completed");
+    let (name, output, failed) = match text(&item["type"]) {
+        "commandExecution" => {
+            let mut output = command_output(item, "", "");
+            if status == "declined" {
+                output["error"] = json!("declined");
+            }
+            (json!("bash"), output.to_string(), unfinished)
+        }
+        "fileChange" => {
+            let changes = item["changes"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            (
+                json!("apply_patch"),
+                file_change_output(changes, unfinished.then_some(status)),
+                unfinished,
+            )
+        }
+        "mcpToolCall" => (
+            json!(format!("{}.{}", text(&item["server"]), text(&item["tool"]))),
+            mcp_body(item),
+            !item["error"].is_null() || status == "failed",
+        ),
+        _ => (
+            json!("web_search"),
+            json!({ "query": item["query"] }).to_string(),
+            false,
+        ),
+    };
+    let mut row = json!({ "role": "tool", "name": name, "output": output, "call_id": item["id"] });
+    if failed {
+        row["is_error"] = json!(true);
+    }
+    row
 }
 
 /// A user message's text and its images (local paths).
@@ -881,9 +975,7 @@ impl Codex {
             }
             "thread/start" => self.thread_opened(result, false),
             "thread/resume" => self.thread_opened(result, true),
-            "account/rateLimits/read" => {
-                Output::events(plan_usage(&result["rateLimits"]).into_iter().collect())
-            }
+            "account/rateLimits/read" => Output::events(usage_events(&result["rateLimits"])),
             "model/list" => {
                 self.catalog = result["data"]
                     .as_array()
@@ -1134,10 +1226,11 @@ impl Codex {
             "turn/started" => agent["status"] = json!("running"),
             "turn/completed" => {
                 let turn = &params["turn"];
-                agent["status"] = json!(if turn["status"] == "failed" {
-                    "failed"
-                } else {
-                    "completed"
+                // Stopped by the user: not done.
+                agent["status"] = json!(match text(&turn["status"]) {
+                    "failed" => "failed",
+                    "interrupted" => "stopped",
+                    _ => "completed",
                 });
                 if let Some(ms) = turn["durationMs"].as_u64() {
                     agent["duration_ms"] = json!(agent["duration_ms"].as_u64().unwrap_or(0) + ms);
@@ -1449,7 +1542,7 @@ impl Codex {
             }
         }
         match method {
-            "account/rateLimits/updated" => plan_usage(&params["rateLimits"]).into_iter().collect(),
+            "account/rateLimits/updated" => usage_events(&params["rateLimits"]),
             "turn/started" => {
                 self.busy = true;
                 if let Some(turn) = params["turn"]["id"].as_str() {
@@ -2418,6 +2511,10 @@ mod tests {
         assert_eq!(runs["agents"][0]["tokens"], 900);
         assert_eq!(runs["agents"][0]["status"], "completed");
         assert_eq!(runs["agents"][0]["duration_ms"], 3814);
+        // A turn of it the user stopped: stopped, not done.
+        let stopped = frame(&mut c, json!({ "method": "turn/completed", "params": { "threadId": "child", "turn": { "id": "c2", "status": "interrupted" } } })).events;
+        let runs = stopped.iter().find(|e| e["type"] == "agent_runs").unwrap();
+        assert_eq!(runs["agents"][0]["status"], "stopped");
         // Its conversation is read back from its thread.
         let ask = sent(
             &c.encode(&json!({ "op": "subagent_transcript", "agent_id": "child" }))
@@ -2843,7 +2940,9 @@ mod tests {
             &mut c,
             json!({ "id": read["id"], "result": { "rateLimits": snapshot } }),
         );
-        assert_eq!(types(&out.events), ["plan_usage"]);
+        // Under 90%: the limit notice says all is well.
+        assert_eq!(types(&out.events), ["plan_usage", "rate_limit"]);
+        assert_eq!(out.events[1]["level"], "ok");
         assert_eq!(out.events[0]["plan"], "plus");
         assert_eq!(
             out.events[0]["windows"][0],
@@ -2855,6 +2954,21 @@ mod tests {
         );
         assert_eq!(out.events[0]["windows"][0]["used"], 40.0);
         assert_eq!(out.events[0]["windows"][0]["resets_at"], Value::Null);
+        // The fullest window, named by its length.
+        let out = frame(
+            &mut c,
+            json!({ "method": "account/rateLimits/updated", "params": { "rateLimits": {
+                "primary": { "usedPercent": 20, "windowDurationMins": 300 },
+                "secondary": { "usedPercent": 93, "windowDurationMins": 10080, "resetsAt": 1791300000 } } } }),
+        );
+        assert_eq!(out.events[1]["level"], "warning");
+        assert_eq!(out.events[1]["window"], "seven_day");
+        assert_eq!(out.events[1]["used"], 93.0);
+        assert_eq!(out.events[1]["resets_at"], 1_791_300_000_000u64);
+        // Out of usage: the turn's error is the limit notice.
+        let limited = error_event("You've hit your usage limit.", &json!("usageLimitExceeded"));
+        assert_eq!(limited["type"], "rate_limit");
+        assert_eq!(limited["level"], "limited");
     }
 
     #[test]
@@ -2930,6 +3044,23 @@ mod tests {
             resumed.events[0]["items"],
             json!([{ "role": "user", "content": "q" }, { "role": "assistant", "content": "a" }])
         );
+        // Tool calls replay as the cards their live output showed, failed
+        // ones marked; one saved before it finished is no failure.
+        let rows = transcript(&json!([{ "items": [
+            { "type": "commandExecution", "id": "c1", "command": "ls", "aggregatedOutput": "a", "exitCode": 0, "status": "completed" },
+            { "type": "commandExecution", "id": "c2", "command": "rm x", "status": "declined" },
+            { "type": "fileChange", "id": "f1", "changes": [{ "path": "/a", "diff": "+x" }], "status": "failed" },
+            { "type": "mcpToolCall", "id": "m1", "server": "s", "tool": "t", "error": { "message": "boom" } },
+            { "type": "commandExecution", "id": "c3", "command": "sleep 9" },
+        ] }]));
+        assert!(rows[0].get("is_error").is_none());
+        assert_eq!(rows[0]["call_id"], "c1");
+        assert_eq!(rows[1]["is_error"], true);
+        assert!(rows[1]["output"].as_str().unwrap().contains("declined"));
+        assert_eq!(rows[2]["is_error"], true);
+        assert_eq!(rows[3]["is_error"], true);
+        assert_eq!(rows[3]["name"], "s.t");
+        assert!(rows[4].get("is_error").is_none());
 
         let mut c = Codex::new(
             Path::new("/p"),

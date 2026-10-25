@@ -580,7 +580,7 @@ impl AgentCore {
     /// The current branch as a transcript, for a client that attaches to a
     /// running session and needs the conversation so far.
     pub fn transcript_event(&self) -> AgentEvent {
-        AgentEvent::Transcript(self.session.transcript_items())
+        AgentEvent::Transcript(self.session.transcript_stamped())
     }
 
     /// Startup batch: the session state plus the trust prompt and the
@@ -1082,7 +1082,7 @@ impl AgentCore {
                             let plan_event = self.plan_from_branch();
                             let save_event = self.save_session_event();
                             let mut events =
-                                vec![AgentEvent::Transcript(self.session.transcript_items())];
+                                vec![AgentEvent::Transcript(self.session.transcript_stamped())];
                             events.extend(plan_event);
                             if let Some(content) = fill {
                                 events.push(AgentEvent::FillInput(content));
@@ -1101,7 +1101,7 @@ impl AgentCore {
                         let plan_event = self.plan_from_branch();
                         let save_event = self.save_session_event();
                         vec![
-                            AgentEvent::Transcript(self.session.transcript_items()),
+                            AgentEvent::Transcript(self.session.transcript_stamped()),
                             AgentEvent::TreeView(self.session.tree_view()),
                         ]
                         .into_iter()
@@ -1122,7 +1122,7 @@ impl AgentCore {
                     Ok(()) => {
                         let save_event = self.save_session_event();
                         vec![
-                            AgentEvent::Transcript(self.session.transcript_items()),
+                            AgentEvent::Transcript(self.session.transcript_stamped()),
                             AgentEvent::TreeView(self.session.tree_view()),
                             AgentEvent::Status(format!("deleted branch {label}")),
                         ]
@@ -5107,7 +5107,7 @@ impl AgentCore {
         let session_id = self.session.session_id().to_string();
         let save_event = self.save_session_event();
         vec![
-            AgentEvent::Transcript(self.session.transcript_items()),
+            AgentEvent::Transcript(self.session.transcript_stamped()),
             AgentEvent::PendingMessages(Vec::new()),
             self.model_status_event(),
             self.context_usage_event(),
@@ -5602,7 +5602,7 @@ impl AgentCore {
                     crate::tools::restore_conflicts_note(&result),
                 ),
                 Err(error) => {
-                    return [AgentEvent::Transcript(self.session.transcript_items())]
+                    return [AgentEvent::Transcript(self.session.transcript_stamped())]
                         .into_iter()
                         .chain(plan_event)
                         .chain([AgentEvent::Error(format!(
@@ -5616,7 +5616,7 @@ impl AgentCore {
         if let Some(conflicts) = conflicts {
             message.push_str(&format!(" · {conflicts}"));
         }
-        [AgentEvent::Transcript(self.session.transcript_items())]
+        [AgentEvent::Transcript(self.session.transcript_stamped())]
             .into_iter()
             .chain(plan_event)
             .chain([AgentEvent::Info(message)])
@@ -5701,7 +5701,7 @@ impl AgentCore {
                 self.model_plan = self.plan.clone();
                 self.plan_set_back.clear();
                 let mut events = vec![
-                    AgentEvent::Transcript(self.session.transcript_items()),
+                    AgentEvent::Transcript(self.session.transcript_stamped()),
                     AgentEvent::PendingMessages(Vec::new()),
                     self.model_status_event(),
                     self.context_usage_event(),

@@ -673,7 +673,8 @@ pub fn event_json(event: AgentEvent) -> Value {
         }),
         AgentEvent::Transcript(items) => json!({
             "type": "transcript",
-            "items": items.into_iter().map(|item| match item {
+            "items": items.into_iter().map(|(item, at)| {
+                let mut row = match item {
                 crate::TranscriptItem::User(content) => json!({ "role": "user", "content": content }),
                 crate::TranscriptItem::UserWithImages { content, images } => {
                     json!({ "role": "user", "content": content, "images": images })
@@ -690,6 +691,12 @@ pub fn event_json(event: AgentEvent) -> Value {
                     item["role"] = json!("turn_stats");
                     item
                 }
+                };
+                // When it was written, ms.
+                if at > 0 {
+                    row["at"] = json!(at * 1000);
+                }
+                row
             }).collect::<Vec<_>>()
         }),
         AgentEvent::Info(message) => json!({ "type": "info", "message": message }),

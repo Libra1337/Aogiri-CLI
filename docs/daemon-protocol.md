@@ -304,7 +304,9 @@ mirror does not have. Requests go through the proxy that `HTTPS_PROXY`,
 `latest.json` URL (empty: no mirror) and `LYNSHEN_SKILL_SOURCES`
 (`Name=https://github.com/o/r;…`) the community list.
 
-`backend` picks the directory: `claude` installs into `~/.claude/skills`,
+`backend` picks the directory: `claude` installs into the `skills` of
+Claude Code's config directory (`~/.claude/skills`, or under
+`CLAUDE_CONFIG_DIR` when the daemon's environment sets it),
 anything else into `~/.lynshen/skills`. `installed` means
 `<installDir>/<id>/SKILL.md` exists. `skill_install` looks the skill up again
 in its source (the bundled index or the cache), then installs the mirror's
@@ -320,8 +322,8 @@ run.
 `~/.agents/skills` (`"shared"`) and, with `cwd`, the project's
 `.lynshen/skills` and `.agents/skills` (`"project"`, only once the project is
 trusted; `projectTrusted` says whether it is). For `claude` they come from
-`~/.claude/skills` and the project's `.claude/skills`, all `enabled`, and
-`toggleable` is false: LynShen does not switch Claude Code's skills.
+the `installDir` above and the project's `.claude/skills`, all `enabled`,
+and `toggleable` is false: LynShen does not switch Claude Code's skills.
 `removable` is true for a folder directly in the personal directory; a shared
 skill is other tools' too and a project's belongs to the project. `problems`
 are what keeps a skill from loading: `unreadable` (an `error` when the skill
@@ -383,7 +385,20 @@ Codex's thread id), so reopening a closed session resumes the same
 conversation (`--resume`, `thread/resume`), and `session_open` with `cwd`
 and `engine` opens any conversation the engine saved for that directory
 (`~/.claude/projects`, `~/.codex/sessions`). `session_history` lists those
-too, with their `engine`. `session_created` for Codex comes once its thread
+too, with their `engine`.
+
+Claude Code keeps its conversations in its config directory: `~/.claude`,
+or `CLAUDE_CONFIG_DIR`. The daemon looks for a session's conversation where
+that session's Claude Code keeps it: `CLAUDE_CONFIG_DIR` in the session's
+`env`, else the daemon's own. When `bin` is a program of the user's that
+sets the directory itself (an account switcher), the daemon runs it once
+without a conversation and reads the directory from Claude Code's
+`initialize` reply, remembers it for that program and environment, and asks
+again when the conversation is not where it was seen. A running session
+takes the directory Claude Code reports, and keeps it across restarts and
+the TUI handoff. So a saved conversation is resumed, never started again
+under its id (which Claude Code refuses: "Session ID … is already in use"),
+and its history shows. `session_created` for Codex comes once its thread
 is open.
 Every session in `session_list` carries its `engine` (and an ACP session
 the `acp_agent` it was created with).
@@ -420,11 +435,21 @@ more from the daemon (`engines/opencode.rs`):
   (`session/resume`, no replay).
 - OpenCode 2.x is refused with an error.
 
+A `transcript` item is `user`/`assistant`/`reasoning` with `content`, `tool`
+with `name` and `output`, `branch`, `plan` or `turn_stats`. Items carry
+`at` (ms) when it is known when they were written: Claude Code's saved rows,
+a LynShen session's entries and the daemon's own snapshot do; a resumed
+Codex thread and an ACP replay do not. A `tool` item carries
+`is_error: true` when the call failed and its `call_id` when the replay
+knows it. A reopened Claude Code conversation has every tool call of its
+turns, as the cards the live turn showed (not the todo list or the plan),
+not only its text.
+
 Differences from a lynshen session:
 
 - A watching client gets a snapshot rebuilt by the daemon: the latest state
   events, the conversation so far (text and tool results; a reopened
-  session starts from the text Claude Code saved) and any open permission
+  session starts from what Claude Code saved) and any open permission
   prompts. Prompts wait for whichever client answers them first; an
   unwatched session is not switched to deferred actions. The snapshot's
   `model_status` names the engine's state at the time of the snapshot
@@ -470,6 +495,39 @@ cards; a command card with `scopes: ["session", "rule"]` can be allowed
 always with `always_scope: "rule"` (a Codex exec rule). Subagents are
 threads of their own: their events feed `agent_runs` and
 `subagent_lifecycle`, never the conversation.
+
+A message sent while a Claude Code turn runs goes to Claude Code at once,
+which takes it into the running turn at its next tool boundary (or runs it
+as the next turn). Until Claude Code takes it in, it is listed in
+`pending_messages` (also part of a watcher's snapshot); its `user_message`
+comes when it is taken in, one each for messages taken in together. An
+`interrupt` empties the list. A reopened conversation keeps these messages
+(Claude Code saves them as `queued_command` rows), the images of every user
+message (written once under `~/.lynshen/uploads/claude` and named by path in
+`images`) and a `/goal <condition>` command as the user wrote it; other
+slash commands stay out of the conversation.
+
+Usage that Claude Code's stream does not show (Task subagents, Workflow
+agents, compaction) comes at the end of a turn as `usage` with
+`aggregate: true` and the `model` it ran on: one per model, the sum of
+several requests, counted toward the turn (so not one request's cache
+figures). Background work that ends after a turn lands in the next one's.
+For billing the local gateway charges a session's requests to its last turn
+until the next one opens, so background work after a turn ends is that
+turn's cost.
+
+A usage limit comes as `rate_limit`, never as a reply or an `error`:
+`level` (`ok`, `warning` or `limited`), `message` (the engine's words for
+the user, or empty), `resets_at` (ms), `window` (which limit:
+`five_hour`, `seven_day`, `seven_day_opus`, `overage`…, when known), `used`
+(percent of it, when known) and, from Claude Code, `overage` (extra usage
+is on). Claude Code sends one when its limits change; the "You've hit your
+limit" reply it makes up for a turn stopped by a limit is that turn's
+`limited` notice, with no `error` after it, and a reopened conversation
+leaves it out. Codex has no warning of its own: from 90% of its fullest
+plan window the notice is a `warning`, at 100% `limited`, and a turn that
+fails for usage ends with a `limited` notice. `plan_usage` (`plan`,
+`windows: [{key, used, resets_at, minutes}]`) comes with it.
 
 And sends more events: `background_tasks` (`tasks: [{id, kind,
 description}]`, the live set: replace yours), `task_progress` (`task_id`,

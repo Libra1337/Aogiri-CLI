@@ -600,7 +600,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `pending_messages` | `messages` | The queued-message list after it changed. |
 | `fill_input` | `content` | Front-end should pre-fill its input box (e.g. after `/checkout`). |
 | `connecting` | — | A model request is starting. |
-| `thinking_start` | — | Reasoning output begins. |
+| `thinking_start` | — | The model answered the request; its first token is on the way. |
 | `reasoning_delta` | `delta` | Reasoning text chunk. |
 | `assistant_start` | — | Assistant reply begins. |
 | `assistant_delta` | `delta` | Reply text chunk. |
@@ -630,7 +630,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `checkpoint_view` | `items: [{id, label, detail}]` | Checkpoint picker data. |
 | `goal` | `goal: {objective, status, token_budget, tokens_used, time_used_seconds, created_at, updated_at} \| null` | Goal state; `null` clears it. |
 | `plan` | `plan: [{step, status, agent, files}]` | Goal/plan step list. `agent` (string or `null`) is the subagent doing the step, as the model named it (path or task name); `files` the files it is expected to write. Saved with the session: part of the startup batch and of a resumed session's events when the session has a plan; `/new` or `/resume` sends an empty `plan` to clear the previous session's plan when it had one and the next session has none. `/rewind`, `/checkout` and `/fork` set the plan the last successful `update_plan` call before that point set (none without one), and send `plan` when it changed. |
-| `transcript` | `items: [{role, ...}]` | Rendered conversation (`/transcript`); roles: `user`, `assistant`, `tool` (`name`, `output`), `branch` (`label`), `compaction` (`summary`: where the older conversation was folded). |
+| `transcript` | `items: [{role, ...}]` | Rendered conversation (`/transcript`); roles: `user`, `assistant`, `tool` (`name`, `output`), `branch` (`label`), `compaction` (`summary`: where the older conversation was folded). Items carry `at` (ms) when it is known when they were written. |
 | `info` | `message` | Informational line (hook output, notices, update available, loop guard warnings; see "Loop guard"). |
 | `error` | `message` | Error line. Also used for malformed commands and unknown ops, and for a turn the loop guard stopped (message starts with `loop guard:`). |
 | `status` | `message` | Turn status string: `ready`, `streaming`, `queued: N`, `steering`, `interrupted`, `compacting`, `approval mode: ...`, `trusted ...`, etc. `ready` marks the end of a turn. |
@@ -1054,7 +1054,7 @@ A normal turn looks like:
 {"op":"user_message","content":"fix the test"}
 < {"type":"user_message","content":"fix the test"}
 < {"type":"connecting"}
-< {"type":"thinking_start"}            // reasoning models only
+< {"type":"thinking_start"}            // the model answered
 < {"type":"reasoning_delta","delta":"..."}
 < {"type":"assistant_start"}
 < {"type":"assistant_delta","delta":"..."}
@@ -1103,7 +1103,7 @@ Suggested rendering (as used by LynShen Desktop):
 | --- | --- |
 | `assistant_start` / `assistant_delta` | streaming message bubble |
 | `response_interrupted` | mark the streaming bubble and thinking section interrupted; later deltas start new ones |
-| `thinking_start` / `reasoning_delta` | collapsible thinking section |
+| `reasoning_delta` | collapsible thinking section |
 | `tool_start` / `tool_update` / `tool_output` | tool cards keyed by `call_id` |
 | `approval_request` | approval dialog → `approve` op |
 | `model_view` / `tree_view` / `resume_view` / `checkpoint_view` | pickers/sidebars |

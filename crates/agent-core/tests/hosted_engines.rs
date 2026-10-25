@@ -678,7 +678,7 @@ fn a_proposed_plan_waits_then_runs_in_the_approved_mode() {
     };
     let plans: Vec<_> = items
         .iter()
-        .filter_map(|item| match item {
+        .filter_map(|(item, _)| match item {
             lynshen_agent_core::TranscriptItem::Plan { status, .. } => Some(status.clone()),
             _ => None,
         })
@@ -2009,7 +2009,7 @@ fn the_loop_guard_warns_a_repeating_model_then_stops_the_turn_and_pauses_the_goa
     };
     let noted = items
         .iter()
-        .filter(|item| {
+        .filter(|(item, _)| {
             matches!(item, lynshen_agent_core::TranscriptItem::Tool { output, .. }
                 if output.contains("\"loop_guard\""))
         })
@@ -2213,7 +2213,7 @@ fn shown_notes(core: &AgentCore) -> Vec<String> {
     };
     items
         .into_iter()
-        .filter_map(|item| match item {
+        .filter_map(|(item, _)| match item {
             lynshen_agent_core::TranscriptItem::User(text)
                 if text.contains("<system-reminder>") =>
             {

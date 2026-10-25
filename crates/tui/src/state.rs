@@ -883,12 +883,12 @@ impl TuiState {
         self.mark_history_dirty();
     }
 
-    pub(super) fn replace_transcript(&mut self, items: Vec<TranscriptItem>) {
+    pub(super) fn replace_transcript(&mut self, items: Vec<(TranscriptItem, u64)>) {
         self.commit_live_assistant();
         self.reset_thinking();
         self.chat = items
             .into_iter()
-            .filter_map(|item| {
+            .filter_map(|(item, _)| {
                 Some(match item {
                     TranscriptItem::User(text) => ChatLine::User(text),
                     TranscriptItem::UserWithImages { content, images } => {

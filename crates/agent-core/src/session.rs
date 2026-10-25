@@ -1081,21 +1081,33 @@ impl SessionStore {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn transcript_items(&self) -> Vec<TranscriptItem> {
-        let mut items: Vec<TranscriptItem> = Vec::new();
+        self.transcript_stamped()
+            .into_iter()
+            .map(|(item, _)| item)
+            .collect()
+    }
+
+    /// The transcript, each item with when it was written (seconds).
+    pub fn transcript_stamped(&self) -> Vec<(TranscriptItem, u64)> {
+        let mut items: Vec<(TranscriptItem, u64)> = Vec::new();
         for entry in self.branch() {
             // A message's images are recorded right after it: they belong to it.
-            if let (EntryKind::UserImage { paths }, Some(TranscriptItem::User(_))) =
+            if let (EntryKind::UserImage { paths }, Some((TranscriptItem::User(_), _))) =
                 (&entry.kind, items.last())
             {
                 if !paths.is_empty() {
-                    let Some(TranscriptItem::User(content)) = items.pop() else {
+                    let Some((TranscriptItem::User(content), at)) = items.pop() else {
                         unreachable!()
                     };
-                    items.push(TranscriptItem::UserWithImages {
-                        content,
-                        images: paths.clone(),
-                    });
+                    items.push((
+                        TranscriptItem::UserWithImages {
+                            content,
+                            images: paths.clone(),
+                        },
+                        at,
+                    ));
                 }
                 continue;
             }
@@ -1113,14 +1125,14 @@ impl SessionStore {
                     status: status.clone(),
                 };
                 match items.iter_mut().find(
-                    |item| matches!(item, TranscriptItem::Plan { id: known, .. } if known == id),
+                    |(item, _)| matches!(item, TranscriptItem::Plan { id: known, .. } if known == id),
                 ) {
-                    Some(item) => *item = latest,
-                    None => items.push(latest),
+                    Some((item, _)) => *item = latest,
+                    None => items.push((latest, entry.created_at)),
                 }
                 continue;
             }
-            items.extend(Self::transcript_item(entry));
+            items.extend(Self::transcript_item(entry).map(|item| (item, entry.created_at)));
         }
         items
     }
@@ -2877,6 +2889,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn transcript_items_carry_when_they_were_written() {
+        let mut session = SessionStore::new();
+        session.append(EntryKind::User {
+            content: "one".to_string(),
+        });
+        session.append(EntryKind::ResponseItem {
+            item: json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "re one" }] }),
+        });
+        let stamped = session.transcript_stamped();
+        assert_eq!(stamped.len(), 2);
+        assert!(stamped.iter().all(|(_, at)| *at > 0));
+        let event = crate::protocol::event_json(crate::AgentEvent::Transcript(stamped.clone()));
+        assert_eq!(event["items"][0]["at"], json!(stamped[0].1 * 1000));
+        assert_eq!(event["items"][1]["content"], "re one");
+        // Unknown: no `at`.
+        let event = crate::protocol::event_json(crate::AgentEvent::Transcript(vec![(
+            crate::TranscriptItem::User("x".into()),
+            0,
+        )]));
+        assert!(event["items"][0].get("at").is_none());
     }
 
     #[test]
