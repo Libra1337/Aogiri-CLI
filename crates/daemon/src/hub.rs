@@ -935,7 +935,7 @@ impl Hub {
                 // the client names; a registered one only from the desktop,
                 // which knows its command.
                 let builtin = (kind == engines::Kind::Acp)
-                    .then(|| record.acp_agent.as_ref())
+                    .then_some(record.acp_agent.as_ref())
                     .flatten()
                     .filter(|agent| agent["builtin"] == true)
                     .and_then(|agent| agent["id"].as_str())

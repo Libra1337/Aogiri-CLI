@@ -1157,8 +1157,6 @@ pub fn spawn(
     let generation = hub.next_generation();
     // An ACP agent reopening its conversation keeps it under the same id.
     let conversation = options.resume.clone().filter(|_| kind == Kind::Acp);
-    let opencode = kind == Kind::Acp
-        && (opencode::is_opencode(&options) || options.agent.as_deref() == Some("opencode"));
     thread::spawn(move || {
         let mut session = Session {
             hub: &hub,
@@ -1175,7 +1173,6 @@ pub fn spawn(
             gateway_key,
             tui_request: None,
             conversation,
-            opencode,
             app_approvals: HashMap::new(),
             app_approval_seq: 0,
             app_stops: Vec::new(),
@@ -1236,8 +1233,6 @@ struct Session<'a> {
     tui_request: Option<Value>,
     /// ACP: the agent's own session id, as recorded for the session.
     conversation: Option<String>,
-    /// The ACP agent is OpenCode (approval modes, LynShen gateway).
-    opencode: bool,
     /// Session-tool calls waiting for the user's approval, by the call id
     /// of the `approval_request` shown for them.
     app_approvals: HashMap<String, HostCall>,
