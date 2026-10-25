@@ -18,7 +18,7 @@ use std::{
 const MAX_READ: u64 = 1024 * 1024;
 const MAX_ENTRIES: usize = 2000;
 const MAX_DIFF: usize = 1024 * 1024;
-/// Largest image sent to a client.
+/// Largest image or video sent to a client.
 const MAX_IMAGE: u64 = 16 * 1024 * 1024;
 
 pub fn handle(hub: &Hub, name: &str, op: &Value) -> Result<Value, String> {
@@ -206,8 +206,9 @@ fn read(path: &Path) -> Result<Value, String> {
     }))
 }
 
-/// An image a message showed: a file in a known directory or one a client
-/// uploaded, as a data URL for the remote page (which cannot open local paths).
+/// An image a message showed, or an image or short video an agent presented:
+/// a file in a known directory or one a client uploaded, as a data URL for
+/// the remote page (which cannot open local paths).
 fn image(hub: &Hub, path: &Path) -> Result<Value, String> {
     let real = match allowed(hub, path, false) {
         Ok(real) => real,
@@ -226,18 +227,8 @@ fn image(hub: &Hub, path: &Path) -> Result<Value, String> {
             real
         }
     };
-    let media = match real
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_lowercase)
-        .as_deref()
-    {
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        _ => return Err(format!("not an image: {}", real.display())),
-    };
+    let media = media_type(&real)
+        .ok_or_else(|| format!("not an image or a video: {}", real.display()))?;
     let meta = fs::metadata(&real).map_err(|error| format!("{}: {error}", real.display()))?;
     if meta.len() > MAX_IMAGE {
         return Err(format!(
@@ -250,6 +241,22 @@ fn image(hub: &Hub, path: &Path) -> Result<Value, String> {
     use base64::{engine::general_purpose::STANDARD, Engine};
     let data = format!("data:{media};base64,{}", STANDARD.encode(bytes));
     Ok(json!({ "type": "fs_image", "path": real, "data": data }))
+}
+
+/// The data URL type `fs_image` sends a file as, by its extension.
+fn media_type(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_lowercase();
+    Some(match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        // Short recordings an agent presents (`present_files`).
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        _ => return None,
+    })
 }
 
 /// Branch and changed files (`git status --porcelain`); `repo: false`
@@ -289,4 +296,22 @@ fn git_status(cwd: &Path) -> Result<Value, String> {
         "branch": String::from_utf8_lossy(&branch.stdout).trim(),
         "files": files,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn images_and_short_videos_have_a_media_type() {
+        let media = |name: &str| media_type(Path::new(name));
+        assert_eq!(media("a.PNG"), Some("image/png"));
+        assert_eq!(media("clip.mp4"), Some("video/mp4"));
+        assert_eq!(media("clip.m4v"), Some("video/mp4"));
+        assert_eq!(media("demo.webm"), Some("video/webm"));
+        assert_eq!(media("screen.MOV"), Some("video/quicktime"));
+        assert_eq!(media("notes.txt"), None);
+        assert_eq!(media("movie.mkv"), None);
+        assert_eq!(media("noext"), None);
+    }
 }
