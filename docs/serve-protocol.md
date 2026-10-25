@@ -29,13 +29,14 @@ standardized subset for ACP clients; see `docs/serve-vs-acp.md` for the split.
 This document describes protocol version 2. The first line on stdout is
 
 ```json
-{"type":"hello","protocol":2,"version":"0.3.0","features":["queue"]}
+{"type":"hello","protocol":2,"version":"0.3.0","features":["queue","files"]}
 ```
 
 A client that does not support `protocol` must stop instead of guessing.
 `features` names what this engine takes beyond the protocol version (an
 older one sends none, so a client checks before relying on it): `queue`,
-queued messages picked by place (see "Picking a queued message").
+queued messages picked by place (see "Picking a queued message"); `files`,
+a `user_message`'s attachments other than images (see `user_message`).
 Every later event carries a `session` field with the engine's current
 session id, the same shape the daemon uses to multiplex several sessions on
 one connection (`docs/agent-daemon-plan.md`). Ops may carry a `session`
@@ -86,7 +87,15 @@ Every command is a JSON object with an `op` field.
 ```
 
 Submits a user turn. `images` is an optional array of local image paths;
-unattachable paths produce `info` events and are skipped.
+unattachable paths produce `info` events and are skipped. `files` is an
+optional array of other local files (absolute paths, any type): they are not
+inlined; the model is told where each is saved, one line
+`[Attached file "<name>" is saved at: <path>]` per file after the text, and
+opens it with its own tools. Events (`user_message`, `unqueued`,
+`fill_input`), `pending_messages` and the transcript carry them back as
+`files` next to `content`, without those lines. The daemon's Claude Code and
+Codex sessions get the same lines (one text block or item each), ACP agents a
+`resource_link` per file.
 
 If a turn is already running, the message is queued instead: the engine emits
 `pending_messages` (the full queue) and `status:"queued: N"`. Queued messages
@@ -207,7 +216,8 @@ No-op when idle or when the queue is empty.
 
 Takes a queued message back before it runs. Emits the updated
 `pending_messages` either way, and
-`{"type":"unqueued","content":…,"text":…,"images":[…]}` when a message was
+`{"type":"unqueued","content":…,"text":…,"images":[…],"files":[…]}`
+(`files` only when it had some) when a message was
 taken back (a client returns it to the message box; one that already started
 is not taken; `text` repeats `content` for older clients). With
 `discard: true` the message is dropped and no `unqueued` follows. The TUI

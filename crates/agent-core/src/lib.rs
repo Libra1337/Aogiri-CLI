@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod android;
 pub mod approval;
+pub mod attachments;
 mod board;
 pub mod chat;
 pub mod command_text;

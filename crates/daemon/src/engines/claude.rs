@@ -41,9 +41,12 @@
 
 mod runs;
 
-use super::{home, resolve, Adapter, Line, Options, Output};
+use super::{home, op_files, resolve, set_files, Adapter, Line, Options, Output};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use lynshen_agent_core::queue::{queue_move_target, QueuePick};
+use lynshen_agent_core::{
+    attachments,
+    queue::{queue_move_target, QueuePick},
+};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -730,6 +733,8 @@ struct Held {
     text: String,
     /// As sent (`images` of the op), for a message taken back.
     images: Value,
+    /// As sent (`files` of the op), for a message taken back.
+    files: Vec<String>,
     /// The stdin line that sends it.
     frame: String,
 }
@@ -967,6 +972,10 @@ impl Claude {
                 Some((media, bytes)) => json!({ "type": "image", "source": { "type": "base64", "media_type": media, "data": STANDARD.encode(bytes) } }),
                 None => json!({ "type": "text", "text": format!("[Attached image: {path} — open it with the Read tool]") }),
             });
+        }
+        // Each other file: a text block saying where it is saved.
+        for file in op_files(op) {
+            content.push(json!({ "type": "text", "text": attachments::file_line(&file) }));
         }
         content
     }
@@ -1611,30 +1620,39 @@ impl Claude {
     /// queue here, where Claude Code took it in.
     fn replayed(&mut self, content: &Value) -> Vec<Value> {
         // Messages queued during a turn may be taken in together, one text
-        // block each: each is a message of its own.
+        // block each: each is a message of its own. An attached-file line
+        // belongs to the message before it.
         // (As sent: a client matches the echo to the message it showed.)
-        let texts: Vec<&str> = content
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|block| block["type"] == "text")
-            .map(|block| text(&block["text"]))
-            .collect();
+        let mut texts: Vec<(&str, Vec<String>)> = Vec::new();
+        for block in content.as_array().into_iter().flatten() {
+            if block["type"] != "text" {
+                continue;
+            }
+            let t = text(&block["text"]);
+            match (attachments::line_path(t), texts.last_mut()) {
+                (Some(path), Some((_, files))) => files.push(path),
+                _ => texts.push((t, Vec::new())),
+            }
+        }
         let queued = |t: &str| self.queued.iter().any(|q| q == t.trim());
-        if texts.len() > 1 && texts.iter().all(|t| queued(t)) {
+        if texts.len() > 1 && texts.iter().all(|(t, _)| queued(t)) {
             let mut events = vec![];
-            for t in &texts {
+            for (t, files) in &texts {
                 if let Some(i) = self.queued.iter().position(|q| q == t.trim()) {
                     self.queued.remove(i);
                 }
-                events.push(json!({ "type": "user_message", "content": t }));
+                let mut echo = json!({ "type": "user_message", "content": t });
+                set_files(&mut echo, files);
+                events.push(echo);
             }
             events.insert(0, self.queued_event());
             return events;
         }
-        let message = match content.as_str() {
-            Some(message) => message.to_string(),
-            None => texts.first().copied().unwrap_or_default().to_string(),
+        // Attached files: text blocks of their own after the text, as sent
+        // (`user_content`), or lines after a text sent as a string.
+        let (message, files) = match content.as_str() {
+            Some(message) => attachments::split_files(message),
+            None => split_blocks(content),
         };
         let trimmed = message.trim();
         let mut events = Vec::new();
@@ -1652,11 +1670,13 @@ impl Claude {
             || trimmed.starts_with("<local-command-")
             || trimmed.starts_with("<task-notification>")
             || is_effort_echo(&message)
-            || (trimmed.is_empty() && !has_image(content))
+            || (trimmed.is_empty() && !has_image(content) && files.is_empty())
         {
             return events;
         }
-        events.push(json!({ "type": "user_message", "content": message }));
+        let mut echo = json!({ "type": "user_message", "content": message });
+        set_files(&mut echo, &files);
+        events.push(echo);
         events
     }
 
@@ -2518,6 +2538,7 @@ impl Claude {
                     self.held.push(Held {
                         text: text(&op["content"]).trim().to_string(),
                         images: op["images"].clone(),
+                        files: op_files(op),
                         frame,
                     });
                     return Ok(Output::events(vec![self.queued_event()]));
@@ -2592,7 +2613,9 @@ impl Claude {
                 let held = self.held.remove(i);
                 let mut events = vec![self.queued_event()];
                 if op["discard"] != true {
-                    events.push(json!({ "type": "unqueued", "content": held.text, "text": held.text, "images": held.images }));
+                    let mut unqueued = json!({ "type": "unqueued", "content": held.text, "text": held.text, "images": held.images });
+                    set_files(&mut unqueued, &held.files);
+                    events.push(unqueued);
                 }
                 return Ok(Output::events(events));
             }
@@ -3271,6 +3294,26 @@ fn row_text(row: &Value) -> Option<String> {
     content_text(&row["message"]["content"])
 }
 
+/// A message sent as blocks (`user_content`): the user's text is the first
+/// text block, as it was typed; each attached file a text block after it.
+/// A message of files alone comes back without the empty text block.
+fn split_blocks(content: &Value) -> (String, Vec<String>) {
+    let mut texts = content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block["type"] == "text")
+        .map(|block| text(&block["text"]))
+        .peekable();
+    let message = match texts.peek() {
+        Some(first) if attachments::line_path(first).is_none() => {
+            texts.next().unwrap_or_default().to_string()
+        }
+        _ => String::new(),
+    };
+    (message, texts.filter_map(attachments::line_path).collect())
+}
+
 fn has_image(content: &Value) -> bool {
     content
         .as_array()
@@ -3282,7 +3325,14 @@ fn has_image(content: &Value) -> bool {
 /// file is named after its data), so the item names them by path, as a
 /// live echo does. A message of images alone shows too.
 fn user_item(content: &Value, images: &Path) -> Option<Value> {
-    let text = content_text(content);
+    // Attached-file lines go to `files`.
+    let (text, files) = match content_text(content) {
+        Some(text) => {
+            let (text, files) = attachments::split_files(&text);
+            (Some(text).filter(|text| !text.is_empty()), files)
+        }
+        None => (None, Vec::new()),
+    };
     let paths: Vec<String> = content
         .as_array()
         .into_iter()
@@ -3290,13 +3340,14 @@ fn user_item(content: &Value, images: &Path) -> Option<Value> {
         .filter(|block| block["type"] == "image")
         .filter_map(|block| saved_image(&block["source"], images))
         .collect();
-    if text.is_none() && paths.is_empty() {
+    if text.is_none() && paths.is_empty() && files.is_empty() {
         return None;
     }
     let mut item = json!({ "role": "user", "content": text.unwrap_or_default() });
     if !paths.is_empty() {
         item["images"] = json!(paths);
     }
+    set_files(&mut item, &files);
     Some(item)
 }
 
@@ -3496,8 +3547,10 @@ fn title(path: &Path) -> String {
                 return text(&row["aiTitle"]).trim().chars().take(80).collect();
             }
             "user" if first.is_empty() && !is_synthetic(&row) => {
+                // A message of files alone names no title.
                 if let Some(text) = row_text(&row) {
-                    first = text
+                    first = attachments::split_files(&text)
+                        .0
                         .lines()
                         .next()
                         .unwrap_or_default()
@@ -4880,6 +4933,105 @@ mod tests {
             json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "" }] } })
         )
         .is_empty());
+    }
+
+    #[test]
+    fn an_attached_file_goes_as_a_line_of_its_own() {
+        let content = Claude::user_content(
+            &json!({ "content": "read", "files": ["/tmp/my report.pdf", "/tmp/会议.mp4"] }),
+        );
+        assert_eq!(
+            content,
+            vec![
+                json!({ "type": "text", "text": "read" }),
+                json!({ "type": "text", "text": "[Attached file \"my report.pdf\" is saved at: /tmp/my report.pdf]" }),
+                json!({ "type": "text", "text": "[Attached file \"会议.mp4\" is saved at: /tmp/会议.mp4]" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn attached_files_show_as_files_when_echoed_and_saved() {
+        let line = |path: &str| json!({ "type": "text", "text": attachments::file_line(path) });
+        let mut c = claude();
+        let echo = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "read" }, line("/a/x.pdf")] } }),
+        );
+        assert_eq!(
+            echo,
+            vec![json!({ "type": "user_message", "content": "read", "files": ["/a/x.pdf"] })]
+        );
+        // Files alone show too.
+        let alone = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [line("/a/x.pdf")] } }),
+        );
+        assert_eq!(
+            alone,
+            vec![json!({ "type": "user_message", "content": "", "files": ["/a/x.pdf"] })]
+        );
+
+        // Held and taken back, or taken in together: each with its files.
+        let mut c = holding(&["apple"]);
+        c.encode(&json!({ "op": "user_message", "content": "banana", "files": ["/b/y.zip"] }))
+            .unwrap();
+        c.encode(&json!({ "op": "user_message", "content": "oops", "files": ["/c/z.txt"] }))
+            .unwrap();
+        let back = c.encode(&json!({ "op": "unqueue", "index": -1 })).unwrap();
+        assert_eq!(
+            back.events[1],
+            json!({ "type": "unqueued", "content": "oops", "text": "oops", "images": null, "files": ["/c/z.txt"] })
+        );
+        c.encode(&json!({ "op": "steer" })).unwrap();
+        let taken = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "apple" }, { "type": "text", "text": "banana" }, line("/b/y.zip")] } }),
+        );
+        assert_eq!(
+            taken[1..],
+            [
+                json!({ "type": "user_message", "content": "apple" }),
+                json!({ "type": "user_message", "content": "banana", "files": ["/b/y.zip"] }),
+            ]
+        );
+
+        let home = std::env::temp_dir().join(format!("claude-files-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let dir = home.join(".claude/projects/-work-docs");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("55-66.jsonl"),
+            [
+                json!({ "type": "user", "message": { "content": [{ "type": "text", "text": "read" }, line("/a/x.pdf")] } }),
+                json!({ "type": "user", "message": { "content": "plain" } }),
+            ]
+            .iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>(),
+        )
+        .unwrap();
+        let items = transcript_in(
+            &home.join(".claude"),
+            Path::new("/work/docs"),
+            "55-66",
+            &home.join("images"),
+        );
+        let users: Vec<Value> = items
+            .into_iter()
+            .map(|mut item| {
+                item.as_object_mut().unwrap().remove("at");
+                item
+            })
+            .collect();
+        assert_eq!(
+            users,
+            vec![
+                json!({ "role": "user", "content": "read", "files": ["/a/x.pdf"] }),
+                json!({ "role": "user", "content": "plain" }),
+            ]
+        );
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]

@@ -2,7 +2,9 @@
 //! events serialize to `{"type": ...}` objects and client ops arrive as
 //! `{"op": ...}` objects. See `docs/serve-protocol.md`.
 
-use crate::{event::AgentEvent, queue::QueuePick, AgentCore, ApprovalMode, ApproveOptions};
+use crate::{
+    attachments, event::AgentEvent, queue::QueuePick, AgentCore, ApprovalMode, ApproveOptions,
+};
 use serde_json::{json, Value};
 
 /// Wire protocol version, announced in the `hello` event. Clients refuse to
@@ -16,7 +18,9 @@ pub const PROTOCOL_VERSION: u64 = 2;
 /// - `queue`: queued messages are picked by `index` (and `text`) on every
 ///   engine: `steer` one, `unqueue` with `discard`, `queue_move`,
 ///   `interrupt` with `index`; Claude Code's queue is held by the daemon.
-pub const FEATURES: &[&str] = &["queue"];
+/// - `files`: a `user_message` takes `files`, attachments other than
+///   images, which each engine gets its own way, not as prompt text.
+pub const FEATURES: &[&str] = &["queue", "files"];
 
 pub fn hello_json(version: &str) -> Value {
     json!({ "type": "hello", "protocol": PROTOCOL_VERSION, "version": version, "features": FEATURES })
@@ -40,17 +44,22 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
                 .get("content")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let images = value
-                .get("images")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item.as_str().map(str::to_string))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            core.submit_user_message_with_images(content.to_string(), images)
+            let strings = |key: &str| {
+                value
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+            // Other files go to the model as lines after the text; events
+            // and the transcript split them back off (`with_files_json`).
+            let content = attachments::with_files(content, &strings("files"));
+            core.submit_user_message_with_images(content, strings("images"))
         }
         "command" => {
             let input = value
@@ -366,14 +375,26 @@ pub fn event_json(event: AgentEvent) -> Value {
             event
         }
         AgentEvent::PendingMessages(messages) => {
+            let messages: Vec<String> = messages
+                .iter()
+                .map(|message| attachments::split_files(message).0)
+                .collect();
             json!({ "type": "pending_messages", "messages": messages })
         }
         // `text` for clients that read only it (desktop 0.10 and older).
         AgentEvent::Unqueued { content, images } => {
-            json!({ "type": "unqueued", "content": content, "text": content, "images": images })
+            let mut event =
+                with_files_json(json!({ "type": "unqueued", "images": images }), &content);
+            event["text"] = event["content"].clone();
+            event
         }
-        AgentEvent::UserMessage(content) => json!({ "type": "user_message", "content": content }),
-        AgentEvent::FillInput(content) => json!({ "type": "fill_input", "content": content }),
+        AgentEvent::UserMessage(content) => {
+            with_files_json(json!({ "type": "user_message" }), &content)
+        }
+        // A message put back in the input: its files apart from its text.
+        AgentEvent::FillInput(content) => {
+            with_files_json(json!({ "type": "fill_input" }), &content)
+        }
         AgentEvent::Connecting => json!({ "type": "connecting" }),
         AgentEvent::CompactionStart => json!({ "type": "compaction_start" }),
         AgentEvent::CompactionProgress { output_tokens } => {
@@ -691,9 +712,9 @@ pub fn event_json(event: AgentEvent) -> Value {
             "type": "transcript",
             "items": items.into_iter().map(|(item, at)| {
                 let mut row = match item {
-                crate::TranscriptItem::User(content) => json!({ "role": "user", "content": content }),
+                crate::TranscriptItem::User(content) => with_files_json(json!({ "role": "user" }), &content),
                 crate::TranscriptItem::UserWithImages { content, images } => {
-                    json!({ "role": "user", "content": content, "images": images })
+                    with_files_json(json!({ "role": "user", "images": images }), &content)
                 }
                 crate::TranscriptItem::Assistant(content) => json!({ "role": "assistant", "content": content }),
                 crate::TranscriptItem::Tool { name, output } => json!({ "role": "tool", "name": name, "output": output }),
@@ -767,6 +788,17 @@ pub fn event_json(event: AgentEvent) -> Value {
             "by": by,
         }),
     }
+}
+
+/// `value` with a user message's `content`, and the files attached to it
+/// as `files` (when there are any).
+fn with_files_json(mut value: Value, message: &str) -> Value {
+    let (content, files) = attachments::split_files(message);
+    value["content"] = json!(content);
+    if !files.is_empty() {
+        value["files"] = json!(files);
+    }
+    value
 }
 
 #[cfg(test)]

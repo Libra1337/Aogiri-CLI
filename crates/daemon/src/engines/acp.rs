@@ -20,8 +20,11 @@
 //!   no replay). An agent that offers neither, or no longer has the
 //!   conversation, starts a new one, and clients are told.
 
-use super::{find_program, opencode, Adapter, Line, Options, Output};
-use lynshen_agent_core::queue::{queue_move_target, QueuePick};
+use super::{find_program, op_files, opencode, Adapter, Line, Options, Output};
+use lynshen_agent_core::{
+    attachments,
+    queue::{queue_move_target, QueuePick},
+};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
@@ -36,6 +39,8 @@ pub const PROTOCOL_VERSION: u64 = 1;
 struct Waiting {
     text: String,
     images: Vec<String>,
+    /// Other files, sent as `resource_link`s.
+    files: Vec<String>,
 }
 
 pub fn command(options: &Options) -> Command {
@@ -213,6 +218,19 @@ impl Replay {
             self.rows.push(json!({ "role": role, "content": chunk }));
         }
         self.message = message;
+    }
+
+    /// A file attached to the user's message being replayed (a new user row
+    /// when the files come first).
+    fn file(&mut self, path: String) {
+        if !self.rows.last().is_some_and(|row| row["role"] == "user") {
+            self.rows.push(json!({ "role": "user", "content": "" }));
+        }
+        if let Some(last) = self.rows.last_mut() {
+            let mut files = last["files"].as_array().cloned().unwrap_or_default();
+            files.push(json!(path));
+            last["files"] = json!(files);
+        }
     }
 
     fn tool(&mut self, tool: &Tool) {
@@ -440,7 +458,7 @@ impl Acp {
     }
 
     /// The prompt blocks of a message: its text, then its images when the
-    /// agent takes them.
+    /// agent takes them, then a `resource_link` per other file.
     fn blocks(&self, message: &Waiting) -> Vec<Value> {
         let mut blocks = vec![json!({ "type": "text", "text": message.text })];
         if self.image_prompts {
@@ -448,6 +466,9 @@ impl Acp {
                 blocks.push(json!({ "type": "image", "mimeType": image_mime(image), "data": "", "uri": format!("file://{image}") }));
             }
         }
+        blocks.extend(message.files.iter().map(|path| {
+            json!({ "type": "resource_link", "uri": attachments::file_uri(path), "name": attachments::file_name(path) })
+        }));
         blocks
     }
 
@@ -686,6 +707,12 @@ impl Acp {
         match text(&update["sessionUpdate"]) {
             // The plan reminder is not what the user wrote.
             "user_message_chunk" if opencode::for_the_model_only(&update["content"]) => {}
+            // A file the user attached (as `blocks` links it).
+            "user_message_chunk" if update["content"]["type"] == "resource_link" => {
+                if let Some(path) = attachments::uri_path(text(&update["content"]["uri"])) {
+                    replay.file(path);
+                }
+            }
             "user_message_chunk" => replay.text("user", update),
             "agent_message_chunk" => replay.text("assistant", update),
             "agent_thought_chunk" => replay.text("reasoning", update),
@@ -951,6 +978,7 @@ impl Adapter for Acp {
                         .flatten()
                         .map(|image| text(image).to_string())
                         .collect(),
+                    files: op_files(op),
                 };
                 if self.session.is_none() || self.prompt_in_flight || self.configuring {
                     self.queued.push_back(message);
@@ -979,7 +1007,9 @@ impl Adapter for Acp {
                 };
                 let mut events = vec![self.pending_event()];
                 if op["discard"] != true {
-                    events.push(json!({ "type": "unqueued", "content": message.text, "text": message.text, "images": message.images }));
+                    let mut unqueued = json!({ "type": "unqueued", "content": message.text, "text": message.text, "images": message.images });
+                    super::set_files(&mut unqueued, &message.files);
+                    events.push(unqueued);
                 }
                 return Ok(Output::events(events));
             }
@@ -1237,6 +1267,53 @@ mod tests {
         let mut a = running_with(&["two"]);
         let out = a.encode(&json!({ "op": "interrupt" })).unwrap();
         assert_eq!(out.events, [pending(&[])]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn attached_files_go_as_resource_links_and_replay_as_files() {
+        let mut a = running_with(&[]);
+        a.encode(&json!({ "op": "user_message", "content": "oops", "files": ["/tmp/x.zip"] }))
+            .unwrap();
+        let back = a.encode(&json!({ "op": "unqueue", "index": 0 })).unwrap();
+        assert_eq!(
+            back.events[1],
+            json!({ "type": "unqueued", "content": "oops", "text": "oops", "images": [], "files": ["/tmp/x.zip"] })
+        );
+        a.encode(&json!({ "op": "user_message", "content": "read", "files": ["/tmp/my report.pdf"] }))
+            .unwrap();
+        let next = frame(&mut a, json!({ "id": 3, "result": { "stopReason": "end_turn" } }));
+        assert_eq!(
+            sent(&next.frames)[0]["params"]["prompt"],
+            json!([
+                { "type": "text", "text": "read" },
+                { "type": "resource_link", "uri": "file:///tmp/my%20report.pdf", "name": "my report.pdf" },
+            ])
+        );
+
+        let mut a = Acp::new(Path::new("/p"), &reopen("ses_1"));
+        a.start();
+        frame(
+            &mut a,
+            json!({ "id": 1, "result": { "agentCapabilities": { "loadSession": true } } }),
+        );
+        for u in [
+            json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": "read" } }),
+            json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "resource_link", "uri": "file:///tmp/my%20report.pdf", "name": "my report.pdf" } }),
+            json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "ok" } }),
+            json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "resource_link", "uri": "file:///tmp/x.zip", "name": "x.zip" } }),
+        ] {
+            frame(&mut a, update(u));
+        }
+        let loaded = frame(&mut a, json!({ "id": 2, "result": {} }));
+        assert_eq!(
+            loaded.events[0]["items"],
+            json!([
+                { "role": "user", "content": "read", "files": ["/tmp/my report.pdf"] },
+                { "role": "assistant", "content": "ok" },
+                { "role": "user", "content": "", "files": ["/tmp/x.zip"] },
+            ])
+        );
     }
 
     #[test]

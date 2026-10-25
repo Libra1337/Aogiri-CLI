@@ -168,7 +168,7 @@ handshake with HTTP 401. Local clients read the daemon token from
 Each WebSocket text message is one JSON frame. The daemon first sends:
 
 ```json
-{"type":"hello","protocol":2,"version":"0.3.0","features":["queue"]}
+{"type":"hello","protocol":2,"version":"0.3.0","features":["queue","files"]}
 {"type":"sessions","sessions":[{"session":"...","cwd":"...","created_at":0,"updated_at":0,"entries":4,"title":"...","archived":false,"open":true,"watchers":0}]}
 {"type":"workspaces","rev":1,"workspaces":[...]}
 ```
