@@ -87,7 +87,7 @@ pub struct Options {
     /// Claude: show thinking summaries (Some(false) hides them).
     pub thinking: Option<bool>,
     /// Claude / Codex: directories besides `cwd` the engine may work in (the
-    /// project's extra directories; set by `spawn`, never by a client).
+    /// session's project's; set by the hub, never by a client).
     pub dirs: Vec<PathBuf>,
     /// ACP: a conversation of the agent's to copy into this new session
     /// (`session/fork`); the original stays as it is.
@@ -630,7 +630,6 @@ pub fn spawn(
         .or(options.resume.as_deref())
         .is_some_and(|session| crate::requirements::gated(&hub, session));
     let options = Options {
-        dirs: crate::projects::extra_dirs(&hub, &cwd),
         approval_mode: if gated {
             Some("read-only".to_string())
         } else {
@@ -859,7 +858,14 @@ impl Session<'_> {
                     next.claude_config = next.claude_config.or(options.claude_config.clone());
                     next.gateway = next.gateway.or(options.gateway);
                     next.approval_mode = next.approval_mode.or(options.approval_mode.clone());
-                    next.dirs = crate::projects::extra_dirs(self.hub, &self.cwd);
+                    next.dirs = crate::projects::extra_dirs(
+                        self.hub,
+                        &self.cwd,
+                        &crate::projects::of_session(
+                            self.hub,
+                            self.id.as_deref().unwrap_or_default(),
+                        ),
+                    );
                     // An ACP agent: the same command, reopened without a replay.
                     next.command = options.command.clone();
                     next.args = options.args.clone();

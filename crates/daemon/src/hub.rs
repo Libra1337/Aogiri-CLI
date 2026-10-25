@@ -462,11 +462,12 @@ impl Hub {
         agent: Option<&str>,
         chat: bool,
     ) -> Result<String, String> {
-        self.create_engine_session(cwd, agent, chat, None, engines::Options::default())
+        self.create_engine_session(cwd, agent, chat, None, engines::Options::default(), None)
     }
 
-    /// `create_session` with the engine to run (None: lynshen) and its start
-    /// options.
+    /// `create_session` with the engine to run (None: lynshen), its start
+    /// options and the project it belongs to (`""`: none; None: the one
+    /// whose main directory is its folder).
     pub fn create_engine_session(
         self: &Arc<Self>,
         cwd: Option<PathBuf>,
@@ -474,6 +475,7 @@ impl Hub {
         chat: bool,
         engine: Option<engines::Kind>,
         options: engines::Options,
+        project: Option<&str>,
     ) -> Result<String, String> {
         if engine.is_some() && agent.is_some() {
             return Err("agents run on the lynshen engine".to_string());
@@ -497,6 +499,16 @@ impl Hub {
         if !cwd.is_dir() {
             return Err(format!("not a directory: {}", cwd.display()));
         }
+        // A chat belongs to no project.
+        let project = match chat {
+            true => String::new(),
+            false => crate::projects::for_new_session(self, &cwd, project)?,
+        };
+        let dirs = crate::projects::extra_dirs(self, &cwd, &project);
+        let options = engines::Options {
+            dirs: dirs.clone(),
+            ..options
+        };
         let agent = agent.map(str::to_string);
         let gateway = options.gateway == Some(true);
         let acp_agent = options
@@ -507,7 +519,7 @@ impl Hub {
         let (id, ops, generation) = match engine {
             None => {
                 let (id, ops, generation, stopper) =
-                    session::spawn(Arc::clone(self), cwd.clone(), None, agent.clone())?;
+                    session::spawn(Arc::clone(self), cwd.clone(), None, agent.clone(), dirs)?;
                 hook_stopper = Some(stopper);
                 (id, ops, generation)
             }
@@ -527,6 +539,7 @@ impl Hub {
                 agent.as_deref(),
                 engine.map(engines::Kind::name),
                 gateway,
+                Some(&project),
             )
             .map_err(|error| error.to_string())?;
         // Which of the desktop's ACP agents runs it: a client can start it again.
@@ -605,6 +618,7 @@ impl Hub {
                     engine: engine.map(|kind| kind.name().to_string()),
                     gateway: false,
                     group: None,
+                    project: None,
                     conversation: None,
                     acp_agent: None,
                 }
@@ -612,6 +626,11 @@ impl Hub {
             (None, None) => return Err(format!("unknown session {id}")),
         };
         let kind = engines::Kind::parse(record.engine.as_deref().unwrap_or_default())?;
+        let dirs = crate::projects::extra_dirs(
+            self,
+            &record.cwd,
+            &crate::projects::of_record(self, &record),
+        );
         let mut gateway = false;
         let mut hook_stopper = None;
         let (ops, generation) = match kind {
@@ -621,6 +640,7 @@ impl Hub {
                     record.cwd.clone(),
                     Some(id.to_string()),
                     record.agent.clone(),
+                    dirs,
                 )?;
                 hook_stopper = Some(stopper);
                 (ops, generation)
@@ -658,6 +678,7 @@ impl Hub {
                     // A copy is made once, when the session is created.
                     fork: None,
                     claude_config,
+                    dirs,
                     ..options
                 };
                 gateway = options.gateway == Some(true);
@@ -685,6 +706,7 @@ impl Hub {
                     record.agent.as_deref(),
                     record.engine.as_deref(),
                     gateway,
+                    record.project.as_deref(),
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -1899,6 +1921,7 @@ impl Hub {
     pub fn sessions_json(&self) -> Value {
         let records = self.store.sessions();
         let saved = saved_by_id(records.iter().map(|record| record.cwd.as_path()));
+        let projects = crate::projects::projects(self);
         let sessions = lock(&self.sessions);
         let busy = lock(&self.busy).clone();
         let failed = lock(&self.failed).clone();
@@ -1925,6 +1948,8 @@ impl Hub {
                     "title": shown_title(&record, summary.map(|s| s.label.as_str())),
                     "archived": record.archived,
                     "group": record.group,
+                    // The project it belongs to, wherever it works; null: none.
+                    "project": Some(crate::projects::member(&projects, &record)).filter(|p| !p.is_empty()),
                     "gateway": record.gateway,
                     "engine": record.engine.as_deref().unwrap_or("lynshen"),
                     "acp_agent": record.acp_agent,
@@ -2221,6 +2246,7 @@ mod tests {
             engine: None,
             gateway: false,
             group: None,
+            project: None,
             conversation: None,
             acp_agent: None,
         };
@@ -2305,10 +2331,10 @@ mod tests {
             None,
         );
         hub.store
-            .record_engine_session("a1", &dir, Some("ops"), None, false)
+            .record_engine_session("a1", &dir, Some("ops"), None, false, None)
             .unwrap();
         hub.store
-            .record_engine_session("u1", &dir, None, None, false)
+            .record_engine_session("u1", &dir, None, None, false, None)
             .unwrap();
         for session in ["a1", "u1"] {
             hub.observe(
@@ -2341,7 +2367,7 @@ mod tests {
         );
         for (message, session) in [("m1", "run1"), ("m2", "run2"), ("m3", "run3")] {
             hub.store
-                .record_engine_session(session, &dir, Some("ops"), None, false)
+                .record_engine_session(session, &dir, Some("ops"), None, false, None)
                 .unwrap();
             hub.store
                 .record_message(&Message {

@@ -117,6 +117,10 @@ pub struct SessionRecord {
     pub gateway: bool,
     /// The LynShen group its gateway requests route to (None: automatic).
     pub group: Option<String>,
+    /// The project it belongs to, wherever it works: an id, or "" for none.
+    /// None: recorded before sessions named theirs, so it belongs to the
+    /// project whose main directory is `cwd` (`projects::member`).
+    pub project: Option<String>,
     /// ACP: the agent's own session id, which a reopen asks it for.
     pub conversation: Option<String>,
     /// ACP: the desktop's registry entry for the agent (`{id, name}`).
@@ -259,6 +263,9 @@ impl Store {
             }
             if record.gateway {
                 open["gateway"] = json!(true);
+            }
+            if let Some(project) = &record.project {
+                open["project"] = json!(project);
             }
             sessions.push(open);
             let mut meta = json!({ "kind": "meta", "session": record.id });
@@ -404,10 +411,12 @@ impl Store {
         cwd: &std::path::Path,
         agent: Option<&str>,
     ) -> io::Result<()> {
-        self.record_engine_session(id, cwd, agent, None, false)
+        self.record_engine_session(id, cwd, agent, None, false, None)
     }
 
-    /// Like `record_session`, for a session run by `engine` (None: lynshen).
+    /// Like `record_session`, for a session run by `engine` (None: lynshen);
+    /// `project`: the project it belongs to ("": none; None leaves what was
+    /// recorded, or the one whose main directory is `cwd`).
     pub fn record_engine_session(
         &self,
         id: &str,
@@ -415,6 +424,7 @@ impl Store {
         agent: Option<&str>,
         engine: Option<&str>,
         gateway: bool,
+        project: Option<&str>,
     ) -> io::Result<()> {
         let mut entry = json!({
             "kind": "open", "session": id, "cwd": cwd.display().to_string(),
@@ -426,6 +436,9 @@ impl Store {
         if gateway {
             entry["gateway"] = json!(true);
         }
+        if let Some(project) = project {
+            entry["project"] = json!(project);
+        }
         self.append(SESSIONS, entry)
     }
 
@@ -436,11 +449,12 @@ impl Store {
         )
     }
 
-    /// Renames, (un)archives, hides or regroups a session from `changes`
-    /// (`title`, `archived`, `hidden`, `group`; the daemon also keeps
-    /// `gateway`, an ACP agent's `conversation` and `acp_agent`); fields left out are
-    /// unchanged, an empty title goes back to the engine's label and an
-    /// empty group to automatic routing. False when `changes` names none.
+    /// Renames, (un)archives, hides, regroups or moves a session from
+    /// `changes` (`title`, `archived`, `hidden`, `group`, `project`; the
+    /// daemon also keeps `gateway`, an ACP agent's `conversation` and
+    /// `acp_agent`); fields left out are unchanged, an empty title goes back
+    /// to the engine's label, an empty group to automatic routing and an
+    /// empty project to none. False when `changes` names none.
     pub fn record_session_meta(&self, id: &str, changes: &Value) -> io::Result<bool> {
         let mut entry = json!({ "kind": "meta", "session": id, "at": now() });
         let mut changed = false;
@@ -459,6 +473,10 @@ impl Store {
         }
         if let Some(group) = changes["group"].as_str() {
             entry["group"] = json!(group.trim());
+            changed = true;
+        }
+        if let Some(project) = changes["project"].as_str() {
+            entry["project"] = json!(project.trim());
             changed = true;
         }
         if let Some(gateway) = changes["gateway"].as_bool() {
@@ -537,12 +555,17 @@ impl Store {
                             engine: entry["engine"].as_str().map(str::to_string),
                             gateway: false,
                             group: None,
+                            project: None,
                             conversation: None,
                             acp_agent: None,
                         }
                     });
                     record.closed = false;
                     record.gateway = entry["gateway"] == true;
+                    // A reopen that names none keeps the one recorded.
+                    if let Some(project) = entry["project"].as_str() {
+                        record.project = Some(project.to_string());
+                    }
                 }
                 Some("close") => {
                     if let Some(record) = records.get_mut(id) {
@@ -563,6 +586,9 @@ impl Store {
                         }
                         if let Some(group) = entry["group"].as_str() {
                             record.group = Some(group.to_string()).filter(|g| !g.is_empty());
+                        }
+                        if let Some(project) = entry["project"].as_str() {
+                            record.project = Some(project.to_string());
                         }
                         if let Some(gateway) = entry["gateway"].as_bool() {
                             record.gateway = gateway;
@@ -1371,7 +1397,7 @@ mod tests {
         let store = store("compact");
         let cwd = std::path::Path::new("/p");
         store
-            .record_engine_session("a", cwd, Some("ops"), Some("claude"), true)
+            .record_engine_session("a", cwd, Some("ops"), Some("claude"), true, None)
             .unwrap();
         store.record_session("b", cwd, None).unwrap();
         for title in ["one", "two", "three"] {
@@ -1442,16 +1468,98 @@ mod tests {
     }
 
     #[test]
+    fn a_session_keeps_its_project_through_compaction_and_reopens() {
+        let store = store("project");
+        store
+            .record_session("old", std::path::Path::new("/p/app"), None)
+            .unwrap();
+        store
+            .record_engine_session(
+                "new",
+                std::path::Path::new("/p/other"),
+                None,
+                Some("claude"),
+                false,
+                Some("p1"),
+            )
+            .unwrap();
+        store
+            .record_session_meta("old", &json!({ "project": "" }))
+            .unwrap();
+        // A reopen that names no project keeps the recorded one.
+        store.record_session_closed("new").unwrap();
+        store
+            .record_engine_session(
+                "new",
+                std::path::Path::new("/p/other"),
+                None,
+                Some("claude"),
+                false,
+                None,
+            )
+            .unwrap();
+        let dir = store.dir.clone();
+        drop(store);
+        let store = reopen(dir).unwrap();
+        let projects: Vec<Option<String>> =
+            store.sessions().into_iter().map(|r| r.project).collect();
+        assert_eq!(projects, [Some(String::new()), Some("p1".into())]);
+    }
+
+    #[test]
+    fn a_store_written_before_sessions_named_their_project_still_loads() {
+        // As a daemon up to 0.7.9 wrote it: no `project` anywhere.
+        let dir = std::env::temp_dir().join(format!(
+            "lynshen-daemon-store-no-project-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(SESSIONS),
+            concat!(
+                "{\"kind\":\"open\",\"session\":\"a\",\"cwd\":\"/p/app\",\"agent\":null,\"at\":1}\n",
+                "{\"kind\":\"meta\",\"session\":\"a\",\"title\":\"Fix login\",\"group\":\"g1\"}\n",
+                "{\"kind\":\"open\",\"session\":\"b\",\"cwd\":\"/p/other\",\"agent\":null,\"at\":2,\"engine\":\"claude\",\"gateway\":true}\n",
+                "{\"kind\":\"close\",\"session\":\"b\"}\n",
+                "{\"kind\":\"meta\",\"session\":\"a\",\"archived\":true}\n",
+            ),
+        )
+        .unwrap();
+        let store = Store::open(dir.clone()).unwrap();
+        let sessions = store.sessions();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].title.as_deref(), Some("Fix login"));
+        assert_eq!(sessions[0].group.as_deref(), Some("g1"));
+        assert!(sessions[0].archived);
+        assert!(sessions[1].gateway && sessions[1].closed);
+        // Unknown: they belong to the project whose folder they run in.
+        assert!(sessions.iter().all(|r| r.project.is_none()));
+        // Compaction keeps it so, and a later move is kept.
+        drop(store);
+        let store = reopen(dir.clone()).unwrap();
+        assert!(store.sessions().iter().all(|r| r.project.is_none()));
+        store
+            .record_session_meta("b", &json!({ "project": "p2" }))
+            .unwrap();
+        drop(store);
+        let store = reopen(dir.clone()).unwrap();
+        assert_eq!(store.sessions()[1].project.as_deref(), Some("p2"));
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn a_session_remembers_whether_it_last_ran_through_the_gateway() {
         let store = store("gateway");
         let cwd = std::path::Path::new("/p");
         store
-            .record_engine_session("c", cwd, None, Some("claude"), true)
+            .record_engine_session("c", cwd, None, Some("claude"), true, None)
             .unwrap();
         assert!(store.sessions()[0].gateway);
         store.record_session_closed("c").unwrap();
         store
-            .record_engine_session("c", cwd, None, Some("claude"), false)
+            .record_engine_session("c", cwd, None, Some("claude"), false, None)
             .unwrap();
         assert!(!store.sessions()[0].gateway);
     }
@@ -1460,7 +1568,7 @@ mod tests {
     fn a_session_keeps_its_group_until_cleared() {
         let store = store("group");
         store
-            .record_engine_session("c", std::path::Path::new("/p"), None, Some("codex"), true)
+            .record_engine_session("c", std::path::Path::new("/p"), None, Some("codex"), true, None)
             .unwrap();
         assert_eq!(store.sessions()[0].group, None);
         assert!(store
@@ -1483,7 +1591,7 @@ mod tests {
         let store = store("compact-group");
         let dir = store.dir.clone();
         store
-            .record_engine_session("c", std::path::Path::new("/p"), None, Some("claude"), false)
+            .record_engine_session("c", std::path::Path::new("/p"), None, Some("claude"), false, None)
             .unwrap();
         store
             .record_session_meta("c", &json!({ "group": "g-1" }))
