@@ -205,6 +205,9 @@ struct State {
     /// The latest turn that ended: its session, its line then, and whether
     /// it failed.
     ended: Option<(String, Line, bool)>,
+    /// When the deferred actions waiting were last checked against the
+    /// store (an action can be closed without being decided).
+    checked: u64,
 }
 
 /// One request for the relay.
@@ -462,6 +465,36 @@ impl LiveActivities {
     /// The sessions the island knows about.
     fn sessions(&self) -> Vec<String> {
         lock(&self.state).lines.keys().cloned().collect()
+    }
+
+    /// Whether the deferred actions waiting are due for a check against
+    /// the store (once per window, and only while one waits).
+    fn check_due(&self, at: u64) -> bool {
+        let mut state = lock(&self.state);
+        let waiting = state
+            .lines
+            .values()
+            .any(|line| line.waiting.iter().any(|key| key.starts_with("a:")));
+        if !waiting || at.saturating_sub(state.checked) < WINDOW_MS {
+            return false;
+        }
+        state.checked = at;
+        true
+    }
+
+    /// Drops the deferred actions no longer open (closed by the user or a
+    /// new run). True when something changed.
+    fn keep_open_actions(&self, open: &BTreeSet<String>) -> bool {
+        let mut state = lock(&self.state);
+        let mut changed = false;
+        state.lines.retain(|_, line| {
+            let before = line.waiting.len();
+            line.waiting
+                .retain(|key| key.strip_prefix("a:").is_none_or(|id| open.contains(id)));
+            changed |= line.waiting.len() != before;
+            !line.idle()
+        });
+        changed
     }
 
     /// A session's engine went away: a turn it ran failed, and what only
@@ -808,6 +841,11 @@ pub fn tick(hub: &Arc<Hub>) {
         if !hub.is_open(&session) {
             live.closed(&session);
         }
+    }
+    let at = now();
+    if live.check_due(at) {
+        let open = hub.store.open_actions().into_iter().map(|a| a.id).collect();
+        live.keep_open_actions(&open);
     }
     send_due(hub);
 }
@@ -1322,6 +1360,27 @@ mod tests {
         for secret in secrets {
             assert!(!text.contains(secret), "{secret} in {text}");
         }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_deferred_action_closed_without_a_decision_stops_waiting() {
+        let (live, dir) = live("closed-action");
+        register(&live, "d1", "activity", &activity_token());
+        event(
+            &live,
+            "s-1",
+            json!({ "type": "action_deferred", "id": "act-1", "call_id": "c1", "name": "bash" }),
+            T0,
+        );
+        assert_eq!(state(&due(&live, T0)[0])["phase"], "waiting");
+        assert!(live.check_due(T0 + WINDOW_MS));
+        assert!(!live.check_due(T0 + WINDOW_MS + 1), "once per window");
+        assert!(!live.keep_open_actions(&BTreeSet::from(["act-1".to_string()])));
+        assert!(live.keep_open_actions(&BTreeSet::new()));
+        let end = due(&live, T0 + WINDOW_MS + 2);
+        assert_eq!(end[0].request["event"], "end");
+        assert!(!live.check_due(T0 + 3 * WINDOW_MS), "nothing waits");
         let _ = fs::remove_dir_all(dir);
     }
 
