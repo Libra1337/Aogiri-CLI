@@ -112,6 +112,20 @@ Runs any slash command exactly as the TUI would (`/model`, `/resume`,
 Structured views come back as events (`model_view`, `resume_view`,
 `tree_view`, ...). `/quit` and `/exit` terminate the process.
 
+### Forking into a new session
+
+`/fork <label>` branches the conversation inside this session (see
+`tree_view`). A fork as a session of its own, which goes on apart from the
+original while both stay listed, is the daemon's: `session_create` with
+`options.fork_from` and `fork_turns` (see "Forks" in
+`docs/daemon-protocol.md`). It copies the session's first `fork_turns` user
+turns on its active branch, with the plan, reply style and system prompt
+they had, into a new session file (`~/.lynshen/sessions/<cwd>/<new id>`, or
+under `fork_cwd`'s when the fork works in another directory); `lynshen serve`
+then opens it like any saved session (`/resume <new id>`). Entries keep their
+ids. The notes sent with the first left-out message, the goal, the agent
+team and the resume summary stay with the original.
+
 ### Rewind
 
 `/rewind` answers with `checkpoint_view` (the user turns of the active
