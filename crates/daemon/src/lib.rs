@@ -6,7 +6,9 @@
 
 mod agent_tools;
 mod agents;
+mod app_tools;
 mod connectors;
+mod devservers;
 mod dispatch;
 mod engines;
 mod feedback;
@@ -255,6 +257,7 @@ fn pump(
         hub.actions_json(),
         hub.dispatch.json(),
         hub.requirements.json(hub),
+        hub.dev_servers.json(),
     ] {
         link.send(&frame.to_string())?;
     }
@@ -370,6 +373,11 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     ) && !hub.is_local(client)
     {
         reply(json!({ "type": "error", "message": "only the desktop can manage devices" }));
+        return;
+    }
+    // What every session is given is the desktop's setting.
+    if name == "app_tools_set" && !hub.is_local(client) {
+        reply(json!({ "type": "error", "message": "only the desktop can change the app tools" }));
         return;
     }
     // An MCP server is a command to run or a place to send credentials.
@@ -884,6 +892,8 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             }),
             _ => Err("agent_memory_read requires agent and file".to_string()),
         },
+        ("app_tools", _) => Ok(app_tools::json(&app_tools::config())),
+        ("app_tools_set", _) => app_tools::set(&op),
         ("schedule_list", _) => Ok(hub.schedules_json(op["agent"].as_str())),
         ("schedule_save", _) => hub
             .save_schedule(&op["schedule"])

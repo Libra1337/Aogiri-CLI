@@ -38,6 +38,9 @@ pub struct Schedule {
     /// The agent proposed it (with its `schedule` tool); it starts switched
     /// off until the user turns it on.
     pub by_agent: bool,
+    /// The `propose_schedule` card it was created from (`prop-…`), which
+    /// the card looks for to show it as created.
+    pub origin: Option<String>,
     pub created_at: u64,
     pub last_run_at: Option<u64>,
     /// The session the last run was delivered to.
@@ -59,6 +62,7 @@ impl Schedule {
             date: None,
             new_session: true,
             by_agent: false,
+            origin: None,
             created_at,
             last_run_at: None,
             last_session: None,
@@ -79,6 +83,7 @@ impl Schedule {
             "date": self.date,
             "new_session": self.new_session,
             "by_agent": self.by_agent,
+            "origin": self.origin,
             "created_at": self.created_at,
             "last_run_at": self.last_run_at,
             "last_session": self.last_session,
@@ -128,6 +133,9 @@ impl Schedule {
         }
         if let Some(date) = text("date") {
             self.date = Some(date);
+        }
+        if let Some(origin) = text("origin").filter(|origin| !origin.is_empty()) {
+            self.origin = Some(origin);
         }
         if let Some(days) = changes["days"].as_array() {
             let mut parsed = days
@@ -491,6 +499,18 @@ mod tests {
 
     fn next(changes: Value, now: &str) -> Option<DateTime<FixedOffset>> {
         next_run(&schedule(changes), &at(now))
+    }
+
+    #[test]
+    fn a_schedule_keeps_the_proposal_it_came_from() {
+        let made = schedule(json!({ "repeat": "daily", "time": "09:00", "origin": "prop-1a2b" }));
+        assert_eq!(made.origin.as_deref(), Some("prop-1a2b"));
+        let saved = Schedule::from_json(&made.to_json()).unwrap();
+        assert_eq!(saved.origin.as_deref(), Some("prop-1a2b"));
+        assert_eq!(
+            schedule(json!({ "repeat": "daily", "time": "09:00" })).origin,
+            None
+        );
     }
 
     #[test]
