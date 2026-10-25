@@ -15,6 +15,7 @@ mod gateway;
 mod http;
 mod hub;
 pub mod install;
+mod liveactivity;
 pub mod noise;
 mod presence;
 mod projects;
@@ -714,6 +715,11 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 .subscribe(&device, &op["subscription"])
                 .map(|()| json!({ "type": "push_subscribed" })),
             None => Err("only a paired device subscribes to notifications".to_string()),
+        },
+        // The Aogiri app's Live Activity tokens (see `liveactivity`).
+        ("liveactivity_token", _) => match hub.device_of(client) {
+            Some(device) => liveactivity::register(hub, &device, &op),
+            None => Err("only a paired device registers a live activity token".to_string()),
         },
         // The session a phone shows on screen now: nothing about it is
         // pushed to that phone (`push::viewing`).
