@@ -2558,6 +2558,16 @@ impl Claude {
                     });
                     return Ok(Output::events(vec![self.queued_event()]));
                 }
+                // The CLI still has messages it has not taken in (the next
+                // turn is starting): this one goes behind them, listed as
+                // theirs are, so a replay of them together is matched.
+                if !self.queued.is_empty() {
+                    self.queued.push(text(&op["content"]).trim().to_string());
+                    return Ok(Output {
+                        events: vec![self.queued_event()],
+                        frames: vec![frame],
+                    });
+                }
                 return Ok(Output {
                     events: Vec::new(),
                     frames: vec![frame],
@@ -4759,7 +4769,7 @@ mod tests {
                 json!({ "type": "user_message", "content": "also this " })
             ]
         );
-        // A message sent before that turn even started waits too.
+        // One sent before that turn started goes behind it, listed as fixed.
         let mut c = holding(&["one"]);
         c.translate(Line::Frame(
             json!({ "type": "result", "subtype": "success" }),
@@ -4767,7 +4777,8 @@ mod tests {
         let second = c
             .encode(&json!({ "op": "user_message", "content": "two" }))
             .unwrap();
-        assert!(second.frames.is_empty());
+        assert_eq!(second.frames.len(), 1);
+        assert_eq!(second.events, vec![pending(&["one", "two"], 2)]);
     }
 
     #[test]

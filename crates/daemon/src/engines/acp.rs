@@ -1846,8 +1846,13 @@ mod tests {
             json!({ "id": 1, "result": { "agentInfo": { "name": "OpenCode", "version": "2.0.29" }, "agentCapabilities": {} } }),
         );
         assert!(refused.frames.is_empty());
-        assert_eq!(refused.events[0]["type"], "error");
-        assert!(text(&refused.events[0]["message"]).contains("OpenCode 1.x"));
+        // The waiting message goes: the queue empties, then the refusal.
+        assert_eq!(
+            refused.events[0],
+            json!({ "type": "pending_messages", "messages": [] })
+        );
+        assert_eq!(refused.events[1]["type"], "error");
+        assert!(text(&refused.events[1]["message"]).contains("OpenCode 1.x"));
         let next = a.encode(&json!({ "op": "user_message", "content": "again" }));
         assert!(next.unwrap_err().contains("OpenCode 1.x"));
     }
