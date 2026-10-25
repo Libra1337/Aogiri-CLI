@@ -122,6 +122,8 @@ pub struct Hub {
     pub(crate) messages: crate::session_messages::Messages,
     /// Chat bots and what they keep (see `connectors`).
     pub connectors: crate::connectors::Connectors,
+    /// Dev servers the sessions' commands started (see `devservers`).
+    pub dev_servers: crate::devservers::DevServers,
     /// When each device was last heard from (ms), since the daemon started.
     seen: Mutex<HashMap<String, u64>>,
 }
@@ -256,6 +258,7 @@ impl Hub {
             uploads,
             push: crate::push::Push::load(store.dir(), &store),
             connectors: crate::connectors::Connectors::load(store.dir()),
+            dev_servers: Default::default(),
             seen: Mutex::new(HashMap::new()),
             terminals: Default::default(),
             store,
@@ -1480,9 +1483,34 @@ impl Hub {
         self.deliver_pending();
         crate::push::tick(self);
         self.sweep_idle_engines();
+        self.scan_dev_servers();
         // The daemon runs for days: a tokenizer no session used for a while
         // is loaded again by the next count.
         lynshen_agent_core::release_idle_tokenizers(TOKENIZER_IDLE);
+    }
+
+    /// Looks for dev servers when a scan is due, off the scheduler thread
+    /// (listing sockets takes a moment), and tells the clients of changes.
+    fn scan_dev_servers(self: &Arc<Self>) {
+        let at = now();
+        if !self.dev_servers.due(at) {
+            return;
+        }
+        let sessions: Vec<crate::devservers::SessionDir> = lock(&self.sessions)
+            .iter()
+            .map(|(id, hosted)| crate::devservers::SessionDir {
+                id: id.clone(),
+                cwd: hosted.cwd.clone(),
+                last_active: at
+                    .saturating_sub(hosted.last_active.elapsed().as_millis() as u64),
+            })
+            .collect();
+        let hub = Arc::clone(self);
+        thread::spawn(move || {
+            if let Some(servers) = hub.dev_servers.scan(&sessions) {
+                hub.broadcast(&crate::devservers::servers_json(&servers));
+            }
+        });
     }
 
     /// Every `IDLE_SWEEP_EVERY`: idle engine sessions close
@@ -1917,6 +1945,7 @@ impl Hub {
     /// Every event a session publishes: its title follows the conversation
     /// (see `titles`).
     pub fn observe(&self, session: &str, event: &Value) {
+        self.dev_servers.observe(event, now());
         crate::session_messages::observe(self, session, event);
         self.connectors.observe(session, event);
         self.usage.observe(session, event, || {

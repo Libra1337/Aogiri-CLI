@@ -173,8 +173,8 @@ Each WebSocket text message is one JSON frame. The daemon first sends:
 {"type":"workspaces","rev":1,"workspaces":[...]}
 ```
 
-followed by the current `agents`, `schedules`, `questions` and `actions`
-lists.
+followed by the current `agents`, `schedules`, `questions`, `actions`,
+`dispatches`, `requirements` and `dev_servers` lists.
 
 A client that does not speak `protocol` 2 must disconnect.
 
@@ -874,6 +874,39 @@ the session publishes `{"type":"surface","session":"<id>","surface":"gui"}`
 and a fresh `transcript`. Variables that would mark the TUI as a nested
 Claude Code session (`CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, …) are
 removed so it saves its transcript.
+
+## Dev servers
+
+A shell command in any session, on any engine, makes the daemon look for
+the web servers it starts (`npm run dev`, `python -m http.server`) for 90
+seconds, every 2 seconds; while servers are up it looks every 10 seconds
+to see them stop. A server counts when:
+
+- it listens on a TCP port on a loopback or wildcard address
+  (`127.0.0.1`, `::1`, `0.0.0.0`, `::`) that was not listening, for the
+  same process, when the daemon first looked;
+- its process works in an open session's directory (the deepest one; the
+  most recently active on a tie). Windows reports no working directory:
+  there the port must also appear in a URL a command printed, and the
+  server goes to the most recently active session;
+- `GET /` answers with `text/html` or a redirect (a database, a debugger or
+  a language server never does).
+
+Clients get the whole list on connect and on every change, broadcast to
+every client:
+
+```json
+{"type":"dev_servers","servers":[{"port":5173,"url":"http://localhost:5173/app/","pid":4242,"name":"node","session":"s…"}]}
+```
+
+`url` is the one a command printed for that port (colour codes removed,
+`0.0.0.0` and `[::]` shown as `localhost`), else `http://localhost:<port>/`
+(`http://[::1]:<port>/` for a server bound only to `::1`). `name` is the
+process name (empty on Windows). An empty `servers` means none are up. The
+daemon only reports servers; it never stops them. Shell commands are a
+LynShen `bash`, `exec_command` or `write_stdin` call, a Claude Code or Codex
+command (`bash`, `BashOutput`, `TaskOutput`), an ACP agent's `execute` call,
+and a change to a session's `background_tasks`.
 
 ## Requirements
 

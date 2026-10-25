@@ -7,6 +7,7 @@
 mod agent_tools;
 mod agents;
 mod connectors;
+mod devservers;
 mod dispatch;
 mod engines;
 mod feedback;
@@ -255,6 +256,7 @@ fn pump(
         hub.actions_json(),
         hub.dispatch.json(),
         hub.requirements.json(hub),
+        hub.dev_servers.json(),
     ] {
         link.send(&frame.to_string())?;
     }
