@@ -356,7 +356,7 @@ fn serves_html(listener: &Listener) -> bool {
 fn list_listeners() -> Option<Vec<Listener>> {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("lsof")
+        let output = std::process::Command::new(lsof())
             .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"])
             .output()
             .ok()?;
@@ -394,6 +394,17 @@ fn list_listeners() -> Option<Vec<Listener>> {
     }
 }
 
+/// macOS's lsof, which is in /usr/sbin: a PATH without it (an app started
+/// from the Dock has a short one) must not hide every server.
+#[cfg(target_os = "macos")]
+fn lsof() -> &'static str {
+    if Path::new("/usr/sbin/lsof").is_file() {
+        "/usr/sbin/lsof"
+    } else {
+        "lsof"
+    }
+}
+
 /// Working directories by pid; None where the system does not report them.
 fn working_dirs(pids: &[u32]) -> Option<HashMap<u32, PathBuf>> {
     #[cfg(target_os = "macos")]
@@ -406,7 +417,7 @@ fn working_dirs(pids: &[u32]) -> Option<HashMap<u32, PathBuf>> {
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        let output = std::process::Command::new("lsof")
+        let output = std::process::Command::new(lsof())
             .args(["-a", "-d", "cwd", "-Fn", "-p", &list])
             .output()
             .ok()?;
