@@ -473,6 +473,13 @@ const STATE_EVENTS: &[&str] = &[
     "pending_messages",
 ];
 
+/// Now, ms since the epoch: when a snapshot item happened.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
 impl Snapshot {
     pub fn seed(&mut self, transcript: Vec<Value>) {
         self.transcript = transcript;
@@ -491,7 +498,8 @@ impl Snapshot {
             }
             "user_message" => {
                 self.in_reply = false;
-                let mut item = json!({ "role": "user", "content": event["content"] });
+                let mut item =
+                    json!({ "role": "user", "content": event["content"], "at": now_ms() });
                 if event["images"].is_array() {
                     item["images"] = event["images"].clone();
                 }
@@ -500,13 +508,13 @@ impl Snapshot {
             "assistant_start" => {
                 self.in_reply = true;
                 self.transcript
-                    .push(json!({ "role": "assistant", "content": "" }));
+                    .push(json!({ "role": "assistant", "content": "", "at": now_ms() }));
             }
             "assistant_delta" => {
                 if !self.in_reply {
                     self.in_reply = true;
                     self.transcript
-                        .push(json!({ "role": "assistant", "content": "" }));
+                        .push(json!({ "role": "assistant", "content": "", "at": now_ms() }));
                 }
                 // Appended in place: rebuilding the reply on every delta
                 // copies it once per token.
@@ -521,7 +529,7 @@ impl Snapshot {
             "tool_start" => {
                 self.in_reply = false;
                 self.transcript.push(json!({
-                    "role": "tool", "name": event["name"], "output": "", "call_id": event["call_id"],
+                    "role": "tool", "name": event["name"], "output": "", "call_id": event["call_id"], "at": now_ms(),
                 }));
             }
             "tool_output" => {
@@ -532,6 +540,9 @@ impl Snapshot {
                     .find(|item| item["call_id"] == event["call_id"])
                 {
                     item["output"] = event["output"].clone();
+                    if event["is_error"] == true {
+                        item["is_error"] = json!(true);
+                    }
                 }
             }
             // A finished turn's figures, as a reopened transcript has them.
@@ -1462,6 +1473,8 @@ mod tests {
             json!({ "type": "assistant_delta", "delta": "lo" }),
             json!({ "type": "tool_start", "call_id": "t1", "name": "bash" }),
             json!({ "type": "tool_output", "call_id": "t1", "name": "bash", "output": "ok", "is_error": false }),
+            json!({ "type": "tool_start", "call_id": "t2", "name": "read" }),
+            json!({ "type": "tool_output", "call_id": "t2", "name": "read", "output": "no", "is_error": true }),
             json!({ "type": "approval_request", "call_id": "a1", "name": "bash" }),
             json!({ "type": "approval_request", "call_id": "a2", "name": "write" }),
         ] {
@@ -1471,12 +1484,25 @@ mod tests {
         let events = snapshot.events(true);
         assert_eq!(events[0], json!({ "type": "startup", "model": "b" }));
         let transcript = events.iter().find(|e| e["type"] == "transcript").unwrap();
+        // Each item says when it happened.
+        let items: Vec<Value> = transcript["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                assert!(item["at"].as_u64().is_some_and(|at| at > 0), "{item}");
+                let mut item = item.clone();
+                item.as_object_mut().unwrap().remove("at");
+                item
+            })
+            .collect();
         assert_eq!(
-            transcript["items"],
+            json!(items),
             json!([
                 { "role": "user", "content": "hi" },
                 { "role": "assistant", "content": "hello" },
                 { "role": "tool", "name": "bash", "output": "ok" },
+                { "role": "tool", "name": "read", "output": "no", "is_error": true },
             ])
         );
         let open: Vec<&Value> = events

@@ -271,7 +271,7 @@ fn each_turn_records_its_model_and_duration_finished_or_stopped() {
     };
     let roles: Vec<&str> = items
         .iter()
-        .map(|item| match item {
+        .map(|(item, _)| match item {
             lynshen_agent_core::TranscriptItem::User(_) => "user",
             lynshen_agent_core::TranscriptItem::Assistant(_) => "assistant",
             lynshen_agent_core::TranscriptItem::TurnStats(_) => "stats",

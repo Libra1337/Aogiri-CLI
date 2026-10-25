@@ -435,11 +435,21 @@ more from the daemon (`engines/opencode.rs`):
   (`session/resume`, no replay).
 - OpenCode 2.x is refused with an error.
 
+A `transcript` item is `user`/`assistant`/`reasoning` with `content`, `tool`
+with `name` and `output`, `branch`, `plan` or `turn_stats`. Items carry
+`at` (ms) when it is known when they were written: Claude Code's saved rows,
+a LynShen session's entries and the daemon's own snapshot do; a resumed
+Codex thread and an ACP replay do not. A `tool` item carries
+`is_error: true` when the call failed and its `call_id` when the replay
+knows it. A reopened Claude Code conversation has every tool call of its
+turns, as the cards the live turn showed (not the todo list or the plan),
+not only its text.
+
 Differences from a lynshen session:
 
 - A watching client gets a snapshot rebuilt by the daemon: the latest state
   events, the conversation so far (text and tool results; a reopened
-  session starts from the text Claude Code saved) and any open permission
+  session starts from what Claude Code saved) and any open permission
   prompts. Prompts wait for whichever client answers them first; an
   unwatched session is not switched to deferred actions. The snapshot's
   `model_status` names the engine's state at the time of the snapshot

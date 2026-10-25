@@ -338,19 +338,56 @@ fn transcript(turns: &Value) -> Vec<Value> {
                     rows.push(json!({ "role": "reasoning", "content": summary }));
                 }
             }
-            "commandExecution" => rows.push(json!({ "role": "tool", "name": "bash", "output": command_output(item, "", "").to_string() })),
-            "fileChange" => rows.push(json!({
-                "role": "tool", "name": "apply_patch",
-                "output": file_change_output(item["changes"].as_array().map(Vec::as_slice).unwrap_or_default(), None),
-            })),
-            "mcpToolCall" => rows.push(json!({
-                "role": "tool", "name": format!("{}.{}", text(&item["server"]), text(&item["tool"])), "output": mcp_body(item),
-            })),
-            "webSearch" => rows.push(json!({ "role": "tool", "name": "web_search", "output": json!({ "query": item["query"] }).to_string() })),
+            "commandExecution" | "fileChange" | "mcpToolCall" | "webSearch" => {
+                rows.push(tool_row(item));
+            }
             _ => {}
         }
     }
     rows
+}
+
+/// A finished tool item of a resumed thread as the card its live
+/// `tool_output` showed, failed (`is_error`) the same way.
+fn tool_row(item: &Value) -> Value {
+    // An item saved before it finished has no status: not a failure.
+    let status = text(&item["status"]);
+    let unfinished = !matches!(status, "" | "completed");
+    let (name, output, failed) = match text(&item["type"]) {
+        "commandExecution" => {
+            let mut output = command_output(item, "", "");
+            if status == "declined" {
+                output["error"] = json!("declined");
+            }
+            (json!("bash"), output.to_string(), unfinished)
+        }
+        "fileChange" => {
+            let changes = item["changes"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            (
+                json!("apply_patch"),
+                file_change_output(changes, unfinished.then_some(status)),
+                unfinished,
+            )
+        }
+        "mcpToolCall" => (
+            json!(format!("{}.{}", text(&item["server"]), text(&item["tool"]))),
+            mcp_body(item),
+            !item["error"].is_null() || status == "failed",
+        ),
+        _ => (
+            json!("web_search"),
+            json!({ "query": item["query"] }).to_string(),
+            false,
+        ),
+    };
+    let mut row = json!({ "role": "tool", "name": name, "output": output, "call_id": item["id"] });
+    if failed {
+        row["is_error"] = json!(true);
+    }
+    row
 }
 
 /// A user message's text and its images (local paths).
@@ -3003,6 +3040,23 @@ mod tests {
             resumed.events[0]["items"],
             json!([{ "role": "user", "content": "q" }, { "role": "assistant", "content": "a" }])
         );
+        // Tool calls replay as the cards their live output showed, failed
+        // ones marked; one saved before it finished is no failure.
+        let rows = transcript(&json!([{ "items": [
+            { "type": "commandExecution", "id": "c1", "command": "ls", "aggregatedOutput": "a", "exitCode": 0, "status": "completed" },
+            { "type": "commandExecution", "id": "c2", "command": "rm x", "status": "declined" },
+            { "type": "fileChange", "id": "f1", "changes": [{ "path": "/a", "diff": "+x" }], "status": "failed" },
+            { "type": "mcpToolCall", "id": "m1", "server": "s", "tool": "t", "error": { "message": "boom" } },
+            { "type": "commandExecution", "id": "c3", "command": "sleep 9" },
+        ] }]));
+        assert!(rows[0].get("is_error").is_none());
+        assert_eq!(rows[0]["call_id"], "c1");
+        assert_eq!(rows[1]["is_error"], true);
+        assert!(rows[1]["output"].as_str().unwrap().contains("declined"));
+        assert_eq!(rows[2]["is_error"], true);
+        assert_eq!(rows[3]["is_error"], true);
+        assert_eq!(rows[3]["name"], "s.t");
+        assert!(rows[4].get("is_error").is_none());
 
         let mut c = Codex::new(
             Path::new("/p"),

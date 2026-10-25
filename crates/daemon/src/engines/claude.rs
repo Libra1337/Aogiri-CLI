@@ -3091,9 +3091,10 @@ fn rows(path: &Path, limit: u64) -> impl Iterator<Item = Value> {
         .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
 }
 
-/// The user and assistant text of a saved conversation, as transcript items
-/// (the newest 500), from config directory `config`. The user's images are
-/// written under `uploads`.
+/// A saved conversation as transcript items (the newest 500): the user's
+/// and the model's text and the tool calls as the cards a live turn showed,
+/// each with when it was written (`at`, ms), from config directory
+/// `config`. The user's images are written under `uploads`.
 pub fn transcript(config: &Path, cwd: &Path, id: &str, uploads: &Path) -> Vec<Value> {
     transcript_in(config, cwd, id, &uploads.join("claude"))
 }
@@ -3102,25 +3103,86 @@ fn transcript_in(config: &Path, cwd: &Path, id: &str, images: &Path) -> Vec<Valu
     if !is_conversation_id(id) {
         return vec![];
     }
+    let mut calls = HashMap::new();
     let mut items: Vec<Value> = rows(
         &project_dir(config, cwd).join(format!("{id}.jsonl")),
         64 * 1024 * 1024,
     )
     .filter(|row| !is_synthetic(row))
-    .filter_map(|row| match text(&row["type"]) {
-        "user" => user_item(&row["message"]["content"], images),
-        // The usage-limit notice Claude Code saves as a reply is none.
-        "assistant" if row["error"] == "rate_limit" => None,
-        "assistant" => {
-            row_text(&row).map(|content| json!({ "role": "assistant", "content": content }))
+    .flat_map(|row| {
+        // A user row's tool results come before any text it holds.
+        let mut items = tool_rows(&row, &mut calls);
+        items.extend(match text(&row["type"]) {
+            "user" => user_item(&row["message"]["content"], images),
+            // The usage-limit notice Claude Code saves as a reply is none.
+            "assistant" if row["error"] == "rate_limit" => None,
+            "assistant" => {
+                row_text(&row).map(|content| json!({ "role": "assistant", "content": content }))
+            }
+            "attachment" => queued_prompt(&row).and_then(|prompt| user_item(prompt, images)),
+            _ => None,
+        });
+        // When each was said or ran: the time its row was written.
+        if let Some(at) = row_time(&row) {
+            for item in &mut items {
+                item["at"] = json!(at);
+            }
         }
-        "attachment" => queued_prompt(&row).and_then(|prompt| user_item(prompt, images)),
-        _ => None,
+        items
     })
     .collect();
     let excess = items.len().saturating_sub(500);
     items.drain(..excess);
     items
+}
+
+/// The tool calls in a saved row, as the cards a live turn showed: an
+/// assistant row's calls are noted in `calls`, a user row's results to them
+/// become tool items (with `is_error` when the call failed). The todo list
+/// and the plan were not cards.
+fn tool_rows(row: &Value, calls: &mut HashMap<String, ToolMeta>) -> Vec<Value> {
+    let blocks = row["message"]["content"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut items = Vec::new();
+    for block in blocks {
+        match text(&block["type"]) {
+            _ if is_tool_use(block) => {
+                let claude_name = text(&block["name"]);
+                if !matches!(claude_name, "TodoWrite" | "ExitPlanMode") {
+                    calls.insert(
+                        text(&block["id"]).to_string(),
+                        ToolMeta {
+                            claude_name: claude_name.to_string(),
+                            name: tool_name(claude_name).to_string(),
+                            input: object(&block["input"]),
+                        },
+                    );
+                }
+            }
+            "tool_result" => {
+                let id = text(&block["tool_use_id"]);
+                if let Some(meta) = calls.remove(id) {
+                    let output = result_card(&meta, block, &row["toolUseResult"]);
+                    let mut item = json!({ "role": "tool", "name": meta.name, "output": output, "call_id": id });
+                    if block["is_error"] == true {
+                        item["is_error"] = json!(true);
+                    }
+                    items.push(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    items
+}
+
+/// When a saved row was written, ms since the epoch.
+fn row_time(row: &Value) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(text(&row["timestamp"]))
+        .ok()
+        .map(|t| t.timestamp_millis())
 }
 
 /// Conversations saved for `cwd` in config directory `config`, newest
@@ -4609,6 +4671,35 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         #[cfg(unix)]
         assert_eq!(project_dir(&home, &link), project_dir(&home, &real));
+    }
+
+    #[test]
+    fn replay_keeps_every_tool_card_and_when_each_row_was_written() {
+        let mut calls = HashMap::new();
+        let call = json!({ "type": "assistant", "message": { "content": [
+            { "type": "tool_use", "id": "t2", "name": "Bash", "input": { "command": "ls" } },
+            { "type": "tool_use", "id": "t3", "name": "Edit", "input": { "file_path": "/a.rs", "old_string": "x", "new_string": "y" } },
+            { "type": "tool_use", "id": "t4", "name": "TodoWrite", "input": { "todos": [] } },
+            { "type": "tool_use", "id": "t5", "name": "Read", "input": { "file_path": "/b.rs", "offset": 40 } },
+        ] } });
+        assert!(tool_rows(&call, &mut calls).is_empty());
+        let result = json!({ "type": "user", "toolUseResult": { "stdout": "a\n", "stderr": "" }, "message": { "content": [
+            { "type": "tool_result", "tool_use_id": "t2", "content": "a" },
+            { "type": "tool_result", "tool_use_id": "t3", "content": "String not found", "is_error": true },
+            { "type": "tool_result", "tool_use_id": "t4", "content": "ok" },
+            { "type": "tool_result", "tool_use_id": "t5", "content": "fn b() {}" },
+        ] } });
+        assert_eq!(
+            tool_rows(&result, &mut calls),
+            vec![
+                json!({ "role": "tool", "name": "bash", "output": "{\"command\":\"ls\",\"stdout\":\"a\\n\"}", "call_id": "t2" }),
+                json!({ "role": "tool", "name": "str_replace", "output": "{\"error\":\"String not found\",\"path\":\"/a.rs\"}", "call_id": "t3", "is_error": true }),
+                json!({ "role": "tool", "name": "read", "output": "{\"line\":40,\"path\":\"/b.rs\"}", "call_id": "t5" }),
+            ]
+        );
+        let row = json!({ "timestamp": "2026-10-23T12:00:00.250Z" });
+        assert_eq!(row_time(&row), Some(1_792_756_800_250));
+        assert_eq!(row_time(&json!({})), None);
     }
 
     #[test]

@@ -2421,10 +2421,13 @@ fn a_claude_session_runs_turns_and_shares_approvals_with_every_client() {
     let snapshot =
         phone.until(|f| f["session"] == session.as_str() && f["type"] == "approval_request");
     let transcript = snapshot.iter().find(|f| f["type"] == "transcript").unwrap();
+    let reply = &transcript["items"][1];
     assert_eq!(
-        transcript["items"][1],
-        json!({ "role": "assistant", "content": "ok: hello" })
+        (&reply["role"], &reply["content"]),
+        (&json!("assistant"), &json!("ok: hello"))
     );
+    // When it was said.
+    assert!(reply["at"].as_u64().is_some_and(|at| at > 0), "{reply}");
     let call = snapshot.last().unwrap()["call_id"].clone();
     phone
         .send(json!({ "op": "approve", "session": session, "call_id": call, "decision": "allow" }));
