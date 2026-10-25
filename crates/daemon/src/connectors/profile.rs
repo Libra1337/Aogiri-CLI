@@ -322,7 +322,7 @@ mod tests {
         for engine in ["claude", "codex", "acp"] {
             let session = format!("s-{engine}");
             hub.store
-                .record_engine_session(&session, &dir, None, Some(engine), false)
+                .record_engine_session(&session, &dir, None, Some(engine), false, None)
                 .unwrap();
             crate::session_messages::observe(
                 &hub,

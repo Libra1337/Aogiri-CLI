@@ -596,7 +596,7 @@ fn a_chat_binding_lists_and_picks_lynshen_sessions_only() {
             ("acp-1", "acp", "OpenCode 的会话"),
         ] {
             store
-                .record_engine_session(id, &project, None, Some(engine), false)
+                .record_engine_session(id, &project, None, Some(engine), false, None)
                 .unwrap();
             store
                 .record_session_meta(id, &json!({ "title": title }))

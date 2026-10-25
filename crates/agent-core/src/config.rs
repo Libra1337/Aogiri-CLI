@@ -1847,7 +1847,10 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
             group_windows: read_group_windows(model.get("group_context_windows")),
             reasoning,
             input_modalities: read_input_modalities(model.get("input_modalities")),
-            hidden: model.get("hidden").and_then(Value::as_bool).unwrap_or(false),
+            hidden: model
+                .get("hidden")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         });
     }
 

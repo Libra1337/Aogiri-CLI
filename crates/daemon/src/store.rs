@@ -1568,7 +1568,14 @@ mod tests {
     fn a_session_keeps_its_group_until_cleared() {
         let store = store("group");
         store
-            .record_engine_session("c", std::path::Path::new("/p"), None, Some("codex"), true, None)
+            .record_engine_session(
+                "c",
+                std::path::Path::new("/p"),
+                None,
+                Some("codex"),
+                true,
+                None,
+            )
             .unwrap();
         assert_eq!(store.sessions()[0].group, None);
         assert!(store
@@ -1591,7 +1598,14 @@ mod tests {
         let store = store("compact-group");
         let dir = store.dir.clone();
         store
-            .record_engine_session("c", std::path::Path::new("/p"), None, Some("claude"), false, None)
+            .record_engine_session(
+                "c",
+                std::path::Path::new("/p"),
+                None,
+                Some("claude"),
+                false,
+                None,
+            )
             .unwrap();
         store
             .record_session_meta("c", &json!({ "group": "g-1" }))

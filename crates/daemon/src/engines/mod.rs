@@ -1578,9 +1578,15 @@ mod tests {
         };
         let engine = adapter(Kind::Claude, Path::new("/tmp"), &current);
         let kept = asleep_options(engine.as_ref(), &current);
-        assert_eq!(kept.resume_at, None, "a rewind applies to the open that asked");
+        assert_eq!(
+            kept.resume_at, None,
+            "a rewind applies to the open that asked"
+        );
         assert_eq!(kept.resume, None);
-        assert!(kept.dirs.is_empty(), "the project's folders are found again");
+        assert!(
+            kept.dirs.is_empty(),
+            "the project's folders are found again"
+        );
         assert_eq!(kept.bin.as_deref(), Some("/opt/claude"));
         assert_eq!(kept.model.as_deref(), Some("started-with"));
         assert!(kept.approval_mode.is_some());
@@ -1600,7 +1606,10 @@ mod tests {
         // Claude's run list comes from its transcript: not trusted to hold.
         assert!(!snapshot.holds(Kind::Claude));
         snapshot.apply(&json!({ "type": "agent_runs", "workflows": [{ "status": "completed", "agents": [{ "state": "async_launched" }] }], "agents": [] }));
-        assert!(snapshot.holds(Kind::Codex), "a workflow's agent still running");
+        assert!(
+            snapshot.holds(Kind::Codex),
+            "a workflow's agent still running"
+        );
         snapshot.apply(&json!({ "type": "agent_runs", "workflows": [{ "status": "completed", "agents": [{ "state": "done" }] }], "agents": [{ "status": "failed" }, { "status": "" }] }));
         assert!(!snapshot.holds(Kind::Codex));
         snapshot.apply(&json!({ "type": "approval_request", "call_id": "c1" }));

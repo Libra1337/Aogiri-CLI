@@ -1060,8 +1060,7 @@ impl Hub {
     /// to sleep can watch it again; clients that open it themselves first
     /// (`session_open`, `watch`) never need this.
     pub fn wake(self: &Arc<Self>, client: u64, session: &str) -> Result<(), String> {
-        if lock(&self.sessions).contains_key(session) || !lock(&self.asleep).contains_key(session)
-        {
+        if lock(&self.sessions).contains_key(session) || !lock(&self.asleep).contains_key(session) {
             return Ok(());
         }
         self.open_session(session, None)?;
@@ -2842,7 +2841,9 @@ mod tests {
         assert!(!failed(&frames));
         hub.observe("s", &ready);
         assert!(
-            frames.try_iter().all(|f| !f.contains("\"type\":\"sessions\"")),
+            frames
+                .try_iter()
+                .all(|f| !f.contains("\"type\":\"sessions\"")),
             "a good turn changes nothing"
         );
         let _ = fs::remove_dir_all(dir);
@@ -2889,10 +2890,16 @@ mod tests {
         let (outbox, frames) = mpsc::channel();
         hub.add_client(Outbox::local(outbox), None);
 
-        assert_eq!(hub.close_idle_engines(at, &set(&["old", "recent"])), ["old"]);
+        assert_eq!(
+            hub.close_idle_engines(at, &set(&["old", "recent"])),
+            ["old"]
+        );
         let shutdown = old.try_recv().unwrap();
         assert_eq!(shutdown["op"], "shutdown");
-        assert_eq!(shutdown["keep"], true, "its options are kept for the next open");
+        assert_eq!(
+            shutdown["keep"], true,
+            "its options are kept for the next open"
+        );
         assert!(lock(&hub.sessions).contains_key("recent"));
 
         // The engine thread ends: clients learn it closed as idle.
@@ -2904,7 +2911,10 @@ mod tests {
             .unwrap();
         assert_eq!(closed["reason"], "idle");
         assert!(lock(&hub.close_reasons).is_empty());
-        assert!(lock(&hub.asleep).contains_key("old"), "a message opens it again");
+        assert!(
+            lock(&hub.asleep).contains_key("old"),
+            "a message opens it again"
+        );
         // What its engine ran with waits for the next open.
         let ran = engines::Options {
             model: Some("claude-opus-5-5".into()),

@@ -356,11 +356,7 @@ pub fn member(projects: &[Value], record: &SessionRecord) -> String {
 /// The project a new session in `cwd` belongs to: `requested` when the
 /// client named one ("": none; an unknown id is an error), else the one
 /// whose main directory is `cwd`, if any.
-pub fn for_new_session(
-    hub: &Hub,
-    cwd: &Path,
-    requested: Option<&str>,
-) -> Result<String, String> {
+pub fn for_new_session(hub: &Hub, cwd: &Path, requested: Option<&str>) -> Result<String, String> {
     match requested.map(str::trim) {
         Some("") => Ok(String::new()),
         Some(id) => project(hub, id)

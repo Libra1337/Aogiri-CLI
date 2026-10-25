@@ -1722,7 +1722,11 @@ mod tests {
             installed_source(&root, "demo").as_deref(),
             Some("https://github.com/example/skills")
         );
-        assert!(installed_from(&root, "demo", "https://github.com/example/skills/"));
+        assert!(installed_from(
+            &root,
+            "demo",
+            "https://github.com/example/skills/"
+        ));
 
         // Another repository's skill of the same name does not replace it
         // (nothing is downloaded); the same repository updates it.

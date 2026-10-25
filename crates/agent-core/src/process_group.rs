@@ -154,8 +154,9 @@ mod tests {
         prepare(&mut command);
         let mut child = command.spawn().unwrap();
         let group = ProcessGroup::adopt(&child).unwrap();
-        assert!(eventually(|| std::fs::read_to_string(&pid_file)
-            .is_ok_and(|text| text.ends_with('\n'))));
+        assert!(eventually(
+            || std::fs::read_to_string(&pid_file).is_ok_and(|text| text.ends_with('\n'))
+        ));
         let grandchild: libc::pid_t = std::fs::read_to_string(&pid_file)
             .unwrap()
             .trim()
