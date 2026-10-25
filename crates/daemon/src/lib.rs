@@ -540,8 +540,27 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     // Input is written in the order it arrives, so these stay on this thread.
     if matches!(
         name,
-        "term_open" | "term_input" | "term_resize" | "term_close"
+        "term_open"
+            | "term_attach"
+            | "term_detach"
+            | "term_input"
+            | "term_resize"
+            | "term_ack"
+            | "term_close"
     ) {
+        // A device without the terminal scope only looks: its window does
+        // not resize the session's TUI.
+        let mut op = op;
+        if name == "term_attach" {
+            if let Some(device) = hub.device_of(client) {
+                if scopes::check(hub, &device, "term_resize", &op).is_err() {
+                    if let Some(fields) = op.as_object_mut() {
+                        fields.remove("cols");
+                        fields.remove("rows");
+                    }
+                }
+            }
+        }
         let result = terminal::handle(hub, client, name, &op);
         respond(hub, client, &request, result);
         return;
@@ -1003,8 +1022,9 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 json!({ "type": "mcp_saved" })
             })
         }
-        // The session's engine stops and its own TUI runs on a terminal for
-        // this client; the engine resumes when the TUI exits.
+        // The session's engine stops and its own TUI runs on a terminal
+        // that belongs to the session: this client views it first, others
+        // attach (`term_attach`); the engine resumes when the TUI exits.
         ("session_tui", Some(session)) => hub
             .forward(
                 &session,

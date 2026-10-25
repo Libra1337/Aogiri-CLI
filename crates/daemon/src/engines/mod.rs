@@ -1450,8 +1450,16 @@ impl Session<'_> {
                             }
                         }
                         "set_attended" => {}
-                        // Another open: answered, so it does not wait forever.
-                        "tui" => self.refuse(&op, crate::session::ALREADY_IN_TERMINAL.to_string()),
+                        // Another client asks for it: it attaches to the
+                        // TUI that runs.
+                        "tui" => {
+                            let viewer = op["client"].as_u64().unwrap_or(0);
+                            if let Err(error) =
+                                crate::terminal::attach_to(&hub, viewer, &term, &op)
+                            {
+                                self.refuse(&op, error);
+                            }
+                        }
                         _ => self.publish(vec![json!({ "type": "error", "message": "the conversation is open in its terminal: exit the TUI to continue here" })]),
                     }
                 }

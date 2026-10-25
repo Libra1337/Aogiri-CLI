@@ -49,6 +49,8 @@ pub fn needed(
 ) -> Option<&'static str> {
     let mode = op["mode"].as_str().unwrap_or_default();
     match name {
+        // Viewing a session's TUI (`term_attach`, `term_ack`, `term_detach`)
+        // needs nothing more than the conversation does; typing does.
         "term_open" | "term_input" | "term_resize" | "term_close" | "session_tui" => Some(TERMINAL),
         "workspaces_set" | "project_add" | "project_create" | "add_directory" => Some(ADD_FOLDER),
         "set_approval_mode" | "approve_plan" if full_mode(mode) => Some(FULL_AUTO),
@@ -239,6 +241,9 @@ mod tests {
             ("term_open", json!({}), Some(TERMINAL)),
             ("term_input", json!({}), Some(TERMINAL)),
             ("session_tui", json!({}), Some(TERMINAL)),
+            ("term_attach", json!({}), None),
+            ("term_ack", json!({}), None),
+            ("term_detach", json!({}), None),
             ("approve", json!({ "decision": "deny" }), None),
             (
                 "approve",

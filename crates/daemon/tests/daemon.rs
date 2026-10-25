@@ -2302,21 +2302,27 @@ fn a_claude_conversation_moves_to_its_tui_and_back() {
     // The session stays listed and open; its GUI ops wait for the TUI.
     desktop.send(json!({ "op": "user_message", "session": session, "content": "too soon" }));
     desktop.until(|f| f["session"] == session.as_str() && f["type"] == "error");
-    // Opening it again is answered, not left waiting.
+    // The TUI is the session's: asking for it again (another window, a
+    // client that lost its view) attaches to the one that runs, with the
+    // latest output replayed.
+    let mut other = Client::connect(&daemon);
     let again = request(
-        &mut desktop,
+        &mut other,
         json!({ "op": "session_tui", "session": session, "cols": 100, "rows": 30 }),
     );
-    assert_eq!(again["type"], "error", "{again}");
-    assert_eq!(
-        again["message"],
-        "the conversation is already open in its terminal"
-    );
+    assert_eq!(again["type"], "term_attached", "{again}");
+    assert_eq!(again["term"], term.as_str());
+    other.until(|f| f["replay"] == true && term_text(std::slice::from_ref(f), &term).contains(&started));
 
-    type_in(&mut desktop, &term, "from the tui\n");
-    let frames =
-        desktop.until(|f| term_text(std::slice::from_ref(f), &term).contains("tui: from the tui"));
-    assert!(!frames.is_empty());
+    type_in(&mut other, &term, "from the tui\n");
+    for client in [&mut desktop, &mut other] {
+        client.until(|f| term_text(std::slice::from_ref(f), &term).contains("tui: from the tui"));
+    }
+    // A viewer that leaves only detaches: the TUI goes on for the others.
+    other.send(json!({ "op": "term_detach", "term": term }));
+    drop(other);
+    type_in(&mut desktop, &term, "still here\n");
+    desktop.until(|f| term_text(std::slice::from_ref(f), &term).contains("tui: still here"));
     type_in(&mut desktop, &term, "exit\n");
 
     // Back in the GUI: the engine resumed, with what the TUI added.
@@ -2461,16 +2467,13 @@ fn a_lynshen_conversation_moves_to_its_tui_and_back() {
         .to_string();
     let resume = format!("TUI --resume {session}");
     desktop.until(|f| term_text(std::slice::from_ref(f), &term).contains(&resume));
-    // Opening it again is answered, not left waiting.
+    // Opening it again attaches to the TUI that runs.
     let again = request(
         &mut desktop,
         json!({ "op": "session_tui", "session": session }),
     );
-    assert_eq!(again["type"], "error", "{again}");
-    assert_eq!(
-        again["message"],
-        "the conversation is already open in its terminal"
-    );
+    assert_eq!(again["type"], "term_attached", "{again}");
+    assert_eq!(again["term"], term.as_str());
     type_in(&mut desktop, &term, "exit\n");
     let frames = desktop.until(|f| f["session"] == session.as_str() && f["type"] == "transcript");
     assert!(frames
@@ -2479,6 +2482,73 @@ fn a_lynshen_conversation_moves_to_its_tui_and_back() {
     // The engine has the session again.
     desktop.send(json!({ "op": "user_message", "session": session, "content": "hi" }));
     desktop.until(ready(&session));
+}
+
+#[test]
+fn a_phone_views_a_sessions_tui_and_types_only_with_the_terminal_scope() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-tui-phone");
+    fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("tui.sh");
+    fs::write(&script, "#!/bin/sh\necho \"TUI $*\"\nwhile read line; do echo \"got: $line\"; [ \"$line\" = exit ] && exit 0; done\n").unwrap();
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&script)
+        .status()
+        .unwrap();
+    let mut desktop = Client::connect(&daemon);
+    let session = desktop.create_session(&dir);
+    desktop.send(json!({ "op": "pair_start", "id": 1 }));
+    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let token = paired_token(&daemon, &mut desktop, &code);
+    let mut phone = Client::connect_with(&daemon, &token);
+    phone.send(json!({ "op": "watch", "session": session }));
+    std::env::set_var("LYNSHEN_BIN", &script);
+    let opened = request(
+        &mut desktop,
+        json!({ "op": "session_tui", "session": session, "cols": 100, "rows": 30 }),
+    );
+    std::env::remove_var("LYNSHEN_BIN");
+    let term = opened["term"].as_str().unwrap().to_string();
+    desktop.until(|f| term_text(std::slice::from_ref(f), &term).contains("TUI --resume"));
+    // The phone learns which terminal from the session's surface event.
+    let surface = phone.until(|f| f["session"] == session.as_str() && f["type"] == "surface");
+    assert_eq!(surface.last().unwrap()["term"], term.as_str());
+    let attached = request(&mut phone, json!({ "op": "term_attach", "term": term, "cols": 40, "rows": 10 }));
+    assert_eq!(attached["type"], "term_attached", "{attached}");
+    // Without the terminal scope it only looks: its window does not resize
+    // the TUI, and it may not type or close it.
+    assert_eq!((attached["cols"].clone(), attached["rows"].clone()), (json!(100), json!(30)));
+    let replay = phone.until(|f| f["replay"] == true);
+    assert!(term_text(&replay, &term).contains("TUI --resume"));
+    for op in [
+        json!({ "op": "term_input", "term": term, "data": "eA==" }),
+        json!({ "op": "term_close", "term": term }),
+    ] {
+        let refused = request(&mut phone, op);
+        assert!(
+            refused["message"].as_str().unwrap_or_default().starts_with("scope_required:terminal"),
+            "{refused}"
+        );
+    }
+    type_in(&mut desktop, &term, "hello phone\n");
+    let seen = phone.until(|f| term_text(std::slice::from_ref(f), &term).contains("got: hello phone"));
+    let bytes: usize = seen
+        .iter()
+        .filter(|f| f["type"] == "term_output" && f["term"] == term.as_str())
+        .map(|f| term_text(std::slice::from_ref(f), &term).len())
+        .sum();
+    phone.send(json!({ "op": "term_ack", "term": term, "bytes": bytes }));
+    // Leaving detaches the phone; the TUI is the session's and goes on.
+    phone.send(json!({ "op": "term_detach", "term": term }));
+    type_in(&mut desktop, &term, "exit\n");
+    desktop.until(|f| {
+        f["session"] == session.as_str() && f["type"] == "surface" && f["surface"] == "gui"
+    });
 }
 
 #[test]

@@ -326,9 +326,14 @@ fn terminal(
                         }
                     }
                     "set_attended" => {}
-                    // Another open (a client that lost its terminal view):
-                    // answered, so its request does not wait forever.
-                    "tui" => refuse_request(hub, &op, ALREADY_IN_TERMINAL),
+                    // Another client asks for it (or one that lost its
+                    // view): it attaches to the TUI that runs.
+                    "tui" => {
+                        let viewer = op["client"].as_u64().unwrap_or(0);
+                        if let Err(error) = crate::terminal::attach_to(&arc, viewer, &term, &op) {
+                            refuse_request(hub, &op, &error);
+                        }
+                    }
                     _ => hub.broadcast(&json!({ "type": "error", "session": id, "message": "the conversation is open in its terminal: exit the TUI to continue here" })),
                 }
             }
