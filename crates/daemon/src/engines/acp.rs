@@ -605,8 +605,9 @@ impl Acp {
     fn settle(&mut self) -> Output {
         self.prompt_in_flight = false;
         self.busy_announced = false;
-        self.next_prompt()
-            .unwrap_or_else(|| Output::events(vec![json!({ "type": "status", "message": "ready" })]))
+        self.next_prompt().unwrap_or_else(|| {
+            Output::events(vec![json!({ "type": "status", "message": "ready" })])
+        })
     }
 
     fn on_update(&mut self, update: &Value) -> Vec<Value> {
@@ -1240,7 +1241,10 @@ mod tests {
             .unwrap();
         assert_eq!(dropped.events, [pending(&[])]);
         // Nothing waits: the turn settles and goes ready.
-        let settled = frame(&mut a, json!({ "id": 3, "result": { "stopReason": "end_turn" } }));
+        let settled = frame(
+            &mut a,
+            json!({ "id": 3, "result": { "stopReason": "end_turn" } }),
+        );
         assert!(settled.frames.is_empty());
     }
 
@@ -1257,11 +1261,18 @@ mod tests {
                 "session/cancel"
             );
             assert_eq!(out.events, [pending(&["three", "two"])]);
-            let done = frame(&mut a, json!({ "id": 3, "result": { "stopReason": "cancelled" } }));
+            let done = frame(
+                &mut a,
+                json!({ "id": 3, "result": { "stopReason": "cancelled" } }),
+            );
             let next = sent(&done.frames);
             assert_eq!(next[0]["method"], "session/prompt");
             assert_eq!(next[0]["params"]["prompt"][0]["text"], "three");
-            assert!(done.events.contains(&pending(&["two"])), "{:?}", done.events);
+            assert!(
+                done.events.contains(&pending(&["two"])),
+                "{:?}",
+                done.events
+            );
         }
         // A plain interrupt drops what waits.
         let mut a = running_with(&["two"]);
@@ -1280,9 +1291,14 @@ mod tests {
             back.events[1],
             json!({ "type": "unqueued", "content": "oops", "text": "oops", "images": [], "files": ["/tmp/x.zip"] })
         );
-        a.encode(&json!({ "op": "user_message", "content": "read", "files": ["/tmp/my report.pdf"] }))
-            .unwrap();
-        let next = frame(&mut a, json!({ "id": 3, "result": { "stopReason": "end_turn" } }));
+        a.encode(
+            &json!({ "op": "user_message", "content": "read", "files": ["/tmp/my report.pdf"] }),
+        )
+        .unwrap();
+        let next = frame(
+            &mut a,
+            json!({ "id": 3, "result": { "stopReason": "end_turn" } }),
+        );
         assert_eq!(
             sent(&next.frames)[0]["params"]["prompt"],
             json!([

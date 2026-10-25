@@ -1013,11 +1013,7 @@ impl Claude {
     /// Hands the held messages at `picked` (ascending) to the CLI with
     /// priority `now`, in the order they were held.
     fn release_all(&mut self, picked: &[usize]) -> Vec<String> {
-        let mut taken: Vec<Held> = picked
-            .iter()
-            .rev()
-            .map(|i| self.held.remove(*i))
-            .collect();
+        let mut taken: Vec<Held> = picked.iter().rev().map(|i| self.held.remove(*i)).collect();
         taken.reverse();
         taken
             .into_iter()
@@ -1031,9 +1027,10 @@ impl Claude {
     /// The steered messages, once their subagents are in the background,
     /// the wait is over or the turn has ended (they start the next one).
     fn steer_ready(&mut self) -> Vec<String> {
-        let ready = self.steering.as_ref().is_some_and(|s| {
-            s.waiting == 0 || !self.active_turn || Instant::now() >= s.deadline
-        });
+        let ready = self
+            .steering
+            .as_ref()
+            .is_some_and(|s| s.waiting == 0 || !self.active_turn || Instant::now() >= s.deadline);
         if !ready {
             return Vec::new();
         }
@@ -4673,7 +4670,11 @@ mod tests {
             .encode(&json!({ "op": "command", "input": "/resume x" }))
             .is_err());
         // Nothing runs: a steer has nothing to do.
-        assert!(c.encode(&json!({ "op": "steer" })).unwrap().frames.is_empty());
+        assert!(c
+            .encode(&json!({ "op": "steer" }))
+            .unwrap()
+            .frames
+            .is_empty());
     }
 
     #[test]
@@ -4760,7 +4761,9 @@ mod tests {
         );
         // A message sent before that turn even started waits too.
         let mut c = holding(&["one"]);
-        c.translate(Line::Frame(json!({ "type": "result", "subtype": "success" })));
+        c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "success" }),
+        ));
         let second = c
             .encode(&json!({ "op": "user_message", "content": "two" }))
             .unwrap();
@@ -4888,7 +4891,10 @@ mod tests {
         let moved = c
             .encode(&json!({ "op": "queue_move", "index": -1, "to": 0 }))
             .unwrap();
-        assert_eq!(moved.events, vec![pending(&["cherry", "apple", "banana"], 0)]);
+        assert_eq!(
+            moved.events,
+            vec![pending(&["cherry", "apple", "banana"], 0)]
+        );
         let dropped = c
             .encode(&json!({ "op": "unqueue", "index": 1, "discard": true }))
             .unwrap();

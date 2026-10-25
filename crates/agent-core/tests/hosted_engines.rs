@@ -1082,9 +1082,16 @@ fn queued_messages_move_drop_and_one_is_sent_now_by_interrupting() {
             _ => None,
         })
         .collect();
-    assert_eq!(users.first().map(|m| m.as_str()), Some("cherry"), "{users:?}");
+    assert_eq!(
+        users.first().map(|m| m.as_str()),
+        Some("cherry"),
+        "{users:?}"
+    );
     assert!(assistant_text(&events).contains("user said: cherry"));
-    assert!(!dir.join("done.txt").exists(), "the interrupted command ran on");
+    assert!(
+        !dir.join("done.txt").exists(),
+        "the interrupted command ran on"
+    );
     // Nothing to send now when nothing runs.
     let mut idle = open(&dir, ApprovalMode::FullAccess);
     assert!(idle.interrupt_send(&at(0)).is_empty());

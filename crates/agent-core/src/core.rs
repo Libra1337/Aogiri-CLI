@@ -10,7 +10,6 @@ use crate::{
         PlanItem, SessionListItemView,
     },
     hooks::Hooks,
-    queue::{queue_move_target, QueuePick},
     llm::{
         ApprovalDecision, ApprovalRequest, GoalToolRequest, OpenAiClient, OpenAiClientConfig,
         StreamEvent, ToolGoalResponse,
@@ -21,6 +20,7 @@ use crate::{
         discover_project_instructions, discover_skills, skill_commands, skill_message,
         skill_pin_message, PromptContext, SessionPrompt,
     },
+    queue::{queue_move_target, QueuePick},
     session::{
         compaction_summary_item, ContextStatistics, EntryKind, SessionLock, SessionStore,
         SessionSummary, ThreadGoal, ThreadGoalStatus,

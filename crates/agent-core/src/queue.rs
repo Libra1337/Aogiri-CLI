@@ -98,14 +98,20 @@ mod tests {
             Some(1)
         );
         // Started meanwhile: nothing to take.
-        assert_eq!(pick(json!({ "index": 0, "text": "one" })).find(&queued), None);
+        assert_eq!(
+            pick(json!({ "index": 0, "text": "one" })).find(&queued),
+            None
+        );
     }
 
     #[test]
     fn a_move_needs_two_places_that_differ() {
         let queued = ["a", "b", "c"];
         let from_last = pick(json!({ "index": -1 }));
-        assert_eq!(queue_move_target(&from_last, Some(0), &queued), Some((2, 0)));
+        assert_eq!(
+            queue_move_target(&from_last, Some(0), &queued),
+            Some((2, 0))
+        );
         assert_eq!(queue_move_target(&from_last, Some(-1), &queued), None);
         assert_eq!(queue_move_target(&from_last, None, &queued), None);
         assert_eq!(queue_move_target(&from_last, Some(5), &queued), None);
