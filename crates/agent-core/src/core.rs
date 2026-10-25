@@ -10,6 +10,7 @@ use crate::{
         PlanItem, SessionListItemView,
     },
     hooks::Hooks,
+    queue::{queue_move_target, QueuePick},
     llm::{
         ApprovalDecision, ApprovalRequest, GoalToolRequest, OpenAiClient, OpenAiClientConfig,
         StreamEvent, ToolGoalResponse,
