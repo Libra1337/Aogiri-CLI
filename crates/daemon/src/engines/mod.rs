@@ -81,6 +81,9 @@ pub struct Options {
     /// LynShen: the directory `fork_from` was saved for, when the fork works
     /// elsewhere (its own worktree). None: the fork's own `cwd`.
     pub fork_cwd: Option<PathBuf>,
+    /// A run of `engine_probe`: nothing is saved and nothing waits on the
+    /// user (set by the daemon, never by a client).
+    pub probe: bool,
     /// ACP: the agent's command line.
     pub command: Option<String>,
     pub args: Vec<String>,
@@ -138,6 +141,7 @@ impl Options {
             fork_from: text("fork_from"),
             fork_turns: value["fork_turns"].as_u64(),
             fork_cwd: text("fork_cwd").map(PathBuf::from),
+            probe: false,
             command: text("command"),
             bin: text("bin"),
             args: value["args"]
@@ -1057,6 +1061,13 @@ impl Session<'_> {
             if !busy {
                 if let Some(mut next) = self.restart.take() {
                     next.resume = adapter.conversation().or(next.resume);
+                    // A fork restarted before its first turn saved it (a
+                    // mode switch): it is forked again, not started empty.
+                    if next.resume.is_none() && options.fork_from.is_some() {
+                        next.fork_from = options.fork_from.clone();
+                        next.fork_turns = options.fork_turns;
+                        next.resume_at = options.resume_at.clone();
+                    }
                     // What the process runs as stays: its binary, environment
                     // and gateway.
                     next.bin = options.bin.clone();

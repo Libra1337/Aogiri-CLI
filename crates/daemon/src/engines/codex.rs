@@ -325,6 +325,23 @@ fn command_output(item: &Value, command: &str, streamed: &str) -> Value {
     out
 }
 
+/// The last turn a fork keeping `keep` user turns of `turns` goes through:
+/// the one before the next user turn (None: the fork keeps them all).
+fn fork_point(turns: &Value, keep: Option<u64>) -> Option<String> {
+    let turns = turns.as_array()?;
+    let next = turns
+        .iter()
+        .enumerate()
+        .filter(|(_, turn)| {
+            turn["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["type"] == "userMessage"))
+        })
+        .nth(usize::try_from(keep?).ok()?)?
+        .0;
+    Some(text(&turns[next.checked_sub(1)?]["id"]).to_string())
+}
+
 /// A resumed thread's history (`thread.turns[].items`) as transcript items.
 fn transcript(turns: &Value) -> Vec<Value> {
     let mut rows = Vec::new();
@@ -515,6 +532,11 @@ pub struct Codex {
     pending: HashMap<u64, (String, String)>,
     thread: Option<String>,
     resume: Option<String>,
+    /// A new thread forked from this one, keeping its first so many user
+    /// turns (None: all of them).
+    fork: Option<(String, Option<u64>)>,
+    /// A probe's run (`engine_probe`): its thread is not saved.
+    ephemeral: bool,
     /// Talks to the LynShen gateway: a resumed thread must too, whichever
     /// provider it was written with (`thread/resume` would use that one).
     gateway: bool,
@@ -587,6 +609,12 @@ impl Codex {
             pending: HashMap::new(),
             thread: None,
             resume: options.resume.clone(),
+            fork: options
+                .fork_from
+                .clone()
+                .filter(|_| options.resume.is_none())
+                .map(|from| (from, options.fork_turns)),
+            ephemeral: options.probe,
             gateway: options.gateway == Some(true),
             active_turn: None,
             busy: false,
@@ -962,6 +990,13 @@ impl Codex {
                     json!({ "type": "compaction_failed", "error": message }),
                 ]);
             }
+            // A fork that cannot be made is an error, not an empty thread.
+            if matches!(method.as_str(), "thread/read" | "thread/fork") && self.fork.is_some() {
+                return Output::events(vec![error_event(
+                    &format!("cannot fork the thread: {message}"),
+                    &Value::Null,
+                )]);
+            }
             if method == "thread/resume" && self.open_params.is_object() {
                 let params = self.open_params.clone();
                 let frame = self.request("thread/start", params, "");
@@ -993,7 +1028,10 @@ impl Codex {
         match method.as_str() {
             "initialize" => {
                 let (approval, sandbox) = policy(self.mode, &self.dirs);
-                let open = json!({ "cwd": self.cwd, "approvalPolicy": approval, "sandbox": sandbox_mode(&sandbox) });
+                let mut open = json!({ "cwd": self.cwd, "approvalPolicy": approval, "sandbox": sandbox_mode(&sandbox) });
+                if self.ephemeral {
+                    open["ephemeral"] = json!(true);
+                }
                 // The app's tools, as dynamic tools: a thread keeps them, so
                 // a resumed one is not told again.
                 self.open_params = open.clone();
@@ -1006,8 +1044,8 @@ impl Codex {
                 }
                 let mut frames =
                     vec![json!({ "jsonrpc": "2.0", "method": "initialized" }).to_string()];
-                frames.push(match self.resume.clone() {
-                    Some(thread) => {
+                frames.push(match (self.resume.clone(), self.fork.clone()) {
+                    (Some(thread), _) => {
                         let mut params = open;
                         params["threadId"] = json!(thread);
                         if self.gateway {
@@ -1015,7 +1053,13 @@ impl Codex {
                         }
                         self.request("thread/resume", params, "")
                     }
-                    None => {
+                    // A fork reads the thread's turns first, to know where to cut.
+                    (None, Some((from, _))) => self.request(
+                        "thread/read",
+                        json!({ "threadId": from, "includeTurns": true }),
+                        "fork",
+                    ),
+                    (None, None) => {
                         let params = self.open_params.clone();
                         self.request("thread/start", params, "")
                     }
@@ -1033,7 +1077,28 @@ impl Codex {
                 }
             }
             "thread/start" => self.thread_opened(result, false),
-            "thread/resume" => self.thread_opened(result, true),
+            "thread/resume" | "thread/fork" => self.thread_opened(result, true),
+            "thread/read" if tag == "fork" => {
+                let Some((from, keep)) = self.fork.clone() else {
+                    return Output::default();
+                };
+                // The forked thread keeps the tools it was started with.
+                let mut params = self.open_params.clone();
+                if let Some(fields) = params.as_object_mut() {
+                    fields.remove("dynamicTools");
+                }
+                params["threadId"] = json!(from);
+                if let Some(last) = fork_point(&result["thread"]["turns"], keep) {
+                    params["lastTurnId"] = json!(last);
+                }
+                if self.gateway {
+                    params["modelProvider"] = json!(GATEWAY_PROVIDER);
+                }
+                Output {
+                    events: vec![],
+                    frames: vec![self.request("thread/fork", params, "")],
+                }
+            }
             "account/rateLimits/read" => Output::events(usage_events(&result["rateLimits"])),
             "model/list" => {
                 self.catalog = result["data"]

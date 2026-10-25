@@ -621,9 +621,15 @@ impl Hub {
             false => crate::projects::for_new_session(self, &cwd, project)?,
         };
         let dirs = crate::projects::extra_dirs(self, &cwd, &project);
-        let options = engines::Options {
+        let mut options = engines::Options {
             dirs: dirs.clone(),
             ..options
+        };
+        // A fork goes on from another conversation: where it cuts, and what
+        // it shows until its engine replays it (see `fork_start`).
+        let (forked, seed) = match options.fork_from.clone() {
+            Some(from) => self.fork_start(engine, &cwd, &from, &mut options)?,
+            None => (None, Vec::new()),
         };
         let agent = agent.map(str::to_string);
         let gateway = options.gateway == Some(true);
@@ -634,8 +640,21 @@ impl Hub {
         let mut hook_stopper = None;
         let (id, ops, generation) = match engine {
             None => {
+                // A fork: a copy of the conversation's first turns, resumed.
+                let resume = match &options.fork_from {
+                    Some(from) => Some(
+                        lynshen_agent_core::fork_session(
+                            options.fork_cwd.as_deref().unwrap_or(&cwd),
+                            &cwd,
+                            from,
+                            options.fork_turns.map(|turns| turns as usize),
+                        )
+                        .map_err(|error| format!("cannot fork {from}: {error}"))?,
+                    ),
+                    None => None,
+                };
                 let (id, ops, generation, stopper) =
-                    session::spawn(Arc::clone(self), cwd.clone(), None, agent.clone(), dirs)?;
+                    session::spawn(Arc::clone(self), cwd.clone(), resume, agent.clone(), dirs)?;
                 hook_stopper = Some(stopper);
                 (id, ops, generation)
             }
@@ -645,7 +664,7 @@ impl Hub {
                     engines::Kind::Claude | engines::Kind::Acp => Some(engines::new_uuid()?),
                     engines::Kind::Codex => None,
                 };
-                engines::spawn(Arc::clone(self), kind, id, cwd.clone(), options, vec![])?
+                engines::spawn(Arc::clone(self), kind, id, cwd.clone(), options, seed)?
             }
         };
         self.store
@@ -664,11 +683,67 @@ impl Hub {
                 .record_session_meta(&id, &json!({ "acp_agent": acp_agent }))
                 .map_err(|error| error.to_string())?;
         }
+        // Where a fork comes from, kept with it: the list names it, and a
+        // Claude fork closed before its first turn is made again from it.
+        if let Some(source) = forked {
+            self.store
+                .record_session_meta(&id, &json!({ "forked_from": source }))
+                .map_err(|error| error.to_string())?;
+        }
         lock(&self.untitled).insert(id.clone());
         self.host(id.clone(), ops, cwd, generation);
         self.set_hook_stopper(&id, hook_stopper);
         self.broadcast(&self.agents_json());
         Ok(id)
+    }
+
+    /// A fork of conversation `from` that `engine` starts in `cwd`: its
+    /// record (`{session, turns, at}`) and the transcript it shows until its
+    /// engine replays it. Claude Code forks at a reply (`resume_at`), found
+    /// here from `fork_turns` when the client named none; Codex and LynShen
+    /// cut at `fork_turns` themselves. An ACP agent's conversation is copied
+    /// whole with `fork` instead.
+    fn fork_start(
+        &self,
+        engine: Option<engines::Kind>,
+        cwd: &std::path::Path,
+        from: &str,
+        options: &mut engines::Options,
+    ) -> Result<(Option<Value>, Vec<Value>), String> {
+        if options.fork_turns == Some(0) {
+            return Err("a fork keeps at least one turn".to_string());
+        }
+        if let Some(dir) = options.fork_cwd.as_deref().filter(|dir| !dir.is_absolute()) {
+            return Err(format!("fork_cwd must be absolute: {}", dir.display()));
+        }
+        let mut seed = Vec::new();
+        match engine {
+            Some(engines::Kind::Acp) => {
+                return Err(
+                    "an ACP agent's conversation is copied whole with options.fork".to_string(),
+                )
+            }
+            Some(engines::Kind::Claude) => {
+                let source_cwd = options.fork_cwd.clone().unwrap_or_else(|| cwd.to_path_buf());
+                let config = engines::claude::config_with(options, &source_cwd, from);
+                let path = engines::claude::find_conversation(&config, &source_cwd, from)
+                    .ok_or_else(|| format!("cannot fork {from}: no saved Claude Code conversation"))?;
+                if options.resume_at.is_none() {
+                    if let Some(turns) = options.fork_turns {
+                        options.resume_at = engines::claude::fork_point(&path, turns)
+                            .map_err(|error| format!("cannot fork {from}: {error}"))?;
+                    }
+                }
+                seed = engines::claude::fork_transcript(
+                    &path,
+                    options.resume_at.as_deref(),
+                    self.uploads.dir(),
+                );
+            }
+            Some(engines::Kind::Codex) | None => {}
+        }
+        let source = json!({ "session": from, "turns": options.fork_turns, "at": options.resume_at });
+        Ok((Some(source), seed))
     }
 
     /// Hosts a session recorded earlier (after a restart or a close). A
@@ -788,12 +863,33 @@ impl Hub {
                     engines::Kind::Codex => true,
                     engines::Kind::Acp => record.conversation.is_some(),
                 };
-                let transcript = claude_config
+                let mut transcript = claude_config
                     .as_deref()
                     .map(|config| {
                         engines::claude::transcript(config, &record.cwd, id, self.uploads.dir())
                     })
                     .unwrap_or_default();
+                // A Claude fork closed before its first turn was never saved:
+                // it is forked again rather than started empty.
+                let refork = match (kind, saved, &record.forked_from) {
+                    (engines::Kind::Claude, false, Some(source)) => {
+                        let from = source["session"].as_str().map(str::to_string);
+                        let at = source["at"].as_str().map(str::to_string);
+                        if let (Some(config), Some(from)) = (claude_config.as_deref(), &from) {
+                            if let Some(path) =
+                                engines::claude::find_conversation(config, &record.cwd, from)
+                            {
+                                transcript = engines::claude::fork_transcript(
+                                    &path,
+                                    at.as_deref(),
+                                    self.uploads.dir(),
+                                );
+                            }
+                        }
+                        from.map(|from| (from, at))
+                    }
+                    _ => None,
+                };
                 // A client that does not say (a phone) keeps how it last ran.
                 let options = engines::Options {
                     resume: match kind {
@@ -803,6 +899,13 @@ impl Hub {
                     gateway: Some(options.gateway.unwrap_or(record.gateway)),
                     // A copy is made once, when the session is created.
                     fork: None,
+                    fork_from: refork.as_ref().map(|(from, _)| from.clone()),
+                    fork_turns: None,
+                    fork_cwd: None,
+                    resume_at: match &refork {
+                        Some((_, at)) => at.clone(),
+                        None => options.resume_at.clone(),
+                    },
                     claude_config,
                     dirs,
                     ..options
@@ -2284,6 +2387,8 @@ impl Hub {
                     "gateway": record.gateway,
                     "engine": record.engine.as_deref().unwrap_or("lynshen"),
                     "acp_agent": record.acp_agent,
+                    // The conversation it was forked from: {session, turns, at}.
+                    "forked_from": record.forked_from,
                     "agent": record.agent,
                     "open": hosted.is_some(),
                     "watchers": hosted.map(|h| h.watchers.len()).unwrap_or(0),
