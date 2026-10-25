@@ -67,9 +67,15 @@ Set `extra_skills_source` to the built-in name `anthropic` or to an HTTPS GitHub
 The built-in source points to <https://github.com/anthropics/skills>. Its vendored index,
 `crates/agent-core/src/anthropic-skills.json`, carries each skill's name, description, tags and
 license and is pinned to a reviewed Git commit, so listing works without a GitHub request. A custom
-repository URL is expected to contain skills at `skills/<slug>/`; LynShen reads its directory
-through the public GitHub API and installs from the default branch. `/skills list` groups available
-skills by source.
+repository is read through the public GitHub API at its default branch's current commit, and
+installs come from that commit. Its skills may sit in `skills/<slug>/` or at the top level.
+`/skills list` groups available skills by source.
+
+A skill's license is the `license` in its `SKILL.md` frontmatter, else the repository's as GitHub
+detects it. A skill whose terms say proprietary or source-available (such as "Proprietary.
+LICENSE.txt has complete terms") is listed with its license but not installed. An installed source
+skill records its repository in `.lynshen-source`: installing a skill of the same name from another
+repository is refused until the installed one is removed.
 
 `/skills install <slug>` or `/skills update <slug>` reads the repository tree from the GitHub API
 and downloads the whole `skills/<slug>/` directory from `raw.githubusercontent.com`. Every path is

@@ -233,7 +233,9 @@ fn catalog(dir: PathBuf, op: &Value) -> Result<Value, String> {
                 "source": key,
                 "sourceName": shown,
                 "isDefault": false,
-                "installed": skills::skill_installed(&dir, &skill.id),
+                // Installed from this source: another repository's skill
+                // of the same name is not this one.
+                "installed": skills::installed_from(&dir, &skill.id, &source.repository),
                 "license": skill.license,
                 "redistributable": skill.redistributable,
                 "homepage": source.homepage(&skill.id),
@@ -326,6 +328,8 @@ fn install(dir: PathBuf, source: &str, id: &str) -> Result<PathBuf, String> {
             skill.license
         ));
     }
+    // Before the mirror and GitHub are tried, so the reason is said once.
+    skills::check_source_free(&dir, id, &found.repository).map_err(|error| error.to_string())?;
     let mut mirror_error = None;
     if let Some(url) = mirror::mirror_url() {
         let installed = mirror::fetch_mirror(&url).and_then(|published| {

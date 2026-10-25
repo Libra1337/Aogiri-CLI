@@ -281,8 +281,11 @@ followed) before the check.
 `skills_catalog` answers at once with the bundled index of
 github.com/anthropics/skills and the community repositories as last read.
 `source` is `anthropic` or a community repository's `owner/repo`;
-`redistributable` is false for Anthropic's source-available document skills,
-which `skill_install` refuses.
+`redistributable` is false for Anthropic's source-available document skills
+and for a community skill whose terms say proprietary or source-available
+(its frontmatter `license`, else its repository's), which `skill_install`
+refuses. A community repository is read at its default branch's current
+commit (`revision`), and its skills install from that commit.
 
 The community sources are cached in `~/.lynshen/cache/skills-catalog.json`.
 `sources` has one entry per source, Anthropic first: `origin` is `bundled`,
@@ -308,7 +311,11 @@ mirror does not have. Requests go through the proxy that `HTTPS_PROXY`,
 Claude Code's config directory (`~/.claude/skills`, or under
 `CLAUDE_CONFIG_DIR` when the daemon's environment sets it),
 anything else into `~/.lynshen/skills`. `installed` means
-`<installDir>/<id>/SKILL.md` exists. `skill_install` looks the skill up again
+`<installDir>/<id>/SKILL.md` exists and, for a community skill, that it came
+from this entry's repository (`<installDir>/<id>/.lynshen-source`; one
+installed before sources were recorded counts for every source). Installing a
+skill whose name another repository's installed skill already has is an
+error until that one is removed. `skill_install` looks the skill up again
 in its source (the bundled index or the cache), then installs the mirror's
 archive of it, checked against the sha256 in the mirror's signed manifest.
 Without one (or without the mirror) it downloads the skill's whole directory

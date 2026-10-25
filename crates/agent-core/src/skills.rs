@@ -18,6 +18,9 @@ const MAX_TREE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_PACKAGE_FILES: usize = 4096;
 const SKILL_STATE_FILE: &str = "skills-state.json";
+/// In a skill installed from a GitHub repository (or the mirror's copy of
+/// one): the repository it came from.
+const SOURCE_FILE: &str = ".lynshen-source";
 pub const ANTHROPIC_SKILLS_URL: &str = "https://github.com/anthropics/skills";
 const ANTHROPIC_SKILLS_INDEX: &str = include_str!("anthropic-skills.json");
 
@@ -172,25 +175,17 @@ pub fn fetch_extra_skill_source(spec: &str) -> Result<Option<SkillSource>, Strin
         return anthropic_source().map(Some);
     }
 
-    let (owner, repository) = github_repository_parts(spec)?;
-    let api_url = format!("https://api.github.com/repos/{owner}/{repository}/contents/skills");
-    let response = ureq::get(&api_url)
-        .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", "lynshen-cli")
-        .timeout(Duration::from_secs(30))
-        .call()
-        .map_err(|error| error.to_string())?;
-    let value = response
-        .into_json::<Value>()
-        .map_err(|error| error.to_string())?;
-    parse_github_skills_directory(&value, &format!("https://github.com/{owner}/{repository}"))
-        .map(Some)
+    let (_, repository) = github_repository_parts(spec)?;
+    fetch_github_source(&repository, spec).map(Some)
 }
 
 /// A GitHub repository's skills, wherever its `SKILL.md` files sit: every
 /// `<id>/SKILL.md` at the top level or `<dir>/<id>/SKILL.md` one level down,
-/// from the directory holding the most. Names and descriptions come from each
-/// SKILL.md's frontmatter, read in parallel.
+/// from the directory holding the most. Read at the default branch's current
+/// commit, which installs then use, so what is installed is what was listed
+/// (as the mirror pins it). Names, descriptions and licenses come from each
+/// SKILL.md's frontmatter, read in parallel; a skill without a license has
+/// the repository's.
 pub fn fetch_github_source(name: &str, repository: &str) -> Result<SkillSource, String> {
     read_github_source(name, repository, &|url, limit| {
         fetch(url, limit, CATALOG_TIMEOUTS)
@@ -203,12 +198,26 @@ fn read_github_source(
     fetch: &(dyn Fn(&str, usize) -> io::Result<Vec<u8>> + Sync),
 ) -> Result<SkillSource, String> {
     let (owner, repo) = github_repository_parts(repository)?;
-    let tree = fetch(
-        &format!("https://api.github.com/repos/{owner}/{repo}/git/trees/HEAD?recursive=1"),
-        MAX_TREE_BYTES,
-    )
-    .map_err(|error| error.to_string())?;
-    let tree: Value = serde_json::from_slice(&tree).map_err(|error| error.to_string())?;
+    let json = |url: &str| -> Result<Value, String> {
+        let bytes = fetch(url, MAX_TREE_BYTES).map_err(|error| error.to_string())?;
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+    };
+    let api = format!("https://api.github.com/repos/{owner}/{repo}");
+    let meta = json(&api)?;
+    let branch = meta["default_branch"]
+        .as_str()
+        .ok_or_else(|| format!("{repository} has no default branch"))?;
+    let revision = json(&format!("{api}/branches/{}", encode_url_path(branch)))?["commit"]["sha"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("{repository}: no commit for {branch}"))?;
+    validate_revision(&revision).map_err(|error| error.to_string())?;
+    let repository_license = meta["license"]["spdx_id"]
+        .as_str()
+        .filter(|id| *id != "NOASSERTION")
+        .unwrap_or_default()
+        .to_string();
+    let tree = json(&format!("{api}/git/trees/{revision}?recursive=1"))?;
     let mut by_dir: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for path in tree["tree"]
         .as_array()
@@ -236,7 +245,7 @@ fn read_github_source(
         // folder (a vendored collection) only when there are none there.
         .max_by_key(|(dir, ids)| (dir == "skills" || dir.is_empty(), ids.len()))
         .ok_or_else(|| format!("no SKILL.md found in {repository}"))?;
-    let read = |id: &str| -> Result<(String, String), String> {
+    let read = |id: &str| -> Result<[String; 3], String> {
         let path = if dir.is_empty() {
             format!("{id}/SKILL.md")
         } else {
@@ -244,17 +253,17 @@ fn read_github_source(
         };
         let bytes = fetch(
             &format!(
-                "https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{}",
+                "https://raw.githubusercontent.com/{owner}/{repo}/{revision}/{}",
                 encode_url_path(&path)
             ),
             256 * 1024,
         )
         .map_err(|error| error.to_string())?;
         let text = String::from_utf8_lossy(&bytes);
-        let field = |key| crate::prompt::read_frontmatter_field(&text, key).unwrap_or_default();
-        Ok((field("name"), field("description")))
+        Ok(["name", "description", "license"]
+            .map(|key| crate::prompt::read_frontmatter_field(&text, key).unwrap_or_default()))
     };
-    let reads: Vec<Result<(String, String), String>> = std::thread::scope(|scope| {
+    let reads: Vec<Result<[String; 3], String>> = std::thread::scope(|scope| {
         let read = &read;
         let handles: Vec<_> = ids.iter().map(|id| scope.spawn(move || read(id))).collect();
         handles
@@ -275,27 +284,47 @@ fn read_github_source(
     let mut skills: Vec<SourceSkill> = ids
         .iter()
         .zip(metas)
-        .map(|(id, (skill_name, description))| SourceSkill {
-            id: id.clone(),
-            name: if skill_name.is_empty() {
-                id.clone()
-            } else {
-                skill_name
-            },
-            description,
-            tags: Vec::new(),
-            license: String::new(),
-            redistributable: true,
+        .map(|(id, [skill_name, description, license])| {
+            let license = match license.trim() {
+                "" => repository_license.clone(),
+                own => own.to_string(),
+            };
+            SourceSkill {
+                id: id.clone(),
+                name: if skill_name.is_empty() {
+                    id.clone()
+                } else {
+                    skill_name
+                },
+                description,
+                tags: Vec::new(),
+                redistributable: offered_license(&license),
+                license,
+            }
         })
         .collect();
     skills.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(SkillSource {
         name: name.to_string(),
         repository: normalize_repository_url(repository),
-        revision: String::new(),
+        revision,
         dir,
         skills,
     })
+}
+
+/// Whether LynShen offers a GitHub skill under `license` (its frontmatter
+/// `license`, else its repository's as GitHub detects it): not when its
+/// terms say proprietary or source-available, as Anthropic's document
+/// skills (and copies of them in other repositories) do; those are listed
+/// with their license and repository link, not installed. A skill that
+/// states no terms (the author's own public repository) installs from
+/// GitHub as published; the mirror packs only licensed ones.
+fn offered_license(license: &str) -> bool {
+    let terms = license.to_ascii_lowercase();
+    !["proprietary", "source-available", "source available"]
+        .iter()
+        .any(|word| terms.contains(word))
 }
 
 /// A source as the marketplace cache and the mirror's catalog store it: the
@@ -423,42 +452,6 @@ fn parse_source_index(value: &Value) -> Result<SkillSource, String> {
     })
 }
 
-pub fn parse_github_skills_directory(
-    value: &Value,
-    repository: &str,
-) -> Result<SkillSource, String> {
-    github_repository_parts(repository)?;
-    let entries = value
-        .as_array()
-        .ok_or_else(|| "GitHub skills directory response is not an array".to_string())?;
-    let mut skills = Vec::new();
-    for entry in entries {
-        if entry.get("type").and_then(Value::as_str) != Some("dir") {
-            continue;
-        }
-        let Some(id) = entry.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        validate_skill_id(id).map_err(|error| error.to_string())?;
-        skills.push(SourceSkill {
-            id: id.to_string(),
-            name: id.to_string(),
-            description: String::new(),
-            tags: Vec::new(),
-            license: String::new(),
-            redistributable: true,
-        });
-    }
-    skills.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(SkillSource {
-        name: github_repository_parts(repository)?.1,
-        repository: normalize_repository_url(repository),
-        revision: String::new(),
-        dir: "skills".to_string(),
-        skills,
-    })
-}
-
 /// Installs the whole `skills/<id>/` directory of `source` into
 /// `skills_dir/<id>`, replacing an earlier install only once every file has
 /// downloaded.
@@ -477,6 +470,7 @@ fn install_github_skill(
     fetch: &dyn Fn(&str, usize) -> io::Result<Vec<u8>>,
 ) -> io::Result<PathBuf> {
     validate_skill_id(&skill.id)?;
+    check_source_free(skills_dir, &skill.id, &source.repository)?;
     let (owner, repository) = github_repository_parts(&source.repository)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     if !source.revision.is_empty() {
@@ -590,7 +584,7 @@ fn install_github_skill(
                 skill.id
             )));
         }
-        Ok(())
+        record_source(&staging, &source.repository)
     })();
     if let Err(error) = downloaded {
         let _ = fs::remove_dir_all(&staging);
@@ -919,6 +913,43 @@ pub fn installed_skill_ids(profile_dir: &Path) -> io::Result<Vec<String>> {
     }
     installed.sort();
     Ok(installed)
+}
+
+/// The repository an installed skill came from; None for one from the
+/// LynShen marketplace, made by hand, or installed before sources were
+/// recorded.
+pub fn installed_source(skills_dir: &Path, id: &str) -> Option<String> {
+    fs::read_to_string(skills_dir.join(safe_skill_dir(id)).join(SOURCE_FILE))
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+/// Whether `id` is installed from `repository`: a skill another repository
+/// installed under the same name is not this one. One whose source was not
+/// recorded counts for every source.
+pub fn installed_from(skills_dir: &Path, id: &str, repository: &str) -> bool {
+    skill_installed(skills_dir, id)
+        && installed_source(skills_dir, id)
+            .is_none_or(|source| source == normalize_repository_url(repository))
+}
+
+/// Two repositories can name a skill alike: one must not replace the
+/// other's. An error while `id` is installed from another repository.
+pub fn check_source_free(skills_dir: &Path, id: &str, repository: &str) -> io::Result<()> {
+    let repository = normalize_repository_url(repository);
+    match installed_source(skills_dir, id).filter(|other| *other != repository) {
+        Some(other) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("skill {id} from {other} is already installed; remove it first"),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Notes in an installed skill the repository it came from.
+pub(crate) fn record_source(dir: &Path, repository: &str) -> io::Result<()> {
+    fs::write(dir.join(SOURCE_FILE), normalize_repository_url(repository))
 }
 
 pub fn skill_installed(skills_dir: &Path, id: &str) -> bool {
@@ -1642,31 +1673,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_github_directory_entries_without_accepting_unsafe_names() {
-        let source = parse_github_skills_directory(
-            &json!([
-                { "name": "review", "type": "dir" },
-                { "name": "README.md", "type": "file" }
-            ]),
-            "https://github.com/example/skills",
-        )
-        .unwrap();
-        assert_eq!(source.name, "skills");
-        assert_eq!(source.skills.len(), 1);
-        assert_eq!(source.skills[0].id, "review");
-        assert_eq!(
-            source.homepage("review"),
-            "https://github.com/example/skills/tree/HEAD/skills/review"
-        );
-
-        assert!(parse_github_skills_directory(
-            &json!([{ "name": "../escape", "type": "dir" }]),
-            "https://github.com/example/skills",
-        )
-        .is_err());
-    }
-
-    #[test]
     fn installs_the_whole_github_skill_directory_at_the_pinned_revision() {
         let root = test_dir("lynshen-github-skill-test");
         let source = github_source();
@@ -1712,6 +1718,22 @@ mod tests {
                 & 0o777,
             0o755
         );
+        assert_eq!(
+            installed_source(&root, "demo").as_deref(),
+            Some("https://github.com/example/skills")
+        );
+        assert!(installed_from(&root, "demo", "https://github.com/example/skills/"));
+
+        // Another repository's skill of the same name does not replace it
+        // (nothing is downloaded); the same repository updates it.
+        let mut other = github_source();
+        other.repository = "https://github.com/someone/else".to_string();
+        let before = fetched.borrow().len();
+        let error = install_github_skill(&root, &other, &other.skills[0], &fetch).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fetched.borrow().len(), before);
+        assert!(!installed_from(&root, "demo", &other.repository));
+        install_github_skill(&root, &source, &source.skills[0], &fetch).unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2164,8 +2186,8 @@ mod tests {
         ]})
         .to_string();
         let blocked = |url: &str, _: usize| -> io::Result<Vec<u8>> {
-            if url.starts_with("https://api.github.com/") {
-                Ok(tree.clone().into_bytes())
+            if let Some(answer) = github_api(url, &tree) {
+                Ok(answer.into_bytes())
             } else {
                 Err(io::Error::other(
                     "raw.githubusercontent.com: connection failed",
@@ -2178,8 +2200,8 @@ mod tests {
 
         // One file read: the source lists both, the other without a description.
         let partly = |url: &str, _: usize| -> io::Result<Vec<u8>> {
-            if url.starts_with("https://api.github.com/") {
-                Ok(tree.clone().into_bytes())
+            if let Some(answer) = github_api(url, &tree) {
+                Ok(answer.into_bytes())
             } else if url.ends_with("/skills/one/SKILL.md") {
                 Ok(b"---\nname: One\ndescription: The first\n---\n".to_vec())
             } else {
@@ -2194,6 +2216,95 @@ mod tests {
         assert_eq!(source.skills[0].description, "The first");
         assert_eq!(source.skills[1].name, "two");
         assert!(source.skills[1].redistributable);
+    }
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// GitHub's API for example/skills, MIT-licensed, default branch `main`
+    /// at SHA, its tree `tree`; None for any other URL.
+    fn github_api(url: &str, tree: &str) -> Option<String> {
+        let api = "https://api.github.com/repos/example/skills";
+        if url == api {
+            Some(json!({ "default_branch": "main", "license": { "spdx_id": "MIT" } }).to_string())
+        } else if url == format!("{api}/branches/main") {
+            Some(json!({ "commit": { "sha": SHA } }).to_string())
+        } else if url == format!("{api}/git/trees/{SHA}?recursive=1") {
+            Some(tree.to_string())
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn a_github_source_is_read_at_one_commit_with_each_skill_license() {
+        let tree = json!({ "tree": [
+            { "path": "skills/open/SKILL.md", "type": "blob" },
+            { "path": "skills/closed/SKILL.md", "type": "blob" },
+            { "path": "skills/apache/SKILL.md", "type": "blob" }
+        ]})
+        .to_string();
+        let raw = format!("https://raw.githubusercontent.com/example/skills/{SHA}/skills/");
+        let fetched = std::sync::Mutex::new(Vec::new());
+        let fetch = |url: &str, _limit: usize| -> io::Result<Vec<u8>> {
+            fetched.lock().unwrap().push(url.to_string());
+            let body = github_api(url, &tree).unwrap_or_else(|| match url.strip_prefix(&raw) {
+                Some("open/SKILL.md") => "---\nname: Open\n---\n".to_string(),
+                Some("closed/SKILL.md") => {
+                    "---\nname: Closed\nlicense: Proprietary. LICENSE.txt has complete terms\n---\n"
+                        .to_string()
+                }
+                Some("apache/SKILL.md") => {
+                    "---\nname: Apache\nlicense: Apache License 2.0\n---\n".to_string()
+                }
+                _ => panic!("unexpected download {url}"),
+            });
+            Ok(body.into_bytes())
+        };
+
+        let source =
+            read_github_source("Example", "https://github.com/example/skills", &fetch).unwrap();
+
+        assert_eq!(source.revision, SHA);
+        assert_eq!(source.dir, "skills");
+        let skill = |id: &str| source.skills.iter().find(|skill| skill.id == id).unwrap();
+        // No license of its own: the repository's.
+        assert_eq!(skill("open").license, "MIT");
+        assert!(skill("open").redistributable);
+        assert!(!skill("closed").redistributable);
+        assert_eq!(skill("apache").license, "Apache License 2.0");
+        assert!(skill("apache").redistributable);
+        // Nothing read at a moving branch.
+        assert!(!fetched
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|url| url.contains("/HEAD")));
+        assert_eq!(
+            source.homepage("open"),
+            format!("https://github.com/example/skills/tree/{SHA}/skills/open")
+        );
+    }
+
+    #[test]
+    fn proprietary_and_source_available_terms_are_not_offered() {
+        for license in [
+            "MIT",
+            "MIT License",
+            "Apache-2.0",
+            "apache license, version 2.0",
+            "BSD-3-Clause",
+            // States no terms: installed from the author's repository.
+            "",
+        ] {
+            assert!(offered_license(license), "{license}");
+        }
+        for license in [
+            "Proprietary",
+            "Proprietary. LICENSE.txt has complete terms",
+            "Anthropic source-available",
+        ] {
+            assert!(!offered_license(license), "{license}");
+        }
     }
 
     #[test]
