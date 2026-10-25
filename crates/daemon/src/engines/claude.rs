@@ -21,7 +21,10 @@
 //!   subagents report through `system/task_*` and
 //!   `background_tasks_changed`; a finished background task also comes back
 //!   as a `<task-notification>` user message that starts a turn.
-//! - Mid-turn user messages queue in the CLI and run as the next turn.
+//! - A user message sent mid-turn is taken into the running turn at the
+//!   next tool boundary (or starts the next turn) and replayed then; until
+//!   that replay it shows as queued (`pending_messages`). Claude Code saves
+//!   it only as a `queued_command` attachment row.
 //! - Full access (`bypassPermissions`) is only honored when the CLI starts
 //!   with `--dangerously-skip-permissions`, so switching into or out of it
 //!   restarts the engine on the same conversation.
@@ -771,6 +774,9 @@ pub struct Claude {
     start_usage: Value,
     active_turn: bool,
     interrupting: bool,
+    /// Messages sent mid-turn that Claude Code has not taken in (replayed)
+    /// yet, trimmed.
+    queued: Vec<String>,
     /// The composer's slash commands: the CLI's `initialize` reply (with
     /// descriptions and argument hints), plus names only `system/init` lists.
     commands: Vec<Value>,
@@ -814,6 +820,7 @@ impl Claude {
             start_usage: Value::Null,
             active_turn: false,
             interrupting: false,
+            queued: Vec::new(),
             commands: Vec::new(),
         }
     }
@@ -898,6 +905,10 @@ impl Claude {
             });
         }
         content
+    }
+
+    fn queued_event(&self) -> Value {
+        json!({ "type": "pending_messages", "messages": self.queued })
     }
 
     fn user_text(text: &str) -> String {
@@ -1428,27 +1439,7 @@ impl Claude {
     fn on_user(&mut self, frame: &Value) -> Vec<Value> {
         let content = &frame["message"]["content"];
         if frame["isReplay"] == true {
-            let message = match content.as_str() {
-                Some(message) => message.to_string(),
-                None => content
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|block| block["type"] == "text")
-                    .map(|block| text(&block["text"]).to_string())
-                    .unwrap_or_default(),
-            };
-            let trimmed = message.trim();
-            // A finished background task comes back as `task_done`.
-            if trimmed.starts_with("<command-")
-                || trimmed.starts_with("<local-command-")
-                || trimmed.starts_with("<task-notification>")
-                || is_effort_echo(&message)
-                || message.is_empty()
-            {
-                return vec![];
-            }
-            return vec![json!({ "type": "user_message", "content": message })];
+            return self.replayed(content);
         }
         let mut events: Vec<Value> = content
             .as_array()
@@ -1464,10 +1455,70 @@ impl Claude {
         events
     }
 
+    /// The echo of a message written to Claude Code's stdin: the user's own
+    /// message, unless it is bookkeeping. A message sent mid-turn leaves the
+    /// queue here, where Claude Code took it in.
+    fn replayed(&mut self, content: &Value) -> Vec<Value> {
+        // Messages queued during a turn may be taken in together, one text
+        // block each: each is a message of its own.
+        // (As sent: a client matches the echo to the message it showed.)
+        let texts: Vec<&str> = content
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|block| block["type"] == "text")
+            .map(|block| text(&block["text"]))
+            .collect();
+        let queued = |t: &str| self.queued.iter().any(|q| q == t.trim());
+        if texts.len() > 1 && texts.iter().all(|t| queued(t)) {
+            let mut events = vec![];
+            for t in &texts {
+                if let Some(i) = self.queued.iter().position(|q| q == t.trim()) {
+                    self.queued.remove(i);
+                }
+                events.push(json!({ "type": "user_message", "content": t }));
+            }
+            events.insert(0, self.queued_event());
+            return events;
+        }
+        let message = match content.as_str() {
+            Some(message) => message.to_string(),
+            None => texts.first().copied().unwrap_or_default().to_string(),
+        };
+        let trimmed = message.trim();
+        let mut events = Vec::new();
+        if let Some(i) = self.queued.iter().position(|q| q == trimmed) {
+            self.queued.remove(i);
+            events.push(self.queued_event());
+        }
+        if let Some(command) = shown_command(trimmed) {
+            events.push(json!({ "type": "user_message", "content": command }));
+            return events;
+        }
+        // A finished background task comes back as `task_done`. A message of
+        // images alone has no text but is the user's.
+        if trimmed.starts_with("<command-")
+            || trimmed.starts_with("<local-command-")
+            || trimmed.starts_with("<task-notification>")
+            || is_effort_echo(&message)
+            || (trimmed.is_empty() && !has_image(content))
+        {
+            return events;
+        }
+        events.push(json!({ "type": "user_message", "content": message }));
+        events
+    }
+
     fn on_result(&mut self, frame: &Value) -> Vec<Value> {
         self.active_turn = false;
         let was_interrupting = std::mem::take(&mut self.interrupting);
         let mut events = Vec::new();
+        // Stopped: what waited is not known to run; if it does, its replay
+        // still shows it.
+        if was_interrupting && !self.queued.is_empty() {
+            self.queued.clear();
+            events.push(self.queued_event());
+        }
         if let Some(usage) = frame["modelUsage"].as_object() {
             for (name, usage) in usage {
                 if let Some(window) = usage["contextWindow"].as_u64().filter(|w| *w > 0) {
@@ -2233,7 +2284,17 @@ impl Adapter for Claude {
 
     fn encode(&mut self, op: &Value) -> Result<Output, String> {
         let frames = match text(&op["op"]) {
-            "user_message" => vec![json!({ "type": "user", "message": { "role": "user", "content": Self::user_content(op) } }).to_string()],
+            "user_message" => {
+                let frames = vec![json!({ "type": "user", "message": { "role": "user", "content": Self::user_content(op) } }).to_string()];
+                // Mid-turn: queued until Claude Code takes it in.
+                let events = if self.active_turn {
+                    self.queued.push(text(&op["content"]).trim().to_string());
+                    vec![self.queued_event()]
+                } else {
+                    Vec::new()
+                };
+                return Ok(Output { events, frames });
+            }
             "approve" => {
                 let call = text(&op["call_id"]);
                 let Some((request_id, request)) = self.approvals.remove(call) else {
@@ -2604,21 +2665,123 @@ fn is_synthetic(row: &Value) -> bool {
     .any(|key| row[*key] == true)
 }
 
-fn row_text(row: &Value) -> Option<String> {
-    let content = &row["message"]["content"];
-    if let Some(text) = content.as_str() {
+/// Slash commands that show in the conversation as the user wrote them.
+/// Claude Code echoes a command as `<command-name>/goal</command-name>
+/// <command-message>…</command-message><command-args>…</command-args>`;
+/// other commands (settings, /compact) stay out of the conversation.
+const SHOWN_COMMANDS: &[&str] = &["/goal"];
+
+/// `/goal <its condition>` for an echoed command that shows.
+fn shown_command(text: &str) -> Option<String> {
+    let between = |open: &str, close: &str| {
+        let start = text.find(open)? + open.len();
+        let end = start + text[start..].find(close)?;
+        Some(text[start..end].trim())
+    };
+    let name = between("<command-name>", "</command-name>")?;
+    if !SHOWN_COMMANDS.contains(&name) {
+        return None;
+    }
+    let args = between("<command-args>", "</command-args>").unwrap_or_default();
+    Some(if args.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} {args}")
+    })
+}
+
+/// The user's or the model's text in a saved message: its text blocks,
+/// without the markup Claude Code adds (`<system-reminder>`, command echoes)
+/// except a command that shows.
+fn content_text(content: &Value) -> Option<String> {
+    let keep = |text: &str| {
         let text = text.trim();
-        return (!text.is_empty() && !text.starts_with('<')).then(|| text.to_string());
+        if text.starts_with('<') {
+            shown_command(text)
+        } else {
+            (!text.is_empty()).then(|| text.to_string())
+        }
+    };
+    if let Some(text) = content.as_str() {
+        return keep(text);
     }
     let text = content
         .as_array()?
         .iter()
         .filter(|block| block["type"] == "text")
         .filter_map(|block| block["text"].as_str())
-        .filter(|text| !text.trim().is_empty() && !text.trim_start().starts_with('<'))
+        .filter_map(keep)
         .collect::<Vec<_>>()
         .join("\n");
     (!text.is_empty()).then_some(text)
+}
+
+fn row_text(row: &Value) -> Option<String> {
+    content_text(&row["message"]["content"])
+}
+
+fn has_image(content: &Value) -> bool {
+    content
+        .as_array()
+        .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
+}
+
+/// A saved user message as a transcript item: its text and its images,
+/// which Claude Code keeps inline. They are written to `images` once (a
+/// file is named after its data), so the item names them by path, as a
+/// live echo does. A message of images alone shows too.
+fn user_item(content: &Value, images: &Path) -> Option<Value> {
+    let text = content_text(content);
+    let paths: Vec<String> = content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block["type"] == "image")
+        .filter_map(|block| saved_image(&block["source"], images))
+        .collect();
+    if text.is_none() && paths.is_empty() {
+        return None;
+    }
+    let mut item = json!({ "role": "user", "content": text.unwrap_or_default() });
+    if !paths.is_empty() {
+        item["images"] = json!(paths);
+    }
+    Some(item)
+}
+
+/// An inline image (`source`) as a file in `dir`, named after its data.
+fn saved_image(source: &Value, dir: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let ext = match text(&source["media_type"]) {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => return None,
+    };
+    let data = source["data"].as_str()?;
+    let digest = Sha256::digest(data.as_bytes());
+    let name: String = digest[..12].iter().map(|b| format!("{b:02x}")).collect();
+    let path = dir.join(format!("{name}.{ext}"));
+    if !path.is_file() {
+        let bytes = STANDARD.decode(data).ok()?;
+        fs::create_dir_all(dir).ok()?;
+        let part = dir.join(format!("{name}.{ext}.part"));
+        fs::write(&part, bytes).ok()?;
+        fs::rename(&part, &path).ok()?;
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// A message the user sent while a turn ran: Claude Code takes it in at the
+/// next tool boundary and saves it only as a `queued_command` attachment
+/// row (a finished background task's notification is one too, not shown).
+fn queued_prompt(row: &Value) -> Option<&Value> {
+    let attachment = &row["attachment"];
+    (row["type"] == "attachment"
+        && attachment["type"] == "queued_command"
+        && attachment["commandMode"] == "prompt")
+        .then_some(&attachment["prompt"])
 }
 
 fn rows(path: &Path, limit: u64) -> impl Iterator<Item = Value> {
@@ -2632,12 +2795,12 @@ fn rows(path: &Path, limit: u64) -> impl Iterator<Item = Value> {
 }
 
 /// The user and assistant text of a saved conversation, as transcript items
-/// (the newest 500).
-pub fn transcript(cwd: &Path, id: &str) -> Vec<Value> {
-    transcript_in(&home(), cwd, id)
+/// (the newest 500). The user's images are written under `uploads`.
+pub fn transcript(cwd: &Path, id: &str, uploads: &Path) -> Vec<Value> {
+    transcript_in(&home(), cwd, id, &uploads.join("claude"))
 }
 
-fn transcript_in(home: &Path, cwd: &Path, id: &str) -> Vec<Value> {
+fn transcript_in(home: &Path, cwd: &Path, id: &str, images: &Path) -> Vec<Value> {
     if !is_conversation_id(id) {
         return vec![];
     }
@@ -2645,9 +2808,14 @@ fn transcript_in(home: &Path, cwd: &Path, id: &str) -> Vec<Value> {
         &project_dir(home, cwd).join(format!("{id}.jsonl")),
         64 * 1024 * 1024,
     )
-    .filter(|row| matches!(text(&row["type"]), "user" | "assistant") && !is_synthetic(row))
-    .filter_map(|row| {
-        row_text(&row).map(|content| json!({ "role": row["type"], "content": content }))
+    .filter(|row| !is_synthetic(row))
+    .filter_map(|row| match text(&row["type"]) {
+        "user" => user_item(&row["message"]["content"], images),
+        "assistant" => {
+            row_text(&row).map(|content| json!({ "role": "assistant", "content": content }))
+        }
+        "attachment" => queued_prompt(&row).and_then(|prompt| user_item(prompt, images)),
+        _ => None,
     })
     .collect();
     let excess = items.len().saturating_sub(500);
@@ -3669,6 +3837,166 @@ mod tests {
             json!({ "type": "user", "isReplay": true, "message": { "content": "/effort high" } })
         )
         .is_empty());
+        // A goal is what the user asked for: it shows.
+        let goal = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": "<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>tests pass</command-args>" } }),
+        );
+        assert_eq!(
+            goal,
+            vec![json!({ "type": "user_message", "content": "/goal tests pass" })]
+        );
+    }
+
+    /// A Claude Code session with a turn running.
+    fn mid_turn() -> Claude {
+        let mut c = claude();
+        assert!(c
+            .encode(&json!({ "op": "user_message", "content": "first" }))
+            .unwrap()
+            .events
+            .is_empty());
+        frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "status", "status": "requesting" }),
+        );
+        c
+    }
+
+    #[test]
+    fn a_message_sent_mid_turn_shows_as_queued_until_claude_takes_it_in() {
+        let mut c = mid_turn();
+        let queued = c
+            .encode(&json!({ "op": "user_message", "content": "also this " }))
+            .unwrap();
+        assert_eq!(queued.frames.len(), 1);
+        assert_eq!(
+            queued.events,
+            vec![json!({ "type": "pending_messages", "messages": ["also this"] })]
+        );
+        let taken = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "also this " }] } }),
+        );
+        assert_eq!(
+            taken,
+            vec![
+                json!({ "type": "pending_messages", "messages": [] }),
+                json!({ "type": "user_message", "content": "also this " })
+            ]
+        );
+        // Stopped with one waiting: the queue empties.
+        c.encode(&json!({ "op": "user_message", "content": "later" }))
+            .unwrap();
+        c.encode(&json!({ "op": "interrupt" })).unwrap();
+        let ended = frame(
+            &mut c,
+            json!({ "type": "result", "subtype": "error_during_execution", "is_error": true }),
+        );
+        assert_eq!(
+            ended[0],
+            json!({ "type": "pending_messages", "messages": [] })
+        );
+    }
+
+    #[test]
+    fn queued_messages_taken_in_together_each_show_as_sent() {
+        let mut c = mid_turn();
+        for text in ["apple", "banana"] {
+            c.encode(&json!({ "op": "user_message", "content": text }))
+                .unwrap();
+        }
+        let taken = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "apple" }, { "type": "text", "text": "banana" }] } }),
+        );
+        assert_eq!(
+            taken,
+            vec![
+                json!({ "type": "pending_messages", "messages": [] }),
+                json!({ "type": "user_message", "content": "apple" }),
+                json!({ "type": "user_message", "content": "banana" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_message_of_images_alone_is_echoed() {
+        let mut c = mid_turn();
+        let image = json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AA==" } });
+        let queued = c
+            .encode(&json!({ "op": "user_message", "content": "", "images": ["/no/such.png"] }))
+            .unwrap();
+        assert_eq!(
+            queued.events,
+            vec![json!({ "type": "pending_messages", "messages": [""] })]
+        );
+        let taken = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "" }, image] } }),
+        );
+        assert_eq!(
+            taken,
+            vec![
+                json!({ "type": "pending_messages", "messages": [] }),
+                json!({ "type": "user_message", "content": "" })
+            ]
+        );
+        // Nothing to show without text or image.
+        assert!(frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "" }] } })
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn saved_messages_keep_their_images_and_queued_messages() {
+        let home = std::env::temp_dir().join(format!("claude-images-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let cwd = Path::new("/work/pics");
+        let dir = home.join(".claude/projects/-work-pics");
+        fs::create_dir_all(&dir).unwrap();
+        let png = STANDARD.encode(b"png bytes");
+        let image = json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": png } });
+        fs::write(
+            dir.join("33-44.jsonl"),
+            [
+                json!({ "type": "user", "message": { "content": [{ "type": "text", "text": "" }, image] } }),
+                json!({ "type": "user", "isMeta": true, "message": { "content": [{ "type": "text", "text": "[Image: source: /tmp/1.png]" }] } }),
+                json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "red" }] } }),
+                json!({ "type": "user", "message": { "content": [{ "type": "text", "text": "and this" }, image] } }),
+                // As claude 2.1.302 saves messages sent mid-turn.
+                json!({ "type": "attachment", "attachment": { "type": "queued_command", "prompt": [{ "type": "text", "text": "apple" }], "commandMode": "prompt" } }),
+                json!({ "type": "attachment", "attachment": { "type": "queued_command", "prompt": [image], "commandMode": "prompt" } }),
+                json!({ "type": "attachment", "attachment": { "type": "queued_command", "prompt": "<task-notification>", "commandMode": "task-notification" } }),
+                json!({ "type": "user", "message": { "content": "<command-name>/goal</command-name><command-args>done</command-args>" } }),
+            ]
+            .iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>(),
+        )
+        .unwrap();
+        let images = home.join("images");
+        let items = transcript_in(&home, cwd, "33-44", &images);
+        let path = items[0]["images"][0].as_str().unwrap().to_string();
+        assert!(path.starts_with(images.to_str().unwrap()) && path.ends_with(".png"));
+        assert_eq!(fs::read(&path).unwrap(), b"png bytes");
+        assert_eq!(
+            items,
+            vec![
+                json!({ "role": "user", "content": "", "images": [path] }),
+                json!({ "role": "assistant", "content": "red" }),
+                json!({ "role": "user", "content": "and this", "images": [path] }),
+                json!({ "role": "user", "content": "apple" }),
+                json!({ "role": "user", "content": "", "images": [path] }),
+                json!({ "role": "user", "content": "/goal done" }),
+            ]
+        );
+        // Read again: the same file.
+        assert_eq!(transcript_in(&home, cwd, "33-44", &images), items);
+        assert_eq!(fs::read_dir(&images).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -3790,7 +4118,7 @@ mod tests {
             .collect::<String>(),
         )
         .unwrap();
-        let items = transcript_in(&home, cwd, "11-22");
+        let items = transcript_in(&home, cwd, "11-22", &home.join("images"));
         let listed = saved_in(&home, cwd);
         assert_eq!(
             items,
@@ -3801,7 +4129,7 @@ mod tests {
         );
         assert_eq!(listed[0].0, "11-22");
         assert_eq!(listed[0].1, "hello there");
-        assert!(transcript_in(&home, cwd, "../etc").is_empty());
+        assert!(transcript_in(&home, cwd, "../etc", &home.join("images")).is_empty());
 
         // A symlinked directory is saved under its real path.
         let real = home.join("real-dir");

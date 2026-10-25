@@ -463,6 +463,9 @@ const STATE_EVENTS: &[&str] = &[
     "plan",
     "rate_limit",
     "plan_usage",
+    // Messages waiting for the turn: a client that attaches (another device,
+    // a desktop back from elsewhere) shows them too.
+    "pending_messages",
 ];
 
 impl Snapshot {
@@ -752,8 +755,11 @@ impl Session<'_> {
         let mut adapter = adapter(self.kind, &self.cwd, &options);
         process.write(adapter.start());
         // A new process runs no background task yet (the last one's went with
-        // it); Claude Code reports none at startup.
-        self.publish(vec![json!({ "type": "background_tasks", "tasks": [] })]);
+        // it); Claude Code reports none at startup. Nothing waits for it.
+        self.publish(vec![
+            json!({ "type": "background_tasks", "tasks": [] }),
+            json!({ "type": "pending_messages", "messages": [] }),
+        ]);
         // What the process runs as now (a restart changes it).
         let mut current = options.clone();
         loop {
@@ -857,9 +863,11 @@ impl Session<'_> {
                             process = started;
                             adapter = self::adapter(self.kind, &self.cwd, &next);
                             process.write(adapter.start());
-                            // The new process runs nothing yet.
+                            // The new process runs nothing yet and nothing
+                            // waits for it.
                             let mut events = notices(said);
                             events.push(json!({ "type": "background_tasks", "tasks": [] }));
+                            events.push(json!({ "type": "pending_messages", "messages": [] }));
                             self.publish(events);
                         }
                         Err(error) => {
@@ -879,8 +887,12 @@ impl Session<'_> {
                         // The TUI resumes the conversation file at once: no
                         // grace period in which a cut-off turn still writes it.
                         process.kill();
-                        // Its background tasks went with the process.
-                        let mut ended = vec![json!({ "type": "background_tasks", "tasks": [] })];
+                        // Its background tasks and the messages waiting
+                        // for it went with the process.
+                        let mut ended = vec![
+                            json!({ "type": "background_tasks", "tasks": [] }),
+                            json!({ "type": "pending_messages", "messages": [] }),
+                        ];
                         if busy {
                             ended.push(json!({ "type": "status", "message": "interrupted" }));
                         }
@@ -903,7 +915,7 @@ impl Session<'_> {
     /// TUI resume it).
     fn saved(&self, id: &str) -> bool {
         match self.kind {
-            Kind::Claude => !claude::transcript(&self.cwd, id).is_empty(),
+            Kind::Claude => !claude::transcript(&self.cwd, id, self.hub.uploads.dir()).is_empty(),
             Kind::Codex => codex::saved(&self.cwd)
                 .iter()
                 .any(|(saved, ..)| saved == id),
@@ -1049,7 +1061,7 @@ impl Session<'_> {
                 // Codex replays its thread when it resumes; Claude Code's
                 // conversation is read from its file.
                 if self.kind == Kind::Claude {
-                    events.push(json!({ "type": "transcript", "items": claude::transcript(&self.cwd, &id) }));
+                    events.push(json!({ "type": "transcript", "items": claude::transcript(&self.cwd, &id, self.hub.uploads.dir()) }));
                 }
                 self.publish(events);
                 Some((started, engine, next))
@@ -1507,6 +1519,22 @@ mod tests {
         let mut plain = Snapshot::default();
         plain.apply(&json!({ "type": "model_status", "model": "m" }));
         assert!(plain.events(false)[0].get("state").is_none());
+    }
+
+    #[test]
+    fn a_client_that_attaches_sees_the_messages_waiting_for_the_turn() {
+        let mut snapshot = Snapshot::default();
+        snapshot.apply(&json!({ "type": "pending_messages", "messages": ["one"] }));
+        snapshot.apply(&json!({ "type": "pending_messages", "messages": ["one", "two"] }));
+        let events = snapshot.events(true);
+        let queued: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["type"] == "pending_messages")
+            .collect();
+        assert_eq!(
+            queued,
+            [&json!({ "type": "pending_messages", "messages": ["one", "two"] })]
+        );
     }
 
     #[test]

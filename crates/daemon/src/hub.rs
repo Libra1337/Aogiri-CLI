@@ -631,7 +631,9 @@ impl Hub {
                     engines::Kind::Acp => record.conversation.is_some(),
                 };
                 let transcript = match kind {
-                    engines::Kind::Claude => engines::claude::transcript(&record.cwd, id),
+                    engines::Kind::Claude => {
+                        engines::claude::transcript(&record.cwd, id, self.uploads.dir())
+                    }
                     engines::Kind::Codex | engines::Kind::Acp => Vec::new(),
                 };
                 // A client that does not say (a phone) keeps how it last ran.

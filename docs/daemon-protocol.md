@@ -471,6 +471,17 @@ always with `always_scope: "rule"` (a Codex exec rule). Subagents are
 threads of their own: their events feed `agent_runs` and
 `subagent_lifecycle`, never the conversation.
 
+A message sent while a Claude Code turn runs goes to Claude Code at once,
+which takes it into the running turn at its next tool boundary (or runs it
+as the next turn). Until Claude Code takes it in, it is listed in
+`pending_messages` (also part of a watcher's snapshot); its `user_message`
+comes when it is taken in, one each for messages taken in together. An
+`interrupt` empties the list. A reopened conversation keeps these messages
+(Claude Code saves them as `queued_command` rows), the images of every user
+message (written once under `~/.lynshen/uploads/claude` and named by path in
+`images`) and a `/goal <condition>` command as the user wrote it; other
+slash commands stay out of the conversation.
+
 And sends more events: `background_tasks` (`tasks: [{id, kind,
 description}]`, the live set: replace yours), `task_progress` (`task_id`,
 `message`), `task_done` (`task_id`, `kind`, `status`, `summary`: a background
