@@ -14,11 +14,12 @@ use crate::hub::Hub;
 use lynshen_agent_core::process_group::{self, ProcessGroup};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
         Arc,
     },
@@ -103,6 +104,9 @@ pub struct Options {
     /// state in, once found (`claude::config_with`, or its `initialize`
     /// reply; set by the daemon, never by a client).
     pub claude_config: Option<PathBuf>,
+    /// Claude / Codex: the app's tools the engine is offered (the ones the
+    /// user left on when it started; set by the daemon, never by a client).
+    pub app_tools: Vec<&'static str>,
 }
 
 impl Options {
@@ -144,6 +148,7 @@ impl Options {
             acp_agent: Some(value["acp_agent"].clone())
                 .filter(|agent| agent["id"].is_string() && agent["name"].is_string()),
             claude_config: None,
+            app_tools: Vec::new(),
         }
     }
 
@@ -191,6 +196,28 @@ impl Output {
     }
 }
 
+/// The engine called one of the app's tools (`app_tools`); `token` is how
+/// the adapter finds the request to answer.
+#[derive(Debug)]
+pub struct HostCall {
+    pub token: Value,
+    pub name: String,
+    pub args: Value,
+}
+
+/// The app tools an engine of `kind` starting now is offered: none for an
+/// ACP agent.
+fn app_tools_for(kind: Kind) -> Vec<&'static str> {
+    match kind {
+        Kind::Acp => Vec::new(),
+        Kind::Claude | Kind::Codex => crate::app_tools::enabled(&crate::app_tools::config()),
+    }
+}
+
+/// A session tool's result on its way back from its thread: (which engine
+/// process asked, token, result).
+type Answer = (u64, Value, Result<Value, String>);
+
 pub trait Adapter: Send {
     /// Frames to send once the engine started.
     fn start(&mut self) -> Vec<String>;
@@ -220,6 +247,14 @@ pub trait Adapter: Send {
     /// A mode switch reaches the running turn (else it applies to the next).
     fn mode_applies_live(&self) -> bool {
         true
+    }
+    /// The app-tool calls the engine made since last asked.
+    fn take_calls(&mut self) -> Vec<HostCall> {
+        Vec::new()
+    }
+    /// Frames answering a `HostCall` with the tool's result.
+    fn answer(&mut self, _token: &Value, _result: Result<Value, String>) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -738,6 +773,7 @@ pub fn spawn(
         } else {
             options.approval_mode
         },
+        app_tools: app_tools_for(kind),
         ..options
     };
     let Start {
@@ -777,6 +813,11 @@ pub fn spawn(
             tui_request: None,
             conversation,
             opencode,
+            app_approvals: HashMap::new(),
+            app_approval_seq: 0,
+            app_stops: Vec::new(),
+            process_seq: 0,
+            app_answers: None,
         };
         session.snapshot.seed(transcript);
         // A resumed conversation is ready once the engine has opened it.
@@ -834,6 +875,17 @@ struct Session<'a> {
     conversation: Option<String>,
     /// The ACP agent is OpenCode (approval modes, LynShen gateway).
     opencode: bool,
+    /// Session-tool calls waiting for the user's approval, by the call id
+    /// of the `approval_request` shown for them.
+    app_approvals: HashMap<String, HostCall>,
+    app_approval_seq: u64,
+    /// Turns true for the session-tool calls running now when the turn is
+    /// interrupted or the engine stops (`send_to_session` may wait).
+    app_stops: Vec<Arc<AtomicBool>>,
+    /// Counts engine processes: an answer for an earlier one is dropped.
+    process_seq: u64,
+    /// Where session tools' threads send their answers (set by `run`).
+    app_answers: Option<Sender<Answer>>,
 }
 
 impl Drop for Session<'_> {
@@ -841,6 +893,7 @@ impl Drop for Session<'_> {
         if let Some(key) = self.gateway_key.take() {
             release_key(self.kind, &key);
         }
+        self.stop_app_calls();
     }
 }
 
@@ -880,7 +933,15 @@ impl Session<'_> {
         ]);
         // What the process runs as now (a restart changes it).
         let mut current = options.clone();
+        // Session tools answer from their own threads (they may wait).
+        let (answers_tx, answers) = mpsc::channel::<Answer>();
+        self.app_answers = Some(answers_tx);
         loop {
+            while let Ok((seq, token, result)) = answers.try_recv() {
+                if seq == self.process_seq {
+                    process.write(adapter.answer(&token, result));
+                }
+            }
             loop {
                 match ops.try_recv() {
                     Ok(op) => {
@@ -930,6 +991,7 @@ impl Session<'_> {
                         }
                         let output = adapter.translate(line);
                         process.write(output.frames);
+                        self.host_calls(&process, adapter.as_mut(), &current);
                         if self.id.is_none() {
                             if let Some(id) = adapter.conversation() {
                                 self.named(id);
@@ -990,6 +1052,8 @@ impl Session<'_> {
                     next.command = options.command.clone();
                     next.args = options.args.clone();
                     next.quiet = true;
+                    next.app_tools = app_tools_for(self.kind);
+                    self.new_process();
                     current = next.clone();
                     process.stop();
                     let id = self.id.clone().unwrap_or_default();
@@ -1040,6 +1104,7 @@ impl Session<'_> {
                             ended.push(json!({ "type": "status", "message": "interrupted" }));
                         }
                         self.publish(ended);
+                        self.new_process();
                         match self.terminal(tui, keep, &request, &ops) {
                             Some((started, next, options)) => {
                                 process = started;
@@ -1304,7 +1369,15 @@ impl Session<'_> {
                 if name == "approve" {
                     if let Some(call) = op["call_id"].as_str() {
                         self.snapshot.answered(call);
+                        if self.app_approvals.contains_key(call) {
+                            let allow = op["decision"] != "deny";
+                            self.decide_app_call(process, adapter, call, allow);
+                            return false;
+                        }
                     }
+                }
+                if name == "interrupt" {
+                    self.stop_app_calls();
                 }
                 if let Some(id) = &self.id {
                     self.hub.note_sent_images(id, op);
@@ -1321,6 +1394,107 @@ impl Session<'_> {
                 false
             }
         }
+    }
+
+    /// Runs the app-tool calls the engine made: a turned-off one is refused,
+    /// `present_files` and `propose_schedule` run here, a session tool runs
+    /// on its own thread (answered through `app_answers`), after the user's
+    /// approval where a LynShen session's would ask (`engine_gate`).
+    fn host_calls(&mut self, process: &Process, adapter: &mut dyn Adapter, current: &Options) {
+        for call in adapter.take_calls() {
+            let name = call.name.as_str();
+            // A resumed Codex thread keeps the tools it started with.
+            if !current.app_tools.contains(&name) || !crate::app_tools::is_on(name) {
+                let refused = Err(crate::app_tools::turned_off(name));
+                process.write(adapter.answer(&call.token, refused));
+                continue;
+            }
+            if !lynshen_agent_core::app_tools::SESSION_TOOLS.contains(&name) {
+                let result = crate::app_tools::run(name, &call.args, &self.cwd);
+                process.write(adapter.answer(&call.token, result));
+                continue;
+            }
+            let Some(session) = self.id.clone() else {
+                let early = Err("the session is not open yet".to_string());
+                process.write(adapter.answer(&call.token, early));
+                continue;
+            };
+            match crate::session_messages::engine_gate(self.hub, &session, name) {
+                None => self.run_session_tool(call),
+                Some(must_ask) => {
+                    self.app_approval_seq += 1;
+                    let id = format!("app-approval-{}", self.app_approval_seq);
+                    let summary = crate::session_messages::summary(self.hub, name, &call.args);
+                    let event = json!({
+                        "type": "approval_request",
+                        "call_id": id,
+                        "name": name,
+                        "summary": summary,
+                        "subagent_id": null,
+                        "hunks": null,
+                        "kind": "tool",
+                        "must_ask": must_ask,
+                        "scopes": ["once"],
+                    });
+                    self.app_approvals.insert(id, call);
+                    self.publish(vec![event]);
+                }
+            }
+        }
+    }
+
+    /// Runs a session tool on its own thread; its answer comes back to
+    /// `run`'s loop (`app_answers`).
+    fn run_session_tool(&mut self, call: HostCall) {
+        let (Some(hub), Some(session), Some(answers)) =
+            (self.hub.handle(), self.id.clone(), self.app_answers.clone())
+        else {
+            return;
+        };
+        let stopped = Arc::new(AtomicBool::new(false));
+        self.app_stops.retain(|stop| !stop.load(Ordering::SeqCst));
+        self.app_stops.push(Arc::clone(&stopped));
+        let seq = self.process_seq;
+        thread::spawn(move || {
+            let result =
+                crate::session_messages::call(&hub, &session, &call.name, &call.args, &stopped);
+            stopped.store(true, Ordering::SeqCst);
+            let _ = answers.send((seq, call.token, result));
+        });
+    }
+
+    /// The user decided a session-tool call that waited for approval.
+    fn decide_app_call(
+        &mut self,
+        process: &mut Process,
+        adapter: &mut dyn Adapter,
+        call: &str,
+        allow: bool,
+    ) {
+        let Some(host) = self.app_approvals.remove(call) else {
+            return;
+        };
+        if allow {
+            self.run_session_tool(host);
+            return;
+        }
+        let denied = Err("The user denied this tool use.".to_string());
+        process.write(adapter.answer(&host.token, denied));
+    }
+
+    /// Session-tool calls waiting for a reply give up (the turn was
+    /// interrupted, or the engine stopped).
+    fn stop_app_calls(&mut self) {
+        for stop in self.app_stops.drain(..) {
+            stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A new engine process: calls of the last one are answered no more.
+    fn new_process(&mut self) {
+        self.process_seq += 1;
+        self.stop_app_calls();
+        self.app_approvals.clear();
     }
 
     fn tagged(&self, mut event: Value) -> Value {
@@ -1376,6 +1550,7 @@ impl Session<'_> {
                 .snapshot
                 .approvals
                 .iter()
+                .filter(|(_, request)| request["must_ask"] != true)
                 .map(|(call, _)| call.clone())
                 .collect();
             for call in open {
@@ -1398,7 +1573,8 @@ impl Session<'_> {
         let mut kept = Vec::with_capacity(events.len());
         for event in events {
             match event["call_id"].as_str() {
-                Some(call) if event["type"] == "approval_request" => {
+                // One that asks in every mode (`sessions.messages` ask) still asks.
+                Some(call) if event["type"] == "approval_request" && event["must_ask"] != true => {
                     let call = call.to_string();
                     self.allow(process, adapter, &call);
                 }
@@ -1409,6 +1585,11 @@ impl Session<'_> {
     }
 
     fn allow(&mut self, process: &mut Process, adapter: &mut dyn Adapter, call: &str) {
+        if self.app_approvals.contains_key(call) {
+            self.snapshot.answered(call);
+            self.decide_app_call(process, adapter, call, true);
+            return;
+        }
         let op = json!({ "op": "approve", "call_id": call, "decision": "allow" });
         match adapter.encode(&op) {
             Ok(output) => {

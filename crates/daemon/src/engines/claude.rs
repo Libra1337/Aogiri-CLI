@@ -42,10 +42,10 @@
 
 mod runs;
 
-use super::{home, op_files, resolve, set_files, Adapter, Line, Options, Output};
+use super::{home, op_files, resolve, set_files, Adapter, HostCall, Line, Options, Output};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use lynshen_agent_core::{
-    attachments,
+    app_tools, attachments,
     queue::{queue_move_target, QueuePick},
 };
 use serde_json::{json, Value};
@@ -66,6 +66,11 @@ const EDIT_PREVIEW_EVERY: Duration = Duration::from_millis(200);
 /// The API takes an image of at most 5 MB base64 (3.75 MB raw); larger ones
 /// stay files the model opens with Read, which downsizes them.
 const IMAGE_CAP: u64 = 3_750_000;
+
+/// The in-process MCP server carrying the app's tools (see `command`).
+const MCP_SERVER: &str = "lynshen";
+/// What Claude Code calls its tools: `mcp__<server>__<tool>`.
+const MCP_PREFIX: &str = "mcp__lynshen__";
 
 /// Settings files written for gateway keys (see `use_gateway`).
 static GATEWAY_FILES: std::sync::Mutex<Vec<(String, std::path::PathBuf)>> =
@@ -146,6 +151,21 @@ pub fn command(id: &str, options: &Options) -> Command {
     ]);
     // Without a prompt tool the CLI drops AskUserQuestion, even in full access.
     command.args(["--permission-prompt-tool", "stdio"]);
+    // The app's tools, served in-process over the control channel
+    // (`mcp_message`). Claude Code runs them without asking: the daemon asks
+    // where a LynShen session would. With all of them off there is no server.
+    if !options.app_tools.is_empty() {
+        command.arg("--mcp-config").arg(
+            json!({ "mcpServers": { MCP_SERVER: { "type": "sdk", "name": MCP_SERVER } } })
+                .to_string(),
+        );
+        let allowed: Vec<String> = options
+            .app_tools
+            .iter()
+            .map(|name| format!("{MCP_PREFIX}{name}"))
+            .collect();
+        command.args(["--allowedTools", &allowed.join(",")]);
+    }
     let mode = to_claude_mode(options.approval_mode.as_deref().unwrap_or_default());
     if mode == "bypassPermissions" {
         command.arg("--dangerously-skip-permissions");
@@ -260,7 +280,11 @@ fn tool_name(name: &str) -> &str {
         "Grep" | "Glob" => "ripgrep",
         "WebSearch" => "web_search",
         "WebFetch" => "web_fetch",
-        other => other,
+        // The app's tools by their own names, as LynShen sessions show them.
+        other => other
+            .strip_prefix(MCP_PREFIX)
+            .filter(|name| app_tools::NAMES.contains(name))
+            .unwrap_or(other),
     }
 }
 
@@ -512,6 +536,15 @@ fn card_json(name: &str, input: &Value) -> String {
         _ => input.clone(),
     };
     card.to_string()
+}
+
+/// The control response carrying an MCP server's JSON-RPC `response`.
+fn mcp_reply(request_id: &Value, response: Value) -> String {
+    json!({ "type": "control_response", "response": {
+        "subtype": "success", "request_id": request_id,
+        "response": { "mcp_response": response },
+    } })
+    .to_string()
 }
 
 fn cap(text: String) -> String {
@@ -841,6 +874,10 @@ pub struct Claude {
     /// The user's program and its environment (`ProbeKey`), which the
     /// directory Claude Code reports is remembered for.
     program: Option<ProbeKey>,
+    /// The app's tools this process serves (`command` offered them).
+    app_tools: Vec<&'static str>,
+    /// App-tool calls waiting for the daemon.
+    calls: Vec<HostCall>,
 }
 
 impl Claude {
@@ -892,6 +929,8 @@ impl Claude {
             commands: Vec::new(),
             config: known_config(options).unwrap_or_else(|| config_dir_in(&options.env)),
             program: options.bin.clone().map(|bin| (bin, options.env.clone())),
+            app_tools: options.app_tools.clone(),
+            calls: Vec::new(),
         }
     }
 
@@ -1795,6 +1834,52 @@ impl Claude {
         events
     }
 
+    /// A JSON-RPC message for the in-process MCP server: `initialize` and
+    /// the tool list are answered here, a tool call waits for the daemon
+    /// (`answer`); a notification gets the empty reply Claude Code expects.
+    fn on_mcp_message(&mut self, request_id: &str, message: &Value) -> Output {
+        let id = &message["id"];
+        let response = match text(&message["method"]) {
+            _ if id.is_null() => json!({ "jsonrpc": "2.0", "result": {}, "id": 0 }),
+            "initialize" => json!({ "jsonrpc": "2.0", "id": id, "result": {
+                "protocolVersion": message["params"]["protocolVersion"],
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": MCP_SERVER, "version": env!("CARGO_PKG_VERSION") },
+            } }),
+            "tools/list" => {
+                // Always in the prompt, not behind tool search: the model
+                // should think of them without looking.
+                let tools: Vec<Value> = app_tools::definitions(&self.app_tools)
+                    .into_iter()
+                    .map(|tool| {
+                        json!({
+                            "name": tool["name"], "description": tool["description"],
+                            "inputSchema": tool["parameters"],
+                            "_meta": { "anthropic/alwaysLoad": true },
+                        })
+                    })
+                    .collect();
+                json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tools } })
+            }
+            "tools/call" => {
+                self.calls.push(HostCall {
+                    token: json!({ "request_id": request_id, "id": id }),
+                    name: text(&message["params"]["name"]).to_string(),
+                    args: object(&message["params"]["arguments"]),
+                });
+                return Output::default();
+            }
+            "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+            method => json!({ "jsonrpc": "2.0", "id": id, "error": {
+                "code": -32601, "message": format!("unknown method {method}"),
+            } }),
+        };
+        Output {
+            events: Vec::new(),
+            frames: vec![mcp_reply(&json!(request_id), response)],
+        }
+    }
+
     fn on_control_request(&mut self, frame: &Value) -> Output {
         let request = &frame["request"];
         let request_id = text(&frame["request_id"]).to_string();
@@ -1814,6 +1899,9 @@ impl Claude {
             });
             self.approvals.insert(call, (request_id, request.clone()));
             return Output::events(vec![event]);
+        }
+        if request["subtype"] == "mcp_message" && request["server_name"] == MCP_SERVER {
+            return self.on_mcp_message(&request_id, &request["message"]);
         }
         if request["subtype"] != "can_use_tool" {
             let subtype = text(&request["subtype"]);
@@ -2903,8 +2991,14 @@ impl Adapter for Claude {
         // The command list with descriptions, before the first turn. The
         // desktop has a stop button per background task, so an interrupt
         // spares them.
+        // The in-process server, unless `command` left it out.
+        let servers: &[&str] = if self.app_tools.is_empty() {
+            &[]
+        } else {
+            &[MCP_SERVER]
+        };
         frames.push(self.control_request(
-            json!({ "subtype": "initialize", "promptSuggestions": true, "agentProgressSummaries": true, "perTaskStopAffordance": true }),
+            json!({ "subtype": "initialize", "promptSuggestions": true, "agentProgressSummaries": true, "perTaskStopAffordance": true, "sdkMcpServers": servers }),
             "",
         ));
         if self.ultracode {
@@ -2963,6 +3057,21 @@ impl Adapter for Claude {
             resume_at: None,
             ..self.keep(Options::default())
         })
+    }
+
+    fn take_calls(&mut self) -> Vec<HostCall> {
+        std::mem::take(&mut self.calls)
+    }
+
+    fn answer(&mut self, token: &Value, result: Result<Value, String>) -> Vec<String> {
+        let (body, is_error) = match result {
+            Ok(output) => (output.to_string(), false),
+            Err(error) => (json!({ "error": error }).to_string(), true),
+        };
+        let response = json!({ "jsonrpc": "2.0", "id": token["id"], "result": {
+            "content": [{ "type": "text", "text": body }], "isError": is_error,
+        } });
+        vec![mcp_reply(&token["request_id"], response)]
     }
 
     fn keep(&self, options: Options) -> Options {
@@ -3599,6 +3708,95 @@ mod tests {
 
     fn frame(claude: &mut Claude, value: Value) -> Vec<Value> {
         claude.translate(Line::Frame(value)).events
+    }
+
+    #[test]
+    fn app_tools_are_served_in_process() {
+        let options = Options {
+            app_tools: vec!["present_files", "propose_schedule", "send_to_session"],
+            ..Options::default()
+        };
+        let mut c = Claude::new(&options);
+        let init = c.start();
+        assert!(
+            init.iter()
+                .any(|frame| frame.contains("\"sdkMcpServers\":[\"lynshen\"]")),
+            "{init:?}"
+        );
+        let mcp = |id: u64, message: Value| {
+            Line::Frame(
+                json!({ "type": "control_request", "request_id": format!("m{id}"), "request": { "subtype": "mcp_message", "server_name": "lynshen", "message": message } }),
+            )
+        };
+        let listed = c.translate(mcp(
+            1,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        ));
+        let reply: Value = serde_json::from_str(&listed.frames[0]).unwrap();
+        let tools = &reply["response"]["response"]["mcp_response"]["result"]["tools"];
+        assert_eq!(tools.as_array().unwrap().len(), 3);
+        assert_eq!(tools[0]["name"], "present_files");
+        assert_eq!(tools[0]["_meta"]["anthropic/alwaysLoad"], true);
+        assert!(tools[0]["inputSchema"]["properties"]["files"].is_object());
+        let notified = c.translate(mcp(
+            2,
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        ));
+        assert_eq!(notified.frames.len(), 1);
+        let called = c.translate(mcp(3, json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": "present_files", "arguments": { "files": ["a.mp4"] } } })));
+        assert!(called.frames.is_empty());
+        let calls = c.take_calls();
+        assert_eq!((calls.len(), calls[0].name.as_str()), (1, "present_files"));
+        let answer: Value =
+            serde_json::from_str(&c.answer(&calls[0].token, Err("no such file: a.mp4".into()))[0])
+                .unwrap();
+        assert_eq!(answer["response"]["request_id"], "m3");
+        let response = &answer["response"]["response"]["mcp_response"];
+        assert_eq!(
+            (
+                response["id"].as_u64(),
+                response["result"]["isError"].as_bool()
+            ),
+            (Some(7), Some(true))
+        );
+        assert_eq!(tool_name("mcp__lynshen__present_files"), "present_files");
+        assert_eq!(tool_name("mcp__lynshen__other"), "mcp__lynshen__other");
+        let args: Vec<String> = command("s", &options)
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        let allowed = args.iter().find(|arg| arg.starts_with("mcp__lynshen__")).unwrap();
+        assert_eq!(
+            allowed,
+            "mcp__lynshen__present_files,mcp__lynshen__propose_schedule,mcp__lynshen__send_to_session"
+        );
+        // All off: no server at all.
+        let none: Vec<String> = command("s", &Options::default())
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert!(!none
+            .iter()
+            .any(|arg| arg == "--mcp-config" || arg == "--allowedTools"));
+        assert!(claude()
+            .start()
+            .iter()
+            .any(|frame| frame.contains("\"sdkMcpServers\":[]")));
+    }
+
+    #[test]
+    fn replay_keeps_app_tool_cards_by_their_names() {
+        let mut calls = HashMap::new();
+        let call = json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": "t1", "name": "mcp__lynshen__present_files", "input": { "files": ["a.html"] } }] } });
+        assert!(tool_rows(&call, &mut calls).is_empty());
+        let result = json!({ "type": "user", "message": { "content": [
+            { "type": "tool_result", "tool_use_id": "t1", "content": [{ "type": "text", "text": "{\"files\":[]}" }] },
+        ] } });
+        let rows = tool_rows(&result, &mut calls);
+        assert_eq!(
+            (rows[0]["name"].as_str(), rows[0]["output"].as_str()),
+            (Some("present_files"), Some("{\"files\":[]}"))
+        );
     }
 
     fn types(events: &[Value]) -> Vec<&str> {

@@ -49,7 +49,7 @@ pub fn definitions(names: &[&str]) -> Vec<Value> {
 fn definition(name: &str) -> Option<Value> {
     let (description, parameters) = match name {
         PRESENT_FILES => (
-            "Show the user the files this task made for them (a report, document, spreadsheet, slides, image, video, web page, export or build), as cards they can open. Call it once, at the end, most important first, each with a one-line description. Not for source files you edited, intermediate files or logs.",
+            "Show the user the deliverables you made (report, slides, image, video, page, build) as cards. Once, at the end, most important first; not edited source or logs.",
             json!({
                 "type": "object",
                 "properties": {
@@ -58,32 +58,29 @@ fn definition(name: &str) -> Option<Value> {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "path": { "type": "string", "description": "Absolute, or relative to the working directory." },
+                                "path": { "type": "string" },
                                 "description": { "type": "string" }
                             },
-                            "required": ["path"],
-                            "additionalProperties": false
+                            "required": ["path"]
                         }
                     }
                 },
-                "required": ["files"],
-                "additionalProperties": false
+                "required": ["files"]
             }),
         ),
         PROPOSE_SCHEDULE => (
-            "Propose a scheduled task: a prompt run at set local times in this project, e.g. a daily test run. The user sees it as a card and decides whether to create it; nothing is scheduled before that. The prompt must stand alone.",
+            "Propose a task run at set local times in this project. The user decides from a card; nothing runs before. The prompt must stand alone.",
             json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string" },
                     "prompt": { "type": "string" },
                     "repeat": { "type": "string", "enum": ["once", "hourly", "daily", "weekdays", "weekly"] },
-                    "time": { "type": "string", "description": "HH:MM, 24-hour; hourly uses the minute." },
-                    "days": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 6 }, "description": "weekly: 0 is Sunday." },
-                    "date": { "type": "string", "description": "once: YYYY-MM-DD." }
+                    "time": { "type": "string", "description": "HH:MM" },
+                    "days": { "type": "array", "items": { "type": "integer" }, "description": "weekly; 0=Sunday" },
+                    "date": { "type": "string", "description": "once; YYYY-MM-DD" }
                 },
-                "required": ["name", "prompt", "repeat", "time"],
-                "additionalProperties": false
+                "required": ["name", "prompt", "repeat", "time"]
             }),
         ),
         LIST_SESSIONS => (
@@ -139,15 +136,14 @@ fn definition(name: &str) -> Option<Value> {
             }),
         ),
         WAIT_SESSION => (
-            "Wait for another conversation's reply to the message you last sent it. Returns early when it waits for the user's approval.",
+            "Wait for a conversation's reply to your last message. Returns early if it awaits the user's approval.",
             json!({
                 "type": "object",
                 "properties": {
                     "session": { "type": "string" },
-                    "timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 1800, "description": "Default 600." }
+                    "timeout_seconds": { "type": "integer", "description": "Default 600, max 1800" }
                 },
-                "required": ["session"],
-                "additionalProperties": false
+                "required": ["session"]
             }),
         ),
         _ => return None,

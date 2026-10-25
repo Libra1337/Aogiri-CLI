@@ -261,6 +261,51 @@ fn print_prompt_token_report() {
             println!("{:<45} {count:>6}", format!("request body ({protocol})"));
         }
     }
+    println!("\n== app tools (daemon sessions, all on) ==");
+    for tool in crate::app_tools::definitions(&crate::app_tools::NAMES) {
+        println!(
+            "{:<45} {:>6}",
+            tool["name"].as_str().unwrap_or_default(),
+            tokens(&tool.to_string())
+        );
+    }
+    println!("{:<45} {:>6}", "app tools total", app_tools_tokens(&crate::app_tools::NAMES));
+}
+
+/// Tokens of the app tools `names` as a request carries them.
+fn app_tools_tokens(names: &[&str]) -> usize {
+    crate::app_tools::definitions(names)
+        .iter()
+        .map(|tool| tokens(&tool.to_string()))
+        .sum()
+}
+
+/// The app's tools a session the daemon hosts gets on top of the default
+/// request (`app_tools`): the four session tools took about 505 tokens before
+/// present_files, propose_schedule and wait_session joined them (0.7.9);
+/// the three add at most `APP_TOOLS_ADDED`.
+const SESSION_TOOLS_BEFORE: usize = 505;
+const APP_TOOLS_ADDED: usize = 340;
+
+#[test]
+fn app_tools_stay_lean() {
+    use crate::app_tools::{NAMES, PRESENT_FILES, PROPOSE_SCHEDULE, WAIT_SESSION};
+    let added = app_tools_tokens(&[PRESENT_FILES, PROPOSE_SCHEDULE, WAIT_SESSION]);
+    assert!(
+        added <= APP_TOOLS_ADDED,
+        "present_files, propose_schedule and wait_session grew to {added} tokens"
+    );
+    let all = app_tools_tokens(&NAMES);
+    assert!(
+        all <= SESSION_TOOLS_BEFORE + APP_TOOLS_ADDED + 10,
+        "the app tools grew to {all} tokens"
+    );
+    // The standalone engine offers none of them.
+    let system = system_prompt(false);
+    let definitions = default_client(system).tool_definitions();
+    assert!(!definitions
+        .iter()
+        .any(|tool| NAMES.contains(&tool["name"].as_str().unwrap_or_default())));
 }
 
 /// The coding session's first request before this budget was kept: 874

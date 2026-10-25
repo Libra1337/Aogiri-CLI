@@ -563,7 +563,8 @@ fn start(hub: &Arc<Hub>, me: &str, args: &Value) -> Result<String, String> {
         .find(|record| record.id == me)
         .map(|record| record.cwd)
         .ok_or("this conversation is not one of the daemon's")?;
-    let sender = hub.messages.mode(me).unwrap_or_else(|| "plan".to_string());
+    // A Claude Code or Codex sender reports its mode in its engine's names.
+    let sender = lynshen_mode(&hub.messages.mode(me).unwrap_or_else(|| "plan".to_string()));
     let mode = helper_mode(&sender, text("approval_mode").as_deref())?;
     let options = engines::Options {
         approval_mode: Some(mode.clone()),
@@ -613,6 +614,18 @@ fn helper_mode(sender: &str, asked: Option<&str>) -> Result<String, String> {
         None if rank(sender) > rank("auto") => Ok("auto".to_string()),
         None => Ok(sender.to_string()),
     }
+}
+
+/// An approval mode in LynShen's names, which every engine takes: Claude
+/// Code's and Codex's names mapped by what they allow.
+fn lynshen_mode(mode: &str) -> String {
+    match mode {
+        "read-only" | "default" => "manual",
+        "acceptEdits" => "auto-edit",
+        "full-auto" | "bypassPermissions" | "dontAsk" => "full-access",
+        other => other,
+    }
+    .to_string()
 }
 
 /// A session this one may read or message.
@@ -1173,6 +1186,11 @@ mod tests {
         // Full access is never passed on.
         assert_eq!(helper_mode("full-access", None).unwrap(), "auto");
         assert!(helper_mode("full-access", Some("full-access")).is_err());
+        // A Claude Code or Codex sender's mode, in LynShen's names.
+        assert_eq!(helper_mode(&lynshen_mode("read-only"), None).unwrap(), "manual");
+        assert_eq!(helper_mode(&lynshen_mode("full-auto"), None).unwrap(), "auto");
+        assert_eq!(lynshen_mode("acceptEdits"), "auto-edit");
+        assert_eq!(lynshen_mode("plan"), "plan");
     }
 
     #[test]

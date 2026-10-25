@@ -21,9 +21,9 @@
 //!   the conversation. `thread/turns/list` reads one back.
 //! - A rewind is `thread/revert` to before a user message's turn.
 
-use super::{home, op_files, resolve, set_files, Adapter, Line, Options, Output};
+use super::{home, op_files, resolve, set_files, Adapter, HostCall, Line, Options, Output};
 use lynshen_agent_core::{
-    attachments,
+    app_tools, attachments,
     queue::{queue_move_target, QueuePick},
 };
 use serde_json::{json, Value};
@@ -286,6 +286,18 @@ fn file_change_output(changes: &[Value], error: Option<&str>) -> String {
     out.to_string()
 }
 
+/// A dynamic tool call's result: the text it returned.
+fn dynamic_body(item: &Value) -> String {
+    item["contentItems"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["type"] == "inputText")
+        .map(|c| text(&c["text"]))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn mcp_body(item: &Value) -> String {
     let body = [
         &item["error"]["message"],
@@ -351,6 +363,14 @@ fn transcript(turns: &Value) -> Vec<Value> {
             }
             "commandExecution" | "fileChange" | "mcpToolCall" | "webSearch" => {
                 rows.push(tool_row(item));
+            }
+            // The app's tools keep their cards on a resumed thread.
+            "dynamicToolCall" if app_tools::NAMES.contains(&text(&item["tool"])) => {
+                let mut row = json!({ "role": "tool", "name": item["tool"], "output": dynamic_body(item), "call_id": item["id"] });
+                if item["success"] == false {
+                    row["is_error"] = json!(true);
+                }
+                rows.push(row);
             }
             _ => {}
         }
@@ -508,6 +528,11 @@ pub struct Codex {
     rolling_back: bool,
     after_rollback: Vec<Value>,
     open_params: Value,
+    /// The app's tools offered as dynamic tools on a new thread (a resumed
+    /// thread keeps the ones it started with).
+    app_tools: Vec<&'static str>,
+    /// App-tool calls waiting for the daemon.
+    calls: Vec<HostCall>,
     /// Synthetic call id → the server request awaiting our answer: its id,
     /// method and params.
     approvals: HashMap<String, (Value, String, Value)>,
@@ -569,6 +594,8 @@ impl Codex {
             rolling_back: false,
             after_rollback: Vec::new(),
             open_params: Value::Null,
+            app_tools: options.app_tools.clone(),
+            calls: Vec::new(),
             approvals: HashMap::new(),
             approval_seq: 0,
             items: HashMap::new(),
@@ -967,7 +994,16 @@ impl Codex {
             "initialize" => {
                 let (approval, sandbox) = policy(self.mode, &self.dirs);
                 let open = json!({ "cwd": self.cwd, "approvalPolicy": approval, "sandbox": sandbox_mode(&sandbox) });
+                // The app's tools, as dynamic tools: a thread keeps them, so
+                // a resumed one is not told again.
                 self.open_params = open.clone();
+                if !self.app_tools.is_empty() {
+                    let tools: Vec<Value> = app_tools::definitions(&self.app_tools)
+                        .into_iter()
+                        .map(|tool| json!({ "name": tool["name"], "description": tool["description"], "inputSchema": tool["parameters"] }))
+                        .collect();
+                    self.open_params["dynamicTools"] = json!(tools);
+                }
                 let mut frames =
                     vec![json!({ "jsonrpc": "2.0", "method": "initialized" }).to_string()];
                 frames.push(match self.resume.clone() {
@@ -979,7 +1015,10 @@ impl Codex {
                         }
                         self.request("thread/resume", params, "")
                     }
-                    None => self.request("thread/start", open, ""),
+                    None => {
+                        let params = self.open_params.clone();
+                        self.request("thread/start", params, "")
+                    }
                 });
                 frames.push(self.request("model/list", json!({}), ""));
                 let cwd = self.cwd.clone();
@@ -1087,6 +1126,23 @@ impl Codex {
         let answer =
             |result: Value| json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
         let full = self.mode == "full-auto";
+        // An app tool: the daemon runs it and answers (`answer`).
+        if method == "item/tool/call" {
+            let tool = text(&params["tool"]);
+            if app_tools::NAMES.contains(&tool) {
+                self.calls.push(HostCall {
+                    token: id.clone(),
+                    name: tool.to_string(),
+                    args: params["arguments"].clone(),
+                });
+                return Output::default();
+            }
+            let unknown = json!({ "contentItems": [{ "type": "inputText", "text": format!("unknown tool: {tool}") }], "success": false });
+            return Output {
+                events: vec![],
+                frames: vec![answer(unknown)],
+            };
+        }
         // Full access never prompts; a turn started before the switch still may.
         match method {
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" if full => {
@@ -1506,7 +1562,7 @@ impl Codex {
                         t => t.into(),
                     });
                 vec![
-                    json!({ "type": "tool_output", "call_id": id, "name": name, "output": item["contentItems"].to_string(), "is_error": failed }),
+                    json!({ "type": "tool_output", "call_id": id, "name": name, "output": dynamic_body(item), "is_error": failed }),
                 ]
             }
             "webSearch" => vec![
@@ -1792,6 +1848,21 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    fn take_calls(&mut self) -> Vec<HostCall> {
+        std::mem::take(&mut self.calls)
+    }
+
+    fn answer(&mut self, token: &Value, result: Result<Value, String>) -> Vec<String> {
+        let (body, success) = match result {
+            Ok(output) => (output.to_string(), true),
+            Err(error) => (json!({ "error": error }).to_string(), false),
+        };
+        vec![json!({ "jsonrpc": "2.0", "id": token, "result": {
+            "contentItems": [{ "type": "inputText", "text": body }], "success": success,
+        } })
+        .to_string()]
+    }
+
     fn start(&mut self) -> Vec<String> {
         vec![self.request(
             "initialize",
@@ -2342,6 +2413,60 @@ mod tests {
             .iter()
             .map(|f| serde_json::from_str(f).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn app_tools_are_dynamic_tools_on_a_new_thread() {
+        let options = Options {
+            app_tools: vec!["present_files", "wait_session"],
+            ..Options::default()
+        };
+        let mut c = Codex::new(Path::new("/p"), &options);
+        c.start();
+        let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        let names: Vec<&str> = next[1]["params"]["dynamicTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, ["present_files", "wait_session"]);
+        assert!(next[1]["params"]["dynamicTools"][0]["inputSchema"].is_object());
+        let call = frame(
+            &mut c,
+            json!({ "id": 40, "method": "item/tool/call", "params": { "threadId": "th", "turnId": "tu", "callId": "c", "tool": "present_files", "arguments": { "files": ["a"] } } }),
+        );
+        assert!(call.frames.is_empty());
+        let calls = c.take_calls();
+        assert_eq!((calls.len(), calls[0].name.as_str()), (1, "present_files"));
+        let answer = sent(&c.answer(&calls[0].token, Ok(json!({ "files": [] }))));
+        assert_eq!(answer[0]["id"], 40);
+        assert_eq!(answer[0]["result"]["success"], true);
+        assert_eq!(answer[0]["result"]["contentItems"][0]["text"], "{\"files\":[]}");
+        let refused = sent(&c.answer(&json!(41), Err("off".into())));
+        assert_eq!(refused[0]["result"]["success"], false);
+        let unknown = sent(&frame(&mut c, json!({ "id": 42, "method": "item/tool/call", "params": { "tool": "other", "arguments": {} } })).frames);
+        assert_eq!(unknown[0]["result"]["success"], false);
+        let done = json!({ "type": "dynamicToolCall", "id": "d", "tool": "present_files", "contentItems": [{ "type": "inputText", "text": "{}" }] });
+        assert_eq!(dynamic_body(&done), "{}");
+        let rows = transcript(&json!([{ "items": [done] }]));
+        assert_eq!((rows[0]["name"].as_str(), rows[0]["output"].as_str()), (Some("present_files"), Some("{}")));
+        // None offered: no dynamic tools; a resumed thread keeps its own.
+        let mut bare = Codex::new(Path::new("/p"), &Options::default());
+        bare.start();
+        let next = sent(&frame(&mut bare, json!({ "id": 1, "result": {} })).frames);
+        assert!(next[1]["params"]["dynamicTools"].is_null());
+        let mut resumed = Codex::new(
+            Path::new("/p"),
+            &Options {
+                resume: Some("th-9".into()),
+                ..options
+            },
+        );
+        resumed.start();
+        let next = sent(&frame(&mut resumed, json!({ "id": 1, "result": {} })).frames);
+        assert_eq!(next[1]["method"], "thread/resume");
+        assert!(next[1]["params"]["dynamicTools"].is_null());
     }
 
     fn opened() -> Codex {
