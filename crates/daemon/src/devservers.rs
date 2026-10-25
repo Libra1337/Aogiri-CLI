@@ -769,17 +769,17 @@ mod tests {
         crate::hub::lock(&later.state).baseline = Some(HashSet::new());
         later.observe(
             &json!({ "type": "tool_start", "name": "BashOutput" }),
-            1_000,
+            10_000,
         );
-        assert!(later.due(1_000));
+        assert!(later.due(10_000));
         // An ACP agent's command, named by its title.
         let acp = DevServers::default();
         crate::hub::lock(&acp.state).baseline = Some(HashSet::new());
         acp.observe(
             &json!({ "type": "tool_update", "name": "npm run dev", "output": json!({ "kind": "execute" }).to_string() }),
-            1_000,
+            10_000,
         );
-        assert!(acp.due(1_000));
+        assert!(acp.due(10_000));
     }
 
     /// Starts a real server in a directory and finds it. Needs python3 and
