@@ -237,7 +237,9 @@ every connected client.
 | `schedule_list` | optional `agent` | `schedules`: all scheduled tasks, or `agent`'s. See "Scheduled tasks" |
 | `session_usage` | `session` (its id) | `session_usage` with `totals`, `sessions` and `turns`: persisted and live usage, with settled gateway charges |
 | `schedule_usage` | `schedule` (its id) | `schedule_usage` with `totals` and `sessions`: token counts and costs of the task's run sessions, including follow-ups; reused sessions count once |
-| `schedule_save` | `schedule`: without `id` creates one (`agent`, `name`, `prompt`, `repeat`, `time`, and `days` / `date` as `repeat` needs; optional `enabled`, `new_session`, both default `true`); with `id` changes the fields present among `name`, `prompt`, `enabled`, `repeat`, `time`, `days`, `date`, `new_session` | `schedule_saved` with `schedule`; `next_run_at` is computed again |
+| `schedule_save` | `schedule`: without `id` creates one (`agent`, `name`, `prompt`, `repeat`, `time`, and `days` / `date` as `repeat` needs; optional `enabled`, `new_session`, both default `true`, and `origin`, the `id` of the `propose_schedule` card it is created from); with `id` changes the fields present among `name`, `prompt`, `enabled`, `repeat`, `time`, `days`, `date`, `new_session` | `schedule_saved` with `schedule`; `next_run_at` is computed again. A schedule carries `origin` (null when it came from no card), so a card finds the task created from it in `schedules` |
+| `app_tools` | – | `app_tools` with `present_files`, `propose_schedule` (booleans) and `sessions` (`off`, `ask`, `on`). See "App tools" |
+| `app_tools_set` | any of `present_files`, `propose_schedule` (booleans), `sessions` (`off`, `ask`, `on`; `true`/`false` for `on`/`off`). Local clients only | `app_tools` as it is now; sessions started from then on follow it |
 | `schedule_delete` | `schedule` (its id) | `schedule_deleted` with `schedule` |
 | `schedule_run` | `schedule` (its id) | `schedule_started` with `schedule`; runs it now, enabled or not (an error when its agent is disabled), without changing `next_run_at` |
 | `question_list` | — | `questions`: unanswered questions, and in `closed` the ones closed in the last 7 days (each with `closed_by`, `closed_reason`, `closed_at`) |
@@ -1017,24 +1019,79 @@ Requirements saved before projects had ids carry `projects: ["/path"]`;
 once the workspaces have projects, the daemon replaces it with the `project`
 whose main directory is the first path (or `null`).
 
+## App tools
+
+The daemon gives every session it hosts the app's own tools, in three
+groups the user switches on and off (config.json, read when an engine
+starts; `app_tools` / `app_tools_set`):
+
+| Group | Key | Tools |
+| --- | --- | --- |
+| Deliverables | `app_tools.present_files` (default `true`) | `present_files` |
+| Scheduled tasks | `app_tools.propose_schedule` (default `true`) | `propose_schedule` (not in an agent's sessions: an agent has its own `schedule` tool) |
+| Conversations | `sessions.messages` (`off`, `ask`, `on`, default `on`) | `list_sessions`, `read_session`, `start_session`, `send_to_session`, `wait_session` (see "Messages between conversations") |
+
+How each engine gets them:
+
+- LynShen: host tools of the session (not the dispatcher's).
+- Claude Code: an in-process MCP server named `lynshen` on the control
+  channel (`--mcp-config` with `{"type":"sdk"}`, `sdkMcpServers` in
+  `initialize`); the tools are always loaded (`_meta.anthropic/alwaysLoad`)
+  and pre-allowed (`--allowedTools mcp__lynshen__<tool>`): the daemon asks
+  where a LynShen session would (below). With every group off there is no
+  server.
+- Codex: `dynamicTools` on `thread/start`, answered on `item/tool/call`. A
+  resumed thread keeps the tools it started with.
+- ACP agents: none.
+
+Every engine's events name the tools by their own names (`present_files`,
+not `mcp__lynshen__present_files`), live and in a replayed transcript. A
+group switched off reaches engines started after the switch; a call to a
+tool switched off since its engine started fails with `<tool> is turned off
+in LynShen's settings`.
+
+`present_files` only shows the user something: it never asks, also in plan
+mode. Its arguments are `files: [{path, description}]` (at most 12; a path
+is absolute or relative to the session's directory). The output, which
+clients draw as cards:
+
+```json
+{"files":[{"path":"/abs/report.html","description":"Q3 report","size":20480,"kind":"file"},{"path":"/abs/demo.mp4","description":"","size":5242880,"kind":"video"}],"missing":["gone.png"]}
+```
+
+`kind` is `image` (png, jpg, jpeg, gif, webp), `video` (mp4, m4v, webm,
+mov) or `file`; a client shows images and videos inline through `fs_image`
+(up to 16 MiB). `missing` lists the paths that are not files (left out when
+none); when none of the paths is a file, the call fails.
+
+`propose_schedule` creates nothing: the user creates the task from its card
+with `schedule_save` (with `origin` set to the proposal's `id`), or not.
+Arguments: `name`, `prompt`, `repeat` (`once`, `hourly`, `daily`,
+`weekdays`, `weekly`), `time` (`HH:MM`), `days` (weekly; 0 is Sunday),
+`date` (once; `YYYY-MM-DD`). The output:
+
+```json
+{"id":"prop-1a2b3c4d5e6f","name":"Tests","prompt":"Run the tests and report failures","repeat":"weekdays","time":"09:00","note":"Shown to the user as a card; nothing is scheduled until they create it."}
+```
+
 ## Messages between conversations
 
-Every LynShen session the daemon hosts (an agent's too, besides its own
-tools; not the dispatcher's) has four tools for the user's other
-conversations on this daemon:
+Every session the daemon hosts (a LynShen agent's too, besides its own
+tools; not the dispatcher's; Claude Code and Codex sessions as above) has
+five tools for the user's other conversations on this daemon:
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
 | `list_sessions` | optional `query` (matches title or directory) | `sessions: [{session, title, cwd, engine, state, updated_at}]`: the other sessions, not archived or hidden, most recently active first, at most 30. `state` is `idle`, `busy` or `closed`. |
 | `read_session` | `session`, optional `turns` (1–10, default 3) | `{session, title, state, turns: [{user, reply}]}`: the latest requests and the reply text to each (tool calls left out). A request keeps its first 1000 characters, a reply its last 3000, all turns together about 12000 (the oldest go first). |
 | `send_to_session` | `session`, `message`, optional `wait_reply` | `{id, session, title, status}` with `status` `delivered` (the receiver was idle and starts on it) or `queued` (it runs after the receiver's current work). With `wait_reply: true` the call waits until the receiver has handled the message and returns `status: "replied"` with `reply` (the last 4000 characters of its reply); it gives up after 10 minutes (the result then has a `note`) or when the sender's turn is stopped (an error; the message stays sent). |
-
 | `start_session` | `message`, optional `engine` (`lynshen`, `claude`, `codex`), `model`, `effort`, `approval_mode` (`plan`, `manual`, `auto-edit`, `auto`), `title`, `wait_reply` | as `send_to_session`, to a new conversation: started in the sender's project on that engine, model and effort, in the sender's approval mode or a stricter one (never full access), listed for the user; the message is its first. Aogiri ticket #48 |
+| `wait_session` | `session`, optional `timeout_seconds` (10–1800, default 600) | Waits for the reply to the last message this session sent `session` (with `send_to_session` or `start_session`, since the daemon started): `{id, session, title, status: "replied", reply}` once it has handled it (again when it already had); `status: "waiting_approval"` (with a `note`) as soon as the receiver waits for the user to approve a step; `status: "running"` when the wait ends first. An error when nothing was sent, the receiver closed before replying, or the sender's turn is stopped. |
 
 A closed receiver is opened first. The message is the receiver's next user
 message (it starts a run, or queues behind the running one), so a Claude
-Code, Codex or ACP session receives it as well; only LynShen sessions can
-send. It arrives wrapped:
+Code, Codex or ACP session receives it as well; LynShen, Claude Code and
+Codex sessions can send. It arrives wrapped:
 
 ```
 <session_message from="s…" title="项目 A：重构接口" hop="1">
@@ -1066,20 +1123,24 @@ nothing):
 - `wait_reply` is refused when the receiver waits (directly or down a chain)
   for the sender's reply.
 
-`send_to_session` reaches outside its conversation, so the approval mode
-gates it like web access: `manual` and `plan` ask first (an unattended
-session defers it as an action), the other modes send at once. Its approval
-card's `summary` is `<receiver title> (<receiver id>)\n<message>`.
-`list_sessions` and `read_session` only read: they never ask and run in plan
-mode too.
+`send_to_session` and `start_session` reach outside their conversation, so
+the approval mode gates them like web access: `manual` and `plan` ask first
+(an unattended LynShen session defers it as an action), the other modes send
+at once. A Claude Code or Codex session asks the same way (in its `default`
+/ `read-only` and `plan` modes), with an `approval_request` the daemon makes
+(`call_id` `app-approval-<n>`, `kind` `tool`, `scopes: ["once"]`) and
+answers itself on `approve`. The approval card's `summary` is `<receiver
+title> (<receiver id>)\n<message>` (`start_session`: `<engine>
+<model>\n<message>`). `list_sessions`, `read_session` and `wait_session`
+only read: they never ask and run in plan mode too.
 
 `sessions.messages` in config.json (read on every call):
 
 | Value | Meaning |
 | --- | --- |
 | `on` (default) | As above. |
-| `ask` | Every `send_to_session` asks the user, in every mode (full access too), and approving it for the session does not stop the next one asking. The approval stands in for the approval-mode rule, which is not checked. |
-| `off` | Sessions opened from then on get none of the three tools; a session opened earlier gets an error from them. Turned on again, it reaches the sessions opened after that. |
+| `ask` | Every `send_to_session` and `start_session` asks the user, in every mode (full access too, also while a switch to it waits; `must_ask: true`), and approving it for the session does not stop the next one asking. The approval stands in for the approval-mode rule, which is not checked. |
+| `off` | Sessions opened from then on get none of the five tools; a session opened earlier gets an error from them. Turned on again, it reaches the sessions opened after that. |
 
 Both sides' clients receive `session_message` (once with `session` set to
 the sender, once to the receiver):

@@ -679,6 +679,25 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `error` | `message` | Error line. Also used for malformed commands and unknown ops, and for a turn the loop guard stopped (message starts with `loop guard:`). |
 | `status` | `message` | Turn status string: `ready`, `streaming`, `queued: N`, `steering`, `interrupted`, `compacting`, `approval mode: ...`, `trusted ...`, etc. `ready` marks the end of a turn. |
 
+## App tools (daemon sessions)
+
+A session the daemon hosts (`docs/daemon-protocol.md` → "App tools") also
+has the app's own tools, whatever its engine; `lynshen serve` on its own
+offers none of them. They arrive as ordinary `tool_start` / `tool_output`
+events under their own names (on Claude Code too: not
+`mcp__lynshen__…`), and a replayed `transcript` keeps them as `tool` items,
+so a client draws the same cards live and after a reopen:
+
+| Tool | `output` (JSON text) | Card |
+| --- | --- | --- |
+| `present_files` | `{files: [{path, description, size, kind}], missing?}`; `kind` is `image`, `video` or `file` | The turn's deliverables: images and videos inline (`fs_image`), other files as cards that open them. |
+| `propose_schedule` | `{id, name, prompt, repeat, time, days?, date?, note}` | A proposed scheduled task with a create button: `schedule_save` with `origin: <id>`; a schedule whose `origin` is `id` shows the card as created. |
+| `start_session` | `{id, session, title, status, reply?}` | A helper conversation the turn started, with a link to it. |
+| `send_to_session` / `wait_session` | `{id, session, title, status, reply?, note?}`; `status` `delivered`, `queued`, `replied`, `waiting_approval` or `running` | A message to another conversation, and its reply. |
+| `list_sessions` / `read_session` | as in the daemon protocol | Plain tool rows. |
+
+A failed call has `is_error: true` and `{"error": "..."}` as its output.
+
 ## Reply styles
 
 A reply style sets how the model writes to the user: tone, length,
