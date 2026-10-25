@@ -92,8 +92,8 @@ optional array of other local files (absolute paths, any type): they are not
 inlined; the model is told where each is saved, one line
 `[Attached file "<name>" is saved at: <path>]` per file after the text, and
 opens it with its own tools. Events (`user_message`, `unqueued`,
-`fill_input`), `pending_messages` and the transcript carry them back as
-`files` next to `content`, without those lines. The daemon's Claude Code and
+`fill_input`) and the transcript carry them back as `files` next to
+`content`, without those lines; `pending_messages` lists the text only. The daemon's Claude Code and
 Codex sessions get the same lines (one text block or item each), ACP agents a
 `resource_link` per file.
 
@@ -641,7 +641,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `mcp_servers` | `servers: [{name, transport, state, tools, error?}]` | MCP server states; `state` ∈ `connecting`/`connected`/`failed`/`disabled`. |
 | `trust_prompt` | `cwd`, `repo_root` | Project has local resources (skills, commands, hooks) and no stored trust decision; answer via `command` `/trust yes\|no\|repo`. |
 | `user_message` | `content` | A user turn was accepted and started (echoes the submitted text). |
-| `pending_messages` | `messages` | The queued-message list after it changed. |
+| `pending_messages` | `messages`, `fixed`? | The queued-message list after it changed (texts, without the attached-file lines). `fixed` (Claude Code sessions): the first `fixed` messages are already with the CLI (steered, or sent as the next turn started); they can no longer be taken back, moved or picked. |
 | `fill_input` | `content` | Front-end should pre-fill its input box (e.g. after `/checkout`). |
 | `connecting` | — | A model request is starting. |
 | `thinking_start` | — | The model answered the request; its first token is on the way. |

@@ -25,10 +25,11 @@
 //!   can be taken back or dropped with `unqueue` and reordered with
 //!   `queue_move`) and starts the next turn when this one ends. `steer`
 //!   writes it to the CLI now with priority `now`, which stops the running
-//!   turn's generation and tool calls and takes the message in at once. A
-//!   subagent the turn runs in the foreground would be one of those calls,
-//!   so it is moved to the background first (`background_tasks`) and
-//!   reports back as a task notification. Until the CLI replays the message
+//!   turn's generation and takes the message in at once. A tool call that
+//!   is running ends first; the next request carries the message with its
+//!   result. A subagent the turn runs in the foreground is such a call, so
+//!   it is moved to the background first (`background_tasks`) and reports
+//!   back as a task notification. Until the CLI replays the message
 //!   it stays listed, first and `fixed` (it can no longer be taken back).
 //!   Claude Code saves it only as a `queued_command` attachment row.
 //! - Full access (`bypassPermissions`) is only honored when the CLI starts
