@@ -746,6 +746,7 @@ impl Hub {
                     project: None,
                     conversation: None,
                     acp_agent: None,
+                    forked_from: None,
                 }
             }
             (None, None) => return Err(format!("unknown session {id}")),
@@ -2579,6 +2580,7 @@ mod tests {
             project: None,
             conversation: None,
             acp_agent: None,
+            forked_from: None,
         };
         assert_eq!(
             shown_title(&record, Some(&scheduled)).as_deref(),

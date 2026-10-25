@@ -125,6 +125,9 @@ pub struct SessionRecord {
     pub conversation: Option<String>,
     /// ACP: the desktop's registry entry for the agent (`{id, name}`).
     pub acp_agent: Option<Value>,
+    /// The conversation it was forked from: `{session, turns, at}` (see
+    /// `Hub::create_engine_session`).
+    pub forked_from: Option<Value>,
 }
 
 /// A message for an agent: from the user, another agent or a timer.
@@ -282,6 +285,15 @@ impl Store {
             }
             if let Some(group) = &record.group {
                 meta["group"] = json!(group);
+            }
+            if let Some(conversation) = &record.conversation {
+                meta["conversation"] = json!(conversation);
+            }
+            if let Some(agent) = &record.acp_agent {
+                meta["acp_agent"] = agent.clone();
+            }
+            if let Some(source) = &record.forked_from {
+                meta["forked_from"] = source.clone();
             }
             if meta.as_object().is_some_and(|fields| fields.len() > 2) {
                 sessions.push(meta);
@@ -451,8 +463,8 @@ impl Store {
 
     /// Renames, (un)archives, hides, regroups or moves a session from
     /// `changes` (`title`, `archived`, `hidden`, `group`, `project`; the
-    /// daemon also keeps `gateway`, an ACP agent's `conversation` and
-    /// `acp_agent`); fields left out are unchanged, an empty title goes back
+    /// daemon also keeps `gateway`, an ACP agent's `conversation`,
+    /// `acp_agent` and a fork's `forked_from`); fields left out are unchanged, an empty title goes back
     /// to the engine's label, an empty group to automatic routing and an
     /// empty project to none. False when `changes` names none.
     pub fn record_session_meta(&self, id: &str, changes: &Value) -> io::Result<bool> {
@@ -489,6 +501,10 @@ impl Store {
         }
         if changes["acp_agent"].is_object() {
             entry["acp_agent"] = changes["acp_agent"].clone();
+            changed = true;
+        }
+        if changes["forked_from"].is_object() {
+            entry["forked_from"] = changes["forked_from"].clone();
             changed = true;
         }
         if changed {
@@ -558,6 +574,7 @@ impl Store {
                             project: None,
                             conversation: None,
                             acp_agent: None,
+                            forked_from: None,
                         }
                     });
                     record.closed = false;
@@ -599,6 +616,9 @@ impl Store {
                         }
                         if entry["acp_agent"].is_object() {
                             record.acp_agent = Some(entry["acp_agent"].clone());
+                        }
+                        if entry["forked_from"].is_object() {
+                            record.forked_from = Some(entry["forked_from"].clone());
                         }
                     }
                 }
@@ -1619,6 +1639,35 @@ mod tests {
         let record = &reopened.sessions()[0];
         assert_eq!(record.group.as_deref(), Some("g-1"));
         assert!(record.gateway);
+    }
+
+    #[test]
+    fn a_fork_and_an_acp_conversation_survive_compaction() {
+        let store = store("compact-fork");
+        let dir = store.dir.clone();
+        for (id, engine) in [("f", "claude"), ("a", "acp")] {
+            store
+                .record_engine_session(id, std::path::Path::new("/p"), None, Some(engine), false, None)
+                .unwrap();
+        }
+        let source = json!({ "session": "orig", "turns": 2, "at": "u-1" });
+        assert!(store
+            .record_session_meta("f", &json!({ "forked_from": source }))
+            .unwrap());
+        store
+            .record_session_meta("a", &json!({ "conversation": "ses_1", "acp_agent": { "id": "x", "name": "X" } }))
+            .unwrap();
+        // Closing and reopening adds lines the compaction folds away.
+        store.record_session_closed("f").unwrap();
+        store
+            .record_engine_session("f", std::path::Path::new("/p"), None, Some("claude"), false, None)
+            .unwrap();
+        drop(store);
+        let reopened = reopen(dir).unwrap();
+        let sessions = reopened.sessions();
+        assert_eq!(sessions[0].forked_from, Some(source));
+        assert_eq!(sessions[1].conversation.as_deref(), Some("ses_1"));
+        assert_eq!(sessions[1].acp_agent, Some(json!({ "id": "x", "name": "X" })));
     }
 
     #[test]

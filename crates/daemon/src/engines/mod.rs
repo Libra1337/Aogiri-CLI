@@ -67,8 +67,20 @@ pub struct Options {
     pub approval_mode: Option<String>,
     pub model: Option<String>,
     pub resume: Option<String>,
-    /// Claude: resume the conversation as it was at this message.
+    /// Claude: resume the conversation as it was at this message (a rewind,
+    /// or with `fork_from` the reply a fork goes on after).
     pub resume_at: Option<String>,
+    /// A new session that forks this conversation (the engine's id: a
+    /// LynShen session, a Claude Code conversation, a Codex thread) instead
+    /// of starting empty; it goes on apart from it, which stays as it is.
+    /// Only `session_create` reads it.
+    pub fork_from: Option<String>,
+    /// Codex / LynShen: how many of `fork_from`'s user turns the fork keeps
+    /// (None: all). Claude Code forks at `resume_at` instead.
+    pub fork_turns: Option<u64>,
+    /// LynShen: the directory `fork_from` was saved for, when the fork works
+    /// elsewhere (its own worktree). None: the fork's own `cwd`.
+    pub fork_cwd: Option<PathBuf>,
     /// ACP: the agent's command line.
     pub command: Option<String>,
     pub args: Vec<String>,
@@ -123,6 +135,9 @@ impl Options {
             model: text("model"),
             resume: None,
             resume_at: text("resume_at"),
+            fork_from: text("fork_from"),
+            fork_turns: value["fork_turns"].as_u64(),
+            fork_cwd: text("fork_cwd").map(PathBuf::from),
             command: text("command"),
             bin: text("bin"),
             args: value["args"]
@@ -514,6 +529,9 @@ fn asleep_options(adapter: &dyn Adapter, current: &Options) -> Options {
         resume_at: None,
         dirs: Vec::new(),
         fork: None,
+        fork_from: None,
+        fork_turns: None,
+        fork_cwd: None,
         quiet: false,
         ..adapter.keep(current.clone())
     }
@@ -931,8 +949,14 @@ impl Session<'_> {
             json!({ "type": "background_tasks", "tasks": [] }),
             json!({ "type": "pending_messages", "messages": [] }),
         ]);
-        // What the process runs as now (a restart changes it).
-        let mut current = options.clone();
+        // What the process runs as now (a restart changes it). A fork is made
+        // once: a restart goes on with the forked conversation.
+        let mut current = Options {
+            fork_from: None,
+            fork_turns: None,
+            fork_cwd: None,
+            ..options.clone()
+        };
         // Session tools answer from their own threads (they may wait).
         let (answers_tx, answers) = mpsc::channel::<Answer>();
         self.app_answers = Some(answers_tx);
