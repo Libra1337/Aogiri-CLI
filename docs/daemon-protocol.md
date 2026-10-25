@@ -304,7 +304,9 @@ mirror does not have. Requests go through the proxy that `HTTPS_PROXY`,
 `latest.json` URL (empty: no mirror) and `LYNSHEN_SKILL_SOURCES`
 (`Name=https://github.com/o/r;…`) the community list.
 
-`backend` picks the directory: `claude` installs into `~/.claude/skills`,
+`backend` picks the directory: `claude` installs into the `skills` of
+Claude Code's config directory (`~/.claude/skills`, or under
+`CLAUDE_CONFIG_DIR` when the daemon's environment sets it),
 anything else into `~/.lynshen/skills`. `installed` means
 `<installDir>/<id>/SKILL.md` exists. `skill_install` looks the skill up again
 in its source (the bundled index or the cache), then installs the mirror's
@@ -320,8 +322,8 @@ run.
 `~/.agents/skills` (`"shared"`) and, with `cwd`, the project's
 `.lynshen/skills` and `.agents/skills` (`"project"`, only once the project is
 trusted; `projectTrusted` says whether it is). For `claude` they come from
-`~/.claude/skills` and the project's `.claude/skills`, all `enabled`, and
-`toggleable` is false: LynShen does not switch Claude Code's skills.
+the `installDir` above and the project's `.claude/skills`, all `enabled`,
+and `toggleable` is false: LynShen does not switch Claude Code's skills.
 `removable` is true for a folder directly in the personal directory; a shared
 skill is other tools' too and a project's belongs to the project. `problems`
 are what keeps a skill from loading: `unreadable` (an `error` when the skill
@@ -383,7 +385,20 @@ Codex's thread id), so reopening a closed session resumes the same
 conversation (`--resume`, `thread/resume`), and `session_open` with `cwd`
 and `engine` opens any conversation the engine saved for that directory
 (`~/.claude/projects`, `~/.codex/sessions`). `session_history` lists those
-too, with their `engine`. `session_created` for Codex comes once its thread
+too, with their `engine`.
+
+Claude Code keeps its conversations in its config directory: `~/.claude`,
+or `CLAUDE_CONFIG_DIR`. The daemon looks for a session's conversation where
+that session's Claude Code keeps it: `CLAUDE_CONFIG_DIR` in the session's
+`env`, else the daemon's own. When `bin` is a program of the user's that
+sets the directory itself (an account switcher), the daemon runs it once
+without a conversation and reads the directory from Claude Code's
+`initialize` reply, remembers it for that program and environment, and asks
+again when the conversation is not where it was seen. A running session
+takes the directory Claude Code reports, and keeps it across restarts and
+the TUI handoff. So a saved conversation is resumed, never started again
+under its id (which Claude Code refuses: "Session ID … is already in use"),
+and its history shows. `session_created` for Codex comes once its thread
 is open.
 Every session in `session_list` carries its `engine` (and an ACP session
 the `acp_agent` it was created with).

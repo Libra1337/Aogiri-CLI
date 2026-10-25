@@ -2557,6 +2557,108 @@ fn full_access_restarts_claude_on_the_same_conversation_and_reopening_resumes_it
         .any(|w| w == ["--resume", session.as_str()]));
 }
 
+/// Creates a Claude Code session with `options`, runs one turn, closes it
+/// and opens it again: what the reopened session shows.
+fn reopened_claude(daemon: &Daemon, dir: &PathBuf, options: &Value) -> (String, Value) {
+    let mut client = Client::connect(daemon);
+    let created = request(
+        &mut client,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": options }),
+    );
+    let session = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    client.send(json!({ "op": "watch", "session": session }));
+    client.until(is_ready(&session));
+    client.send(json!({ "op": "user_message", "session": session, "content": "first" }));
+    client.until(turn_done(&session));
+    client.send(json!({ "op": "session_close", "session": session }));
+    client.until(|f| f["type"] == "session_closed" && f["session"] == session.as_str());
+    let opened = request(
+        &mut client,
+        json!({ "op": "session_open", "session": session, "options": options }),
+    );
+    assert_eq!(opened["type"], "session_opened", "{opened}");
+    client.send(json!({ "op": "watch", "session": session }));
+    let frames = client.until(|f| f["session"] == session.as_str() && f["type"] == "transcript");
+    (session, frames.last().unwrap()["items"].clone())
+}
+
+/// The desktop may set `CLAUDE_CONFIG_DIR` for the engine only: the daemon
+/// looks for the conversation there, resumes it (Claude Code refuses
+/// `--session-id` for a saved one: "Session ID … is already in use") and
+/// shows its history.
+#[test]
+fn a_conversation_saved_where_the_sessions_environment_says_reopens_by_resuming() {
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-claude-env-config");
+    fs::create_dir_all(&dir).unwrap();
+    let config = temp_dir("claude-env-config");
+    let options = json!({ "env": { "CLAUDE_CONFIG_DIR": config } });
+    let (session, items) = reopened_claude(&daemon, &dir, &options);
+    assert_eq!(
+        items,
+        json!([
+            { "role": "user", "content": "first" },
+            { "role": "assistant", "content": "ok: first" },
+        ])
+    );
+    let again = starts(&log).pop().unwrap();
+    assert!(
+        again
+            .windows(2)
+            .any(|w| w == ["--resume", session.as_str()]),
+        "{again:?}"
+    );
+    assert!(fs::read_dir(config.join("projects")).unwrap().count() > 0);
+}
+
+/// The desktop's Claude Code program may be the user's own (an account
+/// switcher) that sets `CLAUDE_CONFIG_DIR` itself before it runs Claude
+/// Code: neither the daemon's nor the session's environment names it.
+#[cfg(unix)]
+#[test]
+fn a_conversation_saved_where_the_users_program_says_reopens_by_resuming() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-claude-wrapper");
+    fs::create_dir_all(&dir).unwrap();
+    let config = temp_dir("claude-wrapper-config");
+    let wrapper = temp_dir("claude-wrapper").with_extension("sh");
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_claude.py");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nCLAUDE_CONFIG_DIR='{}' exec '{}' \"$@\"\n",
+            config.display(),
+            script.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let options = json!({ "bin": wrapper });
+    let (session, items) = reopened_claude(&daemon, &dir, &options);
+    assert_eq!(
+        items,
+        json!([
+            { "role": "user", "content": "first" },
+            { "role": "assistant", "content": "ok: first" },
+        ])
+    );
+    let again = starts(&log).pop().unwrap();
+    assert!(
+        again
+            .windows(2)
+            .any(|w| w == ["--resume", session.as_str()]),
+        "{again:?}"
+    );
+}
+
 fn fake_codex() -> PathBuf {
     let log = temp_dir("fake-codex").with_extension("log");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_codex.py");
@@ -3171,7 +3273,10 @@ fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
         &mut desktop,
         json!({ "op": "skills_catalog", "backend": "claude" }),
     );
-    assert_eq!(catalog["installDir"], json!(home.join(".claude/skills")));
+    assert_eq!(
+        catalog["installDir"],
+        json!(home.join("claude-config/skills"))
+    );
     for op in [
         json!({ "op": "skill_install", "source": "elsewhere", "skill": "review" }),
         json!({ "op": "skill_install", "source": "lynshen", "skill": "review" }),
@@ -3554,7 +3659,7 @@ fn the_desktop_lists_switches_creates_and_deletes_skills() {
 
     // Claude Code's skills are listed, not switched.
     let claude = write(
-        home.join(".claude/skills/frontend"),
+        home.join("claude-config/skills/frontend"),
         "name: frontend\ndescription: UI",
     );
     let list = request(
@@ -3596,7 +3701,7 @@ fn the_desktop_lists_switches_creates_and_deletes_skills() {
     for dir in [review, notes] {
         let _ = fs::remove_dir_all(dir);
     }
-    let _ = fs::remove_dir_all(home.join(".claude/skills"));
+    let _ = fs::remove_dir_all(home.join("claude-config/skills"));
     let _ = fs::remove_dir_all(personal.join("blank"));
 }
 

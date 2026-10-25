@@ -2,7 +2,8 @@
 """A stand-in for `claude --print --input-format stream-json ...`: enough of
 the stream-json protocol for the daemon's engine tests. Every start appends
 its arguments to $FAKE_CLAUDE_LOG; turns are saved like Claude Code saves
-them, under ~/.claude/projects/<munged cwd>/<session id>.jsonl."""
+them, under <config>/projects/<munged cwd>/<session id>.jsonl, where config
+is $CLAUDE_CONFIG_DIR or ~/.claude."""
 import json, os, re, sys
 
 args = sys.argv[1:]
@@ -15,8 +16,13 @@ def arg(flag):
 session = arg("--resume") or arg("--session-id")
 mode = "bypassPermissions" if "--dangerously-skip-permissions" in args else (arg("--permission-mode") or "default")
 cwd = os.getcwd()
-saved = os.path.join(os.environ["HOME"], ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd))
+config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.environ["HOME"], ".claude")
+saved = os.path.join(config, "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd))
 os.makedirs(saved, exist_ok=True)
+# Like Claude Code: a saved conversation can only be resumed.
+if "--session-id" in args and os.path.exists(os.path.join(saved, session + ".jsonl")):
+    sys.stderr.write("Error: Session ID " + session + " is already in use.\n")
+    sys.exit(1)
 
 def out(frame):
     sys.stdout.write(json.dumps(frame) + "\n")
@@ -58,7 +64,7 @@ while True:
         elif request["subtype"] == "list_models":
             response = {"models": [{"value": "sonnet", "resolvedModel": "claude-sonnet-4-5", "displayName": "Sonnet"}]}
         elif request["subtype"] == "initialize":
-            response = {"commands": [{"name": "compact", "description": "Free up context", "argumentHint": "", "builtin": True}]}
+            response = {"commands": [{"name": "compact", "description": "Free up context", "argumentHint": "", "builtin": True}], "pid": os.getpid(), "user_output_styles_dir": os.path.join(config, "output-styles")}
         out({"type": "control_response", "response": {"subtype": "success", "request_id": frame["request_id"], "response": response}})
         continue
     if frame["type"] != "user":

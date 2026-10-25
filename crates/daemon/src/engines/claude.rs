@@ -785,6 +785,12 @@ pub struct Claude {
     /// The composer's slash commands: the CLI's `initialize` reply (with
     /// descriptions and argument hints), plus names only `system/init` lists.
     commands: Vec<Value>,
+    /// Claude Code's config directory, where it keeps the conversation
+    /// (`known_config`; corrected by its `initialize` reply).
+    config: PathBuf,
+    /// The user's program and its environment (`ProbeKey`), which the
+    /// directory Claude Code reports is remembered for.
+    program: Option<ProbeKey>,
 }
 
 impl Claude {
@@ -829,6 +835,8 @@ impl Claude {
             interrupting: false,
             queued: Vec::new(),
             commands: Vec::new(),
+            config: known_config(options).unwrap_or_else(|| config_dir_in(&options.env)),
+            program: options.bin.clone().map(|bin| (bin, options.env.clone())),
         }
     }
 
@@ -839,7 +847,7 @@ impl Claude {
 
     /// Where Claude Code keeps this conversation's Workflows and subagents.
     fn session_dir(&self) -> PathBuf {
-        project_dir(&home(), &self.cwd).join(&self.conversation)
+        project_dir(&self.config, &self.cwd).join(&self.conversation)
     }
 
     fn control_request(&mut self, request: Value, tag: &str) -> String {
@@ -1816,6 +1824,16 @@ impl Claude {
             }
             "initialize" => {
                 let reply = &response["response"];
+                // The config directory as Claude Code resolved it (a program
+                // or settings file may set CLAUDE_CONFIG_DIR).
+                if let Some(dir) = reported_config(reply) {
+                    if let Some(program) = self.program.clone() {
+                        probed()
+                            .get_or_insert_with(HashMap::new)
+                            .insert(program, dir.clone());
+                    }
+                    self.config = dir;
+                }
                 self.set_commands(reply["commands"].as_array().map_or(&[], Vec::as_slice));
                 let mut events = vec![self.command_list()];
                 events.extend(self.fast_state(reply));
@@ -2627,6 +2645,7 @@ impl Adapter for Claude {
             effort: Some(self.effort.clone()),
             fast: self.fast == "on",
             thinking: Some(self.thinking),
+            claude_config: options.claude_config.or(Some(self.config.clone())),
             ..options
         }
     }
@@ -2733,17 +2752,156 @@ fn limit_banner(frame: &Value, info: &Value) -> Vec<Value> {
 
 // --- saved conversations ---
 
+/// Where Claude Code keeps its state when nothing else says:
+/// `CLAUDE_CONFIG_DIR` of the daemon's environment (the engine inherits it),
+/// else `~/.claude`.
+pub fn config_dir() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".claude"))
+}
+
+/// `config_dir` of a Claude Code run with `env` (a session's `Options::env`)
+/// on top of the daemon's environment: the desktop's per-engine variables
+/// may set `CLAUDE_CONFIG_DIR` where the daemon's own environment does not.
+pub fn config_dir_in(env: &[(String, String)]) -> PathBuf {
+    match env.iter().rev().find(|(name, _)| name == "CLAUDE_CONFIG_DIR") {
+        Some((_, dir)) if !dir.is_empty() => PathBuf::from(dir),
+        Some(_) => home().join(".claude"),
+        None => config_dir(),
+    }
+}
+
+/// The config directories programs were seen to use (`probe`), by the
+/// program and the environment it runs with.
+type ProbeKey = (String, Vec<(String, String)>);
+static PROBED: std::sync::Mutex<Option<HashMap<ProbeKey, PathBuf>>> = std::sync::Mutex::new(None);
+
+fn probed() -> std::sync::MutexGuard<'static, Option<HashMap<ProbeKey, PathBuf>>> {
+    PROBED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// `config_dir_in` a Claude Code run with `options`, unless a better one is
+/// known: the one found for the session, or the one a program of the
+/// user's (`bin`) was seen to use.
+fn known_config(options: &Options) -> Option<PathBuf> {
+    if let Some(dir) = &options.claude_config {
+        return Some(dir.clone());
+    }
+    let key = (options.bin.clone()?, options.env.clone());
+    probed().get_or_insert_with(HashMap::new).get(&key).cloned()
+}
+
+/// The config directory where a Claude Code run with `options` keeps
+/// conversation `id` of `cwd`: the one found for the session; else, for a
+/// program of the user's (`bin`, e.g. an account switcher that sets
+/// `CLAUDE_CONFIG_DIR` before it runs Claude Code), the one it was seen to
+/// keep it in, or the session's environment's, or else the program is
+/// asked where (an account switched since it was seen); else
+/// `config_dir_in` the session's environment.
+pub fn config_with(options: &Options, cwd: &Path, id: &str) -> PathBuf {
+    if let Some(dir) = &options.claude_config {
+        return dir.clone();
+    }
+    let plain = config_dir_in(&options.env);
+    let Some(bin) = &options.bin else {
+        return plain;
+    };
+    let seen = known_config(options);
+    if let Some(dir) = seen.as_ref().filter(|dir| is_saved(dir, cwd, id)) {
+        return dir.clone();
+    }
+    if is_saved(&plain, cwd, id) {
+        return plain;
+    }
+    reprobe(bin.clone(), &options.env)
+        .or(seen)
+        .unwrap_or(plain)
+}
+
+/// Runs `probe` for `bin` with `env` and remembers what it found.
+fn reprobe(bin: String, env: &[(String, String)]) -> Option<PathBuf> {
+    let dir = probe(&bin, env)?;
+    probed()
+        .get_or_insert_with(HashMap::new)
+        .insert((bin, env.to_vec()), dir.clone());
+    Some(dir)
+}
+
+/// The config directory an `initialize` reply names: the parent of its
+/// `user_output_styles_dir` (`<config>/output-styles`, as Claude Code
+/// resolves it after its settings; claude 2.1.302 and later).
+fn reported_config(reply: &Value) -> Option<PathBuf> {
+    let styles = Path::new(reply["user_output_styles_dir"].as_str()?);
+    if !styles.is_absolute() || styles.file_name()? != "output-styles" {
+        return None;
+    }
+    styles.parent().map(Path::to_path_buf)
+}
+
+/// Where program `bin` run with `env` has Claude Code keep its state: it
+/// runs once, without a conversation, and its `initialize` reply names the
+/// directory. None when it does not say within 30 s.
+fn probe(bin: &str, env: &[(String, String)]) -> Option<PathBuf> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(bin)
+        .args([
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ])
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .current_dir(home())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+    let request = json!({ "type": "control_request", "request_id": "probe", "request": { "subtype": "initialize" } });
+    let _ = writeln!(stdin, "{request}");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if frame["type"] == "control_response" {
+                let _ = sender.send(reported_config(&frame["response"]["response"]));
+                return;
+            }
+        }
+    });
+    let dir = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .ok()
+        .flatten();
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    dir
+}
+
 /// Claude Code's project directory for `cwd`: every character of the real
 /// path (Claude Code resolves symlinks, e.g. macOS `/tmp` → `/private/tmp`)
 /// that is not ASCII alphanumeric becomes `-`.
-fn project_dir(home: &Path, cwd: &Path) -> PathBuf {
+fn project_dir(config: &Path, cwd: &Path) -> PathBuf {
     let real = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let munged: String = real
         .to_string_lossy()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    home.join(".claude").join("projects").join(munged)
+    config.join("projects").join(munged)
 }
 
 fn is_conversation_id(id: &str) -> bool {
@@ -2896,17 +3054,18 @@ fn rows(path: &Path, limit: u64) -> impl Iterator<Item = Value> {
 }
 
 /// The user and assistant text of a saved conversation, as transcript items
-/// (the newest 500). The user's images are written under `uploads`.
-pub fn transcript(cwd: &Path, id: &str, uploads: &Path) -> Vec<Value> {
-    transcript_in(&home(), cwd, id, &uploads.join("claude"))
+/// (the newest 500), from config directory `config`. The user's images are
+/// written under `uploads`.
+pub fn transcript(config: &Path, cwd: &Path, id: &str, uploads: &Path) -> Vec<Value> {
+    transcript_in(config, cwd, id, &uploads.join("claude"))
 }
 
-fn transcript_in(home: &Path, cwd: &Path, id: &str, images: &Path) -> Vec<Value> {
+fn transcript_in(config: &Path, cwd: &Path, id: &str, images: &Path) -> Vec<Value> {
     if !is_conversation_id(id) {
         return vec![];
     }
     let mut items: Vec<Value> = rows(
-        &project_dir(home, cwd).join(format!("{id}.jsonl")),
+        &project_dir(config, cwd).join(format!("{id}.jsonl")),
         64 * 1024 * 1024,
     )
     .filter(|row| !is_synthetic(row))
@@ -2924,22 +3083,24 @@ fn transcript_in(home: &Path, cwd: &Path, id: &str, images: &Path) -> Vec<Value>
     items
 }
 
-/// Conversations saved for `cwd`, newest first: (id, title, updated ms).
-pub fn saved(cwd: &Path) -> Vec<(String, String, u64)> {
-    saved_in(&home(), cwd)
+/// Conversations saved for `cwd` in config directory `config`, newest
+/// first: (id, title, updated ms).
+pub fn saved(config: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
+    saved_in(config, cwd)
 }
 
-/// Whether Claude Code saved conversation `id` for `cwd` (it has at least one
-/// turn and can be resumed). Unlike `saved`, not limited to the newest ones.
-pub fn is_saved(cwd: &Path, id: &str) -> bool {
+/// Whether Claude Code saved conversation `id` for `cwd` in config directory
+/// `config` (it has at least one turn and can be resumed). Unlike `saved`,
+/// not limited to the newest ones.
+pub fn is_saved(config: &Path, cwd: &Path, id: &str) -> bool {
     is_conversation_id(id)
-        && project_dir(&home(), cwd)
+        && project_dir(config, cwd)
             .join(format!("{id}.jsonl"))
             .is_file()
 }
 
-fn saved_in(home: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
-    let Ok(entries) = fs::read_dir(project_dir(home, cwd)) else {
+fn saved_in(config: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
+    let Ok(entries) = fs::read_dir(project_dir(config, cwd)) else {
         return vec![];
     };
     let mut found: Vec<(String, u64, PathBuf)> = entries
@@ -4176,7 +4337,7 @@ mod tests {
         )
         .unwrap();
         let images = home.join("images");
-        let items = transcript_in(&home, cwd, "33-44", &images);
+        let items = transcript_in(&home.join(".claude"), cwd, "33-44", &images);
         let path = items[0]["images"][0].as_str().unwrap().to_string();
         assert!(path.starts_with(images.to_str().unwrap()) && path.ends_with(".png"));
         assert_eq!(fs::read(&path).unwrap(), b"png bytes");
@@ -4192,7 +4353,7 @@ mod tests {
             ]
         );
         // Read again: the same file.
-        assert_eq!(transcript_in(&home, cwd, "33-44", &images), items);
+        assert_eq!(transcript_in(&home.join(".claude"), cwd, "33-44", &images), items);
         assert_eq!(fs::read_dir(&images).unwrap().count(), 1);
         let _ = fs::remove_dir_all(&home);
     }
@@ -4316,8 +4477,8 @@ mod tests {
             .collect::<String>(),
         )
         .unwrap();
-        let items = transcript_in(&home, cwd, "11-22", &home.join("images"));
-        let listed = saved_in(&home, cwd);
+        let items = transcript_in(&home.join(".claude"), cwd, "11-22", &home.join("images"));
+        let listed = saved_in(&home.join(".claude"), cwd);
         assert_eq!(
             items,
             vec![
@@ -4327,7 +4488,7 @@ mod tests {
         );
         assert_eq!(listed[0].0, "11-22");
         assert_eq!(listed[0].1, "hello there");
-        assert!(transcript_in(&home, cwd, "../etc", &home.join("images")).is_empty());
+        assert!(transcript_in(&home.join(".claude"), cwd, "../etc", &home.join("images")).is_empty());
 
         // A symlinked directory is saved under its real path.
         let real = home.join("real-dir");
@@ -4338,6 +4499,89 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         #[cfg(unix)]
         assert_eq!(project_dir(&home, &link), project_dir(&home, &real));
+    }
+
+    #[test]
+    fn the_config_directory_comes_from_the_session_or_what_claude_reports() {
+        let env = |dir: &str| vec![("CLAUDE_CONFIG_DIR".to_string(), dir.to_string())];
+        assert_eq!(config_dir_in(&env("/tmp/c")), PathBuf::from("/tmp/c"));
+        assert_eq!(config_dir_in(&env("")), home().join(".claude"));
+        assert_eq!(config_dir_in(&[]), config_dir());
+        // Found once, it stays with the session (a restart, the TUI).
+        let options = Options {
+            env: env("/tmp/c"),
+            claude_config: Some(PathBuf::from("/tmp/found")),
+            ..Options::default()
+        };
+        assert_eq!(
+            config_with(&options, Path::new("/w"), "1-2"),
+            PathBuf::from("/tmp/found")
+        );
+        // What Claude Code resolved wins over what the daemon guessed.
+        assert_eq!(
+            reported_config(&json!({ "user_output_styles_dir": "/u/alt/output-styles" })),
+            Some(PathBuf::from("/u/alt"))
+        );
+        assert_eq!(reported_config(&json!({ "user_output_styles_dir": "rel/output-styles" })), None);
+        assert_eq!(reported_config(&json!({})), None);
+        let mut c = Claude::new(&Options {
+            env: env("/tmp/c"),
+            ..Options::default()
+        });
+        assert_eq!(c.config, PathBuf::from("/tmp/c"));
+        let boot = c.start();
+        frame(
+            &mut c,
+            reply(
+                request_id(&boot, "initialize"),
+                json!({ "commands": [], "user_output_styles_dir": "/u/alt/output-styles" }),
+            ),
+        );
+        assert_eq!(c.config, PathBuf::from("/u/alt"));
+        assert_eq!(
+            c.keep(Options::default()).claude_config,
+            Some(PathBuf::from("/u/alt"))
+        );
+    }
+
+    /// A program of the user's that sets the config directory itself is
+    /// asked where it is, once, and remembered for that program.
+    #[cfg(unix)]
+    #[test]
+    fn a_users_program_is_asked_for_its_config_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("claude-probe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("claude-switch");
+        let config = dir.join("account-b");
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nread line\nprintf '%s\\n' '{}'\n",
+                json!({ "type": "control_response", "response": { "subtype": "success", "request_id": "probe", "response": { "user_output_styles_dir": config.join("output-styles") } } })
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let options = Options {
+            bin: Some(program.to_string_lossy().into_owned()),
+            ..Options::default()
+        };
+        let cwd = dir.join("work");
+        assert_eq!(config_with(&options, &cwd, "1-2"), config);
+        assert_eq!(known_config(&options), Some(config.clone()));
+        // Saved where the session's environment says: nothing to ask.
+        let plain = dir.join("plain");
+        let saved = Options {
+            env: vec![("CLAUDE_CONFIG_DIR".into(), plain.to_string_lossy().into())],
+            ..options.clone()
+        };
+        fs::create_dir_all(project_dir(&plain, &cwd)).unwrap();
+        fs::write(project_dir(&plain, &cwd).join("1-2.jsonl"), "{}\n").unwrap();
+        fs::remove_file(&program).unwrap();
+        assert_eq!(config_with(&saved, &cwd, "1-2"), plain);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

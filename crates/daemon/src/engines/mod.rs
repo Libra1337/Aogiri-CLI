@@ -98,6 +98,10 @@ pub struct Options {
     /// ACP: the desktop's registry entry for the agent (`{id, name}`), kept
     /// with the session so a client can start it again.
     pub acp_agent: Option<Value>,
+    /// Claude: the config directory the session's Claude Code keeps its
+    /// state in, once found (`claude::config_with`, or its `initialize`
+    /// reply; set by the daemon, never by a client).
+    pub claude_config: Option<PathBuf>,
 }
 
 impl Options {
@@ -138,6 +142,7 @@ impl Options {
             quiet: false,
             acp_agent: Some(value["acp_agent"].clone())
                 .filter(|agent| agent["id"].is_string() && agent["name"].is_string()),
+            claude_config: None,
         }
     }
 
@@ -840,6 +845,7 @@ impl Session<'_> {
                     // and gateway.
                     next.bin = options.bin.clone();
                     next.env = options.env.clone();
+                    next.claude_config = next.claude_config.or(options.claude_config.clone());
                     next.gateway = next.gateway.or(options.gateway);
                     next.approval_mode = next.approval_mode.or(options.approval_mode.clone());
                     next.dirs = crate::projects::extra_dirs(self.hub, &self.cwd);
@@ -911,11 +917,17 @@ impl Session<'_> {
         }
     }
 
-    /// Whether the engine has saved conversation `id` (only then can its
-    /// TUI resume it).
-    fn saved(&self, id: &str) -> bool {
+    /// Whether the engine run with `options` has saved conversation `id`
+    /// (only then can its TUI resume it).
+    fn saved(&self, id: &str, options: &Options) -> bool {
         match self.kind {
-            Kind::Claude => !claude::transcript(&self.cwd, id, self.hub.uploads.dir()).is_empty(),
+            Kind::Claude => !claude::transcript(
+                &claude::config_with(options, &self.cwd, id),
+                &self.cwd,
+                id,
+                self.hub.uploads.dir(),
+            )
+            .is_empty(),
             Kind::Codex => codex::saved(&self.cwd)
                 .iter()
                 .any(|(saved, ..)| saved == id),
@@ -946,7 +958,7 @@ impl Session<'_> {
             self.refuse(request, "the conversation has not started yet".to_string());
             return None;
         };
-        match tui_command(self.kind, &id, options, &self.cwd, self.saved(&id)) {
+        match tui_command(self.kind, &id, options, &self.cwd, self.saved(&id, options)) {
             Ok(start) => Some((id, start.command, start.key)),
             Err(error) => {
                 self.refuse(request, error);
@@ -1037,7 +1049,7 @@ impl Session<'_> {
         // Back to the engine, on the conversation as the TUI left it (none
         // when the TUI saved nothing: the engine starts it afresh).
         let id = match self.kind {
-            Kind::Codex if !self.saved(&id) => codex::saved(&self.cwd)
+            Kind::Codex if !self.saved(&id, &options) => codex::saved(&self.cwd)
                 .into_iter()
                 .map(|(id, ..)| id)
                 .find(|saved| !earlier.contains(saved))
@@ -1045,7 +1057,7 @@ impl Session<'_> {
             _ => id,
         };
         let next = Options {
-            resume: self.saved(&id).then(|| id.clone()),
+            resume: self.saved(&id, &options).then(|| id.clone()),
             resume_at: None,
             ..options
         };
@@ -1061,7 +1073,8 @@ impl Session<'_> {
                 // Codex replays its thread when it resumes; Claude Code's
                 // conversation is read from its file.
                 if self.kind == Kind::Claude {
-                    events.push(json!({ "type": "transcript", "items": claude::transcript(&self.cwd, &id, self.hub.uploads.dir()) }));
+                    let config = claude::config_with(&next, &self.cwd, &id);
+                    events.push(json!({ "type": "transcript", "items": claude::transcript(&config, &self.cwd, &id, self.hub.uploads.dir()) }));
                 }
                 self.publish(events);
                 Some((started, engine, next))
