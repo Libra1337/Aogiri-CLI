@@ -269,7 +269,11 @@ fn print_prompt_token_report() {
             tokens(&tool.to_string())
         );
     }
-    println!("{:<45} {:>6}", "app tools total", app_tools_tokens(&crate::app_tools::NAMES));
+    println!(
+        "{:<45} {:>6}",
+        "app tools total",
+        app_tools_tokens(&crate::app_tools::NAMES)
+    );
 }
 
 /// Tokens of the app tools `names` as a request carries them.

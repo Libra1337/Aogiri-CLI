@@ -507,7 +507,10 @@ mod tests {
         assert_eq!(made.origin.as_deref(), Some("prop-1a2b"));
         let saved = Schedule::from_json(&made.to_json()).unwrap();
         assert_eq!(saved.origin.as_deref(), Some("prop-1a2b"));
-        assert_eq!(schedule(json!({ "repeat": "daily", "time": "09:00" })).origin, None);
+        assert_eq!(
+            schedule(json!({ "repeat": "daily", "time": "09:00" })).origin,
+            None
+        );
     }
 
     #[test]

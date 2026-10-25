@@ -1501,8 +1501,7 @@ impl Hub {
             .map(|(id, hosted)| crate::devservers::SessionDir {
                 id: id.clone(),
                 cwd: hosted.cwd.clone(),
-                last_active: at
-                    .saturating_sub(hosted.last_active.elapsed().as_millis() as u64),
+                last_active: at.saturating_sub(hosted.last_active.elapsed().as_millis() as u64),
             })
             .collect();
         let hub = Arc::clone(self);

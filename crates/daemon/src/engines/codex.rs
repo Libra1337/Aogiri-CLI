@@ -2442,7 +2442,10 @@ mod tests {
         let answer = sent(&c.answer(&calls[0].token, Ok(json!({ "files": [] }))));
         assert_eq!(answer[0]["id"], 40);
         assert_eq!(answer[0]["result"]["success"], true);
-        assert_eq!(answer[0]["result"]["contentItems"][0]["text"], "{\"files\":[]}");
+        assert_eq!(
+            answer[0]["result"]["contentItems"][0]["text"],
+            "{\"files\":[]}"
+        );
         let refused = sent(&c.answer(&json!(41), Err("off".into())));
         assert_eq!(refused[0]["result"]["success"], false);
         let unknown = sent(&frame(&mut c, json!({ "id": 42, "method": "item/tool/call", "params": { "tool": "other", "arguments": {} } })).frames);
@@ -2450,7 +2453,10 @@ mod tests {
         let done = json!({ "type": "dynamicToolCall", "id": "d", "tool": "present_files", "contentItems": [{ "type": "inputText", "text": "{}" }] });
         assert_eq!(dynamic_body(&done), "{}");
         let rows = transcript(&json!([{ "items": [done] }]));
-        assert_eq!((rows[0]["name"].as_str(), rows[0]["output"].as_str()), (Some("present_files"), Some("{}")));
+        assert_eq!(
+            (rows[0]["name"].as_str(), rows[0]["output"].as_str()),
+            (Some("present_files"), Some("{}"))
+        );
         // None offered: no dynamic tools; a resumed thread keeps its own.
         let mut bare = Codex::new(Path::new("/p"), &Options::default());
         bare.start();

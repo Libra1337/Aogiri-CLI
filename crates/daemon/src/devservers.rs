@@ -45,7 +45,13 @@ pub struct Server {
 /// The shell tools' names in the engines' events: the LynShen engine's
 /// (`bash`, its aliases, and polling a background shell), Claude Code's and
 /// Codex's commands (shown as `bash`), Claude Code's background output.
-const SHELL_TOOLS: [&str; 5] = ["bash", "exec_command", "write_stdin", "BashOutput", "TaskOutput"];
+const SHELL_TOOLS: [&str; 5] = [
+    "bash",
+    "exec_command",
+    "write_stdin",
+    "BashOutput",
+    "TaskOutput",
+];
 
 /// One listening socket.
 #[derive(Clone, Debug, PartialEq)]
@@ -704,7 +710,10 @@ mod tests {
             printed_urls(&printed_text(&acp)),
             vec![(8000, "http://localhost:8000/".to_string())]
         );
-        assert_eq!(printed_text("plain http://127.0.0.1:3000"), "plain http://127.0.0.1:3000");
+        assert_eq!(
+            printed_text("plain http://127.0.0.1:3000"),
+            "plain http://127.0.0.1:3000"
+        );
     }
 
     #[test]
@@ -758,7 +767,10 @@ mod tests {
         // Claude Code's background output and a background shell poll count.
         let later = DevServers::default();
         crate::hub::lock(&later.state).baseline = Some(HashSet::new());
-        later.observe(&json!({ "type": "tool_start", "name": "BashOutput" }), 1_000);
+        later.observe(
+            &json!({ "type": "tool_start", "name": "BashOutput" }),
+            1_000,
+        );
         assert!(later.due(1_000));
         // An ACP agent's command, named by its title.
         let acp = DevServers::default();

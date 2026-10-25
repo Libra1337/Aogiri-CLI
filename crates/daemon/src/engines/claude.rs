@@ -3765,7 +3765,10 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect();
-        let allowed = args.iter().find(|arg| arg.starts_with("mcp__lynshen__")).unwrap();
+        let allowed = args
+            .iter()
+            .find(|arg| arg.starts_with("mcp__lynshen__"))
+            .unwrap();
         assert_eq!(
             allowed,
             "mcp__lynshen__present_files,mcp__lynshen__propose_schedule,mcp__lynshen__send_to_session"

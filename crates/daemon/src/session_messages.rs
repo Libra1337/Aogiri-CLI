@@ -203,9 +203,7 @@ pub(crate) fn engine_gate(hub: &Hub, session: &str, name: &str) -> Option<bool> 
     }
     match Setting::current() {
         Setting::Ask => Some(true),
-        _ if rank(&hub.messages.mode(session).unwrap_or_default()) <= rank("manual") => {
-            Some(false)
-        }
+        _ if rank(&hub.messages.mode(session).unwrap_or_default()) <= rank("manual") => Some(false),
         _ => None,
     }
 }
@@ -923,7 +921,9 @@ fn wait_session(
                 .and_then(|list| list.iter().find(|pending| pending.id == id));
             if pending.is_some_and(|pending| pending.approval) {
                 let mut out = report("waiting_approval");
-                out["note"] = json!("It waits for the user to approve a step; call wait_session again later.");
+                out["note"] = json!(
+                    "It waits for the user to approve a step; call wait_session again later."
+                );
                 return Ok(out);
             }
             if pending.is_none() {
@@ -1187,8 +1187,14 @@ mod tests {
         assert_eq!(helper_mode("full-access", None).unwrap(), "auto");
         assert!(helper_mode("full-access", Some("full-access")).is_err());
         // A Claude Code or Codex sender's mode, in LynShen's names.
-        assert_eq!(helper_mode(&lynshen_mode("read-only"), None).unwrap(), "manual");
-        assert_eq!(helper_mode(&lynshen_mode("full-auto"), None).unwrap(), "auto");
+        assert_eq!(
+            helper_mode(&lynshen_mode("read-only"), None).unwrap(),
+            "manual"
+        );
+        assert_eq!(
+            helper_mode(&lynshen_mode("full-auto"), None).unwrap(),
+            "auto"
+        );
         assert_eq!(lynshen_mode("acceptEdits"), "auto-edit");
         assert_eq!(lynshen_mode("plan"), "plan");
     }
@@ -1229,11 +1235,19 @@ mod tests {
         }
         let running = wait_session(&hub, "a", "b", Duration::ZERO, &stopped).unwrap();
         assert_eq!(running["status"], "running");
-        observe(&hub, "b", &json!({ "type": "approval_request", "call_id": "c" }));
+        observe(
+            &hub,
+            "b",
+            &json!({ "type": "approval_request", "call_id": "c" }),
+        );
         let asked = wait_session(&hub, "a", "b", Duration::from_secs(5), &stopped).unwrap();
         assert_eq!(asked["status"], "waiting_approval");
         observe(&hub, "b", &json!({ "type": "assistant_start" }));
-        observe(&hub, "b", &json!({ "type": "assistant_delta", "delta": "all good" }));
+        observe(
+            &hub,
+            "b",
+            &json!({ "type": "assistant_delta", "delta": "all good" }),
+        );
         observe(&hub, "b", &json!({ "type": "status", "message": "ready" }));
         let done = wait_session(&hub, "a", "b", Duration::from_secs(5), &stopped).unwrap();
         assert_eq!(

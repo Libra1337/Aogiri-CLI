@@ -227,8 +227,8 @@ fn image(hub: &Hub, path: &Path) -> Result<Value, String> {
             real
         }
     };
-    let media = media_type(&real)
-        .ok_or_else(|| format!("not an image or a video: {}", real.display()))?;
+    let media =
+        media_type(&real).ok_or_else(|| format!("not an image or a video: {}", real.display()))?;
     let meta = fs::metadata(&real).map_err(|error| format!("{}: {error}", real.display()))?;
     if meta.len() > MAX_IMAGE {
         return Err(format!(

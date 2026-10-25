@@ -164,7 +164,8 @@ mod tests {
             json(&json!({})),
             json!({ "type": "app_tools", "present_files": true, "propose_schedule": true, "sessions": "on" })
         );
-        let some = json!({ "app_tools": { "present_files": false }, "sessions": { "messages": "off" } });
+        let some =
+            json!({ "app_tools": { "present_files": false }, "sessions": { "messages": "off" } });
         assert_eq!(enabled(&some), [PROPOSE_SCHEDULE]);
         assert_eq!(json(&some)["sessions"], "off");
         assert_eq!(json(&some)["present_files"], false);
