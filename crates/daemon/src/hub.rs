@@ -205,6 +205,20 @@ const OPEN_GRACE: Duration = Duration::from_secs(30);
 /// How often idle engine sessions are looked for (`close_idle_engines`).
 const IDLE_SWEEP_EVERY: Duration = Duration::from_secs(30);
 
+/// `ENGINE_IDLE_CLOSE`, which a debug build's end-to-end checks shorten with
+/// `LYNSHEN_TEST_ENGINE_IDLE_SECS`. A release build always waits the full time.
+fn engine_idle_close() -> Duration {
+    if cfg!(debug_assertions) {
+        if let Some(secs) = std::env::var("LYNSHEN_TEST_ENGINE_IDLE_SECS")
+            .ok()
+            .and_then(|secs| secs.parse().ok())
+        {
+            return Duration::from_secs(secs);
+        }
+    }
+    ENGINE_IDLE_CLOSE
+}
+
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
@@ -988,6 +1002,7 @@ impl Hub {
             .filter(|id| crate::session_messages::awaited(self, id))
             .cloned()
             .collect();
+        let idle_close = engine_idle_close();
         let mut closing = Vec::new();
         {
             // Checked and removed under one lock: an op that reaches the
@@ -1024,7 +1039,7 @@ impl Hub {
                 .count();
             for (id, idle_for) in idle {
                 let over = live > MAX_LIVE_ENGINES && idle_for >= CAP_MIN_IDLE;
-                if idle_for < ENGINE_IDLE_CLOSE && !over {
+                if idle_for < idle_close && !over {
                     continue;
                 }
                 if let Some(hosted) = sessions.remove(&id) {
