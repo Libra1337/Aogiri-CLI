@@ -705,6 +705,48 @@ impl SessionStore {
         Ok(())
     }
 
+    /// A new session, under a new id, holding this one's active branch up to
+    /// its first `keep` user turns (all of it when None): a fork, which goes
+    /// on apart from this session. Entries keep their ids, so a compaction
+    /// still names the entries it replaced. The branch's plan, reply style
+    /// and system prompt come along (a kept prompt keeps the provider's
+    /// cache warm); its goal, team and resume summary stay with this one.
+    pub fn forked(&self, keep: Option<usize>) -> SessionStore {
+        let mut branch = self.branch();
+        if let Some(keep) = keep {
+            // Also before the notes the next message was sent with: they
+            // belong to the turn the fork leaves out (`checkout_before_user`).
+            let mut cut = branch
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| matches!(entry.kind, EntryKind::User { .. }))
+                .nth(keep)
+                .map_or(branch.len(), |(index, _)| index);
+            while cut > 0 && note_in(branch[cut - 1]).is_some() {
+                cut -= 1;
+            }
+            branch.truncate(cut);
+        }
+        let mut fork = SessionStore {
+            next_id: self.next_id,
+            needs_snapshot: true,
+            style: self.style.clone(),
+            prompt: self.prompt.clone(),
+            ..SessionStore::new()
+        };
+        for entry in branch {
+            fork.by_id.insert(entry.id, fork.entries.len());
+            fork.entries.push(entry.clone());
+            fork.leaf_id = Some(entry.id);
+        }
+        fork.rebuild_branch_heads();
+        fork.plan = fork
+            .last_successful_call("update_plan")
+            .and_then(|args| crate::core::parse_plan(&args))
+            .unwrap_or_default();
+        fork
+    }
+
     pub fn branch(&self) -> Vec<&SessionEntry> {
         let mut path = Vec::new();
         let mut current = self.leaf_id;
@@ -2912,6 +2954,71 @@ mod tests {
             0,
         )]));
         assert!(event["items"][0].get("at").is_none());
+    }
+
+    #[test]
+    fn a_fork_keeps_the_first_turns_under_a_new_id() {
+        let mut session = SessionStore::new();
+        session.set_style(Some("concise".to_string()));
+        for turn in ["one", "two", "three"] {
+            // A note sent with the message belongs to its turn.
+            session.append_note(Note::Date, format!("date of {turn}"));
+            session.append(EntryKind::User {
+                content: turn.to_string(),
+            });
+            let call = format!("plan-{turn}");
+            session.append(EntryKind::ResponseItem {
+                item: json!({ "type": "function_call", "name": "update_plan", "call_id": call,
+                    "arguments": json!({ "plan": [{ "step": turn, "status": "pending" }] }).to_string() }),
+            });
+            session.append(EntryKind::ToolOutput {
+                call_id: call,
+                name: "update_plan".to_string(),
+                output: "{}".to_string(),
+                image: None,
+            });
+            session.append(EntryKind::ResponseItem {
+                item: json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": format!("re {turn}") }] }),
+            });
+        }
+        let users = |store: &SessionStore| -> Vec<String> {
+            store
+                .transcript_items()
+                .into_iter()
+                .filter_map(|item| match item {
+                    TranscriptItem::User(text) => Some(text),
+                    _ => None,
+                })
+                .collect()
+        };
+        let fork = session.forked(Some(2));
+        assert_ne!(fork.session_id(), session.session_id());
+        assert_eq!(users(&fork), ["one", "two"]);
+        // The third turn's note went with it.
+        assert_eq!(fork.last_note(Note::Date), Some("date of two"));
+        // The plan is the one the kept turns set; the style comes along.
+        assert_eq!(fork.plan()[0].step, "two");
+        assert_eq!(fork.style(), Some("concise"));
+        // The source is untouched, and a fork of all of it holds all of it.
+        assert_eq!(users(&session), ["one", "two", "three"]);
+        assert_eq!(users(&session.forked(None)), ["one", "two", "three"]);
+        assert!(users(&session.forked(Some(0))).is_empty());
+
+        // Saved for another directory (its own worktree), it loads there.
+        let dir = std::env::temp_dir().join(format!("lynshen-fork-{}", std::process::id()));
+        let cwd = Path::new("/work/fork");
+        let mut fork = fork;
+        fork.save_for_cwd(&dir, cwd).unwrap();
+        let loaded = SessionStore::load_for_cwd(&dir, cwd, fork.session_id()).unwrap();
+        assert_eq!(users(&loaded), ["one", "two"]);
+        assert_eq!(loaded.plan()[0].step, "two");
+        // Appending goes on after the copied entries.
+        let mut loaded = loaded;
+        let next = loaded.append(EntryKind::User {
+            content: "four".to_string(),
+        });
+        assert!(next.0 >= session.next_id);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

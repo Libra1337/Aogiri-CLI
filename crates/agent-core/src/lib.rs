@@ -284,3 +284,19 @@ pub fn android_use_op(name: &str, op: &serde_json::Value) -> Result<serde_json::
 pub fn saved_sessions(cwd: &std::path::Path) -> std::io::Result<Vec<SessionSummary>> {
     session::SessionStore::list_for_cwd(&config::profile_dir()?, cwd)
 }
+
+/// Forks session `from`, saved for `from_cwd`, into a new session saved for
+/// `cwd` (another directory when the fork works in its own worktree) that
+/// holds its first `keep` user turns (all when None). Returns the new
+/// session's id; the original is not touched.
+pub fn fork_session(
+    from_cwd: &std::path::Path,
+    cwd: &std::path::Path,
+    from: &str,
+    keep: Option<usize>,
+) -> std::io::Result<String> {
+    let profile = config::profile_dir()?;
+    let mut fork = session::SessionStore::load_for_cwd(&profile, from_cwd, from)?.forked(keep);
+    fork.save_for_cwd(&profile, cwd)?;
+    Ok(fork.session_id().to_string())
+}
