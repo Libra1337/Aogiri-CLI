@@ -248,11 +248,18 @@ fn pump(
     link: &mut impl Link,
     inbox: &hub::Inbox,
 ) -> Result<(), String> {
-    // The daemon also forks conversations and probes engines (B08); a
-    // client checks for them before it offers either.
+    // The daemon also forks conversations and probes engines (B08), runs
+    // custom providers, built-in ACP agents and session terminals any client
+    // attaches to (B10); a client checks for them before it offers any.
     let mut hello = protocol::hello_json(hub.version);
     if let Some(features) = hello["features"].as_array_mut() {
-        features.extend([json!("fork"), json!("engine_probe")]);
+        features.extend([
+            json!("fork"),
+            json!("engine_probe"),
+            json!("tool_providers"),
+            json!("acp_presets"),
+            json!("term_attach"),
+        ]);
     }
     for frame in [
         hello,
@@ -594,27 +601,62 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         respond(hub, client, &request, result);
         return;
     }
-    // A program to run (an ACP agent, an engine binary, its environment):
-    // only the desktop names one.
+    // A program to run (an ACP agent's command line, an engine binary, its
+    // environment): only the desktop names one. A built-in ACP agent
+    // (`options.agent`) is the daemon's own, so a phone may start it too.
     if matches!(name, "session_create" | "session_open" | "engine_probe") {
         let options = engines::Options::from_json(&op["options"]);
         let acp = op["engine"] == "acp";
-        if (acp || options.runs_programs()) && !hub.is_local(client) {
+        if options.runs_programs() && !hub.is_local(client) {
             reply(
                 json!({ "type": "error", "message": "only the desktop can choose what an engine runs" }),
             );
             return;
         }
-        let checked = options
-            .check_env()
-            .and_then(|()| match acp && options.command.is_none() {
-                true => Err("an ACP session needs options.command".to_string()),
-                false => Ok(()),
-            });
+        let checked = options.check_env().and_then(|()| match acp {
+            true if name == "session_create"
+                && options.command.is_none()
+                && options.agent.is_none() =>
+            {
+                Err("an ACP session needs options.agent or options.command".to_string())
+            }
+            true => engines::acp::preset(&options).map(|_| ()),
+            false => Ok(()),
+        });
         if let Err(message) = checked {
             reply(json!({ "type": "error", "message": message }));
             return;
         }
+        // Pi asks nothing before running tools: a phone starts it only with
+        // the scope 全自动 needs.
+        let never_asks = acp
+            && options
+                .agent
+                .as_deref()
+                .and_then(engines::acp_presets::find)
+                .is_some_and(|preset| !preset.approvals);
+        if never_asks {
+            if let Some(device) = hub.device_of(client) {
+                let full = json!({ "mode": "full-access" });
+                if let Err(message) = scopes::check(hub, &device, "set_approval_mode", &full) {
+                    reply(json!({ "type": "error", "message": message }));
+                    return;
+                }
+            }
+        }
+    }
+    // Each built-in ACP agent's version is asked of the agent (seconds).
+    if name == "acp_presets" {
+        let hub = Arc::clone(hub);
+        thread::spawn(move || {
+            respond(
+                &hub,
+                client,
+                &request,
+                Ok(engines::acp_presets::presets_json()),
+            )
+        });
+        return;
     }
     // What an engine says of itself before any conversation (its models,
     // commands, options), from a run of it that no list shows. It takes

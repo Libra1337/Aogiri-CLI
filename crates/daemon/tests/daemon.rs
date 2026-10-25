@@ -73,7 +73,15 @@ impl Client {
         let hello = client.until(|frame| frame["type"] == "hello");
         assert_eq!(hello.last().unwrap()["protocol"], 2);
         let features = &hello.last().unwrap()["features"];
-        for feature in ["queue", "files", "fork", "engine_probe"] {
+        for feature in [
+            "queue",
+            "files",
+            "fork",
+            "engine_probe",
+            "tool_providers",
+            "acp_presets",
+            "term_attach",
+        ] {
             assert!(
                 features.as_array().unwrap().contains(&json!(feature)),
                 "{features}"

@@ -216,6 +216,34 @@ fn gateway_credentials(config: config::Config) -> Result<(String, String, u64), 
     ))
 }
 
+/// The user's enabled MCP servers as an ACP agent takes them with each
+/// session (`mcpServers`): stdio ones with their command, http ones with
+/// their URL. Servers that sign in with OAuth stay out (their tokens are
+/// this engine's, refreshed here).
+pub fn acp_mcp_servers() -> Vec<serde_json::Value> {
+    let Ok(config) = config::Config::load_existing() else {
+        return Vec::new();
+    };
+    let pairs = |map: &std::collections::BTreeMap<String, String>| {
+        map.iter()
+            .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+            .collect::<Vec<_>>()
+    };
+    config
+        .mcp_servers
+        .iter()
+        .filter(|server| server.enabled && server.oauth.is_none())
+        .map(|server| match server.transport {
+            config::McpTransportKind::Stdio => serde_json::json!({
+                "name": server.name, "command": server.command, "args": server.args, "env": pairs(&server.env),
+            }),
+            config::McpTransportKind::Http => serde_json::json!({
+                "type": "http", "name": server.name, "url": server.url, "headers": pairs(&server.headers),
+            }),
+        })
+        .collect()
+}
+
 /// Saves an MCP server change to config.json: `mcp_set` (`server`, a config
 /// entry), `mcp_remove` (`name`) or `mcp_toggle` (`name`, `enabled`), the
 /// session ops, for a client with no session to send it to. Running sessions

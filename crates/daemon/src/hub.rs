@@ -640,10 +640,14 @@ impl Hub {
             engines::pin_tool_provider(&self.store, kind, &mut options);
         }
         let tool_provider = options.tool_provider.clone();
-        let acp_agent = options
-            .acp_agent
-            .clone()
-            .filter(|_| engine == Some(engines::Kind::Acp));
+        // Which ACP agent runs it (a built-in one by its id, or the
+        // desktop's registry entry): a client can start it again.
+        let acp_agent = match &options.agent {
+            Some(id) => engines::acp_presets::find(id)
+                .map(|preset| json!({ "id": preset.id, "name": preset.name, "builtin": true })),
+            None => options.acp_agent.clone(),
+        }
+        .filter(|_| engine == Some(engines::Kind::Acp));
         let mut hook_stopper = None;
         let (id, ops, generation) = match engine {
             None => {
@@ -926,6 +930,33 @@ impl Hub {
                         from.map(|from| (from, at))
                     }
                     _ => None,
+                };
+                // A built-in ACP agent opens again from its record, whatever
+                // the client names; a registered one only from the desktop,
+                // which knows its command.
+                let builtin = (kind == engines::Kind::Acp)
+                    .then(|| record.acp_agent.as_ref())
+                    .flatten()
+                    .filter(|agent| agent["builtin"] == true)
+                    .and_then(|agent| agent["id"].as_str())
+                    .map(str::to_string);
+                if kind == engines::Kind::Acp
+                    && builtin.is_none()
+                    && options.command.is_none()
+                    && options.agent.is_none()
+                {
+                    return Err(
+                        "this agent's session can only be reopened on the desktop".to_string()
+                    );
+                }
+                let options = match builtin {
+                    Some(agent) => engines::Options {
+                        agent: Some(agent),
+                        command: None,
+                        args: Vec::new(),
+                        ..options
+                    },
+                    None => options,
                 };
                 // A client that does not say (a phone) keeps how it last ran,
                 // on the provider it last ran on off the gateway (a session
