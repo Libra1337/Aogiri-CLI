@@ -1010,6 +1010,24 @@ impl Claude {
         held.frame
     }
 
+    /// Hands the held messages at `picked` (ascending) to the CLI with
+    /// priority `now`, in the order they were held.
+    fn release_all(&mut self, picked: &[usize]) -> Vec<String> {
+        let mut taken: Vec<Held> = picked
+            .iter()
+            .rev()
+            .map(|i| self.held.remove(*i))
+            .collect();
+        taken.reverse();
+        taken
+            .into_iter()
+            .map(|held| {
+                self.queued.push(held.text);
+                now_priority(&held.frame)
+            })
+            .collect()
+    }
+
     /// The steered messages, once their subagents are in the background,
     /// the wait is over or the turn has ended (they start the next one).
     fn steer_ready(&mut self) -> Vec<String> {
@@ -2565,12 +2583,7 @@ impl Claude {
                 if picked.is_empty() {
                     return Ok(Output::default());
                 }
-                let mut steered = picked
-                    .iter()
-                    .rev()
-                    .map(|i| now_priority(&self.release(*i)))
-                    .collect::<Vec<_>>();
-                steered.reverse();
+                let steered = self.release_all(&picked);
                 let events = vec![self.queued_event()];
                 // Already waiting for moves: these go with those.
                 if let Some(steering) = &mut self.steering {
@@ -4895,7 +4908,10 @@ mod tests {
     #[test]
     fn queued_messages_taken_in_together_each_show_as_sent() {
         let mut c = holding(&["apple", "banana"]);
-        c.encode(&json!({ "op": "steer" })).unwrap();
+        let steer = c.encode(&json!({ "op": "steer" })).unwrap();
+        // Both go, in the order sent, and stay listed so.
+        assert!(steer.frames[0].contains("apple") && steer.frames[1].contains("banana"));
+        assert_eq!(steer.events, vec![pending(&["apple", "banana"], 2)]);
         let taken = frame(
             &mut c,
             json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "apple" }, { "type": "text", "text": "banana" }] } }),
