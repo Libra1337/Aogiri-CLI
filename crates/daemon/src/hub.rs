@@ -819,6 +819,7 @@ impl Hub {
         lock(&self.busy).remove(id);
         lock(&self.claims).remove(id);
         self.usage.close(id);
+        self.usage.forget(id);
         self.broadcast(&json!({ "type": "session_closed", "session": id }));
     }
 

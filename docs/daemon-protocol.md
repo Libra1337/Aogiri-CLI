@@ -482,6 +482,15 @@ message (written once under `~/.lynshen/uploads/claude` and named by path in
 `images`) and a `/goal <condition>` command as the user wrote it; other
 slash commands stay out of the conversation.
 
+Usage that Claude Code's stream does not show (Task subagents, Workflow
+agents, compaction) comes at the end of a turn as `usage` with
+`aggregate: true` and the `model` it ran on: one per model, the sum of
+several requests, counted toward the turn (so not one request's cache
+figures). Background work that ends after a turn lands in the next one's.
+For billing the local gateway charges a session's requests to its last turn
+until the next one opens, so background work after a turn ends is that
+turn's cost.
+
 And sends more events: `background_tasks` (`tasks: [{id, kind,
 description}]`, the live set: replace yours), `task_progress` (`task_id`,
 `message`), `task_done` (`task_id`, `kind`, `status`, `summary`: a background
