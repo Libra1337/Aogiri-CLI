@@ -575,7 +575,8 @@ mod tests {
     }
 
     fn client(hub: &Hub, device: bool) -> (u64, mpsc::Receiver<String>) {
-        let (outbox, frames) = Hub::outbox();
+        let (sender, frames) = mpsc::channel();
+        let outbox = crate::hub::Outbox::local(sender);
         let device = device.then(|| "dev-1".to_string());
         (hub.add_client(outbox, device), frames)
     }

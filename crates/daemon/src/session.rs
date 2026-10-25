@@ -358,9 +358,6 @@ fn terminal(
 }
 
 /// Applies one op; returns true when the session should stop.
-/// The answer to a TUI open while the conversation already runs in one.
-pub(crate) const ALREADY_IN_TERMINAL: &str = "the conversation is already open in its terminal";
-
 /// An error answer to one request (`op["id"]`), for its client only.
 fn refuse_request(hub: &Hub, op: &Value, message: &str) {
     let mut error = json!({ "type": "error", "message": message });

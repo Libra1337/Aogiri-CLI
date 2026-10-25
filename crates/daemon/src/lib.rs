@@ -550,7 +550,7 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     ) {
         // A device without the terminal scope only looks: its window does
         // not resize the session's TUI.
-        let mut op = op;
+        let mut op = op.clone();
         if name == "term_attach" {
             if let Some(device) = hub.device_of(client) {
                 if scopes::check(hub, &device, "term_resize", &op).is_err() {

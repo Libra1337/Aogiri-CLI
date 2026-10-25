@@ -2312,7 +2312,9 @@ fn a_claude_conversation_moves_to_its_tui_and_back() {
     );
     assert_eq!(again["type"], "term_attached", "{again}");
     assert_eq!(again["term"], term.as_str());
-    other.until(|f| f["replay"] == true && term_text(std::slice::from_ref(f), &term).contains(&started));
+    other.until(|f| {
+        f["replay"] == true && term_text(std::slice::from_ref(f), &term).contains(&started)
+    });
 
     type_in(&mut other, &term, "from the tui\n");
     for client in [&mut desktop, &mut other] {
@@ -2518,11 +2520,17 @@ fn a_phone_views_a_sessions_tui_and_types_only_with_the_terminal_scope() {
     // The phone learns which terminal from the session's surface event.
     let surface = phone.until(|f| f["session"] == session.as_str() && f["type"] == "surface");
     assert_eq!(surface.last().unwrap()["term"], term.as_str());
-    let attached = request(&mut phone, json!({ "op": "term_attach", "term": term, "cols": 40, "rows": 10 }));
+    let attached = request(
+        &mut phone,
+        json!({ "op": "term_attach", "term": term, "cols": 40, "rows": 10 }),
+    );
     assert_eq!(attached["type"], "term_attached", "{attached}");
     // Without the terminal scope it only looks: its window does not resize
     // the TUI, and it may not type or close it.
-    assert_eq!((attached["cols"].clone(), attached["rows"].clone()), (json!(100), json!(30)));
+    assert_eq!(
+        (attached["cols"].clone(), attached["rows"].clone()),
+        (json!(100), json!(30))
+    );
     let replay = phone.until(|f| f["replay"] == true);
     assert!(term_text(&replay, &term).contains("TUI --resume"));
     for op in [
@@ -2531,12 +2539,16 @@ fn a_phone_views_a_sessions_tui_and_types_only_with_the_terminal_scope() {
     ] {
         let refused = request(&mut phone, op);
         assert!(
-            refused["message"].as_str().unwrap_or_default().starts_with("scope_required:terminal"),
+            refused["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("scope_required:terminal"),
             "{refused}"
         );
     }
     type_in(&mut desktop, &term, "hello phone\n");
-    let seen = phone.until(|f| term_text(std::slice::from_ref(f), &term).contains("got: hello phone"));
+    let seen =
+        phone.until(|f| term_text(std::slice::from_ref(f), &term).contains("got: hello phone"));
     let bytes: usize = seen
         .iter()
         .filter(|f| f["type"] == "term_output" && f["term"] == term.as_str())
