@@ -21,10 +21,16 @@
 //!   subagents report through `system/task_*` and
 //!   `background_tasks_changed`; a finished background task also comes back
 //!   as a `<task-notification>` user message that starts a turn.
-//! - A user message sent mid-turn is taken into the running turn at the
-//!   next tool boundary (or starts the next turn) and replayed then; until
-//!   that replay it shows as queued (`pending_messages`). Claude Code saves
-//!   it only as a `queued_command` attachment row.
+//! - A user message sent mid-turn waits here (`pending_messages`, where it
+//!   can be taken back or dropped with `unqueue` and reordered with
+//!   `queue_move`) and starts the next turn when this one ends. `steer`
+//!   writes it to the CLI now with priority `now`, which stops the running
+//!   turn's generation and tool calls and takes the message in at once. A
+//!   subagent the turn runs in the foreground would be one of those calls,
+//!   so it is moved to the background first (`background_tasks`) and
+//!   reports back as a task notification. Until the CLI replays the message
+//!   it stays listed, first and `fixed` (it can no longer be taken back).
+//!   Claude Code saves it only as a `queued_command` attachment row.
 //! - Full access (`bypassPermissions`) is only honored when the CLI starts
 //!   with `--dangerously-skip-permissions`, so switching into or out of it
 //!   restarts the engine on the same conversation.
@@ -37,6 +43,7 @@ mod runs;
 
 use super::{home, resolve, Adapter, Line, Options, Output};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use lynshen_agent_core::queue::{queue_move_target, QueuePick};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -712,6 +719,31 @@ struct Task {
     /// Runs in the background: its end is news. A foreground subagent's
     /// result is its Agent call's card.
     background: bool,
+    /// The tool call that started it.
+    tool_use_id: String,
+    /// The subagent that launched it (empty: the main loop).
+    parent: String,
+}
+
+/// A message sent mid-turn, waiting here to be written to the CLI.
+struct Held {
+    text: String,
+    /// As sent (`images` of the op), for a message taken back.
+    images: Value,
+    /// The stdin line that sends it.
+    frame: String,
+}
+
+/// How long a steer waits for its subagents to move to the background
+/// before it is sent anyway.
+const STEER_MOVE_WAIT: Duration = Duration::from_secs(5);
+
+/// Steered messages waiting for the foreground subagents to move to the
+/// background (`background_tasks` answers) before they go to the CLI.
+struct Steering {
+    frames: Vec<String>,
+    waiting: usize,
+    deadline: Instant,
 }
 
 struct ToolMeta {
@@ -784,9 +816,16 @@ pub struct Claude {
     streamed_usage: HashMap<String, Tokens>,
     active_turn: bool,
     interrupting: bool,
-    /// Messages sent mid-turn that Claude Code has not taken in (replayed)
-    /// yet, trimmed.
+    /// Messages written to the CLI that it has not taken in (replayed) yet,
+    /// trimmed.
     queued: Vec<String>,
+    /// Messages sent mid-turn, waiting here for the turn to end (or a steer).
+    held: Vec<Held>,
+    /// A steer waiting for its subagents to move to the background.
+    steering: Option<Steering>,
+    /// A steer went to the CLI during this turn: priority `now` ends it as
+    /// `error_during_execution`, which is no error to report.
+    steered: bool,
     /// The composer's slash commands: the CLI's `initialize` reply (with
     /// descriptions and argument hints), plus names only `system/init` lists.
     commands: Vec<Value>,
@@ -841,6 +880,9 @@ impl Claude {
             active_turn: false,
             interrupting: false,
             queued: Vec::new(),
+            held: Vec::new(),
+            steering: None,
+            steered: false,
             commands: Vec::new(),
             config: known_config(options).unwrap_or_else(|| config_dir_in(&options.env)),
             program: options.bin.clone().map(|bin| (bin, options.env.clone())),
@@ -929,8 +971,69 @@ impl Claude {
         content
     }
 
+    /// What waits: the messages the CLI has (`fixed`, first), then those
+    /// held here.
     fn queued_event(&self) -> Value {
-        json!({ "type": "pending_messages", "messages": self.queued })
+        json!({ "type": "pending_messages", "messages": self.waiting_texts(), "fixed": self.queued.len() })
+    }
+
+    fn waiting_texts(&self) -> Vec<&str> {
+        self.queued
+            .iter()
+            .map(String::as_str)
+            .chain(self.held.iter().map(|h| h.text.as_str()))
+            .collect()
+    }
+
+    /// The held message an op picks, as its place among the held; the
+    /// CLI's own (`fixed`) can no longer be picked.
+    fn held_pick(&self, pick: &QueuePick) -> Option<usize> {
+        let fixed = self.queued.len();
+        pick.find(&self.waiting_texts())
+            .filter(|at| *at >= fixed)
+            .map(|at| at - fixed)
+    }
+
+    /// Hands held message `i` to the CLI.
+    fn release(&mut self, i: usize) -> String {
+        let held = self.held.remove(i);
+        self.queued.push(held.text);
+        held.frame
+    }
+
+    /// The steered messages, once their subagents are in the background,
+    /// the wait is over or the turn has ended (they start the next one).
+    fn steer_ready(&mut self) -> Vec<String> {
+        let ready = self.steering.as_ref().is_some_and(|s| {
+            s.waiting == 0 || !self.active_turn || Instant::now() >= s.deadline
+        });
+        if !ready {
+            return Vec::new();
+        }
+        self.steered |= self.active_turn;
+        self.steering.take().map(|s| s.frames).unwrap_or_default()
+    }
+
+    /// The tool calls of the subagents the main loop runs in the foreground.
+    fn foreground_subagents(&self) -> Vec<String> {
+        self.tasks
+            .values()
+            .filter(|t| t.kind == "local_agent" && !t.background && t.parent.is_empty())
+            .map(|t| t.tool_use_id.clone())
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
+
+    /// The turn ended: the next held message starts the next one, unless
+    /// the CLI already has messages to run.
+    fn on_turn_end(&mut self, frame: &Value) -> Output {
+        let mut events = self.on_result(frame);
+        let mut frames = Vec::new();
+        if self.queued.is_empty() && !self.held.is_empty() {
+            frames.push(self.release(0));
+            events.push(self.queued_event());
+        }
+        Output { events, frames }
     }
 
     fn user_text(text: &str) -> String {
@@ -1605,13 +1708,8 @@ impl Claude {
     fn on_result(&mut self, frame: &Value) -> Vec<Value> {
         self.active_turn = false;
         let was_interrupting = std::mem::take(&mut self.interrupting);
+        let was_steered = std::mem::take(&mut self.steered);
         let mut events = Vec::new();
-        // Stopped: what waited is not known to run; if it does, its replay
-        // still shows it.
-        if was_interrupting && !self.queued.is_empty() {
-            self.queued.clear();
-            events.push(self.queued_event());
-        }
         if let Some(usage) = frame["modelUsage"].as_object() {
             for (name, usage) in usage {
                 if let Some(window) = usage["contextWindow"].as_u64().filter(|w| *w > 0) {
@@ -1633,7 +1731,9 @@ impl Claude {
         }
         let subtype = text(&frame["subtype"]);
         let failed = frame["is_error"] == true || subtype.to_lowercase().starts_with("error");
-        if failed && !was_interrupting {
+        // A steer (priority `now`) cut the turn short: not a failure.
+        let cut_by_steer = was_steered && subtype == "error_during_execution";
+        if failed && !was_interrupting && !cut_by_steer {
             let errors = frame["errors"]
                 .as_array()
                 .into_iter()
@@ -1742,6 +1842,12 @@ impl Claude {
         let Some((subtype, tag)) = self.pending.remove(text(&response["request_id"])) else {
             return vec![];
         };
+        // Moved or not, the steer waits for one answer fewer.
+        if subtype == "background_tasks" && tag == "steer" {
+            if let Some(steering) = &mut self.steering {
+                steering.waiting = steering.waiting.saturating_sub(1);
+            }
+        }
         if response["subtype"] == "error" {
             if subtype == "set_model" {
                 self.pending_model.clear();
@@ -1767,6 +1873,7 @@ impl Claude {
                 "mcp_status"
                 | "mcp_toggle"
                 | "mcp_reconnect"
+                | "background_tasks"
                 | "list_permission_rules"
                 | "stop_task"
                 | "rename_session"
@@ -1977,6 +2084,8 @@ impl Claude {
                         || (kind != "local_agent" && frame["is_backgrounded"] != false),
                     kind,
                     description: text(&frame["description"]).to_string(),
+                    tool_use_id: text(&frame["tool_use_id"]).to_string(),
+                    parent: text(&frame["parent_task_id"]).to_string(),
                 };
                 let events = if task.kind == "local_agent" {
                     vec![agent("running", "", &task.description)]
@@ -2226,56 +2335,19 @@ fn command_entry(name: &str, args: &str, description: &str) -> Value {
     json!({ "command": format!("/{name}"), "marker": null, "args": args, "description": description })
 }
 
-impl Adapter for Claude {
-    fn start(&mut self) -> Vec<String> {
-        let mut frames = if self.mode == "bypassPermissions" {
-            vec![self.control_request(json!({ "subtype": "list_models" }), "boot")]
-        } else {
-            let mode = self.mode;
-            vec![
-                self.control_request(
-                    json!({ "subtype": "set_permission_mode", "mode": mode }),
-                    "",
-                ),
-                self.control_request(json!({ "subtype": "list_models" }), ""),
-            ]
-        };
-        if self.fast_wanted {
-            frames.push(self.control_request(
-                json!({ "subtype": "apply_flag_settings", "settings": { "fastMode": true } }),
-                "",
-            ));
+/// A user message frame sent with priority `now` (a steer).
+fn now_priority(frame: &str) -> String {
+    match serde_json::from_str::<Value>(frame) {
+        Ok(mut value) => {
+            value["priority"] = json!("now");
+            value.to_string()
         }
-        // The command list with descriptions, before the first turn. The
-        // desktop has a stop button per background task, so an interrupt
-        // spares them.
-        frames.push(self.control_request(
-            json!({ "subtype": "initialize", "promptSuggestions": true, "agentProgressSummaries": true, "perTaskStopAffordance": true }),
-            "",
-        ));
-        if self.ultracode {
-            frames.push(self.control_request(
-                json!({ "subtype": "apply_flag_settings", "settings": { "ultracode": true } }),
-                "",
-            ));
-        }
-        if !self.thinking {
-            let frame = self.thinking_request(false);
-            frames.push(frame);
-        }
-        frames.push(self.control_request(json!({ "subtype": "get_settings" }), ""));
-        frames.push(self.control_request(json!({ "subtype": "mcp_status" }), ""));
-        // A resumed conversation's totals start from what it spent before.
-        if self.model_totals.is_none() {
-            frames.push(self.control_request(
-                json!({ "subtype": "get_usage", "skip_behaviors": true }),
-                "",
-            ));
-        }
-        frames
+        Err(_) => frame.to_string(),
     }
+}
 
-    fn translate(&mut self, line: Line) -> Output {
+impl Claude {
+    fn translate_line(&mut self, line: Line) -> Output {
         let frame = match line {
             // Diagnostics, kept for an exit message (Session::note_stderr);
             // only a failed resume is acted on.
@@ -2414,7 +2486,7 @@ impl Adapter for Claude {
             "stream_event" => self.on_stream_event(&frame),
             "assistant" => self.on_assistant(&frame),
             "user" => self.on_user(&frame),
-            "result" => self.on_result(&frame),
+            "result" => return self.on_turn_end(&frame),
             "control_request" => return self.on_control_request(&frame),
             "control_response" => self.on_control_response(&frame),
             "rate_limit_event" => {
@@ -2436,18 +2508,109 @@ impl Adapter for Claude {
         Output::events(events)
     }
 
-    fn encode(&mut self, op: &Value) -> Result<Output, String> {
+    fn encode_op(&mut self, op: &Value) -> Result<Output, String> {
         let frames = match text(&op["op"]) {
             "user_message" => {
-                let frames = vec![json!({ "type": "user", "message": { "role": "user", "content": Self::user_content(op) } }).to_string()];
-                // Mid-turn: queued until Claude Code takes it in.
-                let events = if self.active_turn {
-                    self.queued.push(text(&op["content"]).trim().to_string());
-                    vec![self.queued_event()]
+                let frame = json!({ "type": "user", "message": { "role": "user", "content": Self::user_content(op) } }).to_string();
+                // Mid-turn it waits here (as Codex's do) until the turn
+                // ends, or is steered in.
+                if self.active_turn || !self.held.is_empty() {
+                    self.held.push(Held {
+                        text: text(&op["content"]).trim().to_string(),
+                        images: op["images"].clone(),
+                        frame,
+                    });
+                    return Ok(Output::events(vec![self.queued_event()]));
+                }
+                return Ok(Output {
+                    events: Vec::new(),
+                    frames: vec![frame],
+                });
+            }
+            // A held message (`QueuePick`; every one that waits when the op
+            // names none) goes to the CLI now, with priority `now`: the
+            // running turn stops what it does and takes it in. Foreground
+            // subagents move to the background first.
+            "steer" => {
+                if !self.active_turn {
+                    return Ok(Output::default());
+                }
+                let pick = QueuePick::from_op(op);
+                let picked: Vec<usize> = if pick == QueuePick::default() {
+                    (0..self.held.len()).collect()
                 } else {
-                    Vec::new()
+                    self.held_pick(&pick).into_iter().collect()
                 };
-                return Ok(Output { events, frames });
+                if picked.is_empty() {
+                    return Ok(Output::default());
+                }
+                let mut steered = picked
+                    .iter()
+                    .rev()
+                    .map(|i| now_priority(&self.release(*i)))
+                    .collect::<Vec<_>>();
+                steered.reverse();
+                let events = vec![self.queued_event()];
+                // Already waiting for moves: these go with those.
+                if let Some(steering) = &mut self.steering {
+                    steering.frames.extend(steered);
+                    return Ok(Output::events(events));
+                }
+                let moves: Vec<String> = self
+                    .foreground_subagents()
+                    .into_iter()
+                    .map(|id| {
+                        self.control_request(
+                            json!({ "subtype": "background_tasks", "tool_use_id": id }),
+                            "steer",
+                        )
+                    })
+                    .collect();
+                if moves.is_empty() {
+                    self.steered = true;
+                    return Ok(Output {
+                        events,
+                        frames: steered,
+                    });
+                }
+                self.steering = Some(Steering {
+                    frames: steered,
+                    waiting: moves.len(),
+                    deadline: Instant::now() + STEER_MOVE_WAIT,
+                });
+                return Ok(Output {
+                    events,
+                    frames: moves,
+                });
+            }
+            // A held message taken back (dropped with `discard`); the CLI's
+            // own are past that.
+            "unqueue" => {
+                let Some(i) = self.held_pick(&QueuePick::from_op(op)) else {
+                    return Ok(Output::events(vec![self.queued_event()]));
+                };
+                let held = self.held.remove(i);
+                let mut events = vec![self.queued_event()];
+                if op["discard"] != true {
+                    events.push(json!({ "type": "unqueued", "content": held.text, "text": held.text, "images": held.images }));
+                }
+                return Ok(Output::events(events));
+            }
+            // A held message to another place among the held (`index` to
+            // `to`, in the listed messages; the CLI's own stay first).
+            "queue_move" => {
+                let fixed = self.queued.len();
+                let Some((from, to)) = queue_move_target(
+                    &QueuePick::from_op(op),
+                    op["to"].as_i64(),
+                    &self.waiting_texts(),
+                )
+                .filter(|(from, to)| *from >= fixed && *to >= fixed) else {
+                    return Ok(Output::default());
+                };
+                let item = self.held.remove(from - fixed);
+                self.held.insert(to - fixed, item);
+                return Ok(Output::events(vec![self.queued_event()]));
             }
             "approve" => {
                 let call = text(&op["call_id"]);
@@ -2501,12 +2664,26 @@ impl Adapter for Claude {
                 };
                 vec![json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request_id, "response": result } }).to_string()]
             }
+            // With `index` (a held message): that one goes first once the
+            // turn has stopped ("interrupt and send"); the others still wait.
             "interrupt" => {
                 if !self.active_turn {
                     return Ok(Output::default());
                 }
+                let mut events = Vec::new();
+                if op["index"].is_i64() {
+                    if let Some(i) = self.held_pick(&QueuePick::from_op(op)) {
+                        let chosen = self.held.remove(i);
+                        self.held.insert(0, chosen);
+                        events.push(self.queued_event());
+                    }
+                }
                 self.interrupting = true;
-                vec![self.control_request(json!({ "subtype": "interrupt" }), "")]
+                let frame = self.control_request(json!({ "subtype": "interrupt" }), "");
+                return Ok(Output {
+                    events,
+                    frames: vec![frame],
+                });
             }
             "set_approval_mode" => {
                 let mode = to_claude_mode(text(&op["mode"]));
@@ -2656,6 +2833,68 @@ impl Adapter for Claude {
             events: Vec::new(),
             frames,
         })
+    }
+}
+
+impl Adapter for Claude {
+    fn start(&mut self) -> Vec<String> {
+        let mut frames = if self.mode == "bypassPermissions" {
+            vec![self.control_request(json!({ "subtype": "list_models" }), "boot")]
+        } else {
+            let mode = self.mode;
+            vec![
+                self.control_request(
+                    json!({ "subtype": "set_permission_mode", "mode": mode }),
+                    "",
+                ),
+                self.control_request(json!({ "subtype": "list_models" }), ""),
+            ]
+        };
+        if self.fast_wanted {
+            frames.push(self.control_request(
+                json!({ "subtype": "apply_flag_settings", "settings": { "fastMode": true } }),
+                "",
+            ));
+        }
+        // The command list with descriptions, before the first turn. The
+        // desktop has a stop button per background task, so an interrupt
+        // spares them.
+        frames.push(self.control_request(
+            json!({ "subtype": "initialize", "promptSuggestions": true, "agentProgressSummaries": true, "perTaskStopAffordance": true }),
+            "",
+        ));
+        if self.ultracode {
+            frames.push(self.control_request(
+                json!({ "subtype": "apply_flag_settings", "settings": { "ultracode": true } }),
+                "",
+            ));
+        }
+        if !self.thinking {
+            let frame = self.thinking_request(false);
+            frames.push(frame);
+        }
+        frames.push(self.control_request(json!({ "subtype": "get_settings" }), ""));
+        frames.push(self.control_request(json!({ "subtype": "mcp_status" }), ""));
+        // A resumed conversation's totals start from what it spent before.
+        if self.model_totals.is_none() {
+            frames.push(self.control_request(
+                json!({ "subtype": "get_usage", "skip_behaviors": true }),
+                "",
+            ));
+        }
+        frames
+    }
+
+    fn translate(&mut self, line: Line) -> Output {
+        let mut output = self.translate_line(line);
+        output.frames.extend(self.steer_ready());
+        output
+    }
+
+    fn encode(&mut self, op: &Value) -> Result<Output, String> {
+        let mut output = self.encode_op(op)?;
+        output.frames.extend(self.steer_ready());
+        Ok(output)
     }
 
     fn busy(&self) -> bool {
@@ -4364,7 +4603,8 @@ mod tests {
         assert!(c
             .encode(&json!({ "op": "command", "input": "/resume x" }))
             .is_err());
-        assert!(c.encode(&json!({ "op": "steer" })).is_err());
+        // Nothing runs: a steer has nothing to do.
+        assert!(c.encode(&json!({ "op": "steer" })).unwrap().frames.is_empty());
     }
 
     #[test]
@@ -4409,17 +4649,35 @@ mod tests {
         c
     }
 
+    /// `mid_turn`, then `texts` sent during it (held here).
+    fn holding(texts: &[&str]) -> Claude {
+        let mut c = mid_turn();
+        for text in texts {
+            c.encode(&json!({ "op": "user_message", "content": text }))
+                .unwrap();
+        }
+        c
+    }
+
+    fn pending(messages: &[&str], fixed: usize) -> Value {
+        json!({ "type": "pending_messages", "messages": messages, "fixed": fixed })
+    }
+
     #[test]
-    fn a_message_sent_mid_turn_shows_as_queued_until_claude_takes_it_in() {
+    fn a_message_sent_mid_turn_waits_and_starts_the_next_turn() {
         let mut c = mid_turn();
         let queued = c
             .encode(&json!({ "op": "user_message", "content": "also this " }))
             .unwrap();
-        assert_eq!(queued.frames.len(), 1);
-        assert_eq!(
-            queued.events,
-            vec![json!({ "type": "pending_messages", "messages": ["also this"] })]
-        );
+        // Held here, not written to the CLI.
+        assert!(queued.frames.is_empty());
+        assert_eq!(queued.events, vec![pending(&["also this"], 0)]);
+        // The turn ends: it goes, listed as fixed until the CLI replays it.
+        let ended = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "success" }),
+        ));
+        assert!(ended.frames[0].contains("also this"));
+        assert!(ended.events.contains(&pending(&["also this"], 1)));
         let taken = frame(
             &mut c,
             json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "also this " }] } }),
@@ -4427,31 +4685,161 @@ mod tests {
         assert_eq!(
             taken,
             vec![
-                json!({ "type": "pending_messages", "messages": [] }),
+                pending(&[], 0),
                 json!({ "type": "user_message", "content": "also this " })
             ]
         );
-        // Stopped with one waiting: the queue empties.
-        c.encode(&json!({ "op": "user_message", "content": "later" }))
+        // A message sent before that turn even started waits too.
+        let mut c = holding(&["one"]);
+        c.translate(Line::Frame(json!({ "type": "result", "subtype": "success" })));
+        let second = c
+            .encode(&json!({ "op": "user_message", "content": "two" }))
             .unwrap();
-        c.encode(&json!({ "op": "interrupt" })).unwrap();
-        let ended = frame(
-            &mut c,
+        assert!(second.frames.is_empty());
+    }
+
+    #[test]
+    fn a_plain_interrupt_keeps_what_waits_and_it_runs_next() {
+        let mut c = holding(&["later"]);
+        let stop = c.encode(&json!({ "op": "interrupt" })).unwrap();
+        assert!(stop.frames[0].contains("interrupt"));
+        let ended = c.translate(Line::Frame(
             json!({ "type": "result", "subtype": "error_during_execution", "is_error": true }),
-        );
+        ));
+        assert!(ended.events.iter().all(|e| e["type"] != "error"));
+        assert_eq!(ended.frames.len(), 1);
+        assert!(ended.frames[0].contains("later"));
+    }
+
+    #[test]
+    fn a_steer_goes_with_priority_now_and_its_cut_is_no_error() {
+        let mut c = holding(&["apple", "banana"]);
+        let steer = c.encode(&json!({ "op": "steer", "index": -1 })).unwrap();
+        assert_eq!(steer.frames.len(), 1);
+        let sent: Value = serde_json::from_str(&steer.frames[0]).unwrap();
+        assert_eq!(sent["priority"], "now");
+        assert_eq!(sent["message"]["content"][0]["text"], "banana");
+        assert_eq!(steer.events, vec![pending(&["banana", "apple"], 1)]);
+        // The CLI has it: no steering or taking it back again.
+        assert!(c
+            .encode(&json!({ "op": "steer", "index": 0 }))
+            .unwrap()
+            .frames
+            .is_empty());
+        let refused = c.encode(&json!({ "op": "unqueue", "index": 0 })).unwrap();
+        assert_eq!(refused.events, vec![pending(&["banana", "apple"], 1)]);
+        // It cuts the turn short: no error, just the end of that turn; apple
+        // waits for banana to be taken in.
+        let ended = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "error_during_execution", "is_error": true }),
+        ));
+        assert!(ended.events.iter().all(|e| e["type"] != "error"));
+        assert!(ended.frames.is_empty());
+        // The next turn's failure is reported again.
+        let failed = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "error_during_execution", "is_error": true }),
+        ));
+        assert!(failed.events.iter().any(|e| e["type"] == "error"));
+    }
+
+    #[test]
+    fn a_steer_moves_foreground_subagents_to_the_background_first() {
+        let mut c = holding(&["apple"]);
+        let started = |id: &str, tool: &str, extra: Value| {
+            let mut frame = json!({ "type": "system", "subtype": "task_started", "task_id": id, "tool_use_id": tool, "task_type": "local_agent", "description": "look", "is_backgrounded": false });
+            for (k, v) in extra.as_object().unwrap() {
+                frame[k] = v.clone();
+            }
+            Line::Frame(frame)
+        };
+        c.translate(started("a1", "t1", json!({})));
+        // Already in the background, or launched by a subagent: left alone.
+        c.translate(started("a2", "t2", json!({ "is_backgrounded": true })));
+        c.translate(started("a3", "t3", json!({ "parent_task_id": "a1" })));
+        let steer = c.encode(&json!({ "op": "steer" })).unwrap();
+        assert_eq!(steer.frames.len(), 1);
+        let moved: Value = serde_json::from_str(&steer.frames[0]).unwrap();
         assert_eq!(
-            ended[0],
-            json!({ "type": "pending_messages", "messages": [] })
+            moved["request"],
+            json!({ "subtype": "background_tasks", "tool_use_id": "t1" })
+        );
+        assert_eq!(steer.events, vec![pending(&["apple"], 1)]);
+        // Other output meanwhile: still waiting.
+        let streamed = c.translate(Line::Frame(
+            json!({ "type": "system", "subtype": "status", "status": "requesting" }),
+        ));
+        assert!(streamed.frames.is_empty());
+        // Moved: the message goes.
+        let answered = c.translate(Line::Frame(json!({ "type": "control_response", "response": { "subtype": "success", "request_id": moved["request_id"], "response": { "backgrounded": true } } })));
+        assert_eq!(answered.frames.len(), 1);
+        assert!(
+            answered.frames[0].contains("apple")
+                && answered.frames[0].contains("\"priority\":\"now\"")
         );
     }
 
     #[test]
-    fn queued_messages_taken_in_together_each_show_as_sent() {
+    fn a_steer_waiting_for_moves_goes_when_the_turn_ends_or_a_move_fails() {
+        let started = json!({ "type": "system", "subtype": "task_started", "task_id": "a1", "tool_use_id": "t1", "task_type": "local_agent", "is_backgrounded": false });
+        let mut c = holding(&["apple"]);
+        c.translate(Line::Frame(started.clone()));
+        c.encode(&json!({ "op": "steer" })).unwrap();
+        let ended = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "success" }),
+        ));
+        assert_eq!(ended.frames.len(), 1);
+        assert!(ended.frames[0].contains("apple"));
+
+        let mut c = holding(&["apple"]);
+        c.translate(Line::Frame(started));
+        let steer = c.encode(&json!({ "op": "steer" })).unwrap();
+        let moved: Value = serde_json::from_str(&steer.frames[0]).unwrap();
+        let failed = c.translate(Line::Frame(json!({ "type": "control_response", "response": { "subtype": "error", "request_id": moved["request_id"], "error": "background tasks are disabled" } })));
+        assert_eq!(failed.frames.len(), 1);
+        // Not an error that ends the turn.
+        assert!(failed.events.iter().all(|e| e["type"] != "error"));
+    }
+
+    #[test]
+    fn held_messages_are_taken_back_moved_dropped_or_sent_by_interrupting() {
         let mut c = mid_turn();
-        for text in ["apple", "banana"] {
-            c.encode(&json!({ "op": "user_message", "content": text }))
-                .unwrap();
-        }
+        c.encode(&json!({ "op": "user_message", "content": "oops", "images": ["/tmp/a.png"] }))
+            .unwrap();
+        let back = c
+            .encode(&json!({ "op": "unqueue", "index": 0, "text": "oops" }))
+            .unwrap();
+        assert_eq!(
+            back.events,
+            vec![
+                pending(&[], 0),
+                json!({ "type": "unqueued", "content": "oops", "text": "oops", "images": ["/tmp/a.png"] }),
+            ]
+        );
+        let mut c = holding(&["apple", "banana", "cherry"]);
+        let moved = c
+            .encode(&json!({ "op": "queue_move", "index": -1, "to": 0 }))
+            .unwrap();
+        assert_eq!(moved.events, vec![pending(&["cherry", "apple", "banana"], 0)]);
+        let dropped = c
+            .encode(&json!({ "op": "unqueue", "index": 1, "discard": true }))
+            .unwrap();
+        assert_eq!(dropped.events, vec![pending(&["cherry", "banana"], 0)]);
+        let stop = c
+            .encode(&json!({ "op": "interrupt", "index": -1 }))
+            .unwrap();
+        assert!(stop.frames[0].contains("interrupt"));
+        assert_eq!(stop.events, vec![pending(&["banana", "cherry"], 0)]);
+        let ended = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "error_during_execution", "is_error": true }),
+        ));
+        assert_eq!(ended.frames.len(), 1);
+        assert!(ended.frames[0].contains("banana"));
+    }
+
+    #[test]
+    fn queued_messages_taken_in_together_each_show_as_sent() {
+        let mut c = holding(&["apple", "banana"]);
+        c.encode(&json!({ "op": "steer" })).unwrap();
         let taken = frame(
             &mut c,
             json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "apple" }, { "type": "text", "text": "banana" }] } }),
@@ -4459,7 +4847,7 @@ mod tests {
         assert_eq!(
             taken,
             vec![
-                json!({ "type": "pending_messages", "messages": [] }),
+                pending(&[], 0),
                 json!({ "type": "user_message", "content": "apple" }),
                 json!({ "type": "user_message", "content": "banana" }),
             ]
@@ -4473,10 +4861,8 @@ mod tests {
         let queued = c
             .encode(&json!({ "op": "user_message", "content": "", "images": ["/no/such.png"] }))
             .unwrap();
-        assert_eq!(
-            queued.events,
-            vec![json!({ "type": "pending_messages", "messages": [""] })]
-        );
+        assert_eq!(queued.events, vec![pending(&[""], 0)]);
+        c.encode(&json!({ "op": "steer" })).unwrap();
         let taken = frame(
             &mut c,
             json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "" }, image] } }),
@@ -4484,7 +4870,7 @@ mod tests {
         assert_eq!(
             taken,
             vec![
-                json!({ "type": "pending_messages", "messages": [] }),
+                pending(&[], 0),
                 json!({ "type": "user_message", "content": "" })
             ]
         );

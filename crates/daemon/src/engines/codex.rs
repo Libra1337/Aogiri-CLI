@@ -22,6 +22,7 @@
 //! - A rewind is `thread/revert` to before a user message's turn.
 
 use super::{home, resolve, Adapter, Line, Options, Output};
+use lynshen_agent_core::queue::{queue_move_target, QueuePick};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -643,8 +644,12 @@ impl Codex {
             .is_some_and(|tiers| tiers.iter().any(|t| t["id"] == "priority"))
     }
 
+    fn waiting_texts(&self) -> Vec<&str> {
+        self.waiting.iter().map(|(text, _)| text.as_str()).collect()
+    }
+
     fn pending_event(&self) -> Value {
-        let texts: Vec<&str> = self.waiting.iter().map(|(text, _)| text.as_str()).collect();
+        let texts: Vec<&str> = self.waiting_texts();
         json!({ "type": "pending_messages", "messages": texts })
     }
 
@@ -1836,39 +1841,57 @@ impl Adapter for Codex {
                 vec![self.turn_start(input)]
             }
             // A waiting message taken back before it runs (serve-protocol
-            // `unqueue`): the one at `index` when its text is `text`, else
-            // the first with that text.
+            // `unqueue`, picked as `QueuePick` says), or dropped (`discard`).
             "unqueue" => {
-                let wanted = op["text"].as_str();
-                let index = op["index"].as_u64().map_or(usize::MAX, |i| i as usize);
-                let at = match wanted {
-                    None => (index < self.waiting.len()).then_some(index),
-                    Some(wanted) => self
-                        .waiting
-                        .get(index)
-                        .filter(|(text, _)| text == wanted)
-                        .map(|_| index)
-                        .or_else(|| self.waiting.iter().position(|(text, _)| text == wanted)),
-                };
+                let at = QueuePick::from_op(op).find(&self.waiting_texts());
                 let mut events = Vec::new();
                 if let Some(at) = at {
-                    let (text, _) = self.waiting.remove(at);
+                    let (content, input) = self.waiting.remove(at);
                     events.push(self.pending_event());
-                    events.push(json!({ "type": "unqueued", "text": text }));
+                    if op["discard"] != true {
+                        let images: Vec<&str> = input
+                            .iter()
+                            .filter(|c| c["type"] == "localImage")
+                            .map(|c| text(&c["path"]))
+                            .collect();
+                        events.push(json!({ "type": "unqueued", "content": content, "text": content, "images": images }));
+                    }
                 } else {
                     events.push(self.pending_event());
                 }
                 return Ok(Output::events(events));
             }
+            // A waiting message to another place: `index` to `to`.
+            "queue_move" => {
+                let Some((from, to)) = queue_move_target(
+                    &QueuePick::from_op(op),
+                    op["to"].as_i64(),
+                    &self.waiting_texts(),
+                ) else {
+                    return Ok(Output::default());
+                };
+                let item = self.waiting.remove(from);
+                self.waiting.insert(to, item);
+                return Ok(Output::events(vec![self.pending_event()]));
+            }
+            // One waiting message (`index`, `text`) into the running turn, or
+            // every one that waits when the op names none.
             "steer" => {
                 let (Some(thread), Some(turn)) = (self.thread.clone(), self.active_turn.clone())
                 else {
                     return Ok(Output::default());
                 };
-                if self.waiting.is_empty() {
+                let pick = QueuePick::from_op(op);
+                self.steering = if pick == QueuePick::default() {
+                    std::mem::take(&mut self.waiting)
+                } else {
+                    pick.find(&self.waiting_texts())
+                        .map(|at| vec![self.waiting.remove(at)])
+                        .unwrap_or_default()
+                };
+                if self.steering.is_empty() {
                     return Ok(Output::default());
                 }
-                self.steering = std::mem::take(&mut self.waiting);
                 let input: Vec<Value> = self
                     .steering
                     .iter()
@@ -1990,7 +2013,24 @@ impl Adapter for Codex {
                     json!({ "type": "status", "message": "ready" }),
                 ]));
             }
+            // With `index`: that waiting message starts the next turn once
+            // this one has stopped ("interrupt and send").
             "interrupt" => match (self.thread.clone(), self.active_turn.clone()) {
+                (Some(thread), Some(turn)) if op["index"].is_i64() => {
+                    if let Some(at) = QueuePick::from_op(op).find(&self.waiting_texts()) {
+                        let chosen = self.waiting.remove(at);
+                        self.waiting.insert(0, chosen);
+                    }
+                    let frame = self.request(
+                        "turn/interrupt",
+                        json!({ "threadId": thread, "turnId": turn }),
+                        "",
+                    );
+                    return Ok(Output {
+                        events: vec![self.pending_event()],
+                        frames: vec![frame],
+                    });
+                }
                 (Some(thread), Some(turn)) => vec![self.request(
                     "turn/interrupt",
                     json!({ "threadId": thread, "turnId": turn }),
@@ -2388,7 +2428,7 @@ mod tests {
         );
         assert_eq!(
             taken.events[1],
-            json!({ "type": "unqueued", "text": "also this" })
+            json!({ "type": "unqueued", "content": "also this", "text": "also this", "images": [] })
         );
         // Taking back what is no longer queued answers with the queue alone.
         let gone = c
@@ -2486,6 +2526,79 @@ mod tests {
         let frames = sent(&stop.frames);
         assert_eq!(frames[0]["method"], "turn/interrupt");
         assert_eq!(frames[0]["params"]["turnId"], "turn-1");
+    }
+
+    /// A busy Codex with `texts` waiting.
+    fn waiting(texts: &[&str]) -> Codex {
+        let mut c = opened();
+        busy(&mut c);
+        for text in texts {
+            c.encode(&json!({ "op": "user_message", "content": text }))
+                .unwrap();
+        }
+        c
+    }
+
+    #[test]
+    fn one_waiting_message_steers_in_by_its_place() {
+        let mut c = waiting(&["one", "two"]);
+        let steer = c.encode(&json!({ "op": "steer", "index": 1 })).unwrap();
+        let frames = sent(&steer.frames);
+        assert_eq!(frames[0]["method"], "turn/steer");
+        assert_eq!(frames[0]["params"]["input"][0]["text"], "two");
+        assert_eq!(frames[0]["params"]["input"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            steer.events,
+            vec![json!({ "type": "pending_messages", "messages": ["one"] })]
+        );
+        assert!(c
+            .encode(&json!({ "op": "steer", "index": -3 }))
+            .unwrap()
+            .frames
+            .is_empty());
+        // By its text, after the queue moved on.
+        let mut c = waiting(&["one", "two"]);
+        let steer = c
+            .encode(&json!({ "op": "steer", "index": 0, "text": "two" }))
+            .unwrap();
+        assert_eq!(sent(&steer.frames)[0]["params"]["input"][0]["text"], "two");
+    }
+
+    #[test]
+    fn waiting_messages_move_and_drop() {
+        let mut c = waiting(&["one", "two", "three"]);
+        let moved = c
+            .encode(&json!({ "op": "queue_move", "index": -1, "to": 0 }))
+            .unwrap();
+        assert_eq!(
+            moved.events,
+            vec![json!({ "type": "pending_messages", "messages": ["three", "one", "two"] })]
+        );
+        let dropped = c
+            .encode(&json!({ "op": "unqueue", "index": 1, "discard": true }))
+            .unwrap();
+        assert_eq!(
+            dropped.events,
+            vec![json!({ "type": "pending_messages", "messages": ["three", "two"] })]
+        );
+    }
+
+    #[test]
+    fn interrupting_for_a_waiting_message_starts_it_next() {
+        let mut c = waiting(&["one", "two"]);
+        let stop = c.encode(&json!({ "op": "interrupt", "index": 1 })).unwrap();
+        assert_eq!(sent(&stop.frames)[0]["method"], "turn/interrupt");
+        assert_eq!(
+            stop.events,
+            vec![json!({ "type": "pending_messages", "messages": ["two", "one"] })]
+        );
+        let next = frame(
+            &mut c,
+            json!({ "method": "turn/completed", "params": { "threadId": "th-1", "turn": { "id": "turn-1", "status": "interrupted" } } }),
+        );
+        let started = sent(&next.frames);
+        assert_eq!(started[0]["method"], "turn/start");
+        assert_eq!(started[0]["params"]["input"][0]["text"], "two");
     }
 
     #[test]

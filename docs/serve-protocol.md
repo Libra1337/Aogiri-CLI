@@ -29,10 +29,13 @@ standardized subset for ACP clients; see `docs/serve-vs-acp.md` for the split.
 This document describes protocol version 2. The first line on stdout is
 
 ```json
-{"type":"hello","protocol":2,"version":"0.3.0"}
+{"type":"hello","protocol":2,"version":"0.3.0","features":["queue"]}
 ```
 
 A client that does not support `protocol` must stop instead of guessing.
+`features` names what this engine takes beyond the protocol version (an
+older one sends none, so a client checks before relying on it): `queue`,
+queued messages picked by place (see "Picking a queued message").
 Every later event carries a `session` field with the engine's current
 session id, the same shape the daemon uses to multiplex several sessions on
 one connection (`docs/agent-daemon-plan.md`). Ops may carry a `session`

@@ -11,8 +11,15 @@ pub const PROTOCOL_VERSION: u64 = 2;
 
 /// First frame on every connection: the protocol version and the engine
 /// build, so a client can refuse a mismatch before reading anything else.
+/// What this side takes beyond the protocol version, for a client to check
+/// before relying on it (an older engine or daemon sends none):
+/// - `queue`: queued messages are picked by `index` (and `text`) on every
+///   engine: `steer` one, `unqueue` with `discard`, `queue_move`,
+///   `interrupt` with `index`; Claude Code's queue is held by the daemon.
+pub const FEATURES: &[&str] = &["queue"];
+
 pub fn hello_json(version: &str) -> Value {
-    json!({ "type": "hello", "protocol": PROTOCOL_VERSION, "version": version })
+    json!({ "type": "hello", "protocol": PROTOCOL_VERSION, "version": version, "features": FEATURES })
 }
 
 /// An engine event on the wire, tagged with the session it belongs to so
