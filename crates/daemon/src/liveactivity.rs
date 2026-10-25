@@ -556,6 +556,7 @@ impl LiveActivities {
             devices,
             lines,
             ended,
+            ..
         } = &mut *state;
         let lines_iter = lines.iter_mut();
         let ended_iter = ended.iter_mut().map(|(id, line, _)| (&*id, line));
@@ -1306,12 +1307,19 @@ mod tests {
         event(
             &live,
             "s-1",
-            json!({ "type": "approval_request", "call_id": "c1", "kind": "command" }),
+            json!({ "type": "user_message", "content": "x" }),
             T0,
         );
-        assert_eq!(due(&live, T0)[0].request["event"], "start");
+        assert!(due(&live, T0).is_empty());
+        event(
+            &live,
+            "s-1",
+            json!({ "type": "approval_request", "call_id": "c1", "kind": "command" }),
+            T0 + 100,
+        );
+        assert_eq!(due(&live, T0 + 100)[0].request["event"], "start");
         // Its token arrives at once: an update right away, no alert.
-        register(&live, "d1", "activity", &activity_token());
+        register_at(&live, "d1", "activity", &activity_token(), T0 + 400);
         let sync = due(&live, T0 + 500);
         assert_eq!(sync.len(), 1);
         assert_eq!(
@@ -1323,22 +1331,17 @@ mod tests {
         );
         assert!(sync[0].request.get("alert").is_none());
         // The same token again (the app reconnected): nothing new.
-        register(&live, "d1", "activity", &activity_token());
+        register_at(&live, "d1", "activity", &activity_token(), T0 + 600);
         assert!(due(&live, T0 + 600).is_empty());
-        // Answered and running, then a second request: alert again.
+        // Answered: back to running, within the window.
         event(
             &live,
             "s-1",
             json!({ "type": "tool_output", "call_id": "c1" }),
             T0 + 700,
         );
-        event(
-            &live,
-            "s-1",
-            json!({ "type": "user_message", "content": "x" }),
-            T0 + 800,
-        );
-        assert!(due(&live, T0 + 800).is_empty(), "within the window");
+        assert!(due(&live, T0 + 700).is_empty(), "within the window");
+        // Another request: it lights the island up again.
         event(
             &live,
             "s-1",
@@ -1346,6 +1349,7 @@ mod tests {
             T0 + 900,
         );
         let again = due(&live, T0 + 900);
+        assert_eq!(again.len(), 1);
         assert_eq!(again[0].request["alert"]["title"], "电脑想修改文件");
         let _ = fs::remove_dir_all(dir);
     }
