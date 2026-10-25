@@ -100,6 +100,9 @@ struct Content {
     since: u64,
     /// The request waiting is a question (for the alert's text).
     question: bool,
+    /// The newest request waiting (`<session>/<key>`), not sent: another
+    /// one lights the island up again.
+    request: String,
 }
 
 impl Content {
@@ -145,8 +148,9 @@ struct Line {
     /// Requests waiting for the user: `c:<call id>` (an approval_request,
     /// which ends with its turn) or `a:<action id>` (a deferred action).
     waiting: BTreeSet<String>,
-    /// What the latest request asks (an A title).
+    /// What the latest request asks (an A title), and its key.
     ask: &'static str,
+    latest: String,
     waiting_since: u64,
     /// The latest change (ms): the newest line is the one shown.
     touched: u64,
@@ -224,6 +228,9 @@ pub struct LivePush {
 pub struct LiveActivities {
     path: PathBuf,
     state: Mutex<State>,
+    /// Requests for the relay in the order they were decided, and whether
+    /// a thread is sending them: an update never overtakes the end.
+    outbox: Mutex<(Vec<LivePush>, bool)>,
 }
 
 impl LiveActivities {
@@ -253,6 +260,7 @@ impl LiveActivities {
         Self {
             path,
             state: Mutex::new(state),
+            outbox: Mutex::new((Vec::new(), false)),
         }
     }
 
@@ -422,7 +430,10 @@ impl LiveActivities {
                     .unwrap_or_default();
                 let done = steps.iter().filter(|s| s["status"] == "completed").count();
                 let plan = (done as u32, steps.len() as u32);
-                let line = state.lines.entry(session.to_string()).or_default();
+                // A plan replayed when a session opens is not work.
+                let Some(line) = state.lines.get_mut(session) else {
+                    return false;
+                };
                 let changed = line.plan != plan;
                 line.plan = plan;
                 changed
@@ -435,10 +446,12 @@ impl LiveActivities {
                 if line.waiting.is_empty() {
                     line.waiting_since = at;
                 }
-                line.waiting.insert(match kind {
+                let key = match kind {
                     "approval_request" => format!("c:{call}"),
                     _ => format!("a:{action}"),
-                });
+                };
+                line.waiting.insert(key.clone());
+                line.latest = key;
                 line.ask = ask_title(event);
                 line.touched = at;
                 true
@@ -580,7 +593,12 @@ impl LiveActivities {
                 if lane.content.as_ref() == Some(&content) {
                     continue;
                 }
-                let into_waiting = phase == Phase::Waiting && lane.phase != Some(phase);
+                // A request the activity does not show yet.
+                let into_waiting = phase == Phase::Waiting
+                    && lane
+                        .content
+                        .as_ref()
+                        .is_none_or(|c| c.request != content.request);
                 let open = lane
                     .last_sent
                     .is_none_or(|sent| at.saturating_sub(sent) >= WINDOW_MS);
@@ -683,6 +701,7 @@ fn content(
                 line.waiting_since
             },
             question: line.ask == ASK_QUESTION,
+            request: format!("{id}/{}", line.latest),
         };
     }
     if let Some((id, line)) = pick(|l| l.running) {
@@ -703,6 +722,7 @@ fn content(
             total: line.plan.1,
             since: line.since,
             question: false,
+            request: String::new(),
         };
     }
     let (phase, title) = match ended {
@@ -728,6 +748,7 @@ fn content(
         total: line.plan.1,
         since: line.since,
         question: false,
+        request: String::new(),
     }
 }
 
@@ -868,14 +889,31 @@ fn send_due(hub: &Arc<Hub>) {
         let record = hub.store.sessions().into_iter().find(|r| r.id == session)?;
         crate::hub::shown_title(&record, None)
     };
-    let sends = hub.push.live.sends(now(), &host, &title);
-    if sends.is_empty() {
-        return;
+    {
+        // Decided and queued under one lock: what is decided later is
+        // sent later.
+        let mut outbox = lock(&hub.push.live.outbox);
+        let sends = hub.push.live.sends(now(), &host, &title);
+        if sends.is_empty() {
+            return;
+        }
+        outbox.0.extend(sends);
+        if std::mem::replace(&mut outbox.1, true) {
+            return;
+        }
     }
     let hub = Arc::clone(hub);
-    // In order: an update and the end after it.
-    thread::spawn(move || {
-        for send in sends {
+    // One thread at a time, in order, until the outbox is empty.
+    thread::spawn(move || loop {
+        let batch = {
+            let mut outbox = lock(&hub.push.live.outbox);
+            if outbox.0.is_empty() {
+                outbox.1 = false;
+                return;
+            }
+            std::mem::take(&mut outbox.0)
+        };
+        for send in batch {
             match hub
                 .relay
                 .live_activity(&send.token, &send.environment, &send.request, send.ttl)
