@@ -2920,8 +2920,11 @@ impl Adapter for Claude {
         Ok(output)
     }
 
+    /// A turn runs, or messages wait here for the next one (between a turn
+    /// and the next one the CLI starts): a restart or an idle close waits
+    /// for them, which they would otherwise lose.
     fn busy(&self) -> bool {
-        self.active_turn
+        self.active_turn || !self.held.is_empty()
     }
 
     fn restart_for(&self, op: &Value) -> Option<Options> {
