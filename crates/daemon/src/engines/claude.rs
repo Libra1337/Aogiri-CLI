@@ -2697,6 +2697,12 @@ impl Adapter for Claude {
     fn approval_mode(&self) -> Option<String> {
         Some(from_claude_mode(self.mode).to_string())
     }
+
+    fn model(&self) -> Option<String> {
+        (!self.model.is_empty())
+            .then(|| self.model.clone())
+            .or(self.requested_model.clone())
+    }
 }
 
 /// A subscription's usage from a `rate_limit_info`: per window when the

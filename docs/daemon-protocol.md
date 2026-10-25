@@ -196,7 +196,7 @@ every connected client.
 | `session_history` | `cwd` | `session_history`: every session saved in `cwd`, newest first, whoever ran it (daemon, TUI, `lynshen serve`), with `title`, `updated_at`, `entries`, `archived`, `agent`, `open` |
 | `session_create` | `cwd`, optional `engine` (`lynshen`, default, `claude`, `codex` or `acp`), `options` and `project` | `session_created` with `session`; the session's startup events follow. See "Other engines". `project`: the project it belongs to, whatever its `cwd` (an unknown id is an error); `""` or null: none; left out: the project whose `path` is `cwd`, if any. A chat belongs to none; a session started with `start_session` belongs to its parent's project |
 | `session_open` | `session`, optional `cwd`, `engine`, `options` | `session_opened`; with `cwd`, also opens a session saved there that the daemon never hosted. Reopens a closed session (or one from before a restart), resuming its transcript and its undecided deferred actions |
-| `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped |
+| `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped (with `reason: "idle"` when the daemon closed an idle engine session; see "Differences from `lynshen serve`") |
 | `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` opens a closed session first, as `session_open` does (an error when it cannot), and also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `approval_mode_pending`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
 | `actions_list` | — | `actions`: undecided deferred actions across all sessions, and in `closed` the ones closed lately (as in `questions`) |
 | `pair_start` | — | `pairing` with `code` and `expires_at` (local clients only) |
@@ -1139,6 +1139,30 @@ Differences from `lynshen serve`:
   `approval_request` into a deferred action.
 - `decide_action` is recorded in `actions.jsonl` before the engine acts on
   it, so an approved action is never offered again after a restart.
+- An idle engine session (Claude Code, Codex, an ACP agent) closes by itself
+  too, when no client watches it: 30 minutes after its last activity (an op
+  from a client, a turn starting or ending, a watcher leaving, held work
+  ending), or sooner, least recently active first, while more than 16 engine
+  processes run (never one active in the last 2 minutes or opened in the last
+  30 seconds). It is idle when no turn runs, no message waits or is being
+  delivered, no background task, subagent, workflow or approval is open, its
+  TUI is not open, no title is being written and no other session waits on
+  its reply. Clients receive `session_closed` with `reason: "idle"`; the
+  session stays listed. The next `session_open` without `options`, `watch`,
+  delivery or message opens it as it last ran (model, approval mode, effort
+  and the other settings it kept), resuming its whole conversation. A
+  `user_message`, `command`, `continue` or `approve_plan` sent to such a
+  session opens it first, the sender watches it again, and every client
+  receives `session_reopened` with `session`.
+- Each engine runs in its own process group (Windows: a job object):
+  stopping the engine ends what it started (MCP servers, shells), and the
+  daemon ends them all when it exits, after `restart_when_idle` too.
+  `restart_when_idle` also waits, up to 10 minutes, for held work (an
+  engine's TUI or background work, a LynShen session's background shell or
+  subagent) besides running turns.
+- A connection that falls 10,000 frames behind (a stalled network) is
+  dropped instead of queued for without end; it reconnects and gets a fresh
+  snapshot.
 - An idle LynShen session closes by itself. It closes when nobody has
   watched it and nothing has happened in it for 10 minutes, and its engine
   is idle: no turn, queued message, prompt, deferred action or approved

@@ -3452,6 +3452,12 @@ impl AgentCore {
             && !self.tool_state.has_live_shells()
     }
 
+    /// Work still going outside a turn: a background shell running or a
+    /// subagent not finished. A host waits for it before it restarts.
+    pub fn has_background_work(&self) -> bool {
+        self.tool_state.has_running_shell() || self.subagent_manager.has_unfinished()
+    }
+
     /// What this engine holds of its session only in memory, for the
     /// session's next engine (`restore_kept_state`) when a host closes this
     /// one while the session stays in use.
