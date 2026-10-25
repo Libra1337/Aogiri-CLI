@@ -1194,7 +1194,14 @@ impl Session<'_> {
                         }
                         let events =
                             self.allow_while_opening(&mut process, adapter.as_mut(), output.events);
+                        // The conversation cannot open (a fork that cannot
+                        // be made): the start fails now, with that error.
+                        let failed = self.id.is_none() && events.iter().any(|e| e["fatal"] == true);
                         self.publish(events);
+                        if failed {
+                            process.stop();
+                            return;
+                        }
                     }
                     Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {
                         let reason = process.exit_reason();

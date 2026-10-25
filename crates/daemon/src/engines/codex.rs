@@ -992,10 +992,11 @@ impl Codex {
             }
             // A fork that cannot be made is an error, not an empty thread.
             if matches!(method.as_str(), "thread/read" | "thread/fork") && self.fork.is_some() {
-                return Output::events(vec![error_event(
-                    &format!("cannot fork the thread: {message}"),
-                    &Value::Null,
-                )]);
+                return Output::events(vec![json!({
+                    "type": "error",
+                    "message": format!("cannot fork the thread: {message}"),
+                    "fatal": true,
+                })]);
             }
             if method == "thread/resume" && self.open_params.is_object() {
                 let params = self.open_params.clone();
@@ -3393,6 +3394,101 @@ mod tests {
         let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
         assert_eq!(next[1]["method"], "thread/resume");
         assert_eq!(next[1]["params"]["modelProvider"], GATEWAY_PROVIDER);
+    }
+
+    #[test]
+    fn a_fork_reads_the_thread_then_forks_it_through_the_kept_turn() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                fork_from: Some("th-1".into()),
+                fork_turns: Some(1),
+                app_tools: vec!["present_files"],
+                ..Options::default()
+            },
+        );
+        c.start();
+        let opened = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        let read = opened
+            .iter()
+            .find(|f| f["method"] == "thread/read")
+            .unwrap();
+        assert_eq!(
+            read["params"],
+            json!({ "threadId": "th-1", "includeTurns": true })
+        );
+        assert!(opened.iter().all(|f| f["method"] != "thread/start"));
+        let user =
+            |id: &str| json!({ "id": id, "items": [{ "type": "userMessage", "content": [] }] });
+        let turns = json!([user("t1"), { "id": "t1b", "items": [] }, user("t2")]);
+        let forked = sent(
+            &frame(
+                &mut c,
+                json!({ "id": read["id"], "result": { "thread": { "turns": turns } } }),
+            )
+            .frames,
+        );
+        assert_eq!(forked[0]["method"], "thread/fork");
+        assert_eq!(forked[0]["params"]["threadId"], "th-1");
+        assert_eq!(forked[0]["params"]["lastTurnId"], "t1b");
+        // The thread keeps the tools it started with.
+        assert!(forked[0]["params"].get("dynamicTools").is_none());
+        let events = frame(&mut c, json!({ "id": forked[0]["id"], "result": { "thread": { "id": "th-2", "turns": [user("t1")] }, "model": "m" } })).events;
+        let startup = events.iter().find(|e| e["type"] == "startup").unwrap();
+        assert_eq!(startup["session_id"], "th-2");
+        assert_eq!(c.conversation().as_deref(), Some("th-2"));
+    }
+
+    #[test]
+    fn a_fork_that_fails_says_so_instead_of_starting_empty() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                fork_from: Some("gone".into()),
+                fork_turns: Some(1),
+                ..Options::default()
+            },
+        );
+        c.start();
+        let opened = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        let read = opened
+            .iter()
+            .find(|f| f["method"] == "thread/read")
+            .unwrap();
+        let failed = frame(
+            &mut c,
+            json!({ "id": read["id"], "error": { "code": -32600, "message": "no rollout" } }),
+        );
+        assert!(failed.frames.is_empty());
+        assert_eq!(failed.events[0]["type"], "error");
+        assert!(text(&failed.events[0]["message"]).contains("cannot fork"));
+    }
+
+    #[test]
+    fn a_fork_point_is_the_turn_before_the_next_user_turn() {
+        let user = |id: &str| json!({ "id": id, "items": [{ "type": "userMessage" }] });
+        let turns = json!([user("a"), user("b"), { "id": "b2", "items": [] }]);
+        assert_eq!(fork_point(&turns, Some(1)).as_deref(), Some("a"));
+        assert_eq!(fork_point(&turns, Some(2)), None);
+        assert_eq!(fork_point(&turns, None), None);
+    }
+
+    #[test]
+    fn a_probe_opens_an_ephemeral_thread() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                probe: true,
+                ..Options::default()
+            },
+        );
+        c.start();
+        let opened = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        let start = opened
+            .iter()
+            .find(|f| f["method"] == "thread/start")
+            .unwrap();
+        assert_eq!(start["params"]["ephemeral"], true);
     }
 
     #[test]
