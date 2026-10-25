@@ -269,6 +269,9 @@ type pushRequest struct {
 	Topic     string `json:"topic"`
 	// Makes each request's signature unique; not used otherwise.
 	Nonce string `json:"nonce"`
+	// A Live Activity push (liveactivity.go) instead of a notification:
+	// APNs only.
+	LiveActivity json.RawMessage `json:"liveactivity"`
 }
 
 // pusher serves POST /relay/v1/push and GET /relay/v1/push/key.
@@ -386,6 +389,10 @@ func (p *pusher) servePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sub := req.Subscription
+	if len(req.LiveActivity) > 0 && sub.Provider != "apns" {
+		http.Error(w, "a live activity goes through apns only", http.StatusBadRequest)
+		return
+	}
 	if sub.Provider != "" {
 		p.serveNative(w, r, id, req, now)
 		return
@@ -499,13 +506,17 @@ func (p *pusher) serveNative(w http.ResponseWriter, r *http.Request, id string, 
 		http.Error(w, provider+" is not configured", http.StatusNotImplemented)
 		return
 	}
+	if req.Encrypted != "" {
+		http.Error(w, "a native notice is not encrypted", http.StatusBadRequest)
+		return
+	}
+	if len(req.LiveActivity) > 0 {
+		p.serveLiveActivity(w, r, id, req, sender, now)
+		return
+	}
 	target, ok := nativeTargetOf(req.Subscription)
 	if !ok {
 		http.Error(w, "bad device token", http.StatusBadRequest)
-		return
-	}
-	if req.Encrypted != "" {
-		http.Error(w, "a native notice is not encrypted", http.StatusBadRequest)
 		return
 	}
 	n, err := parseNotice(req.Payload)
@@ -524,6 +535,48 @@ func (p *pusher) serveNative(w http.ResponseWriter, r *http.Request, id string, 
 	ctx, cancel := context.WithTimeout(r.Context(), pushTimeout)
 	defer cancel()
 	result, err := sender.send(ctx, target, n, nativeDelivery{ttl: ttl, topic: topic, now: now})
+	answerNative(w, id, provider, result, err)
+}
+
+// serveLiveActivity delivers a Live Activity start, update or end through
+// APNs (liveactivity.go).
+func (p *pusher) serveLiveActivity(w http.ResponseWriter, r *http.Request, id string, req pushRequest, sender nativeSender, now time.Time) {
+	la, ok := sender.(liveActivitySender)
+	if !ok {
+		http.Error(w, "a live activity goes through apns only", http.StatusBadRequest)
+		return
+	}
+	sub := req.Subscription
+	env := sub.Environment
+	if env == "" {
+		env = "production"
+	}
+	if !liveActivityToken(sub.Token) || (env != "production" && env != "sandbox") {
+		http.Error(w, "bad live activity token", http.StatusBadRequest)
+		return
+	}
+	if len(req.Payload) > 0 {
+		http.Error(w, "a live activity has no payload", http.StatusBadRequest)
+		return
+	}
+	activity, err := parseLiveActivity(req.LiveActivity, now)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	ttl := liveActivityDefaultTTL
+	if req.TTL != nil && *req.TTL >= 0 && *req.TTL <= liveActivityMaxTTL {
+		ttl = *req.TTL
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), pushTimeout)
+	defer cancel()
+	target := nativeTarget{Token: strings.ToLower(sub.Token), Environment: env}
+	result, err := la.sendLiveActivity(ctx, target, activity, ttl, now)
+	answerNative(w, id, "apns", result, err)
+}
+
+// answerNative passes a provider's answer on to the daemon.
+func answerNative(w http.ResponseWriter, id, provider string, result nativeResult, err error) {
 	if err != nil {
 		log.Printf("push for host %s via %s failed: %v", id, provider, err)
 		http.Error(w, "push service unreachable", http.StatusBadGateway)

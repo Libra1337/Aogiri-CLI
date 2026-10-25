@@ -343,10 +343,6 @@ func firstNonEmpty(values ...string) string {
 }
 
 func (a *apnsSender) send(ctx context.Context, target nativeTarget, n *notice, delivery nativeDelivery) (nativeResult, error) {
-	origin, ok := a.origins[target.Environment]
-	if !ok {
-		return nativeResult{}, errors.New("unknown APNs environment")
-	}
 	body, err := apnsPayload(n)
 	if err != nil {
 		return nativeResult{}, err
@@ -354,7 +350,34 @@ func (a *apnsSender) send(ctx context.Context, target nativeTarget, n *notice, d
 	if len(body) > maxNativeMessage {
 		return nativeResult{Status: http.StatusRequestEntityTooLarge}, nil
 	}
-	token, err := a.providerToken(delivery.now)
+	priority := "10"
+	if n.Level == "silent" {
+		priority = "5"
+	}
+	expiration := int64(0)
+	if delivery.ttl > 0 {
+		expiration = delivery.now.Add(time.Duration(delivery.ttl) * time.Second).Unix()
+	}
+	headers := map[string]string{
+		"apns-topic":      a.config.topic,
+		"apns-push-type":  "alert",
+		"apns-priority":   priority,
+		"apns-expiration": strconv.FormatInt(expiration, 10),
+	}
+	if delivery.topic != "" && len(delivery.topic) <= 64 {
+		headers["apns-collapse-id"] = delivery.topic
+	}
+	return a.post(ctx, target, body, headers, delivery.now)
+}
+
+// post sends one APNs request with the provider token and `headers`, and
+// returns Apple's status and reason.
+func (a *apnsSender) post(ctx context.Context, target nativeTarget, body []byte, headers map[string]string, now time.Time) (nativeResult, error) {
+	origin, ok := a.origins[target.Environment]
+	if !ok {
+		return nativeResult{}, errors.New("unknown APNs environment")
+	}
+	token, err := a.providerToken(now)
 	if err != nil {
 		return nativeResult{}, err
 	}
@@ -363,21 +386,9 @@ func (a *apnsSender) send(ctx context.Context, target nativeTarget, n *notice, d
 		return nativeResult{}, err
 	}
 	out.Header.Set("Authorization", "bearer "+token)
-	out.Header.Set("apns-topic", a.config.topic)
-	out.Header.Set("apns-push-type", "alert")
 	out.Header.Set("Content-Type", "application/json")
-	if n.Level == "silent" {
-		out.Header.Set("apns-priority", "5")
-	} else {
-		out.Header.Set("apns-priority", "10")
-	}
-	expiration := int64(0)
-	if delivery.ttl > 0 {
-		expiration = delivery.now.Add(time.Duration(delivery.ttl) * time.Second).Unix()
-	}
-	out.Header.Set("apns-expiration", strconv.FormatInt(expiration, 10))
-	if delivery.topic != "" && len(delivery.topic) <= 64 {
-		out.Header.Set("apns-collapse-id", delivery.topic)
+	for name, value := range headers {
+		out.Header.Set(name, value)
 	}
 	res, err := a.client.Do(out)
 	if err != nil {
