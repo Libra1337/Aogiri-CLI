@@ -232,7 +232,7 @@ impl Link for WebSocket<TcpStream> {
 /// `device` is the paired device it authenticated as; None for a local
 /// client.
 fn attach(hub: &Arc<Hub>, link: &mut impl Link, device: Option<String>) -> Result<(), String> {
-    let (outbox, inbox) = mpsc::channel();
+    let (outbox, inbox) = Hub::outbox();
     let client = hub.add_client(outbox, device);
     let result = pump(hub, client, link, &inbox);
     hub.remove_client(client);
@@ -243,7 +243,7 @@ fn pump(
     hub: &Arc<Hub>,
     client: u64,
     link: &mut impl Link,
-    inbox: &mpsc::Receiver<String>,
+    inbox: &hub::Inbox,
 ) -> Result<(), String> {
     for frame in [
         protocol::hello_json(hub.version),
@@ -569,9 +569,15 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             None => Err("session_history requires cwd".to_string()),
         },
         // A client's title is its own: never one the daemon may rewrite.
-        ("session_meta", Some(session)) => match hub.store.record_session_meta(
+        ("session_meta", Some(session)) => match op["project"]
+            .as_str()
+            .map(str::trim)
+            .filter(|p| !p.is_empty() && projects::project(hub, p).is_none())
+        {
+            Some(unknown) => Err(format!("unknown project {unknown}")),
+            None => match hub.store.record_session_meta(
             &session,
-            &json!({ "title": op["title"], "archived": op["archived"], "hidden": op["hidden"], "group": op["group"] }),
+            &json!({ "title": op["title"], "archived": op["archived"], "hidden": op["hidden"], "group": op["group"], "project": op["project"] }),
         ) {
             Ok(true) => {
                 // The local gateway routes this session's next request there.
@@ -592,8 +598,9 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 hub.broadcast(&hub.sessions_json());
                 Ok(Value::Null)
             }
-            Ok(false) => Err("session_meta requires title, archived, hidden or group".to_string()),
+            Ok(false) => Err("session_meta requires title, archived, hidden, group or project".to_string()),
             Err(error) => Err(error.to_string()),
+        },
         },
         ("pair_link", _) => hub.relay.pair_link(hub),
         ("relay_status", _) => Ok(hub.relay.status_json()),
@@ -662,6 +669,8 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                     op["chat"].as_bool().unwrap_or(false),
                     engine,
                     engines::Options::from_json(&op["options"]),
+                    // Left out: the project of its folder; null or "": none.
+                    op.get("project").map(|p| p.as_str().unwrap_or_default()),
                 )
             })
             .map(|session| json!({ "type": "session_created", "session": session })),
@@ -962,6 +971,12 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             .map(|()| Value::Null),
         // Ops the daemon sends a session itself.
         ("tui" | "tui_exit", Some(_)) => Err(format!("{name} is not a client op")),
+        // A message to an engine session closed as idle opens it again first
+        // (clients that do not reopen it themselves keep working).
+        ("user_message" | "command" | "continue" | "approve_plan", Some(session)) => hub
+            .wake(client, &session)
+            .and_then(|()| hub.forward(&session, op.clone()))
+            .map(|()| Value::Null),
         (_, Some(session)) => hub.forward(&session, op.clone()).map(|()| Value::Null),
         (name, None) => Err(format!("{name} requires session")),
     };

@@ -9,7 +9,11 @@
 //! deferred actions and questions.
 
 use super::{bind, profile, redact, render, Redeemed, MODES};
-use crate::{hub::Hub, session_messages::rank, store::Device};
+use crate::{
+    hub::{Hub, Outbox},
+    session_messages::rank,
+    store::Device,
+};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -328,7 +332,9 @@ impl Chat {
             return;
         };
         let (outbox, inbox) = mpsc::channel();
-        let client = self.hub.add_client(outbox, Some(device.id.clone()));
+        let client = self
+            .hub
+            .add_client(Outbox::local(outbox), Some(device.id.clone()));
         let binding = Binding {
             peer: peer.peer,
             chat: peer.chat,

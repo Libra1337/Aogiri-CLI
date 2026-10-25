@@ -496,7 +496,10 @@ fn start(hub: &Arc<Hub>, me: &str, args: &Value) -> Result<String, String> {
         ..engines::Options::default()
     };
     let handle = hub.handle().ok_or("the daemon is stopping")?;
-    let id = handle.create_engine_session(Some(cwd), None, false, engine, options)?;
+    // The new session belongs to this one's project, wherever this one runs.
+    let project = crate::projects::of_session(hub, me);
+    let id =
+        handle.create_engine_session(Some(cwd), None, false, engine, options, Some(&project))?;
     // The lynshen engine takes its mode, model and effort as ops.
     hub.forward(&id, json!({ "op": "set_approval_mode", "mode": mode }))?;
     if engine.is_none() {

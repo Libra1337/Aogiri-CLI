@@ -24,12 +24,13 @@ ureq = { version = "2", features = ["json"] }
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 # device_id.rs (gateway device binding): the SMBIOS system UUID and the
-# permanent MACs of the network adapters. Already in the tree through
-# lynshen-sandbox.
+# permanent MACs of the network adapters; process_group.rs: the job object
+# a host's engine runs in. Already in the tree through lynshen-sandbox.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
+    "Win32_System_JobObjects",
     "Win32_System_SystemInformation",
 ] }

@@ -137,6 +137,11 @@ impl Turns {
         self.failed.take()
     }
 
+    /// A turn has started and not yet ended.
+    pub fn running(&self) -> bool {
+        self.running
+    }
+
     /// Turns ended so far.
     pub fn done(&self) -> u32 {
         self.done

@@ -37,7 +37,7 @@ State lives in `~/.lynshen/daemon/`:
 | File | Contents |
 | --- | --- |
 | `token` | Client token, created on first start, mode 0600. |
-| `sessions.jsonl` | Append log of sessions opened and closed. |
+| `sessions.jsonl` | Append log of sessions opened and closed, and their metadata (title, archive state, project...). A session recorded before sessions carried a project (a daemon up to 0.7.9) belongs to the project whose `path` is its `cwd`, if any, until it is moved. |
 | `actions.jsonl` | Append log of deferred actions and their decisions. |
 | `messages.jsonl` | Append log of messages to agents and their delivery. |
 | `timers.jsonl` | Append log of agent timers set, fired and cancelled. |
@@ -189,14 +189,14 @@ every connected client.
 
 | Op | Fields | Reply |
 | --- | --- | --- |
-| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers`, `running` (a turn runs or messages wait; the list is sent again when it changes), `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at`, `entries` (how many entries the engine saved for a LynShen session, null for other engines; 0 for one opened without a first message) |
-| `gateway_catalog` | — | `gateway_catalog`: `models` (the LynShen models the user chose to show, `lynshen_models` in config.json) and `groups` (the gateway's groups with their models and multipliers); empty when not signed in or offline. For clients that cannot read this machine's login (the remote page) |
+| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers`, `running` (a turn runs or messages wait; the list is sent again when it changes), `failed` (its latest turn ended on an error; cleared when the next turn starts, and the list is sent again when it changes), `project` (the id of the project it belongs to, else null), `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at`, `entries` (how many entries the engine saved for a LynShen session, null for other engines; 0 for one opened without a first message) |
+| `gateway_catalog` | — | `gateway_catalog`: `models` (the LynShen models the user chose to show, `lynshen_models` in config.json; one the gateway hides from pickers has `hidden: true`: it stays callable by name, and pickers list it only while a session runs it) and `groups` (the gateway's groups with their models and multipliers); empty when not signed in or offline. For clients that cannot read this machine's login (the remote page) |
 | `restart_when_idle` | — | none. Desktop only: this daemon exits once no session is running (after a `daemon_restarting` broadcast), so the desktop can start a newer one without cutting off a task |
-| `session_meta` | `session`, and any of `title`, `archived`, `hidden`, `group` | none; every client receives the new `sessions` list. An empty title goes back to the engine's label; a hidden session leaves `session_list` and `session_history` (its conversation stays on disk). A session created here is titled after its first user message (first line, 40 characters) unless a client titled it first. After its 1st and 3rd turns, then every 5th, the title model (`title_model` in config.json, else the main `model`) renames it from the project name, the current title, the first and latest requests and the start of the latest reply. A title a client set with `session_meta` is never replaced |
+| `session_meta` | `session`, and any of `title`, `archived`, `hidden`, `group`, `project` | none; `project` moves the session into that project (an unknown id is an error) or, empty, out of any; every client receives the new `sessions` list. An empty title goes back to the engine's label; a hidden session leaves `session_list` and `session_history` (its conversation stays on disk). A session created here is titled after its first user message (first line, 40 characters) unless a client titled it first. After its 1st and 3rd turns, then every 5th, the title model (`title_model` in config.json, else the main `model`) renames it from the project name, the current title, the first and latest requests and the start of the latest reply. A title a client set with `session_meta` is never replaced |
 | `session_history` | `cwd` | `session_history`: every session saved in `cwd`, newest first, whoever ran it (daemon, TUI, `lynshen serve`), with `title`, `updated_at`, `entries`, `archived`, `agent`, `open` |
-| `session_create` | `cwd`, optional `engine` (`lynshen`, default, `claude`, `codex` or `acp`) and `options` | `session_created` with `session`; the session's startup events follow. See "Other engines" |
+| `session_create` | `cwd`, optional `engine` (`lynshen`, default, `claude`, `codex` or `acp`), `options` and `project` | `session_created` with `session`; the session's startup events follow. See "Other engines". `project`: the project it belongs to, whatever its `cwd` (an unknown id is an error); `""` or null: none; left out: the project whose `path` is `cwd`, if any. A chat belongs to none; a session started with `start_session` belongs to its parent's project |
 | `session_open` | `session`, optional `cwd`, `engine`, `options` | `session_opened`; with `cwd`, also opens a session saved there that the daemon never hosted. Reopens a closed session (or one from before a restart), resuming its transcript and its undecided deferred actions |
-| `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped |
+| `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped (with `reason: "idle"` when the daemon closed an idle engine session; see "Differences from `lynshen serve`") |
 | `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` opens a closed session first, as `session_open` does (an error when it cannot), and also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `approval_mode_pending`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
 | `actions_list` | — | `actions`: undecided deferred actions across all sessions, and in `closed` the ones closed lately (as in `questions`) |
 | `pair_start` | — | `pairing` with `code` and `expires_at` (local clients only) |
@@ -215,8 +215,8 @@ every connected client.
 | `pair_link` | — | `pair_link` with `link`, `code` and `expires_at`; an error while the relay is off (local clients only) |
 | `connector_list`, `connector_add`, `connector_set`, `connector_remove`, `connector_bind_start` | see `docs/chat-connectors.md` | `connectors`, `connector_added`, `connector_removed`, `connector_bind_code` (local clients only) |
 | `ping` | — | `pong`. Clients behind the relay send it every minute so an idle stream is not closed |
-| `workspaces` | — | `workspaces` with `rev` and `workspaces: [{id, name, is_default?, color?, icon?, projects: [{id, name, path, dirs?, chats?, worktree?, color?, icon?}]}]`. A project's `color` and `icon` are kept as the client sent them (shaped as an agent's, see "Agents"). `dirs`: the project's extra directories (absolute paths, not including `path`); remote clients may read them, and an engine started in `path` may work in those that exist: Claude Code gets one `--add-dir` each, Codex has them as writable roots of its workspace-write sandbox (and `--add-dir` in its TUI), and a LynShen session's file tools and sandbox treat them as writable workspace (ACP agents get nothing) |
-| `workspaces_set` | `rev`, `workspaces` | `workspaces`; replaces the list when `rev` is the current one, else an error (another client changed it). A project's `dirs`, when present, must be a list of absolute paths. Desktop imports its list with `rev: 0` into an empty daemon |
+| `workspaces` | — | `workspaces` with `rev` and `workspaces: [{id, name, is_default?, color?, icon?, projects: [{id, name, path, dirs?, chats?, worktree?, color?, icon?}]}]`. A project's `color` and `icon` are kept as the client sent them (shaped as an agent's, see "Agents"). `dirs`: the project's extra directories (absolute paths, not including `path`); remote clients may read them, and an engine started for a session of the project may work in the project's `path` and `dirs` that exist, besides its own `cwd`: Claude Code gets one `--add-dir` each, Codex has them as writable roots of its workspace-write sandbox (and `--add-dir` in its TUI), and a LynShen session's file tools and sandbox treat them as writable workspace (ACP agents get nothing) |
+| `workspaces_set` | `rev`, `workspaces` | `workspaces`; replaces the list when `rev` is the current one, else an error (another client changed it). A project id may appear in one workspace only (sessions name their project by id). The sessions of a project a save removes (here or with `project_remove`) belong to none and are archived; every client receives the new `sessions` list. A project's `dirs`, when present, must be a list of absolute paths. Desktop imports its list with `rev: 0` into an empty daemon |
 | `project_add` | `path`, optional `workspace`, `project_name`, `workspace_name` | `workspaces`; adds an existing directory. With no workspaces yet, one named `workspace_name` is created |
 | `project_create` | `parent`, `name`, optional `git_init`, `workspace`, `workspace_name` | `workspaces`; makes the folder `parent/name` (optionally `git init`) and adds it |
 | `project_remove` | `workspace`, `project` | `workspaces`; the files stay |
@@ -281,8 +281,11 @@ followed) before the check.
 `skills_catalog` answers at once with the bundled index of
 github.com/anthropics/skills and the community repositories as last read.
 `source` is `anthropic` or a community repository's `owner/repo`;
-`redistributable` is false for Anthropic's source-available document skills,
-which `skill_install` refuses.
+`redistributable` is false for Anthropic's source-available document skills
+and for a community skill whose terms say proprietary or source-available
+(its frontmatter `license`, else its repository's), which `skill_install`
+refuses. A community repository is read at its default branch's current
+commit (`revision`), and its skills install from that commit.
 
 The community sources are cached in `~/.lynshen/cache/skills-catalog.json`.
 `sources` has one entry per source, Anthropic first: `origin` is `bundled`,
@@ -308,7 +311,11 @@ mirror does not have. Requests go through the proxy that `HTTPS_PROXY`,
 Claude Code's config directory (`~/.claude/skills`, or under
 `CLAUDE_CONFIG_DIR` when the daemon's environment sets it),
 anything else into `~/.lynshen/skills`. `installed` means
-`<installDir>/<id>/SKILL.md` exists. `skill_install` looks the skill up again
+`<installDir>/<id>/SKILL.md` exists and, for a community skill, that it came
+from this entry's repository (`<installDir>/<id>/.lynshen-source`; one
+installed before sources were recorded counts for every source). Installing a
+skill whose name another repository's installed skill already has is an
+error until that one is removed. `skill_install` looks the skill up again
 in its source (the bundled index or the cache), then installs the mirror's
 archive of it, checked against the sha256 in the mirror's signed manifest.
 Without one (or without the mirror) it downloads the skill's whole directory
@@ -868,7 +875,7 @@ where the last one stopped. The requirement's id comes as `requirement`
 | `{"op":"requirement_image","requirement":"R-1","index":0}` | `requirement_image` with `data` (a data URL) | |
 | `{"op":"requirement_begin","requirement":"R-1","session":"s…","plan":false,"mode":"edits","text":"…","lang":"zh"}` | `requirement_begun` with `requirement`, `session` | Starts work behind the gate (below): links the session, switches it to read-only and sends the requirement with the ask to only explain its understanding. `text`: the user's added words (optional). `lang`: `zh` (default) or `en`. |
 | `{"op":"requirement_confirm","requirement":"R-1","text":"…","lang":"zh"}` | `requirement_confirmed` with `requirement`, `stage` (`plan` or `go`) | The user confirms the gate's current step; an error without a gate or while its session runs a turn. `text` (optional) goes with the next message. |
-| `{"op":"requirement_reply","requirement":"R-1","text":"…","new_session":false,"cwd":"/path","engine":"claude","plan":false,"mode":"auto","lang":"zh"}` | `requirement_replied` with `session` | Sends `text` to its latest session (reopened if closed). With `new_session`, or no session yet, starts one in `cwd` (default: the latest session's, else the project's main directory; neither is an error) on `engine` (default: the latest session's, else lynshen) and runs `requirement_begin` on it with `plan` (default `false`), `mode` (default `auto`) and `text`. |
+| `{"op":"requirement_reply","requirement":"R-1","text":"…","new_session":false,"cwd":"/path","engine":"claude","plan":false,"mode":"auto","lang":"zh"}` | `requirement_replied` with `session` | Sends `text` to its latest session (reopened if closed). With `new_session`, or no session yet, starts one in `cwd` (default: the latest session's, else the project's main directory; neither is an error), belonging to `project` (default: the requirement's), on `engine` (default: the latest session's, else lynshen) and runs `requirement_begin` on it with `plan` (default `false`), `mode` (default `auto`) and `text`. |
 | `{"op":"requirement_proposal","requirement":"R-1","accept":true}` | `requirement_proposal_decided` with `requirement`, `accept` | Decides an agent's proposal: a proposed requirement accepted becomes `idea`, turned down is deleted; a close proposal accepted sets `state` to its `outcome` (and ends any gate), turned down is dropped. The agent is not told. |
 
 `dispatch_send` also takes `requirement`: its tasks' sessions are linked to it.
@@ -1132,6 +1139,30 @@ Differences from `lynshen serve`:
   `approval_request` into a deferred action.
 - `decide_action` is recorded in `actions.jsonl` before the engine acts on
   it, so an approved action is never offered again after a restart.
+- An idle engine session (Claude Code, Codex, an ACP agent) closes by itself
+  too, when no client watches it: 30 minutes after its last activity (an op
+  from a client, a turn starting or ending, a watcher leaving, held work
+  ending), or sooner, least recently active first, while more than 16 engine
+  processes run (never one active in the last 2 minutes or opened in the last
+  30 seconds). It is idle when no turn runs, no message waits or is being
+  delivered, no background task, subagent, workflow or approval is open, its
+  TUI is not open, no title is being written and no other session waits on
+  its reply. Clients receive `session_closed` with `reason: "idle"`; the
+  session stays listed. The next `session_open` without `options`, `watch`,
+  delivery or message opens it as it last ran (model, approval mode, effort
+  and the other settings it kept), resuming its whole conversation. A
+  `user_message`, `command`, `continue` or `approve_plan` sent to such a
+  session opens it first, the sender watches it again, and every client
+  receives `session_reopened` with `session`.
+- Each engine runs in its own process group (Windows: a job object):
+  stopping the engine ends what it started (MCP servers, shells), and the
+  daemon ends them all when it exits, after `restart_when_idle` too.
+  `restart_when_idle` also waits, up to 10 minutes, for held work (an
+  engine's TUI or background work, a LynShen session's background shell or
+  subagent) besides running turns.
+- A connection that falls 10,000 frames behind (a stalled network) is
+  dropped instead of queued for without end; it reconnects and gets a fresh
+  snapshot.
 - An idle LynShen session closes by itself. It closes when nobody has
   watched it and nothing has happened in it for 10 minutes, and its engine
   is idle: no turn, queued message, prompt, deferred action or approved

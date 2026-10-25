@@ -38,8 +38,9 @@ const BUSY_POLL: Duration = Duration::from_millis(30);
 /// the daemon about 0.15% of a core with nothing happening.
 const IDLE_POLL: Duration = Duration::from_millis(250);
 
-/// Opens an engine in `cwd` (resuming `resume` when given) on a new thread,
-/// set up for `agent` when the session belongs to one. Returns the session
+/// Opens an engine in `cwd` (resuming `resume` when given), which may also
+/// write in `dirs` (its project's other folders), on a new thread, set up
+/// for `agent` when the session belongs to one. Returns the session
 /// id once the engine is ready, with the thread's generation (see
 /// `Hub::session_ended`) and its engine's hook stopper (see
 /// `Hub::set_hook_stopper`), or the open error.
@@ -48,12 +49,13 @@ pub fn spawn(
     cwd: PathBuf,
     resume: Option<String>,
     agent: Option<String>,
+    dirs: Vec<PathBuf>,
 ) -> Result<(String, Sender<Value>, u64, HookStopper), String> {
     let (ops_tx, ops_rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let generation = hub.next_generation();
     thread::spawn(move || {
-        let core = match open(&hub, cwd, resume.as_deref(), agent.as_deref()) {
+        let core = match open(&hub, cwd, resume.as_deref(), agent.as_deref(), &dirs) {
             Ok(core) => core,
             Err(error) => {
                 let _ = ready_tx.send(Err(error));
@@ -76,8 +78,8 @@ fn open(
     cwd: PathBuf,
     resume: Option<&str>,
     agent: Option<&str>,
+    dirs: &[PathBuf],
 ) -> Result<AgentCore, String> {
-    let dirs = crate::projects::extra_dirs(hub, &cwd);
     let mut core = AgentCore::open(cwd)
         .map_err(|error| error.to_string())?
         .with_version(hub.version);
@@ -123,7 +125,7 @@ fn open(
         core.set_host_extensions(host);
     }
     // After an agent's sandbox, which replaces the default one.
-    core.add_writable_dirs(&dirs);
+    core.add_writable_dirs(dirs);
     // What the session's previous engine held only in memory, when it
     // closed as idle: its approval mode wins over the agent's, not over a
     // requirement's gate (below).
@@ -202,6 +204,8 @@ fn run(hub: &Hub, mut core: AgentCore, id: &str, ops: Receiver<Value>, generatio
         // Reconciled every tick, so a message that never started a run (an
         // engine error) does not hold a running slot.
         hub.set_busy(id, !ready);
+        // A daemon update waits for it (`restart_when_idle`).
+        hub.set_held(id, core.has_background_work());
         if !ready {
             active = Instant::now();
         }
@@ -297,6 +301,8 @@ fn terminal(
     let tui = crate::terminal::tui(&command, &cwd);
     match crate::terminal::open_command(&arc, client, request, tui, Some(on_exit)) {
         Ok(term) => {
+            // The conversation is in the TUI until it exits.
+            hub.set_held(id, true);
             let surface = json!({ "type": "surface", "surface": "tui", "term": term, "client": client, "session": id });
             hub.broadcast(&surface);
             loop {
@@ -325,7 +331,8 @@ fn terminal(
         }
         Err(error) => refuse(error),
     }
-    match open(&arc, cwd, Some(id), None) {
+    let dirs = crate::projects::extra_dirs(&arc, &cwd, &crate::projects::of_session(&arc, id));
+    match open(&arc, cwd, Some(id), None, &dirs) {
         Ok(core) => {
             hub.broadcast(&json!({ "type": "surface", "surface": "gui", "session": id }));
             for event in core.state_events() {

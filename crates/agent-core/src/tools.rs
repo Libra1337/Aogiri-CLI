@@ -3165,6 +3165,27 @@ impl ToolState {
                 .unwrap_or(true)
     }
 
+    /// A background shell of this engine's is still running (one past its
+    /// timeout is not: the next poll ends it).
+    pub fn has_running_shell(&self) -> bool {
+        let owned: Vec<u64> = match self.inner.lock() {
+            Ok(inner) => inner.shells.iter().copied().collect(),
+            Err(_) => return false,
+        };
+        if owned.is_empty() {
+            return false;
+        }
+        let Ok(mut sessions) = shell_sessions().lock() else {
+            return false;
+        };
+        owned.iter().any(|id| {
+            sessions.get_mut(id).is_some_and(|session| {
+                session.started.elapsed().unwrap_or_default() < session.timeout
+                    && matches!(session.child.try_wait(), Ok(None))
+            })
+        })
+    }
+
     fn own_shell(&self, session_id: u64) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.shells.insert(session_id);

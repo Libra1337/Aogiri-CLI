@@ -66,6 +66,10 @@ jobs:
       - name: Shell tests
         run: cargo test -p lynshen-agent-core --lib shell::tests
 
+      # An engine's job object: ending it ends what the engine started.
+      - name: Process group tests
+        run: cargo test -p lynshen-agent-core --lib process_group
+
   # The Windows sandbox (sandbox_windows = "restricted-token", opt-in): the
   # crate's policy checks, then the engine's path through the real
   # `lynshen __sandbox-exec` runner and the shells. Both tests print every

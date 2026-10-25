@@ -3452,6 +3452,12 @@ impl AgentCore {
             && !self.tool_state.has_live_shells()
     }
 
+    /// Work still going outside a turn: a background shell running or a
+    /// subagent not finished. A host waits for it before it restarts.
+    pub fn has_background_work(&self) -> bool {
+        self.tool_state.has_running_shell() || self.subagent_manager.has_unfinished()
+    }
+
     /// What this engine holds of its session only in memory, for the
     /// session's next engine (`restore_kept_state`) when a host closes this
     /// one while the session stays in use.
@@ -5499,7 +5505,15 @@ impl AgentCore {
             .iter()
             .any(|m| m.name == self.config.model)
         {
-            if let Some(model) = self.config.models.first().map(|m| m.name.clone()) {
+            // A login never starts on a hidden model.
+            if let Some(model) = self
+                .config
+                .models
+                .iter()
+                .find(|m| !m.hidden)
+                .or_else(|| self.config.models.first())
+                .map(|m| m.name.clone())
+            {
                 self.config.model = model.clone();
                 let supported = self.reasoning_efforts_for_model(&model);
                 if !supported
@@ -6139,6 +6153,7 @@ impl AgentCore {
         self.config
             .models
             .iter()
+            .filter(|model_config| in_model_picker(model_config, &self.config.model))
             .map(|model_config| {
                 let active = model_config.name == self.config.model;
                 ModelOptionView {
@@ -6286,7 +6301,6 @@ fn current_utc_date() -> String {
 /// models instead.
 const DEFAULT_LYNSHEN_MODELS: &[&str] = &[
     "gpt-6.1-sol",
-    "codex-auto-review",
     "gpt-6-astra",
     "gpt-6-sol",
     "gpt-6-luna",
@@ -6305,15 +6319,32 @@ const DEFAULT_LYNSHEN_MODELS: &[&str] = &[
 ];
 
 fn default_lynshen_models(available: &[ModelConfig]) -> Vec<ModelConfig> {
+    // A model the gateway hides from pickers is never a default.
     let picked: Vec<ModelConfig> = DEFAULT_LYNSHEN_MODELS
         .iter()
-        .filter_map(|name| available.iter().find(|m| m.name == *name).cloned())
+        .filter_map(|name| {
+            available
+                .iter()
+                .find(|m| m.name == *name && !m.hidden)
+                .cloned()
+        })
         .collect();
     if picked.is_empty() {
-        available.iter().take(6).cloned().collect()
+        available
+            .iter()
+            .filter(|m| !m.hidden)
+            .take(6)
+            .cloned()
+            .collect()
     } else {
         picked
     }
+}
+
+/// A model the gateway hides stays callable by name; the picker lists it
+/// only while it is the active model.
+fn in_model_picker(model: &ModelConfig, active: &str) -> bool {
+    !model.hidden || model.name == active
 }
 
 /// A gateway model as the engine runs it. Values the gateway leaves unset stay
@@ -6349,6 +6380,7 @@ fn lynshen_model_config(model: &OAuthModel) -> ModelConfig {
         group_windows: model.group_windows.clone(),
         reasoning: None,
         input_modalities: None,
+        hidden: model.hidden,
     }
 }
 
@@ -7373,6 +7405,7 @@ mod model_config_tests {
             reasoning_efforts: None,
             display_name: None,
             group_windows: Default::default(),
+            hidden: false,
         }
     }
 
@@ -7403,7 +7436,6 @@ mod model_config_tests {
     fn default_lynshen_models_preserve_original_catalog_order() {
         let requested = [
             "gpt-6.1-sol",
-            "codex-auto-review",
             "gpt-6-astra",
             "gpt-6-sol",
             "gpt-6-luna",
@@ -7438,6 +7470,33 @@ mod model_config_tests {
         assert_eq!(default_lynshen_models(&subset)[0].name, "claude-fable-5");
         let other = vec![lynshen_model_config(&oauth_model("private-model"))];
         assert_eq!(default_lynshen_models(&other)[0].name, "private-model");
+        // A model the gateway hides from pickers is never a default.
+        let mut hidden = oauth_model("gpt-6.1-sol");
+        hidden.hidden = true;
+        let mixed = vec![
+            lynshen_model_config(&hidden),
+            lynshen_model_config(&oauth_model("private-model")),
+        ];
+        let names: Vec<_> = default_lynshen_models(&mixed)
+            .into_iter()
+            .map(|model| model.name)
+            .collect();
+        assert_eq!(names, ["private-model"]);
+    }
+
+    #[test]
+    fn a_hidden_gateway_model_is_left_out_of_the_picker_unless_active() {
+        let hidden = lynshen_model_config(&OAuthModel {
+            hidden: true,
+            ..oauth_model("codex-auto-review")
+        });
+        assert!(hidden.hidden);
+        assert!(!in_model_picker(&hidden, "gpt-6-sol"));
+        assert!(in_model_picker(&hidden, "codex-auto-review"));
+        assert!(in_model_picker(
+            &lynshen_model_config(&oauth_model("gpt-6-sol")),
+            "x"
+        ));
     }
 
     #[test]
@@ -7560,6 +7619,7 @@ mod model_config_tests {
             reasoning_efforts: Some(vec!["low".to_string(), "high".to_string()]),
             display_name: None,
             group_windows: Default::default(),
+            hidden: false,
         };
         let config = lynshen_model_config(&model);
         assert_eq!(config.reasoning_efforts, vec!["low", "high"]);

@@ -25,6 +25,7 @@ mod oauth;
 mod plan_mode;
 mod plan_progress;
 mod plan_reminder;
+pub mod process_group;
 mod prompt;
 #[cfg(test)]
 mod prompt_budget;

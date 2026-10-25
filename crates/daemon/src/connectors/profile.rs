@@ -230,7 +230,10 @@ mod tests {
             })
             .unwrap();
         let (outbox, _inbox) = mpsc::channel();
-        let client = hub.add_client(outbox, Some("dev-chat".to_string()));
+        let client = hub.add_client(
+            crate::hub::Outbox::local(outbox),
+            Some("dev-chat".to_string()),
+        );
         for session in ["s1", "s-full"] {
             hub.store.record_session(session, &dir, None).unwrap();
         }
@@ -319,7 +322,7 @@ mod tests {
         for engine in ["claude", "codex", "acp"] {
             let session = format!("s-{engine}");
             hub.store
-                .record_engine_session(&session, &dir, None, Some(engine), false)
+                .record_engine_session(&session, &dir, None, Some(engine), false, None)
                 .unwrap();
             crate::session_messages::observe(
                 &hub,
