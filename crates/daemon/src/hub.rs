@@ -55,6 +55,8 @@ pub struct Hub {
     kept: Mutex<HashMap<String, KeptState>>,
     /// Sessions whose engine is running a turn or has queued messages.
     busy: Mutex<HashSet<String>>,
+    /// Sessions whose latest turn ended on an error, until the next starts.
+    failed: Mutex<HashSet<String>>,
     /// A newer daemon waits to replace this one (`restart_when_idle`).
     restart_pending: AtomicBool,
     /// Delivered messages a session thread has not processed yet. They hold
@@ -170,6 +172,7 @@ impl Hub {
             sessions: Mutex::new(HashMap::new()),
             kept: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashSet::new()),
+            failed: Mutex::new(HashSet::new()),
             restart_pending: AtomicBool::new(false),
             claims: Mutex::new(HashMap::new()),
             delivering: Mutex::new(()),
@@ -1612,13 +1615,36 @@ impl Hub {
         if event["type"] == "session_title" {
             self.adopt_engine_title(session, event["title"].as_str().unwrap_or_default());
         }
-        let (due, ended, failed) = {
+        // `ended`: a turn with a reply ended; `started` / `over`: any turn.
+        let (due, ended, started, over, failed) = {
             let mut turns = lock(&self.turns);
             let turns = turns.entry(session.to_string()).or_default();
             let before = turns.done();
+            let running = turns.running();
             let due = turns.observe(event);
-            (due, turns.done() != before, turns.take_failed())
+            (
+                due,
+                turns.done() != before,
+                !running && turns.running(),
+                running && !turns.running(),
+                turns.take_failed(),
+            )
         };
+        // Every client follows which sessions failed, watched or not (a
+        // desktop marks them in the lists it is not showing).
+        if started || over {
+            let changed = {
+                let mut set = lock(&self.failed);
+                if over && failed.is_some() {
+                    set.insert(session.to_string())
+                } else {
+                    set.remove(session)
+                }
+            };
+            if changed {
+                self.broadcast(&self.sessions_json());
+            }
+        }
         if due {
             self.retitle(session);
         }
@@ -1875,6 +1901,7 @@ impl Hub {
         let saved = saved_by_id(records.iter().map(|record| record.cwd.as_path()));
         let sessions = lock(&self.sessions);
         let busy = lock(&self.busy).clone();
+        let failed = lock(&self.failed).clone();
         let list: Vec<Value> = records
             .into_iter()
             // An agent's session stays on its agent's page even when a
@@ -1906,6 +1933,8 @@ impl Hub {
                     "watchers": hosted.map(|h| h.watchers.len()).unwrap_or(0),
                     // A turn runs (or messages wait): 进行中 on the phone.
                     "running": busy.contains(&record.id),
+                    // Its latest turn ended on an error.
+                    "failed": failed.contains(&record.id),
                 })
             })
             .collect();
@@ -2459,6 +2488,49 @@ mod tests {
         assert!(lock(&hub.sessions).contains_key("s1"));
         hub.session_ended("s1", new);
         assert!(!lock(&hub.sessions).contains_key("s1"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn every_client_learns_when_a_turn_fails_until_the_next_starts() {
+        let dir = std::env::temp_dir().join(format!(
+            "lynshen-hub-failed-list-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let hub = Hub::new(
+            Store::open(dir.join("daemon")).unwrap(),
+            Agents::open(dir.join("agents")).unwrap(),
+            "test",
+            None,
+        );
+        hub.store
+            .record_session("s", std::path::Path::new("/tmp"), None)
+            .unwrap();
+        let (outbox, frames) = mpsc::channel();
+        hub.add_client(outbox, None);
+        let failed = |frames: &mpsc::Receiver<String>| {
+            let list: Value = frames
+                .try_iter()
+                .map(|f| serde_json::from_str::<Value>(&f).unwrap())
+                .filter(|f| f["type"] == "sessions")
+                .last()
+                .unwrap();
+            list["sessions"][0]["failed"].as_bool().unwrap()
+        };
+        let ready = json!({ "type": "status", "message": "ready" });
+
+        hub.observe("s", &json!({ "type": "user_message", "content": "go" }));
+        hub.observe("s", &json!({ "type": "error", "message": "rate limited" }));
+        hub.observe("s", &ready);
+        assert!(failed(&frames));
+        hub.observe("s", &json!({ "type": "user_message", "content": "again" }));
+        assert!(!failed(&frames));
+        hub.observe("s", &ready);
+        assert!(
+            frames.try_iter().all(|f| !f.contains("\"type\":\"sessions\"")),
+            "a good turn changes nothing"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 }
