@@ -29,10 +29,14 @@ standardized subset for ACP clients; see `docs/serve-vs-acp.md` for the split.
 This document describes protocol version 2. The first line on stdout is
 
 ```json
-{"type":"hello","protocol":2,"version":"0.3.0"}
+{"type":"hello","protocol":2,"version":"0.3.0","features":["queue","files"]}
 ```
 
 A client that does not support `protocol` must stop instead of guessing.
+`features` names what this engine takes beyond the protocol version (an
+older one sends none, so a client checks before relying on it): `queue`,
+queued messages picked by place (see "Picking a queued message"); `files`,
+a `user_message`'s attachments other than images (see `user_message`).
 Every later event carries a `session` field with the engine's current
 session id, the same shape the daemon uses to multiplex several sessions on
 one connection (`docs/agent-daemon-plan.md`). Ops may carry a `session`
@@ -83,7 +87,15 @@ Every command is a JSON object with an `op` field.
 ```
 
 Submits a user turn. `images` is an optional array of local image paths;
-unattachable paths produce `info` events and are skipped.
+unattachable paths produce `info` events and are skipped. `files` is an
+optional array of other local files (absolute paths, any type): they are not
+inlined; the model is told where each is saved, one line
+`[Attached file "<name>" is saved at: <path>]` per file after the text, and
+opens it with its own tools. Events (`user_message`, `unqueued`,
+`fill_input`) and the transcript carry them back as `files` next to
+`content`, without those lines; `pending_messages` lists the text only. The daemon's Claude Code and
+Codex sessions get the same lines (one text block or item each), ACP agents a
+`resource_link` per file.
 
 If a turn is already running, the message is queued instead: the engine emits
 `pending_messages` (the full queue) and `status:"queued: N"`. Queued messages
@@ -156,15 +168,27 @@ In `manual` approval mode a `restore` asks first, like an edit; a `restore`
 with `force` asks in every mode but `full-access`, and "always allow" does
 not cover it; `list` and `create` never ask.
 
+### Picking a queued message
+
+`steer`, `unqueue`, `queue_move` and `interrupt` with `index` name a queued
+message by its place in the `pending_messages` the client saw: `index`
+counts from the first (0, the default), or from the last when negative (`-1`
+is the message just sent, so a client can send a message and steer it in at
+once without knowing the queue's length). With `text` too, the message at
+`index` counts only when its text is `text`, else the first queued message
+with that text (the queue may have moved on since the client saw it).
+Nothing there, nothing happens.
+
 ### `steer`
 
 ```json
 {"op":"steer"}
+{"op":"steer","index":-1}
 ```
 
-Sends the next queued message into the in-flight turn; running tools and
-subagents keep going. Emits `status:"steering"` and the updated
-`pending_messages`.
+Sends a queued message (the next one by default) into the in-flight turn;
+running tools and subagents keep going, and the other queued messages keep
+waiting. Emits `status:"steering"` and the updated `pending_messages`.
 
 - While the model's response streams (reasoning, text, or tool-call
   arguments with no tool running yet), the response is cut off as soon as
@@ -187,14 +211,26 @@ No-op when idle or when the queue is empty.
 
 ```json
 {"op":"unqueue","index":0,"text":"also check the tests"}
+{"op":"unqueue","index":-1,"discard":true}
 ```
 
-Takes a queued message back before it runs. Removes the message at `index`
-when its text equals `text`, else the first queued message with that text
-(the queue may have moved on since the client saw it); without `text`, the
-one at `index`. Emits the updated `pending_messages` either way, and
-`{"type":"unqueued","text":…}` when a message was taken back (a client
-returns its text to the message box; one that already started is not taken).
+Takes a queued message back before it runs. Emits the updated
+`pending_messages` either way, and
+`{"type":"unqueued","content":…,"text":…,"images":[…],"files":[…]}`
+(`files` only when it had some) when a message was
+taken back (a client returns it to the message box; one that already started
+is not taken; `text` repeats `content` for older clients). With
+`discard: true` the message is dropped and no `unqueued` follows. The TUI
+takes the last queued message back with ↑ on an empty input.
+
+### `queue_move`
+
+```json
+{"op":"queue_move","index":-1,"to":0}
+```
+
+Moves a queued message to place `to` (negative from the last). Emits the
+updated `pending_messages`.
 
 ### `interrupt`
 
@@ -207,6 +243,14 @@ closes subagents, clears pending approvals. Emits
 `info:"request interrupted"` and `status:"interrupted"`. Queued messages still
 auto-start as the next turn; send `interrupt` again (or avoid queueing) to
 stop those too. No-op when idle.
+
+```json
+{"op":"interrupt","index":-1}
+```
+
+With `index`: "interrupt and send". The turn stops and that queued message
+starts the next one at once, ahead of the others. The daemon's Claude Code,
+Codex and ACP sessions take the same field.
 
 ### `approve`
 
@@ -597,7 +641,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `mcp_servers` | `servers: [{name, transport, state, tools, error?}]` | MCP server states; `state` ∈ `connecting`/`connected`/`failed`/`disabled`. |
 | `trust_prompt` | `cwd`, `repo_root` | Project has local resources (skills, commands, hooks) and no stored trust decision; answer via `command` `/trust yes\|no\|repo`. |
 | `user_message` | `content` | A user turn was accepted and started (echoes the submitted text). |
-| `pending_messages` | `messages` | The queued-message list after it changed. |
+| `pending_messages` | `messages`, `fixed`? | The queued-message list after it changed (texts, without the attached-file lines). `fixed` (Claude Code sessions): the first `fixed` messages are already with the CLI (steered, or sent as the next turn started); they can no longer be taken back, moved or picked. |
 | `fill_input` | `content` | Front-end should pre-fill its input box (e.g. after `/checkout`). |
 | `connecting` | — | A model request is starting. |
 | `thinking_start` | — | The model answered the request; its first token is on the way. |

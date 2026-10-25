@@ -8,7 +8,11 @@
 //!   calls and plans meanwhile. There is no turn-started notification.
 //! - Permission prompts are `session/request_permission` requests answered
 //!   with one of the options the agent offered.
-//! - One prompt at a time: messages sent during a turn run as the next turns.
+//! - One prompt at a time: messages sent during a turn wait here
+//!   (`pending_messages`) and run as the next turns; `unqueue` takes one back
+//!   (or drops it), `queue_move` reorders them, and `steer` (or `interrupt`
+//!   with `index`) cancels the turn so the chosen one runs as soon as it
+//!   settles.
 //! - Reopening: the daemon keeps the agent's session id (`conversation`), and
 //!   a reopened session asks for it again: `session/load` when the agent
 //!   offers it (`loadSession`; it replays the conversation, which becomes the
@@ -16,7 +20,11 @@
 //!   no replay). An agent that offers neither, or no longer has the
 //!   conversation, starts a new one, and clients are told.
 
-use super::{find_program, opencode, Adapter, Line, Options, Output};
+use super::{find_program, op_files, opencode, Adapter, Line, Options, Output};
+use lynshen_agent_core::{
+    attachments,
+    queue::{queue_move_target, QueuePick},
+};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
@@ -25,6 +33,15 @@ use std::{
 };
 
 pub const PROTOCOL_VERSION: u64 = 1;
+
+/// A message waiting for the session or the running turn: what the user
+/// sent, made into prompt blocks when it goes.
+struct Waiting {
+    text: String,
+    images: Vec<String>,
+    /// Other files, sent as `resource_link`s.
+    files: Vec<String>,
+}
 
 pub fn command(options: &Options) -> Command {
     let program = options.command.as_deref().unwrap_or_default();
@@ -203,6 +220,19 @@ impl Replay {
         self.message = message;
     }
 
+    /// A file attached to the user's message being replayed (a new user row
+    /// when the files come first).
+    fn file(&mut self, path: String) {
+        if !self.rows.last().is_some_and(|row| row["role"] == "user") {
+            self.rows.push(json!({ "role": "user", "content": "" }));
+        }
+        if let Some(last) = self.rows.last_mut() {
+            let mut files = last["files"].as_array().cloned().unwrap_or_default();
+            files.push(json!(path));
+            last["files"] = json!(files);
+        }
+    }
+
     fn tool(&mut self, tool: &Tool) {
         self.message = None;
         self.rows
@@ -218,7 +248,8 @@ pub struct Acp {
     image_prompts: bool,
     prompt_in_flight: bool,
     busy_announced: bool,
-    queued: VecDeque<Vec<Value>>,
+    /// Messages waiting for the session or the running turn.
+    queued: VecDeque<Waiting>,
     session_failed: bool,
     /// Synthetic call id → (request id, the options offered).
     approvals: HashMap<String, (Value, Vec<Value>)>,
@@ -370,13 +401,7 @@ impl Acp {
         }
         self.configuring = false;
         self.mode_failed = None;
-        match self.next_prompt() {
-            Some(prompt) => Output {
-                frames: vec![prompt],
-                events: vec![json!({ "type": "connecting" })],
-            },
-            None => Output::default(),
-        }
+        self.next_prompt().unwrap_or_default()
     }
 
     /// OpenCode did not switch to `agent`. 全自动 runs anyway: it is OpenCode
@@ -391,9 +416,9 @@ impl Acp {
             let mut output = Output::events(vec![
                 json!({ "type": "error", "message": format!("[opencode] OpenCode did not switch to {mode} ({message}); it runs on its current agent") }),
             ]);
-            if let Some(prompt) = self.next_prompt() {
-                output.frames.push(prompt);
-                output.events.push(json!({ "type": "connecting" }));
+            if let Some(next) = self.next_prompt() {
+                output.frames.extend(next.frames);
+                output.events.extend(next.events);
             }
             return output;
         }
@@ -404,6 +429,7 @@ impl Acp {
         let mut events = vec![json!({ "type": "error", "message": reason })];
         if !self.queued.is_empty() {
             self.queued.clear();
+            events.push(self.pending_event());
             events.push(json!({ "type": "error", "message": "[opencode] The waiting message was not sent." }));
             if !self.prompt_in_flight {
                 events.push(json!({ "type": "status", "message": "ready" }));
@@ -412,8 +438,9 @@ impl Acp {
         Output::events(events)
     }
 
-    /// The next queued message, when the session can take one.
-    fn next_prompt(&mut self) -> Option<String> {
+    /// The next queued message, when the session can take one: its prompt
+    /// and the events that say it started (the queue without it).
+    fn next_prompt(&mut self) -> Option<Output> {
         if self.session.is_none()
             || self.prompt_in_flight
             || self.configuring
@@ -422,7 +449,35 @@ impl Acp {
             return None;
         }
         let next = self.queued.pop_front()?;
-        Some(self.prompt(next))
+        let blocks = self.blocks(&next);
+        let prompt = self.prompt(blocks);
+        Some(Output {
+            events: vec![self.pending_event(), json!({ "type": "connecting" })],
+            frames: vec![prompt],
+        })
+    }
+
+    /// The prompt blocks of a message: its text, then its images when the
+    /// agent takes them, then a `resource_link` per other file.
+    fn blocks(&self, message: &Waiting) -> Vec<Value> {
+        let mut blocks = vec![json!({ "type": "text", "text": message.text })];
+        if self.image_prompts {
+            for image in &message.images {
+                blocks.push(json!({ "type": "image", "mimeType": image_mime(image), "data": "", "uri": format!("file://{image}") }));
+            }
+        }
+        blocks.extend(message.files.iter().map(|path| {
+            json!({ "type": "resource_link", "uri": attachments::file_uri(path), "name": attachments::file_name(path) })
+        }));
+        blocks
+    }
+
+    fn waiting_texts(&self) -> Vec<&str> {
+        self.queued.iter().map(|m| m.text.as_str()).collect()
+    }
+
+    fn pending_event(&self) -> Value {
+        json!({ "type": "pending_messages", "messages": self.waiting_texts() })
     }
 
     fn request(&mut self, method: &str, params: Value) -> String {
@@ -539,9 +594,9 @@ impl Acp {
         if let Some(mode) = &self.mode {
             events.push(json!({ "type": "approval_mode", "mode": mode }));
         }
-        if let Some(prompt) = self.next_prompt() {
-            frames.push(prompt);
-            events.push(json!({ "type": "connecting" }));
+        if let Some(next) = self.next_prompt() {
+            frames.extend(next.frames);
+            events.extend(next.events);
         }
         Output { events, frames }
     }
@@ -550,13 +605,9 @@ impl Acp {
     fn settle(&mut self) -> Output {
         self.prompt_in_flight = false;
         self.busy_announced = false;
-        match self.next_prompt() {
-            Some(prompt) => Output {
-                frames: vec![prompt],
-                events: vec![json!({ "type": "connecting" })],
-            },
-            None => Output::events(vec![json!({ "type": "status", "message": "ready" })]),
-        }
+        self.next_prompt().unwrap_or_else(|| {
+            Output::events(vec![json!({ "type": "status", "message": "ready" })])
+        })
     }
 
     fn on_update(&mut self, update: &Value) -> Vec<Value> {
@@ -657,6 +708,12 @@ impl Acp {
         match text(&update["sessionUpdate"]) {
             // The plan reminder is not what the user wrote.
             "user_message_chunk" if opencode::for_the_model_only(&update["content"]) => {}
+            // A file the user attached (as `blocks` links it).
+            "user_message_chunk" if update["content"]["type"] == "resource_link" => {
+                if let Some(path) = attachments::uri_path(text(&update["content"]["uri"])) {
+                    replay.file(path);
+                }
+            }
             "user_message_chunk" => replay.text("user", update),
             "agent_message_chunk" => replay.text("assistant", update),
             "agent_thought_chunk" => replay.text("reasoning", update),
@@ -739,6 +796,7 @@ impl Acp {
             if method == "session/new" || method == "initialize" {
                 if !self.queued.is_empty() {
                     self.queued.clear();
+                    output.events.push(self.pending_event());
                     output.events.push(json!({ "type": "error", "message": "The agent could not open a session; the messages waiting for it were not sent" }));
                 }
                 self.session_failed = method == "session/new";
@@ -754,6 +812,7 @@ impl Acp {
                     self.queued.clear();
                     self.refused = Some(reason.clone());
                     return Output::events(vec![
+                        self.pending_event(),
                         json!({ "type": "error", "message": reason }),
                         json!({ "type": "status", "message": "ready" }),
                     ]);
@@ -912,23 +971,62 @@ impl Adapter for Acp {
                 if let Some(reason) = &self.mode_failed {
                     return Err(reason.clone());
                 }
-                let mut blocks = vec![json!({ "type": "text", "text": op["content"] })];
-                if self.image_prompts {
-                    for image in op["images"].as_array().into_iter().flatten().map(text) {
-                        blocks.push(json!({ "type": "image", "mimeType": image_mime(image), "data": "", "uri": format!("file://{image}") }));
-                    }
-                }
+                let message = Waiting {
+                    text: text(&op["content"]).to_string(),
+                    images: op["images"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|image| text(image).to_string())
+                        .collect(),
+                    files: op_files(op),
+                };
                 if self.session.is_none() || self.prompt_in_flight || self.configuring {
-                    self.queued.push_back(blocks);
-                    if self.session.is_none() && self.session_failed {
+                    self.queued.push_back(message);
+                    let frames = if self.session.is_none() && self.session_failed {
                         self.session_failed = false;
                         vec![self.new_session()]
                     } else {
                         vec![]
-                    }
+                    };
+                    return Ok(Output {
+                        events: vec![self.pending_event()],
+                        frames,
+                    });
                 } else {
+                    let blocks = self.blocks(&message);
                     vec![self.prompt(blocks)]
                 }
+            }
+            // A waiting message taken back (dropped with `discard`).
+            "unqueue" => {
+                let Some(message) = QueuePick::from_op(op)
+                    .find(&self.waiting_texts())
+                    .and_then(|at| self.queued.remove(at))
+                else {
+                    return Ok(Output::events(vec![self.pending_event()]));
+                };
+                let mut events = vec![self.pending_event()];
+                if op["discard"] != true {
+                    let mut unqueued = json!({ "type": "unqueued", "content": message.text, "text": message.text, "images": message.images });
+                    super::set_files(&mut unqueued, &message.files);
+                    events.push(unqueued);
+                }
+                return Ok(Output::events(events));
+            }
+            // A waiting message to another place: `index` to `to`.
+            "queue_move" => {
+                let Some((from, to)) = queue_move_target(
+                    &QueuePick::from_op(op),
+                    op["to"].as_i64(),
+                    &self.waiting_texts(),
+                ) else {
+                    return Ok(Output::default());
+                };
+                if let Some(item) = self.queued.remove(from) {
+                    self.queued.insert(to, item);
+                }
+                return Ok(Output::events(vec![self.pending_event()]));
             }
             "approve" => {
                 let call = text(&op["call_id"]);
@@ -958,18 +1056,38 @@ impl Adapter for Acp {
                         .to_string(),
                 ]
             }
-            "interrupt" => {
+            // `steer` (or `interrupt` with `index`): an agent cannot take a
+            // message mid-turn, so the turn is cancelled and, once it
+            // settles, the chosen waiting message starts the next one, ahead
+            // of the others. A plain `interrupt` drops what waits.
+            "steer" | "interrupt" => {
                 let Some(session) = self.session.clone() else {
                     return Ok(Output::default());
                 };
+                let send_now = op["op"] == "steer" || op["index"].is_i64();
+                let mut events = Vec::new();
+                if send_now {
+                    let Some(at) = QueuePick::from_op(op).find(&self.waiting_texts()) else {
+                        return Ok(Output::default());
+                    };
+                    if !self.prompt_in_flight {
+                        return Ok(Output::default());
+                    }
+                    if let Some(chosen) = self.queued.remove(at) {
+                        self.queued.push_front(chosen);
+                    }
+                    events.push(self.pending_event());
+                } else if !self.queued.is_empty() {
+                    self.queued.clear();
+                    events.push(self.pending_event());
+                }
                 let mut frames: Vec<String> = self
                     .approvals
                     .drain()
                     .map(|(_, (request, _))| json!({ "jsonrpc": "2.0", "id": request, "result": { "outcome": { "outcome": "cancelled" } } }).to_string())
                     .collect();
-                self.queued.clear();
                 frames.push(json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": session } }).to_string());
-                frames
+                return Ok(Output { events, frames });
             }
             // OpenCode: the mode is the agent the session runs on (and in
             // 自动编辑 the daemon answers edit requests itself).
@@ -1076,6 +1194,142 @@ mod tests {
             json!({ "id": 4, "result": { "stopReason": "end_turn" } }),
         );
         assert!(!a.busy());
+    }
+
+    /// An open session with "one" running and `texts` waiting.
+    fn running_with(texts: &[&str]) -> Acp {
+        let mut a = Acp::new(Path::new("/p"), &Options::default());
+        a.start();
+        frame(&mut a, json!({ "id": 1, "result": {} }));
+        frame(&mut a, json!({ "id": 2, "result": { "sessionId": "s1" } }));
+        a.encode(&json!({ "op": "user_message", "content": "one" }))
+            .unwrap();
+        for text in texts {
+            a.encode(&json!({ "op": "user_message", "content": text }))
+                .unwrap();
+        }
+        a
+    }
+
+    fn pending(messages: &[&str]) -> Value {
+        json!({ "type": "pending_messages", "messages": messages })
+    }
+
+    #[test]
+    fn waiting_messages_are_listed_taken_back_moved_and_dropped() {
+        let mut a = running_with(&["two"]);
+        let queued = a
+            .encode(&json!({ "op": "user_message", "content": "three", "images": ["/tmp/a.png"] }))
+            .unwrap();
+        assert_eq!(queued.events, [pending(&["two", "three"])]);
+        let moved = a
+            .encode(&json!({ "op": "queue_move", "index": -1, "to": 0 }))
+            .unwrap();
+        assert_eq!(moved.events, [pending(&["three", "two"])]);
+        let back = a
+            .encode(&json!({ "op": "unqueue", "index": 0, "text": "three" }))
+            .unwrap();
+        assert_eq!(
+            back.events,
+            [
+                pending(&["two"]),
+                json!({ "type": "unqueued", "content": "three", "text": "three", "images": ["/tmp/a.png"] }),
+            ]
+        );
+        let dropped = a
+            .encode(&json!({ "op": "unqueue", "index": 0, "discard": true }))
+            .unwrap();
+        assert_eq!(dropped.events, [pending(&[])]);
+        // Nothing waits: the turn settles and goes ready.
+        let settled = frame(
+            &mut a,
+            json!({ "id": 3, "result": { "stopReason": "end_turn" } }),
+        );
+        assert!(settled.frames.is_empty());
+    }
+
+    #[test]
+    fn steering_cancels_the_turn_and_the_chosen_message_runs_next() {
+        for op in [
+            json!({ "op": "steer", "index": -1 }),
+            json!({ "op": "interrupt", "index": -1 }),
+        ] {
+            let mut a = running_with(&["two", "three"]);
+            let out = a.encode(&op).unwrap();
+            assert_eq!(
+                sent(&out.frames).last().unwrap()["method"],
+                "session/cancel"
+            );
+            assert_eq!(out.events, [pending(&["three", "two"])]);
+            let done = frame(
+                &mut a,
+                json!({ "id": 3, "result": { "stopReason": "cancelled" } }),
+            );
+            let next = sent(&done.frames);
+            assert_eq!(next[0]["method"], "session/prompt");
+            assert_eq!(next[0]["params"]["prompt"][0]["text"], "three");
+            assert!(
+                done.events.contains(&pending(&["two"])),
+                "{:?}",
+                done.events
+            );
+        }
+        // A plain interrupt drops what waits.
+        let mut a = running_with(&["two"]);
+        let out = a.encode(&json!({ "op": "interrupt" })).unwrap();
+        assert_eq!(out.events, [pending(&[])]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn attached_files_go_as_resource_links_and_replay_as_files() {
+        let mut a = running_with(&[]);
+        a.encode(&json!({ "op": "user_message", "content": "oops", "files": ["/tmp/x.zip"] }))
+            .unwrap();
+        let back = a.encode(&json!({ "op": "unqueue", "index": 0 })).unwrap();
+        assert_eq!(
+            back.events[1],
+            json!({ "type": "unqueued", "content": "oops", "text": "oops", "images": [], "files": ["/tmp/x.zip"] })
+        );
+        a.encode(
+            &json!({ "op": "user_message", "content": "read", "files": ["/tmp/my report.pdf"] }),
+        )
+        .unwrap();
+        let next = frame(
+            &mut a,
+            json!({ "id": 3, "result": { "stopReason": "end_turn" } }),
+        );
+        assert_eq!(
+            sent(&next.frames)[0]["params"]["prompt"],
+            json!([
+                { "type": "text", "text": "read" },
+                { "type": "resource_link", "uri": "file:///tmp/my%20report.pdf", "name": "my report.pdf" },
+            ])
+        );
+
+        let mut a = Acp::new(Path::new("/p"), &reopen("ses_1"));
+        a.start();
+        frame(
+            &mut a,
+            json!({ "id": 1, "result": { "agentCapabilities": { "loadSession": true } } }),
+        );
+        for u in [
+            json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": "read" } }),
+            json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "resource_link", "uri": "file:///tmp/my%20report.pdf", "name": "my report.pdf" } }),
+            json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "ok" } }),
+            json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "resource_link", "uri": "file:///tmp/x.zip", "name": "x.zip" } }),
+        ] {
+            frame(&mut a, update(u));
+        }
+        let loaded = frame(&mut a, json!({ "id": 2, "result": {} }));
+        assert_eq!(
+            loaded.events[0]["items"],
+            json!([
+                { "role": "user", "content": "read", "files": ["/tmp/my report.pdf"] },
+                { "role": "assistant", "content": "ok" },
+                { "role": "user", "content": "", "files": ["/tmp/x.zip"] },
+            ])
+        );
     }
 
     #[test]
@@ -1592,8 +1846,13 @@ mod tests {
             json!({ "id": 1, "result": { "agentInfo": { "name": "OpenCode", "version": "2.0.29" }, "agentCapabilities": {} } }),
         );
         assert!(refused.frames.is_empty());
-        assert_eq!(refused.events[0]["type"], "error");
-        assert!(text(&refused.events[0]["message"]).contains("OpenCode 1.x"));
+        // The waiting message goes: the queue empties, then the refusal.
+        assert_eq!(
+            refused.events[0],
+            json!({ "type": "pending_messages", "messages": [] })
+        );
+        assert_eq!(refused.events[1]["type"], "error");
+        assert!(text(&refused.events[1]["message"]).contains("OpenCode 1.x"));
         let next = a.encode(&json!({ "op": "user_message", "content": "again" }));
         assert!(next.unwrap_err().contains("OpenCode 1.x"));
     }

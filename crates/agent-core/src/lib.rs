@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod android;
 pub mod approval;
+pub mod attachments;
 mod board;
 pub mod chat;
 pub mod command_text;
@@ -32,6 +33,7 @@ mod prompt_budget;
 pub mod protocol;
 pub mod provider_login;
 mod providers;
+pub mod queue;
 mod roles;
 pub mod sandbox;
 mod search;

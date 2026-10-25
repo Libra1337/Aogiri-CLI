@@ -310,8 +310,13 @@ impl TuiState {
                     self.pending_messages = messages;
                     changed
                 }
-                // The TUI sends no unqueue; pending_messages already redrew.
-                AgentEvent::Unqueued(_) => false,
+                // A queued message taken back goes back to the input to edit.
+                AgentEvent::Unqueued { content, .. } => {
+                    input.clear();
+                    input.push_text(&content);
+                    self.completion_index = 0;
+                    true
+                }
                 // The TUI shows its own turn timer and usage.
                 AgentEvent::TurnStats(_) => false,
                 AgentEvent::UserMessage(message) => {

@@ -21,7 +21,11 @@
 //!   the conversation. `thread/turns/list` reads one back.
 //! - A rewind is `thread/revert` to before a user message's turn.
 
-use super::{home, resolve, Adapter, Line, Options, Output};
+use super::{home, op_files, resolve, set_files, Adapter, Line, Options, Output};
+use lynshen_agent_core::{
+    attachments,
+    queue::{queue_move_target, QueuePick},
+};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -320,12 +324,13 @@ fn transcript(turns: &Value) -> Vec<Value> {
     {
         match text(&item["type"]) {
             "userMessage" => {
-                let (content, images) = user_input(&item["content"]);
-                if !content.is_empty() || !images.is_empty() {
+                let (content, images, files) = user_input(&item["content"]);
+                if !content.is_empty() || !images.is_empty() || !files.is_empty() {
                     let mut row = json!({ "role": "user", "content": content });
                     if !images.is_empty() {
                         row["images"] = json!(images);
                     }
+                    set_files(&mut row, &files);
                     rows.push(row);
                 }
             }
@@ -397,13 +402,24 @@ fn tool_row(item: &Value) -> Value {
 }
 
 /// A user message's text and its images (local paths).
-fn user_input(content: &Value) -> (String, Vec<String>) {
+/// A user message's text, its images (local paths) and the files its
+/// attached-file items name (one text item each, as sent; inputs merged from
+/// several messages keep every message's files).
+fn user_input(content: &Value) -> (String, Vec<String>, Vec<String>) {
     let blocks = content.as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut files = Vec::new();
     let text_part = blocks
         .iter()
         .filter(|c| c["type"] == "text")
         .map(|c| text(&c["text"]))
         .filter(|t| !t.is_empty())
+        .filter(|t| match attachments::line_path(t) {
+            Some(path) => {
+                files.push(path);
+                false
+            }
+            None => true,
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let images = blocks
@@ -412,7 +428,7 @@ fn user_input(content: &Value) -> (String, Vec<String>) {
         .map(|c| text(&c["path"]).to_string())
         .filter(|p| !p.is_empty())
         .collect();
-    (text_part, images)
+    (text_part, images, files)
 }
 
 /// A subagent's short name from its path (`/root/pong` → `pong`).
@@ -643,8 +659,12 @@ impl Codex {
             .is_some_and(|tiers| tiers.iter().any(|t| t["id"] == "priority"))
     }
 
+    fn waiting_texts(&self) -> Vec<&str> {
+        self.waiting.iter().map(|(text, _)| text.as_str()).collect()
+    }
+
     fn pending_event(&self) -> Value {
-        let texts: Vec<&str> = self.waiting.iter().map(|(text, _)| text.as_str()).collect();
+        let texts: Vec<&str> = self.waiting_texts();
         json!({ "type": "pending_messages", "messages": texts })
     }
 
@@ -1283,14 +1303,15 @@ impl Codex {
                 if !turn.is_empty() {
                     self.user_turns.push(turn.to_string());
                 }
-                let (content, images) = user_input(&item["content"]);
-                if content.is_empty() && images.is_empty() {
+                let (content, images, files) = user_input(&item["content"]);
+                if content.is_empty() && images.is_empty() && files.is_empty() {
                     vec![]
                 } else {
                     let mut event = json!({ "type": "user_message", "content": content });
                     if !images.is_empty() {
                         event["images"] = json!(images);
                     }
+                    set_files(&mut event, &files);
                     vec![event]
                 }
             }
@@ -1820,6 +1841,10 @@ impl Adapter for Codex {
                 for image in op["images"].as_array().into_iter().flatten() {
                     input.push(json!({ "type": "localImage", "path": image }));
                 }
+                // Each other file: a text item saying where it is saved.
+                for file in op_files(op) {
+                    input.push(json!({ "type": "text", "text": attachments::file_line(&file), "text_elements": [] }));
+                }
                 if self.thread.is_none() {
                     self.queued.extend(input);
                     return Ok(Output::default());
@@ -1836,39 +1861,55 @@ impl Adapter for Codex {
                 vec![self.turn_start(input)]
             }
             // A waiting message taken back before it runs (serve-protocol
-            // `unqueue`): the one at `index` when its text is `text`, else
-            // the first with that text.
+            // `unqueue`, picked as `QueuePick` says), or dropped (`discard`).
             "unqueue" => {
-                let wanted = op["text"].as_str();
-                let index = op["index"].as_u64().map_or(usize::MAX, |i| i as usize);
-                let at = match wanted {
-                    None => (index < self.waiting.len()).then_some(index),
-                    Some(wanted) => self
-                        .waiting
-                        .get(index)
-                        .filter(|(text, _)| text == wanted)
-                        .map(|_| index)
-                        .or_else(|| self.waiting.iter().position(|(text, _)| text == wanted)),
-                };
+                let at = QueuePick::from_op(op).find(&self.waiting_texts());
                 let mut events = Vec::new();
                 if let Some(at) = at {
-                    let (text, _) = self.waiting.remove(at);
+                    let (content, input) = self.waiting.remove(at);
                     events.push(self.pending_event());
-                    events.push(json!({ "type": "unqueued", "text": text }));
+                    if op["discard"] != true {
+                        let (_, images, files) = user_input(&json!(input));
+                        let mut unqueued = json!({ "type": "unqueued", "content": content, "text": content, "images": images });
+                        set_files(&mut unqueued, &files);
+                        events.push(unqueued);
+                    }
                 } else {
                     events.push(self.pending_event());
                 }
                 return Ok(Output::events(events));
             }
+            // A waiting message to another place: `index` to `to`.
+            "queue_move" => {
+                let Some((from, to)) = queue_move_target(
+                    &QueuePick::from_op(op),
+                    op["to"].as_i64(),
+                    &self.waiting_texts(),
+                ) else {
+                    return Ok(Output::default());
+                };
+                let item = self.waiting.remove(from);
+                self.waiting.insert(to, item);
+                return Ok(Output::events(vec![self.pending_event()]));
+            }
+            // One waiting message (`index`, `text`) into the running turn, or
+            // every one that waits when the op names none.
             "steer" => {
                 let (Some(thread), Some(turn)) = (self.thread.clone(), self.active_turn.clone())
                 else {
                     return Ok(Output::default());
                 };
-                if self.waiting.is_empty() {
+                let pick = QueuePick::from_op(op);
+                self.steering = if pick == QueuePick::default() {
+                    std::mem::take(&mut self.waiting)
+                } else {
+                    pick.find(&self.waiting_texts())
+                        .map(|at| vec![self.waiting.remove(at)])
+                        .unwrap_or_default()
+                };
+                if self.steering.is_empty() {
                     return Ok(Output::default());
                 }
-                self.steering = std::mem::take(&mut self.waiting);
                 let input: Vec<Value> = self
                     .steering
                     .iter()
@@ -1990,7 +2031,24 @@ impl Adapter for Codex {
                     json!({ "type": "status", "message": "ready" }),
                 ]));
             }
+            // With `index`: that waiting message starts the next turn once
+            // this one has stopped ("interrupt and send").
             "interrupt" => match (self.thread.clone(), self.active_turn.clone()) {
+                (Some(thread), Some(turn)) if op["index"].is_i64() => {
+                    if let Some(at) = QueuePick::from_op(op).find(&self.waiting_texts()) {
+                        let chosen = self.waiting.remove(at);
+                        self.waiting.insert(0, chosen);
+                    }
+                    let frame = self.request(
+                        "turn/interrupt",
+                        json!({ "threadId": thread, "turnId": turn }),
+                        "",
+                    );
+                    return Ok(Output {
+                        events: vec![self.pending_event()],
+                        frames: vec![frame],
+                    });
+                }
                 (Some(thread), Some(turn)) => vec![self.request(
                     "turn/interrupt",
                     json!({ "threadId": thread, "turnId": turn }),
@@ -2388,7 +2446,7 @@ mod tests {
         );
         assert_eq!(
             taken.events[1],
-            json!({ "type": "unqueued", "text": "also this" })
+            json!({ "type": "unqueued", "content": "also this", "text": "also this", "images": [] })
         );
         // Taking back what is no longer queued answers with the queue alone.
         let gone = c
@@ -2486,6 +2544,127 @@ mod tests {
         let frames = sent(&stop.frames);
         assert_eq!(frames[0]["method"], "turn/interrupt");
         assert_eq!(frames[0]["params"]["turnId"], "turn-1");
+    }
+
+    /// A busy Codex with `texts` waiting.
+    fn waiting(texts: &[&str]) -> Codex {
+        let mut c = opened();
+        busy(&mut c);
+        for text in texts {
+            c.encode(&json!({ "op": "user_message", "content": text }))
+                .unwrap();
+        }
+        c
+    }
+
+    #[test]
+    fn attached_files_go_as_text_items_and_come_back_as_files() {
+        let mut c = opened();
+        let line = attachments::file_line("/tmp/my report.pdf");
+        let turn = sent(
+            &c.encode(&json!({ "op": "user_message", "content": "read", "images": ["/tmp/a.png"], "files": ["/tmp/my report.pdf"] }))
+                .unwrap()
+                .frames,
+        );
+        assert_eq!(
+            turn[0]["params"]["input"],
+            json!([
+                { "type": "text", "text": "read", "text_elements": [] },
+                { "type": "localImage", "path": "/tmp/a.png" },
+                { "type": "text", "text": line, "text_elements": [] },
+            ])
+        );
+        // The echo, a saved thread and a message taken back: `files`.
+        let content = turn[0]["params"]["input"].clone();
+        let echo = frame(
+            &mut c,
+            json!({ "method": "item/started", "params": { "item": { "id": "u1", "type": "userMessage", "content": content } } }),
+        );
+        assert_eq!(
+            echo.events,
+            vec![
+                json!({ "type": "user_message", "content": "read", "images": ["/tmp/a.png"], "files": ["/tmp/my report.pdf"] })
+            ]
+        );
+        let item = json!({ "type": "userMessage", "content": content });
+        assert_eq!(
+            transcript(&json!([{ "items": [item] }])),
+            vec![
+                json!({ "role": "user", "content": "read", "images": ["/tmp/a.png"], "files": ["/tmp/my report.pdf"] })
+            ]
+        );
+        let mut c = waiting(&[]);
+        c.encode(
+            &json!({ "op": "user_message", "content": "oops", "files": ["/tmp/my report.pdf"] }),
+        )
+        .unwrap();
+        let back = c.encode(&json!({ "op": "unqueue", "index": 0 })).unwrap();
+        assert_eq!(
+            back.events[1],
+            json!({ "type": "unqueued", "content": "oops", "text": "oops", "images": [], "files": ["/tmp/my report.pdf"] })
+        );
+    }
+
+    #[test]
+    fn one_waiting_message_steers_in_by_its_place() {
+        let mut c = waiting(&["one", "two"]);
+        let steer = c.encode(&json!({ "op": "steer", "index": 1 })).unwrap();
+        let frames = sent(&steer.frames);
+        assert_eq!(frames[0]["method"], "turn/steer");
+        assert_eq!(frames[0]["params"]["input"][0]["text"], "two");
+        assert_eq!(frames[0]["params"]["input"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            steer.events,
+            vec![json!({ "type": "pending_messages", "messages": ["one"] })]
+        );
+        assert!(c
+            .encode(&json!({ "op": "steer", "index": -3 }))
+            .unwrap()
+            .frames
+            .is_empty());
+        // By its text, after the queue moved on.
+        let mut c = waiting(&["one", "two"]);
+        let steer = c
+            .encode(&json!({ "op": "steer", "index": 0, "text": "two" }))
+            .unwrap();
+        assert_eq!(sent(&steer.frames)[0]["params"]["input"][0]["text"], "two");
+    }
+
+    #[test]
+    fn waiting_messages_move_and_drop() {
+        let mut c = waiting(&["one", "two", "three"]);
+        let moved = c
+            .encode(&json!({ "op": "queue_move", "index": -1, "to": 0 }))
+            .unwrap();
+        assert_eq!(
+            moved.events,
+            vec![json!({ "type": "pending_messages", "messages": ["three", "one", "two"] })]
+        );
+        let dropped = c
+            .encode(&json!({ "op": "unqueue", "index": 1, "discard": true }))
+            .unwrap();
+        assert_eq!(
+            dropped.events,
+            vec![json!({ "type": "pending_messages", "messages": ["three", "two"] })]
+        );
+    }
+
+    #[test]
+    fn interrupting_for_a_waiting_message_starts_it_next() {
+        let mut c = waiting(&["one", "two"]);
+        let stop = c.encode(&json!({ "op": "interrupt", "index": 1 })).unwrap();
+        assert_eq!(sent(&stop.frames)[0]["method"], "turn/interrupt");
+        assert_eq!(
+            stop.events,
+            vec![json!({ "type": "pending_messages", "messages": ["two", "one"] })]
+        );
+        let next = frame(
+            &mut c,
+            json!({ "method": "turn/completed", "params": { "threadId": "th-1", "turn": { "id": "turn-1", "status": "interrupted" } } }),
+        );
+        let started = sent(&next.frames);
+        assert_eq!(started[0]["method"], "turn/start");
+        assert_eq!(started[0]["params"]["input"][0]["text"], "two");
     }
 
     #[test]

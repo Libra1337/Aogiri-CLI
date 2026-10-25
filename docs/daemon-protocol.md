@@ -168,7 +168,7 @@ handshake with HTTP 401. Local clients read the daemon token from
 Each WebSocket text message is one JSON frame. The daemon first sends:
 
 ```json
-{"type":"hello","protocol":2,"version":"0.3.0"}
+{"type":"hello","protocol":2,"version":"0.3.0","features":["queue","files"]}
 {"type":"sessions","sessions":[{"session":"...","cwd":"...","created_at":0,"updated_at":0,"entries":4,"title":"...","archived":false,"open":true,"watchers":0}]}
 {"type":"workspaces","rev":1,"workspaces":[...]}
 ```
@@ -387,6 +387,13 @@ agent offers it (its replay becomes the session's `transcript`), else
 conversation, starts a new one under the same session id, and clients get
 an `info` event saying so.
 
+An agent runs one prompt at a time: a message sent during a turn waits in
+the daemon (`pending_messages`) and runs as the next turn. `unqueue` takes
+one back (or drops it), `queue_move` reorders them, and `steer` (or
+`interrupt` with `index`), which an agent cannot do mid-turn, cancels the
+turn (`session/cancel`) and runs the picked message first as soon as it
+settles. A plain `interrupt` drops the waiting messages.
+
 The session id is the engine's conversation id (Claude Code's session id,
 Codex's thread id), so reopening a closed session resumes the same
 conversation (`--resume`, `thread/resume`), and `session_open` with `cwd`
@@ -469,10 +476,14 @@ Differences from a lynshen session:
   conversation (it only honors that mode as a start flag), after the running
   turn. Codex applies a new mode, and a model picked with `/model`, from the
   next turn.
-- `steer`, `decide_action`, `mcp_set`/`mcp_remove` and the lynshen-only
+- `decide_action`, `mcp_set`/`mcp_remove` and the lynshen-only
   commands (`/resume`, `/rewind`, `/tree`, ...) are refused with an `error`
   event. Other slash commands go to Claude Code as a user message, as Claude
   Code expects.
+- Queued messages take the same ops on every engine (`steer`, `unqueue`
+  with `discard`, `queue_move`, `interrupt` with `index`; see "Picking a
+  queued message" in docs/serve-protocol.md), each engine its own way
+  (below). The hello's `features` has `queue` when the daemon does.
 
 Claude Code sessions take more:
 
@@ -494,7 +505,10 @@ Codex sessions take the same `steer`, `/fast`, `/thinking`, `rename`,
 `mcp_login` `name` (answered by `mcp_login` with the server's sign-in `url`)
 and `/login` (a device code to sign Codex in to ChatGPT, as an `info`). A
 message sent mid-turn waits in the daemon (`pending_messages`) and starts the
-next turn; `steer` sends it into the running one (`turn/steer`). Approval
+next turn; `steer` sends it into the running one (`turn/steer`): the
+picked message, or every one that waits when the op names none.
+`interrupt` with `index` stops the turn and starts that message next.
+Approval
 mode `plan` is Codex's plan collaboration mode and `auto` its `auto_review`
 reviewer. Codex's own requests for permissions, for the user's answers
 (`ask_question` with `questions`) and MCP elicitations come as approval
@@ -503,12 +517,20 @@ always with `always_scope: "rule"` (a Codex exec rule). Subagents are
 threads of their own: their events feed `agent_runs` and
 `subagent_lifecycle`, never the conversation.
 
-A message sent while a Claude Code turn runs goes to Claude Code at once,
-which takes it into the running turn at its next tool boundary (or runs it
-as the next turn). Until Claude Code takes it in, it is listed in
-`pending_messages` (also part of a watcher's snapshot); its `user_message`
-comes when it is taken in, one each for messages taken in together. An
-`interrupt` empties the list. A reopened conversation keeps these messages
+A message sent while a Claude Code turn runs waits in the daemon, listed in
+`pending_messages` (also part of a watcher's snapshot), and starts the next
+turn when this one ends; until then it can be taken back, dropped or moved.
+`steer` writes it to Claude Code now with priority `now`: the running turn
+stops what it does (its generation and tool calls; a subagent it runs in the
+foreground is moved to the background first and reports back as a task
+notification) and takes the message in at once; the turn it cuts short ends
+without an error. Without an index every waiting message goes. A message
+Claude Code has but has not taken in yet stays first in the list, counted
+in `pending_messages`'s `fixed`, and can no longer be taken back, steered or
+moved. Its `user_message` comes when it is taken in, one each for messages
+taken in together. A plain `interrupt` keeps the waiting messages: the next
+one starts once the turn has stopped; with `index` that one goes first. A
+reopened conversation keeps these messages
 (Claude Code saves them as `queued_command` rows), the images of every user
 message (written once under `~/.lynshen/uploads/claude` and named by path in
 `images`) and a `/goal <condition>` command as the user wrote it; other
