@@ -113,14 +113,18 @@ fn open(
             session.clone(),
         ));
     }
-    // The dispatcher keeps its closed set of routing tools.
-    let messages = (agent != Some(crate::dispatch::AGENT))
-        .then(|| crate::session_messages::extensions(Arc::clone(hub), session))
-        .flatten();
-    let host = match (host, messages) {
-        (Some(agent), Some(messages)) => Some(agent.with(messages)),
-        (agent, messages) => agent.or(messages),
-    };
+    // The app's tools (`app_tools`); the dispatcher keeps its closed set of
+    // routing tools, and an agent proposes schedules with its own tool.
+    if agent != Some(crate::dispatch::AGENT) {
+        let app = crate::app_tools::extensions(core.cwd().to_path_buf(), agent.is_none());
+        let messages = crate::session_messages::extensions(Arc::clone(hub), session);
+        for extra in [app, messages].into_iter().flatten() {
+            host = Some(match host {
+                Some(host) => host.with(extra),
+                None => extra,
+            });
+        }
+    }
     if let Some(host) = host {
         core.set_host_extensions(host);
     }

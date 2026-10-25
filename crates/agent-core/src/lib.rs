@@ -1,5 +1,6 @@
 pub mod actions;
 pub mod android;
+pub mod app_tools;
 pub mod approval;
 pub mod attachments;
 mod board;
@@ -231,6 +232,18 @@ pub fn change_mcp_config(op: &serde_json::Value) -> Result<(), String> {
     config
         .save()
         .map_err(|error| format!("failed to save config: {error}"))
+}
+
+/// Changes `~/.lynshen/config.json` in place under its lock: `edit` gets the
+/// parsed file (an empty object when there is none); every other key stays.
+/// For daemon settings kept there (`app_tools`, `sessions.messages`).
+pub fn edit_config(
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> Result<(), String>,
+) -> Result<(), String> {
+    let path = config::lynshen_dir()
+        .map_err(|error| error.to_string())?
+        .join("config.json");
+    config::edit_config_json(&path, edit)
 }
 
 /// The desktop's Android phone ops (see `android`): `android_use_status`
