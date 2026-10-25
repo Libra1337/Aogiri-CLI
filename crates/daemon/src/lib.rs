@@ -34,6 +34,7 @@ mod store;
 mod styles;
 mod terminal;
 mod titles;
+mod tool_providers;
 mod uploads;
 mod usage;
 mod webpush;
@@ -386,6 +387,32 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         reply(json!({ "type": "error", "message": "only the desktop can change the app tools" }));
         return;
     }
+    // Custom providers for Claude Code and Codex: where their sessions'
+    // requests go and with which key. Only the desktop manages them; the
+    // model list waits on the provider's API.
+    if matches!(
+        name,
+        "tool_providers"
+            | "tool_provider_save"
+            | "tool_provider_remove"
+            | "tool_provider_select"
+            | "tool_provider_models"
+    ) {
+        if !hub.is_local(client) {
+            reply(json!({ "type": "error", "message": "only the desktop can manage custom providers" }));
+            return;
+        }
+        let hub = Arc::clone(hub);
+        let name = name.to_string();
+        thread::spawn(move || {
+            let result = match name.as_str() {
+                "tool_provider_models" => tool_providers::models(&hub.store, &op),
+                _ => tool_providers::handle(&hub.store, &op),
+            };
+            respond(&hub, client, &request, result);
+        });
+        return;
+    }
     // An MCP server is a command to run or a place to send credentials.
     if matches!(name, "mcp_set" | "mcp_remove" | "mcp_toggle") && !hub.is_local(client) {
         reply(json!({ "type": "error", "message": "only the desktop can change MCP servers" }));
@@ -602,7 +629,7 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         thread::spawn(move || {
             let result = engines::Kind::parse(&engine).and_then(|kind| match kind {
                 _ if !cwd.is_dir() => Err(format!("not a directory: {}", cwd.display())),
-                Some(kind) => engines::probe_cached(kind, &cwd, &options, force).map(
+                Some(kind) => engines::probe_cached(&hub.store, kind, &cwd, &options, force).map(
                     |(events, at, cached)| {
                         json!({ "type": "engine_probed", "engine": kind.name(), "events": events, "at": at, "cached": cached })
                     },

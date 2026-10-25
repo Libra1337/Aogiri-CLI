@@ -11,6 +11,7 @@ pub mod codex;
 pub mod opencode;
 
 use crate::hub::Hub;
+use crate::store::Store;
 use lynshen_agent_core::process_group::{self, ProcessGroup};
 use serde_json::{json, Value};
 use std::{
@@ -95,6 +96,11 @@ pub struct Options {
     /// instead of the provider in their own config (which stays untouched).
     /// None: as the session last ran.
     pub gateway: Option<bool>,
+    /// Claude / Codex off the LynShen gateway: the custom provider
+    /// (`tool_providers`) the session runs on, by id; "" the tool's own
+    /// configuration; None the tool's selected one (a new session). A
+    /// session keeps the one it started on (see `pin_tool_provider`).
+    pub tool_provider: Option<String>,
     /// Claude: start with ultracode on (standing Workflow orchestration).
     pub ultracode: bool,
     /// Claude: the thinking effort to start with.
@@ -157,6 +163,9 @@ impl Options {
                 .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
                 .collect(),
             gateway: value["lynshen_gateway"].as_bool(),
+            tool_provider: value["tool_provider"]
+                .as_str()
+                .map(|id| id.trim().to_string()),
             ultracode: value["ultracode"] == true,
             effort: text("effort"),
             fast: value["fast"] == true,
@@ -295,18 +304,25 @@ struct Start {
 }
 
 /// How the engine starts in `cwd`.
-fn command(kind: Kind, id: &str, options: &Options, cwd: &Path) -> Result<Start, String> {
+fn command(
+    store: &Store,
+    kind: Kind,
+    id: &str,
+    options: &Options,
+    cwd: &Path,
+) -> Result<Start, String> {
     let command = match kind {
         Kind::Claude => claude::command(id, options),
         Kind::Codex => codex::command(options),
         Kind::Acp => acp::command(options),
     };
-    with_gateway(kind, id, options, cwd, command)
+    with_gateway(store, kind, id, options, cwd, command)
 }
 
 /// The engine's own TUI resuming conversation `id` (Claude Code, Codex),
 /// configured as its GUI process is: environment and gateway.
 fn tui_command(
+    store: &Store,
     kind: Kind,
     id: &str,
     options: &Options,
@@ -318,13 +334,15 @@ fn tui_command(
         Kind::Codex => codex::tui(saved.then_some(id), options),
         Kind::Acp => return Err("an ACP agent has no TUI here".to_string()),
     };
-    with_gateway(kind, id, options, cwd, command)
+    with_gateway(store, kind, id, options, cwd, command)
 }
 
-/// `command` with the session's environment, and on the LynShen gateway when
-/// it runs there: with the local gateway key it holds. OpenCode also gets
-/// the agent its approval modes run on (see `opencode`).
+/// `command` with the session's environment, and on the LynShen gateway or
+/// a custom provider when it runs there: with the local gateway key it
+/// holds. OpenCode also gets the agent its approval modes run on (see
+/// `opencode`).
 fn with_gateway(
+    store: &Store,
     kind: Kind,
     id: &str,
     options: &Options,
@@ -333,6 +351,41 @@ fn with_gateway(
 ) -> Result<Start, String> {
     command.envs(options.env.iter().map(|(name, value)| (name, value)));
     let opencode = kind == Kind::Acp && opencode::is_opencode(options);
+    // A custom provider: through the local gateway, which sends its requests
+    // to the provider with its key and nothing of LynShen's (no login needed).
+    if let Some(provider) = custom_provider(store, kind, options)? {
+        let tool = kind.name();
+        let provider_id = provider["id"].as_str().unwrap_or_default().to_string();
+        let secret = crate::tool_providers::key(tool, &provider_id).ok_or_else(|| {
+            format!(
+                "自定义服务商「{}」没有保存 API key，请在设置里重新填写。",
+                provider["name"].as_str().unwrap_or(&provider_id)
+            )
+        })?;
+        let base = crate::gateway::base_url()?;
+        let key = crate::gateway::issue(id)?;
+        let mut route = provider.clone();
+        route["tool"] = json!(tool);
+        route["key"] = json!(secret);
+        crate::gateway::set_custom(&key, route);
+        let configured = match kind {
+            Kind::Claude => {
+                claude::use_gateway(&mut command, id, &base, &key, provider["model"].as_str())
+            }
+            _ => codex::use_gateway(&mut command, &base, &key, provider["name"].as_str()),
+        };
+        return match configured {
+            Ok(()) => Ok(Start {
+                command,
+                key: Some(key),
+                notices: Vec::new(),
+            }),
+            Err(error) => {
+                release_key(kind, &key);
+                Err(error)
+            }
+        };
+    }
     if options.gateway != Some(true) {
         let notices = if opencode {
             opencode::configure(&mut command, options, cwd, None)?
@@ -353,8 +406,10 @@ fn with_gateway(
     let base = crate::gateway::base_url()?;
     let key = crate::gateway::issue(id)?;
     let configured = match kind {
-        Kind::Claude => claude::use_gateway(&mut command, id, &base, &key).map(|()| Vec::new()),
-        Kind::Codex => codex::use_gateway(&mut command, &base, &key).map(|()| Vec::new()),
+        Kind::Claude => {
+            claude::use_gateway(&mut command, id, &base, &key, None).map(|()| Vec::new())
+        }
+        Kind::Codex => codex::use_gateway(&mut command, &base, &key, None).map(|()| Vec::new()),
         Kind::Acp => opencode::configure(&mut command, options, cwd, Some((&base, &key))),
     };
     match configured {
@@ -368,6 +423,58 @@ fn with_gateway(
             Err(error)
         }
     }
+}
+
+/// Settles which custom provider a Claude Code / Codex session off the
+/// gateway runs on, so it keeps that one when it reopens or restarts: one
+/// upstream rejects another's conversation state (Claude's thinking
+/// signatures). None (a new session, or one leaving the gateway) takes the
+/// tool's selected provider ("" when none is).
+pub fn pin_tool_provider(store: &Store, kind: Kind, options: &mut Options) {
+    if matches!(kind, Kind::Claude | Kind::Codex)
+        && options.gateway != Some(true)
+        && options.tool_provider.is_none()
+    {
+        let selected = crate::tool_providers::selected(store, kind.name());
+        options.tool_provider = Some(
+            selected
+                .and_then(|p| p["id"].as_str().map(str::to_string))
+                .unwrap_or_default(),
+        );
+    }
+}
+
+/// The custom provider a session runs on (None: the LynShen gateway or the
+/// tool's own configuration), without its key. One that was removed fails
+/// the start rather than moving the conversation somewhere else.
+pub fn custom_provider(store: &Store, kind: Kind, options: &Options) -> Result<Option<Value>, String> {
+    if !matches!(kind, Kind::Claude | Kind::Codex) || options.gateway == Some(true) {
+        return Ok(None);
+    }
+    match options.tool_provider.as_deref() {
+        None | Some("") => Ok(None),
+        Some(id) => crate::tool_providers::find(store, kind.name(), id)
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "这个会话使用的自定义服务商「{id}」已被删除，无法继续。请把会话切换到 LynShen 网关或 {} 自己的配置后再打开。",
+                    match kind {
+                        Kind::Claude => "Claude Code",
+                        _ => "Codex",
+                    }
+                )
+            }),
+    }
+}
+
+/// The `tool_provider` state event: the custom provider the session runs
+/// on (id, name, model, models; never its key or URL), or null.
+fn tool_provider_event(store: &Store, kind: Kind, options: &Options) -> Value {
+    let provider = custom_provider(store, kind, options)
+        .ok()
+        .flatten()
+        .map(|p| crate::tool_providers::view(&p));
+    json!({ "type": "tool_provider", "provider": provider })
 }
 
 /// Notices as `info` events.
@@ -426,6 +533,7 @@ fn probe_key(kind: Kind, cwd: &Path, options: &Options) -> String {
         options.bin,
         options.env,
         options.gateway,
+        options.tool_provider,
         options.command,
         options.args,
         options.model,
@@ -437,11 +545,16 @@ fn probe_key(kind: Kind, cwd: &Path, options: &Options) -> String {
 /// anyway): the events, when they were found (ms) and whether they came
 /// from the cache.
 pub fn probe_cached(
+    store: &Store,
     kind: Kind,
     cwd: &Path,
     options: &Options,
     force: bool,
 ) -> Result<(Vec<Value>, u64, bool), String> {
+    // On the provider a new session would start on.
+    let mut options = options.clone();
+    pin_tool_provider(store, kind, &mut options);
+    let options = &options;
     let slot = {
         let mut probes = PROBES
             .lock()
@@ -459,7 +572,7 @@ pub fn probe_cached(
             return Ok((events.clone(), *ms, true));
         }
     }
-    let events = probe(kind, cwd, options)?;
+    let events = probe(store, kind, cwd, options)?;
     let ms = now_ms();
     *slot = Some((Instant::now(), ms, events.clone()));
     Ok((events, ms, false))
@@ -470,7 +583,12 @@ pub fn probe_cached(
 /// (Claude Code `--no-session-persistence`, a Codex `ephemeral` thread),
 /// asked for its models, then stopped. Returns the last event of each
 /// PROBE_KEEPS kind it sent.
-pub fn probe(kind: Kind, cwd: &Path, options: &Options) -> Result<Vec<Value>, String> {
+pub fn probe(
+    store: &Store,
+    kind: Kind,
+    cwd: &Path,
+    options: &Options,
+) -> Result<Vec<Value>, String> {
     let options = Options {
         probe: true,
         resume: None,
@@ -483,7 +601,7 @@ pub fn probe(kind: Kind, cwd: &Path, options: &Options) -> Result<Vec<Value>, St
         ..options.clone()
     };
     let id = new_uuid()?;
-    let Start { command, key, .. } = command(kind, &id, &options, cwd)?;
+    let Start { command, key, .. } = command(store, kind, &id, &options, cwd)?;
     let release = |key: &Option<String>| {
         if let Some(key) = key {
             release_key(kind, key);
@@ -740,6 +858,7 @@ const STATE_EVENTS: &[&str] = &[
     // Messages waiting for the turn: a client that attaches (another device,
     // a desktop back from elsewhere) shows them too.
     "pending_messages",
+    "tool_provider",
 ];
 
 /// The non-image files a `user_message` op attaches (`files`, absolute
@@ -966,7 +1085,13 @@ pub fn spawn(
         command,
         key: gateway_key,
         notices: started,
-    } = command(kind, id.as_deref().unwrap_or_default(), &options, &cwd)?;
+    } = command(
+        &hub.store,
+        kind,
+        id.as_deref().unwrap_or_default(),
+        &options,
+        &cwd,
+    )?;
     let process = match Process::spawn(command, &cwd) {
         Ok(process) => process,
         Err(error) => {
@@ -1116,6 +1241,7 @@ impl Session<'_> {
         self.publish(vec![
             json!({ "type": "background_tasks", "tasks": [] }),
             json!({ "type": "pending_messages", "messages": [] }),
+            tool_provider_event(&self.hub.store, self.kind, &options),
         ]);
         // What the process runs as now (a restart changes it). A fork's
         // fields stay until it is saved: the engine only forks while it has
@@ -1240,7 +1366,20 @@ impl Session<'_> {
                     next.bin = options.bin.clone();
                     next.env = options.env.clone();
                     next.claude_config = next.claude_config.or(options.claude_config.clone());
-                    next.gateway = next.gateway.or(options.gateway);
+                    next.gateway = next.gateway.or(current.gateway);
+                    // On the provider it ran on; off the gateway for the
+                    // first time: the tool's selected one, kept from now on.
+                    next.tool_provider = next.tool_provider.or(current.tool_provider.clone());
+                    if next.gateway == Some(true) {
+                        next.tool_provider = None;
+                    }
+                    pin_tool_provider(&self.hub.store, self.kind, &mut next);
+                    if let (Some(id), Some(provider)) = (&self.id, &next.tool_provider) {
+                        let _ = self
+                            .hub
+                            .store
+                            .record_session_meta(id, &json!({ "tool_provider": provider }));
+                    }
                     next.approval_mode = next.approval_mode.or(options.approval_mode.clone());
                     next.dirs = crate::projects::extra_dirs(
                         self.hub,
@@ -1263,11 +1402,13 @@ impl Session<'_> {
                         release_key(self.kind, &key);
                     }
                     let mut said = Vec::new();
-                    match command(self.kind, &id, &next, &self.cwd).and_then(|start| {
-                        self.gateway_key = start.key;
-                        said = start.notices;
-                        Process::spawn(start.command, &self.cwd)
-                    }) {
+                    match command(&self.hub.store, self.kind, &id, &next, &self.cwd).and_then(
+                        |start| {
+                            self.gateway_key = start.key;
+                            said = start.notices;
+                            Process::spawn(start.command, &self.cwd)
+                        },
+                    ) {
                         Ok(started) => {
                             process = started;
                             adapter = self::adapter(self.kind, &self.cwd, &next);
@@ -1277,6 +1418,7 @@ impl Session<'_> {
                             let mut events = notices(said);
                             events.push(json!({ "type": "background_tasks", "tasks": [] }));
                             events.push(json!({ "type": "pending_messages", "messages": [] }));
+                            events.push(tool_provider_event(&self.hub.store, self.kind, &next));
                             self.publish(events);
                         }
                         Err(error) => {
@@ -1371,7 +1513,14 @@ impl Session<'_> {
             );
             return None;
         }
-        match tui_command(self.kind, &id, options, &self.cwd, self.saved(&id, options)) {
+        match tui_command(
+            &self.hub.store,
+            self.kind,
+            &id,
+            options,
+            &self.cwd,
+            self.saved(&id, options),
+        ) {
             Ok(start) => Some((id, start.command, start.key)),
             Err(error) => {
                 self.refuse(request, error);
@@ -1484,7 +1633,7 @@ impl Session<'_> {
             resume_at: None,
             ..options
         };
-        let started = self::command(self.kind, &id, &next, &self.cwd).and_then(|start| {
+        let started = self::command(&self.hub.store, self.kind, &id, &next, &self.cwd).and_then(|start| {
             self.gateway_key = start.key;
             Process::spawn(start.command, &self.cwd)
         });
@@ -1551,6 +1700,12 @@ impl Session<'_> {
                 self.restart = Some(
                     adapter.keep(Options {
                         gateway: Some(gateway),
+                        // Off the gateway: the custom provider the client
+                        // names ("" the tool's own), else the selected one.
+                        tool_provider: op["tool_provider"]
+                            .as_str()
+                            .filter(|_| !gateway)
+                            .map(|id| id.trim().to_string()),
                         model: op["model"]
                             .as_str()
                             .filter(|m| !m.is_empty())

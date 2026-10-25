@@ -127,6 +127,24 @@ while True:
                 break
         allowed = answer["response"]["response"]["behavior"] == "allow"
         out({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "hi" if allowed else "denied", "is_error": not allowed}]}, "tool_use_result": {"stdout": "hi"} if allowed else {}})
+    # "api": one Messages request where its settings send it (a gateway or
+    # custom provider session's --settings file), with the key they hold, as
+    # Claude Code would; the reply says the status.
+    if text.startswith("api"):
+        import urllib.request, urllib.error
+        env = json.load(open(arg("--settings")))["env"] if arg("--settings") else {}
+        model = env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL") or arg("--model") or "claude-sonnet-4-5"
+        body = json.dumps({"model": model, "max_tokens": 16, "stream": False, "messages": [{"role": "user", "content": text}]}).encode()
+        request = urllib.request.Request(env.get("ANTHROPIC_BASE_URL", "") + "/v1/messages?beta=true", data=body, method="POST", headers={
+            "Authorization": "Bearer " + env.get("ANTHROPIC_AUTH_TOKEN", ""), "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01", "X-LynShen-Device": "v1;hw=engine"})
+        try:
+            status = urllib.request.urlopen(request, timeout=20).status
+        except urllib.error.HTTPError as error:
+            status = error.code
+        except Exception as error:
+            status = "failed " + str(error)
+        text = "%s %s" % (text, status)
     reply = "mode: " + mode if text == "which mode" else "ok: " + text
     out({"type": "stream_event", "event": {"type": "message_start", "message": {"usage": {"input_tokens": 5}}}})
     out({"type": "assistant", "uuid": "u-1", "message": {"content": [{"type": "text", "text": reply}]}})

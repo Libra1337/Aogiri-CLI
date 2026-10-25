@@ -634,6 +634,12 @@ impl Hub {
         };
         let agent = agent.map(str::to_string);
         let gateway = options.gateway == Some(true);
+        // Claude Code / Codex off the gateway: the custom provider it starts
+        // on, kept with it (`pin_tool_provider`).
+        if let Some(kind) = engine {
+            engines::pin_tool_provider(&self.store, kind, &mut options);
+        }
+        let tool_provider = options.tool_provider.clone();
         let acp_agent = options
             .acp_agent
             .clone()
@@ -678,6 +684,11 @@ impl Hub {
                 Some(&project),
             )
             .map_err(|error| error.to_string())?;
+        if let Some(provider) = tool_provider.filter(|_| !gateway) {
+            self.store
+                .record_session_meta(&id, &json!({ "tool_provider": provider }))
+                .map_err(|error| error.to_string())?;
+        }
         // Which of the desktop's ACP agents runs it: a client can start it again.
         if let Some(acp_agent) = acp_agent {
             self.store
@@ -846,6 +857,7 @@ impl Hub {
                     conversation: None,
                     acp_agent: None,
                     forked_from: None,
+                    tool_provider: None,
                 }
             }
             (None, None) => return Err(format!("unknown session {id}")),
@@ -857,6 +869,7 @@ impl Hub {
             &crate::projects::of_record(self, &record),
         );
         let mut gateway = false;
+        let mut tool_provider = None;
         let mut hook_stopper = None;
         let (ops, generation) = match kind {
             None => {
@@ -914,13 +927,21 @@ impl Hub {
                     }
                     _ => None,
                 };
-                // A client that does not say (a phone) keeps how it last ran.
-                let options = engines::Options {
+                // A client that does not say (a phone) keeps how it last ran,
+                // on the provider it last ran on off the gateway (a session
+                // recorded before providers were: the tool's own).
+                let mut options = engines::Options {
                     resume: match kind {
                         engines::Kind::Acp => record.conversation.clone(),
                         _ => saved.then(|| id.to_string()),
                     },
                     gateway: Some(options.gateway.unwrap_or(record.gateway)),
+                    tool_provider: options.tool_provider.or_else(|| {
+                        record
+                            .tool_provider
+                            .clone()
+                            .or_else(|| (!record.gateway).then(String::new))
+                    }),
                     // A copy is made once, when the session is created.
                     fork: None,
                     fork_from: refork.as_ref().map(|(from, _)| from.clone()),
@@ -935,6 +956,11 @@ impl Hub {
                     ..options
                 };
                 gateway = options.gateway == Some(true);
+                if gateway {
+                    options.tool_provider = None;
+                }
+                engines::pin_tool_provider(&self.store, kind, &mut options);
+                tool_provider = options.tool_provider.clone();
                 // A new start keeps the recorded id; a resume opens it. An
                 // ACP session keeps the daemon's id either way (`resume` is
                 // the agent's).
@@ -961,6 +987,11 @@ impl Hub {
                     gateway,
                     record.project.as_deref(),
                 )
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(provider) = tool_provider.filter(|p| record.tool_provider.as_ref() != Some(p)) {
+            self.store
+                .record_session_meta(id, &json!({ "tool_provider": provider }))
                 .map_err(|error| error.to_string())?;
         }
         self.host(id.to_string(), ops, record.cwd, generation);
@@ -2084,6 +2115,7 @@ impl Hub {
             Some(SessionInfo {
                 engine: record.engine.unwrap_or_else(|| "lynshen".to_string()),
                 gateway: record.gateway,
+                tool_provider: record.tool_provider,
                 cwd: record.cwd.to_string_lossy().into_owned(),
             })
         });
@@ -2409,6 +2441,7 @@ impl Hub {
                     // The project it belongs to, wherever it works; null: none.
                     "project": Some(crate::projects::member(&projects, &record)).filter(|p| !p.is_empty()),
                     "gateway": record.gateway,
+                    "tool_provider": record.tool_provider.as_deref().filter(|p| !p.is_empty() && !record.gateway),
                     "engine": record.engine.as_deref().unwrap_or("lynshen"),
                     "acp_agent": record.acp_agent,
                     // The conversation it was forked from: {session, turns, at}.
@@ -2710,6 +2743,7 @@ mod tests {
             conversation: None,
             acp_agent: None,
             forked_from: None,
+            tool_provider: None,
         };
         assert_eq!(
             shown_title(&record, Some(&scheduled)).as_deref(),

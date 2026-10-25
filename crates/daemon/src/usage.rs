@@ -45,6 +45,9 @@ pub struct SessionInfo {
     pub engine: String,
     /// Claude / Codex through the LynShen gateway.
     pub gateway: bool,
+    /// Claude / Codex on a custom provider (`tool_providers`), by id: its
+    /// turns are this computer's own record, never the account's.
+    pub tool_provider: Option<String>,
     pub cwd: String,
 }
 
@@ -154,7 +157,16 @@ impl Usage {
             },
         };
         let (provider, model) = state.routes.get(session).cloned().unwrap_or_default();
-        let (kind, channel) = channel(&info.engine, info.gateway, &provider);
+        let custom = info
+            .tool_provider
+            .as_deref()
+            .filter(|id| !id.is_empty() && !info.gateway);
+        // A custom provider: its own channel (`claude:<id>`), never priced
+        // as Anthropic's or OpenAI's and never the gateway's.
+        let (kind, channel) = match custom {
+            Some(id) => ("local", format!("{}:{id}", info.engine)),
+            None => channel(&info.engine, info.gateway, &provider),
+        };
         let record = state.open.entry(turn.clone()).or_insert_with(|| {
             json!({
                 "turn_id": turn,
@@ -172,6 +184,9 @@ impl Usage {
         });
         record["channel_kind"] = json!(kind);
         record["channel"] = json!(channel);
+        if custom.is_some() {
+            record["local_only"] = json!(true);
+        }
         let model = event["model"]
             .as_str()
             .filter(|m| !m.is_empty())
@@ -245,7 +260,7 @@ impl Usage {
             })
             .map(|mut record| {
                 record["ended_at"] = json!(ended);
-                record["upload"] = json!(upload);
+                mark_upload(&mut record, upload);
                 format!("{record}\n")
             })
             .collect();
@@ -419,6 +434,16 @@ impl Usage {
         fs::write(&sent_path, end.to_string()).map_err(|error| error.to_string())?;
         Ok(true)
     }
+}
+
+/// Whether a written turn goes to the LynShen account (`signed_in`): never a
+/// custom provider's (`local_only`, dropped here).
+fn mark_upload(record: &mut Value, signed_in: bool) {
+    let local_only = record
+        .as_object_mut()
+        .and_then(|fields| fields.remove("local_only"))
+        == Some(json!(true));
+    record["upload"] = json!(signed_in && !local_only);
 }
 
 /// The next batch to upload from `text` (FILE from `offset`): the upload
@@ -774,8 +799,55 @@ mod tests {
         Some(SessionInfo {
             engine: engine.to_string(),
             gateway,
+            tool_provider: None,
             cwd: "/p".to_string(),
         })
+    }
+
+    #[test]
+    fn a_custom_providers_turns_are_local_and_never_uploaded() {
+        let (usage, dir) = usage_in("custom-provider");
+        let custom = || {
+            Some(SessionInfo {
+                engine: "claude".to_string(),
+                gateway: false,
+                tool_provider: Some("relay".to_string()),
+                cwd: "/p".to_string(),
+            })
+        };
+        usage.observe(
+            "s-custom",
+            &json!({ "type": "model_status", "model": "claude-opus-4-1" }),
+            || None,
+        );
+        usage.observe("s-custom", &json!({ "type": "user_message" }), custom);
+        usage.observe("s-custom", &spend(100, 10), custom);
+        let mut event = spend(5, 5);
+        event["type"] = json!("usage");
+        usage.tag_event("s-custom", &mut event);
+        assert_eq!(event["billing_gateway"], false);
+        usage.close("s-custom");
+        let records = usage.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["channel_kind"], "local");
+        assert_eq!(records[0]["channel"], "claude:relay");
+        assert_eq!(records[0]["upload"], false);
+        assert!(records[0].get("local_only").is_none());
+        // Never priced as Anthropic's own API.
+        assert!(records[0]["estimated_cost_usd"].is_null());
+        // Signed in or not, it stays here; a gateway turn would go.
+        let mut record = json!({ "local_only": true });
+        mark_upload(&mut record, true);
+        assert_eq!(record, json!({ "upload": false }));
+        let mut record = json!({ "turn_id": "t" });
+        mark_upload(&mut record, true);
+        assert_eq!(record["upload"], true);
+        // The upload batch passes over it.
+        let text = std::fs::read_to_string(dir.join(FILE)).unwrap();
+        let (turns, end) = pending(&text, 0);
+        assert!(turns.is_empty());
+        assert_eq!(end, text.len() as u64);
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn usage_in(name: &str) -> (Usage, PathBuf) {

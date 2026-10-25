@@ -151,6 +151,32 @@ pub fn lynshen_logout() -> Result<(), String> {
     oauth::logout(&config.lynshen_api_url, config.encrypt_secrets)
 }
 
+/// The API key of `tool`'s custom provider `id` (the daemon's
+/// `tool_providers`), from auth.json's `tool_providers` block, decrypted.
+pub fn tool_provider_key(tool: &str, id: &str) -> Option<String> {
+    let encrypt = config::Config::load_existing()
+        .map(|config| config.encrypt_secrets)
+        .unwrap_or(false);
+    let auth = config::AuthStore::load_or_create(encrypt).ok()?;
+    auth.tool_key(tool, id)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+}
+
+/// Saves (`Some`) or removes (`None`) that key, encrypted as the rest of
+/// auth.json is (`docs/secrets.md`). Holds the lock logins hold, so a token
+/// refresh in another process does not write over it.
+pub fn set_tool_provider_key(tool: &str, id: &str, key: Option<&str>) -> Result<(), String> {
+    let encrypt = config::Config::load_existing()
+        .map(|config| config.encrypt_secrets)
+        .unwrap_or(false);
+    let _lock = oauth::lock_auth_refresh()?;
+    let mut auth = config::AuthStore::load_or_create(encrypt).map_err(|e| e.to_string())?;
+    auth.set_tool_key(tool, id, key.map(str::to_string));
+    auth.save().map_err(|error| error.to_string())
+}
+
 /// A daemon secret (a chat bot's token) as it is saved: a `jcenc1:` envelope
 /// when config.json's `encrypt_secrets` is on and a secret key exists, else
 /// the plaintext (`docs/secrets.md`).

@@ -2486,6 +2486,190 @@ fn a_lynshen_conversation_moves_to_its_tui_and_back() {
     desktop.until(ready(&session));
 }
 
+/// A stand-in for a user's own Anthropic-format API: answers each POST with
+/// a Messages reply and sends what it received (head and body) on.
+fn fake_provider() -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut received = String::new();
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = v.trim().parse().unwrap_or(0);
+                }
+                received.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            if !received.starts_with("POST ") {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                continue;
+            }
+            let mut body = vec![0u8; length];
+            let _ = reader.read_exact(&mut body);
+            received.push_str(&String::from_utf8_lossy(&body));
+            let reply = json!({ "id": "msg_1", "type": "message", "role": "assistant", "model": "own-model",
+                "content": [{ "type": "text", "text": "hi" }], "stop_reason": "end_turn",
+                "usage": { "input_tokens": 11, "output_tokens": 2 } })
+            .to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = tx.send(received);
+        }
+    });
+    (format!("http://{address}"), rx)
+}
+
+#[test]
+fn a_custom_provider_gets_its_key_alone_and_its_turns_stay_off_the_gateway_ledger() {
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-custom-provider");
+    fs::create_dir_all(&dir).unwrap();
+    let (api, received) = fake_provider();
+    let mut desktop = Client::connect(&daemon);
+    // A phone may neither list nor change them.
+    desktop.send(json!({ "op": "pair_start", "id": 1 }));
+    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let token = paired_token(&daemon, &mut desktop, &code);
+    let mut phone = Client::connect_with(&daemon, &token);
+    let refused = request(&mut phone, json!({ "op": "tool_providers", "tool": "claude" }));
+    assert_eq!(refused["type"], "error", "{refused}");
+
+    let saved = request(
+        &mut desktop,
+        json!({ "op": "tool_provider_save", "tool": "claude", "provider": {
+            "id": "own", "name": "Own API", "base_url": format!("{api}/v1"), "format": "anthropic",
+            "model": "own-model", "key": "sk-own-provider" } }),
+    );
+    assert_eq!(saved["type"], "tool_providers", "{saved}");
+    assert!(!saved.to_string().contains("sk-own-provider"));
+    let selected = request(
+        &mut desktop,
+        json!({ "op": "tool_provider_select", "tool": "claude", "provider_id": "own" }),
+    );
+    assert_eq!(selected["config"]["selected"], "own", "{selected}");
+    // The key is in auth.json's own block, not in the daemon's state.
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let auth: Value =
+        serde_json::from_str(&fs::read_to_string(home.join(".lynshen/auth.json")).unwrap()).unwrap();
+    assert_eq!(auth["tool_providers"]["claude:own"], "sk-own-provider");
+    assert!(auth["providers"].get("claude:own").is_none());
+    assert!(!fs::read_to_string(daemon.state.join("settings.json"))
+        .unwrap()
+        .contains("sk-own-provider"));
+
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": { "approval_mode": "auto-edit" } }),
+    );
+    let session = created["session"].as_str().unwrap().to_string();
+    desktop.send(json!({ "op": "watch", "session": session }));
+    let frames = desktop.until(is_ready(&session));
+    let provider = frames
+        .iter()
+        .rev()
+        .find(|f| f["type"] == "tool_provider")
+        .unwrap_or_else(|| panic!("{frames:#?}"));
+    assert_eq!(provider["provider"]["id"], "own");
+    assert!(provider["provider"].get("base_url").is_none());
+    let args = starts_after(&log, 1)[0].clone();
+    assert!(args.windows(2).any(|w| w == ["--model", "own-model"]), "{args:?}");
+    assert!(args.iter().all(|a| !a.contains("sk-own-provider")), "{args:?}");
+
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "api call" }));
+    let frames = desktop.until(turn_done(&session));
+    assert!(claude_reply(&frames, &session).contains("api call 200"), "{frames:#?}");
+    let head = received
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(head.starts_with("post /v1/messages?beta=true "), "{head}");
+    assert!(head.contains("x-api-key: sk-own-provider"), "{head}");
+    assert!(!head.contains("authorization:"), "{head}");
+    assert!(!head.contains("jgw-"), "{head}");
+    assert!(!head.contains("x-lynshen-"), "{head}");
+    assert!(head.contains("\"model\":\"own-model\""), "{head}");
+
+    // The session keeps it; the list says so; its usage is this computer's.
+    let listed = request(&mut desktop, json!({ "op": "session_list" }));
+    let entry = listed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session"] == session.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(entry["tool_provider"], "own", "{entry}");
+    let mut records = Vec::new();
+    for _ in 0..100 {
+        records = fs::read_to_string(daemon.state.join("usage.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|r| r["session"] == session.as_str())
+            .collect();
+        if !records.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!records.is_empty());
+    for record in &records {
+        assert_eq!(record["channel_kind"], "local", "{record}");
+        assert_eq!(record["channel"], "claude:own", "{record}");
+        assert_eq!(record["upload"], false, "{record}");
+    }
+
+    // Selecting another default leaves this session on its own provider;
+    // removing the provider stops it from starting again, by name.
+    request(
+        &mut desktop,
+        json!({ "op": "tool_provider_select", "tool": "claude", "provider_id": "" }),
+    );
+    desktop.send(json!({ "op": "session_close", "session": session }));
+    desktop.until(|f| f["type"] == "session_closed" && f["session"] == session.as_str());
+    request(&mut desktop, json!({ "op": "session_open", "session": session }));
+    let args = starts_after(&log, 2)[1].clone();
+    assert!(args.windows(2).any(|w| w == ["--model", "own-model"]), "{args:?}");
+    desktop.send(json!({ "op": "session_close", "session": session }));
+    desktop.until(|f| f["type"] == "session_closed" && f["session"] == session.as_str());
+    request(
+        &mut desktop,
+        json!({ "op": "tool_provider_remove", "tool": "claude", "provider_id": "own" }),
+    );
+    let auth: Value =
+        serde_json::from_str(&fs::read_to_string(home.join(".lynshen/auth.json")).unwrap()).unwrap();
+    assert!(auth.get("tool_providers").is_none(), "{auth}");
+    let gone = request(&mut desktop, json!({ "op": "session_open", "session": session }));
+    assert_eq!(gone["type"], "error", "{gone}");
+    assert!(gone["message"].as_str().unwrap().contains("own"), "{gone}");
+    // Reopened on the tool's own configuration, it runs.
+    let reopened = request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": session, "options": { "tool_provider": "" } }),
+    );
+    assert_ne!(reopened["type"], "error", "{reopened}");
+}
+
 #[test]
 fn a_phone_views_a_sessions_tui_and_types_only_with_the_terminal_scope() {
     let _guard = setup();

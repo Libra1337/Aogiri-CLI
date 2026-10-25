@@ -128,6 +128,9 @@ pub struct SessionRecord {
     /// The conversation it was forked from: `{session, turns, at}` (see
     /// `Hub::create_engine_session`).
     pub forked_from: Option<Value>,
+    /// Claude / Codex: the custom provider it last ran on off the LynShen
+    /// gateway ("": the tool's own configuration; None: not recorded).
+    pub tool_provider: Option<String>,
 }
 
 /// A message for an agent: from the user, another agent or a timer.
@@ -291,6 +294,9 @@ impl Store {
             }
             if let Some(agent) = &record.acp_agent {
                 meta["acp_agent"] = agent.clone();
+            }
+            if let Some(provider) = &record.tool_provider {
+                meta["tool_provider"] = json!(provider);
             }
             if let Some(source) = &record.forked_from {
                 meta["forked_from"] = source.clone();
@@ -463,8 +469,8 @@ impl Store {
 
     /// Renames, (un)archives, hides, regroups or moves a session from
     /// `changes` (`title`, `archived`, `hidden`, `group`, `project`; the
-    /// daemon also keeps `gateway`, an ACP agent's `conversation`,
-    /// `acp_agent` and a fork's `forked_from`); fields left out are unchanged, an empty title goes back
+    /// daemon also keeps `gateway`, `tool_provider`, an ACP agent's
+    /// `conversation`, `acp_agent` and a fork's `forked_from`); fields left out are unchanged, an empty title goes back
     /// to the engine's label, an empty group to automatic routing and an
     /// empty project to none. False when `changes` names none.
     pub fn record_session_meta(&self, id: &str, changes: &Value) -> io::Result<bool> {
@@ -505,6 +511,10 @@ impl Store {
         }
         if changes["forked_from"].is_object() {
             entry["forked_from"] = changes["forked_from"].clone();
+            changed = true;
+        }
+        if let Some(provider) = changes["tool_provider"].as_str() {
+            entry["tool_provider"] = json!(provider);
             changed = true;
         }
         if changed {
@@ -575,6 +585,7 @@ impl Store {
                             conversation: None,
                             acp_agent: None,
                             forked_from: None,
+                            tool_provider: None,
                         }
                     });
                     record.closed = false;
@@ -619,6 +630,9 @@ impl Store {
                         }
                         if entry["forked_from"].is_object() {
                             record.forked_from = Some(entry["forked_from"].clone());
+                        }
+                        if let Some(provider) = entry["tool_provider"].as_str() {
+                            record.tool_provider = Some(provider.to_string());
                         }
                     }
                 }
