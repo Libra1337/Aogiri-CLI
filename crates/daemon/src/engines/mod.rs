@@ -24,7 +24,7 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// How long a retired engine gets to exit on its own after its stdin closes.
@@ -67,8 +67,23 @@ pub struct Options {
     pub approval_mode: Option<String>,
     pub model: Option<String>,
     pub resume: Option<String>,
-    /// Claude: resume the conversation as it was at this message.
+    /// Claude: resume the conversation as it was at this message (a rewind,
+    /// or with `fork_from` the reply a fork goes on after).
     pub resume_at: Option<String>,
+    /// A new session that forks this conversation (the engine's id: a
+    /// LynShen session, a Claude Code conversation, a Codex thread) instead
+    /// of starting empty; it goes on apart from it, which stays as it is.
+    /// Only `session_create` reads it.
+    pub fork_from: Option<String>,
+    /// Codex / LynShen: how many of `fork_from`'s user turns the fork keeps
+    /// (None: all). Claude Code forks at `resume_at` instead.
+    pub fork_turns: Option<u64>,
+    /// LynShen: the directory `fork_from` was saved for, when the fork works
+    /// elsewhere (its own worktree). None: the fork's own `cwd`.
+    pub fork_cwd: Option<PathBuf>,
+    /// A run of `engine_probe`: nothing is saved and nothing waits on the
+    /// user (set by the daemon, never by a client).
+    pub probe: bool,
     /// ACP: the agent's command line.
     pub command: Option<String>,
     pub args: Vec<String>,
@@ -123,6 +138,10 @@ impl Options {
             model: text("model"),
             resume: None,
             resume_at: text("resume_at"),
+            fork_from: text("fork_from"),
+            fork_turns: value["fork_turns"].as_u64(),
+            fork_cwd: text("fork_cwd").map(PathBuf::from),
+            probe: false,
             command: text("command"),
             bin: text("bin"),
             args: value["args"]
@@ -375,6 +394,170 @@ pub(crate) fn plan_window(
     })
 }
 
+/// The events a probe keeps (the last of each kind): what a client shows of
+/// an engine before any conversation of it.
+const PROBE_KEEPS: &[&str] = &[
+    "model_status",
+    "model_view",
+    "engine_caps",
+    "command_list",
+    "session_options",
+];
+/// A probe gives up after this long, and waits this long for the rest once
+/// the engine has said something (and again once its models were asked for).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(25);
+const PROBE_SETTLE: Duration = Duration::from_secs(4);
+/// A probe's answer is reused for this long (`force` asks again): models
+/// and commands change with a release or a setting, not from one minute to
+/// the next, and each probe starts a process.
+const PROBE_FRESH: Duration = Duration::from_secs(10 * 60);
+
+/// One probe answer per engine setup (`probe_key`): when it was made and
+/// the events. Its own lock also makes a second probe of the same setup
+/// wait for the first and take its answer.
+type ProbeSlot = Arc<std::sync::Mutex<Option<(Instant, u64, Vec<Value>)>>>;
+static PROBES: std::sync::Mutex<Option<HashMap<String, ProbeSlot>>> = std::sync::Mutex::new(None);
+
+/// What makes two probes the same: the engine, where it runs and what runs.
+fn probe_key(kind: Kind, cwd: &Path, options: &Options) -> String {
+    json!([
+        kind.name(),
+        cwd,
+        options.bin,
+        options.env,
+        options.gateway,
+        options.command,
+        options.args,
+        options.model,
+    ])
+    .to_string()
+}
+
+/// `probe`, answered from the cache while it is fresh (`force`: run it
+/// anyway): the events, when they were found (ms) and whether they came
+/// from the cache.
+pub fn probe_cached(
+    kind: Kind,
+    cwd: &Path,
+    options: &Options,
+    force: bool,
+) -> Result<(Vec<Value>, u64, bool), String> {
+    let slot = {
+        let mut probes = PROBES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(
+            probes
+                .get_or_insert_with(HashMap::new)
+                .entry(probe_key(kind, cwd, options))
+                .or_default(),
+        )
+    };
+    let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((at, ms, events)) = slot.as_ref() {
+        if !force && at.elapsed() < PROBE_FRESH {
+            return Ok((events.clone(), *ms, true));
+        }
+    }
+    let events = probe(kind, cwd, options)?;
+    let ms = now_ms();
+    *slot = Some((Instant::now(), ms, events.clone()));
+    Ok((events, ms, false))
+}
+
+/// What an engine says of itself before any conversation: started in `cwd`
+/// as a session of it would be, but out of every list and saving nothing
+/// (Claude Code `--no-session-persistence`, a Codex `ephemeral` thread),
+/// asked for its models, then stopped. Returns the last event of each
+/// PROBE_KEEPS kind it sent.
+pub fn probe(kind: Kind, cwd: &Path, options: &Options) -> Result<Vec<Value>, String> {
+    let options = Options {
+        probe: true,
+        resume: None,
+        resume_at: None,
+        fork: None,
+        fork_from: None,
+        fork_turns: None,
+        fork_cwd: None,
+        app_tools: Vec::new(),
+        ..options.clone()
+    };
+    let id = new_uuid()?;
+    let Start { command, key, .. } = command(kind, &id, &options, cwd)?;
+    let release = |key: &Option<String>| {
+        if let Some(key) = key {
+            release_key(kind, key);
+        }
+    };
+    let process = match Process::spawn(command, cwd) {
+        Ok(process) => process,
+        Err(error) => {
+            release(&key);
+            return Err(error);
+        }
+    };
+    let mut engine = adapter(kind, cwd, &options);
+    process.write(engine.start());
+    let mut kept: HashMap<String, Value> = HashMap::new();
+    let keep = |events: Vec<Value>, kept: &mut HashMap<String, Value>| {
+        for event in events {
+            if let Some(kind) = event["type"].as_str().filter(|t| PROBE_KEEPS.contains(t)) {
+                kept.insert(kind.to_string(), event);
+            }
+        }
+    };
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let mut settle: Option<Instant> = None;
+    let mut asked = false;
+    let mut said = None;
+    loop {
+        let until = settle.map_or(deadline, |at| at.min(deadline));
+        let Some(wait) = until.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match process.lines.recv_timeout(wait) {
+            Ok(Ok(line)) => {
+                if let Line::Stderr(text) = &line {
+                    said = Some(text.clone()).filter(|text| !text.trim().is_empty());
+                }
+                let out = engine.translate(line);
+                process.write(out.frames);
+                keep(out.events, &mut kept);
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+        // Talking: it has a little longer to say the rest. Its conversation
+        // open (it said which model it is on): its models, asked for.
+        if settle.is_none() && !kept.is_empty() {
+            settle = Some(Instant::now() + PROBE_SETTLE);
+        }
+        if !asked && kept.contains_key("model_status") {
+            asked = true;
+            settle = Some(Instant::now() + PROBE_SETTLE);
+            if let Ok(out) = engine.encode(&json!({ "op": "command", "input": "/model" })) {
+                process.write(out.frames);
+                keep(out.events, &mut kept);
+            }
+        }
+        if kept.contains_key("model_view") && kept.contains_key("command_list") {
+            break;
+        }
+    }
+    process.kill();
+    release(&key);
+    if kept.is_empty() {
+        return Err(match said {
+            Some(line) => format!("{} said nothing about itself: {line}", kind.name()),
+            None => format!("{} said nothing about itself", kind.name()),
+        });
+    }
+    // In a steady order, as a session sends them.
+    Ok(PROBE_KEEPS
+        .iter()
+        .filter_map(|name| kept.remove(*name))
+        .collect())
+}
+
 /// A local gateway key is done with: no request may use it again.
 fn release_key(kind: Kind, key: &str) {
     crate::gateway::revoke(key);
@@ -514,6 +697,9 @@ fn asleep_options(adapter: &dyn Adapter, current: &Options) -> Options {
         resume_at: None,
         dirs: Vec::new(),
         fork: None,
+        fork_from: None,
+        fork_turns: None,
+        fork_cwd: None,
         quiet: false,
         ..adapter.keep(current.clone())
     }
@@ -931,7 +1117,9 @@ impl Session<'_> {
             json!({ "type": "background_tasks", "tasks": [] }),
             json!({ "type": "pending_messages", "messages": [] }),
         ]);
-        // What the process runs as now (a restart changes it).
+        // What the process runs as now (a restart changes it). A fork's
+        // fields stay until it is saved: the engine only forks while it has
+        // no conversation of its own (`claude::command`, `Codex::new`).
         let mut current = options.clone();
         // Session tools answer from their own threads (they may wait).
         let (answers_tx, answers) = mpsc::channel::<Answer>();
@@ -1002,7 +1190,14 @@ impl Session<'_> {
                         }
                         let events =
                             self.allow_while_opening(&mut process, adapter.as_mut(), output.events);
+                        // The conversation cannot open (a fork that cannot
+                        // be made): the start fails now, with that error.
+                        let failed = self.id.is_none() && events.iter().any(|e| e["fatal"] == true);
                         self.publish(events);
+                        if failed {
+                            process.stop();
+                            return;
+                        }
                     }
                     Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {
                         let reason = process.exit_reason();
@@ -1033,6 +1228,13 @@ impl Session<'_> {
             if !busy {
                 if let Some(mut next) = self.restart.take() {
                     next.resume = adapter.conversation().or(next.resume);
+                    // A fork restarted before its first turn saved it (a
+                    // mode switch): it is forked again, not started empty.
+                    if next.resume.is_none() && options.fork_from.is_some() {
+                        next.fork_from = options.fork_from.clone();
+                        next.fork_turns = options.fork_turns;
+                        next.resume_at = options.resume_at.clone();
+                    }
                     // What the process runs as stays: its binary, environment
                     // and gateway.
                     next.bin = options.bin.clone();
@@ -1160,6 +1362,15 @@ impl Session<'_> {
             self.refuse(request, "the conversation has not started yet".to_string());
             return None;
         };
+        // Claude Code writes a fork with its first turn; its TUI would start
+        // the conversation empty.
+        if self.kind == Kind::Claude && options.fork_from.is_some() && !self.saved(&id, options) {
+            self.refuse(
+                request,
+                "send the fork its first message before opening it in its terminal".to_string(),
+            );
+            return None;
+        }
         match tui_command(self.kind, &id, options, &self.cwd, self.saved(&id, options)) {
             Ok(start) => Some((id, start.command, start.key)),
             Err(error) => {

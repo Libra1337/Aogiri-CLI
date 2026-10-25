@@ -13,7 +13,10 @@ with open(os.environ["FAKE_CLAUDE_LOG"], "a") as log:
 def arg(flag):
     return args[args.index(flag) + 1] if flag in args else None
 
-session = arg("--resume") or arg("--session-id")
+# A fork resumes another conversation into a new one under --session-id.
+fork = "--fork-session" in args
+source = arg("--resume") if fork else None
+session = arg("--session-id") if fork else (arg("--resume") or arg("--session-id"))
 mode = "bypassPermissions" if "--dangerously-skip-permissions" in args else (arg("--permission-mode") or "default")
 cwd = os.getcwd()
 config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.environ["HOME"], ".claude")
@@ -24,13 +27,53 @@ if "--session-id" in args and os.path.exists(os.path.join(saved, session + ".jso
     sys.stderr.write("Error: Session ID " + session + " is already in use.\n")
     sys.exit(1)
 
+# A fork copies the source's saved rows up to --resume-session-at.
+if source:
+    at = arg("--resume-session-at")
+    found = None
+    for d in os.listdir(os.path.join(config, "projects")):
+        path = os.path.join(config, "projects", d, source + ".jsonl")
+        if os.path.exists(path):
+            found = path
+    if found is None:
+        sys.stderr.write("No conversation found with session ID: " + source + "\n")
+        sys.exit(1)
+    copied = []
+    for line in open(found):
+        copied.append(line)
+        if at and json.loads(line).get("uuid") == at:
+            break
+    pending_copy = copied
+    last = [json.loads(copied[-1]).get("uuid")] if copied else [None]
+else:
+    pending_copy = None
+    last = [None]
+uuids = [0]
+# A resumed conversation goes on from its last row.
+if not source and os.path.exists(os.path.join(saved, session + ".jsonl")):
+    for line in open(os.path.join(saved, session + ".jsonl")):
+        uuids[0] += 1
+        last[0] = json.loads(line).get("uuid") or last[0]
+
 def out(frame):
     sys.stdout.write(json.dumps(frame) + "\n")
     sys.stdout.flush()
 
 def save(role, text):
-    with open(os.path.join(saved, session + ".jsonl"), "a") as f:
-        f.write(json.dumps({"type": role, "message": {"content": text}}) + "\n")
+    global pending_copy
+    if "--no-session-persistence" in args:
+        return
+    path = os.path.join(saved, session + ".jsonl")
+    # Like Claude Code, a fork's file is written with its first turn.
+    if pending_copy is not None:
+        with open(path, "a") as f:
+            f.writelines(pending_copy)
+        pending_copy = None
+    uuids[0] += 1
+    row = {"type": role, "uuid": "%s-%d" % (session[:8], uuids[0]), "parentUuid": last[0], "message": {"content": text}}
+    last[0] = row["uuid"]
+    with open(path, "a") as f:
+        f.write(json.dumps(row) + "\n")
 
 def read():
     line = sys.stdin.readline()

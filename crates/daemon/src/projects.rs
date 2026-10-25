@@ -389,6 +389,7 @@ mod tests {
             project: project.map(str::to_string),
             conversation: None,
             acp_agent: None,
+            forked_from: None,
         }
     }
 

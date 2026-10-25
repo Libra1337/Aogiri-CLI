@@ -325,6 +325,23 @@ fn command_output(item: &Value, command: &str, streamed: &str) -> Value {
     out
 }
 
+/// The last turn a fork keeping `keep` user turns of `turns` goes through:
+/// the one before the next user turn (None: the fork keeps them all).
+fn fork_point(turns: &Value, keep: Option<u64>) -> Option<String> {
+    let turns = turns.as_array()?;
+    let next = turns
+        .iter()
+        .enumerate()
+        .filter(|(_, turn)| {
+            turn["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["type"] == "userMessage"))
+        })
+        .nth(usize::try_from(keep?).ok()?)?
+        .0;
+    Some(text(&turns[next.checked_sub(1)?]["id"]).to_string())
+}
+
 /// A resumed thread's history (`thread.turns[].items`) as transcript items.
 fn transcript(turns: &Value) -> Vec<Value> {
     let mut rows = Vec::new();
@@ -515,6 +532,11 @@ pub struct Codex {
     pending: HashMap<u64, (String, String)>,
     thread: Option<String>,
     resume: Option<String>,
+    /// A new thread forked from this one, keeping its first so many user
+    /// turns (None: all of them).
+    fork: Option<(String, Option<u64>)>,
+    /// A probe's run (`engine_probe`): its thread is not saved.
+    ephemeral: bool,
     /// Talks to the LynShen gateway: a resumed thread must too, whichever
     /// provider it was written with (`thread/resume` would use that one).
     gateway: bool,
@@ -587,6 +609,12 @@ impl Codex {
             pending: HashMap::new(),
             thread: None,
             resume: options.resume.clone(),
+            fork: options
+                .fork_from
+                .clone()
+                .filter(|_| options.resume.is_none())
+                .map(|from| (from, options.fork_turns)),
+            ephemeral: options.probe,
             gateway: options.gateway == Some(true),
             active_turn: None,
             busy: false,
@@ -962,6 +990,14 @@ impl Codex {
                     json!({ "type": "compaction_failed", "error": message }),
                 ]);
             }
+            // A fork that cannot be made is an error, not an empty thread.
+            if matches!(method.as_str(), "thread/read" | "thread/fork") && self.fork.is_some() {
+                return Output::events(vec![json!({
+                    "type": "error",
+                    "message": format!("cannot fork the thread: {message}"),
+                    "fatal": true,
+                })]);
+            }
             if method == "thread/resume" && self.open_params.is_object() {
                 let params = self.open_params.clone();
                 let frame = self.request("thread/start", params, "");
@@ -993,7 +1029,10 @@ impl Codex {
         match method.as_str() {
             "initialize" => {
                 let (approval, sandbox) = policy(self.mode, &self.dirs);
-                let open = json!({ "cwd": self.cwd, "approvalPolicy": approval, "sandbox": sandbox_mode(&sandbox) });
+                let mut open = json!({ "cwd": self.cwd, "approvalPolicy": approval, "sandbox": sandbox_mode(&sandbox) });
+                if self.ephemeral {
+                    open["ephemeral"] = json!(true);
+                }
                 // The app's tools, as dynamic tools: a thread keeps them, so
                 // a resumed one is not told again.
                 self.open_params = open.clone();
@@ -1006,8 +1045,8 @@ impl Codex {
                 }
                 let mut frames =
                     vec![json!({ "jsonrpc": "2.0", "method": "initialized" }).to_string()];
-                frames.push(match self.resume.clone() {
-                    Some(thread) => {
+                frames.push(match (self.resume.clone(), self.fork.clone()) {
+                    (Some(thread), _) => {
                         let mut params = open;
                         params["threadId"] = json!(thread);
                         if self.gateway {
@@ -1015,7 +1054,13 @@ impl Codex {
                         }
                         self.request("thread/resume", params, "")
                     }
-                    None => {
+                    // A fork reads the thread's turns first, to know where to cut.
+                    (None, Some((from, _))) => self.request(
+                        "thread/read",
+                        json!({ "threadId": from, "includeTurns": true }),
+                        "fork",
+                    ),
+                    (None, None) => {
                         let params = self.open_params.clone();
                         self.request("thread/start", params, "")
                     }
@@ -1033,7 +1078,28 @@ impl Codex {
                 }
             }
             "thread/start" => self.thread_opened(result, false),
-            "thread/resume" => self.thread_opened(result, true),
+            "thread/resume" | "thread/fork" => self.thread_opened(result, true),
+            "thread/read" if tag == "fork" => {
+                let Some((from, keep)) = self.fork.clone() else {
+                    return Output::default();
+                };
+                // The forked thread keeps the tools it was started with.
+                let mut params = self.open_params.clone();
+                if let Some(fields) = params.as_object_mut() {
+                    fields.remove("dynamicTools");
+                }
+                params["threadId"] = json!(from);
+                if let Some(last) = fork_point(&result["thread"]["turns"], keep) {
+                    params["lastTurnId"] = json!(last);
+                }
+                if self.gateway {
+                    params["modelProvider"] = json!(GATEWAY_PROVIDER);
+                }
+                Output {
+                    events: vec![],
+                    frames: vec![self.request("thread/fork", params, "")],
+                }
+            }
             "account/rateLimits/read" => Output::events(usage_events(&result["rateLimits"])),
             "model/list" => {
                 self.catalog = result["data"]
@@ -3328,6 +3394,101 @@ mod tests {
         let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
         assert_eq!(next[1]["method"], "thread/resume");
         assert_eq!(next[1]["params"]["modelProvider"], GATEWAY_PROVIDER);
+    }
+
+    #[test]
+    fn a_fork_reads_the_thread_then_forks_it_through_the_kept_turn() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                fork_from: Some("th-1".into()),
+                fork_turns: Some(1),
+                app_tools: vec!["present_files"],
+                ..Options::default()
+            },
+        );
+        c.start();
+        let opened = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        let read = opened
+            .iter()
+            .find(|f| f["method"] == "thread/read")
+            .unwrap();
+        assert_eq!(
+            read["params"],
+            json!({ "threadId": "th-1", "includeTurns": true })
+        );
+        assert!(opened.iter().all(|f| f["method"] != "thread/start"));
+        let user =
+            |id: &str| json!({ "id": id, "items": [{ "type": "userMessage", "content": [] }] });
+        let turns = json!([user("t1"), { "id": "t1b", "items": [] }, user("t2")]);
+        let forked = sent(
+            &frame(
+                &mut c,
+                json!({ "id": read["id"], "result": { "thread": { "turns": turns } } }),
+            )
+            .frames,
+        );
+        assert_eq!(forked[0]["method"], "thread/fork");
+        assert_eq!(forked[0]["params"]["threadId"], "th-1");
+        assert_eq!(forked[0]["params"]["lastTurnId"], "t1b");
+        // The thread keeps the tools it started with.
+        assert!(forked[0]["params"].get("dynamicTools").is_none());
+        let events = frame(&mut c, json!({ "id": forked[0]["id"], "result": { "thread": { "id": "th-2", "turns": [user("t1")] }, "model": "m" } })).events;
+        let startup = events.iter().find(|e| e["type"] == "startup").unwrap();
+        assert_eq!(startup["session_id"], "th-2");
+        assert_eq!(c.conversation().as_deref(), Some("th-2"));
+    }
+
+    #[test]
+    fn a_fork_that_fails_says_so_instead_of_starting_empty() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                fork_from: Some("gone".into()),
+                fork_turns: Some(1),
+                ..Options::default()
+            },
+        );
+        c.start();
+        let opened = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        let read = opened
+            .iter()
+            .find(|f| f["method"] == "thread/read")
+            .unwrap();
+        let failed = frame(
+            &mut c,
+            json!({ "id": read["id"], "error": { "code": -32600, "message": "no rollout" } }),
+        );
+        assert!(failed.frames.is_empty());
+        assert_eq!(failed.events[0]["type"], "error");
+        assert!(text(&failed.events[0]["message"]).contains("cannot fork"));
+    }
+
+    #[test]
+    fn a_fork_point_is_the_turn_before_the_next_user_turn() {
+        let user = |id: &str| json!({ "id": id, "items": [{ "type": "userMessage" }] });
+        let turns = json!([user("a"), user("b"), { "id": "b2", "items": [] }]);
+        assert_eq!(fork_point(&turns, Some(1)).as_deref(), Some("a"));
+        assert_eq!(fork_point(&turns, Some(2)), None);
+        assert_eq!(fork_point(&turns, None), None);
+    }
+
+    #[test]
+    fn a_probe_opens_an_ephemeral_thread() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                probe: true,
+                ..Options::default()
+            },
+        );
+        c.start();
+        let opened = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        let start = opened
+            .iter()
+            .find(|f| f["method"] == "thread/start")
+            .unwrap();
+        assert_eq!(start["params"]["ephemeral"], true);
     }
 
     #[test]

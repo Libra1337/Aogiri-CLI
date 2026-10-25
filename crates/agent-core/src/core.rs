@@ -6259,7 +6259,7 @@ fn compacted(
 }
 
 /// The steps of an `update_plan` call; None without a `plan` array.
-fn parse_plan(args: &Value) -> Option<Vec<PlanItem>> {
+pub(crate) fn parse_plan(args: &Value) -> Option<Vec<PlanItem>> {
     let items = args.get("plan").and_then(Value::as_array)?;
     let mut plan = Vec::new();
     for item in items {

@@ -30,8 +30,15 @@ def save():
             f.write(json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": turn[0]["content"][0]["text"]}]}}) + "\n")
             f.write(json.dumps({"type": "turn", "items": turn}) + "\n")
 
+def as_turns(items_list):
+    return [{"id": "turn-%d" % i, "items": t} for i, t in enumerate(items_list)]
+
+def load(tid):
+    with open(rollout(tid)) as f:
+        return [json.loads(l)["items"] for l in f if json.loads(l)["type"] == "turn"]
+
 def opened(req):
-    out({"id": req["id"], "result": {"thread": {"id": thread, "turns": [{"items": t} for t in turns]}, "model": "gpt-5", "modelProvider": "openai", "cwd": cwd}})
+    out({"id": req["id"], "result": {"thread": {"id": thread, "turns": as_turns(turns)}, "model": "gpt-5", "modelProvider": "openai", "cwd": cwd}})
 
 while True:
     msg = read()
@@ -45,8 +52,20 @@ while True:
         opened(msg)
     elif method == "thread/resume":
         thread = msg["params"]["threadId"]
-        with open(rollout(thread)) as f:
-            turns = [json.loads(l)["items"] for l in f if json.loads(l)["type"] == "turn"]
+        turns = load(thread)
+        opened(msg)
+    elif method == "thread/read":
+        source = msg["params"]["threadId"]
+        out({"id": msg["id"], "result": {"thread": {"id": source, "turns": as_turns(load(source))}}})
+    elif method == "thread/fork":
+        # A new thread holding the source's turns through lastTurnId.
+        source = load(msg["params"]["threadId"])
+        last = msg["params"].get("lastTurnId")
+        if last is not None:
+            source = source[: int(last.split("-")[1]) + 1]
+        thread = "th-" + uuid.uuid4().hex[:8]
+        turns = source
+        save()
         opened(msg)
     elif method == "model/list":
         out({"id": msg["id"], "result": {"data": [{"model": "gpt-5", "supportedReasoningEfforts": [{"reasoningEffort": "low"}]}]}})

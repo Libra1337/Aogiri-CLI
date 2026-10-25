@@ -247,8 +247,14 @@ fn pump(
     link: &mut impl Link,
     inbox: &hub::Inbox,
 ) -> Result<(), String> {
+    // The daemon also forks conversations and probes engines (B08); a
+    // client checks for them before it offers either.
+    let mut hello = protocol::hello_json(hub.version);
+    if let Some(features) = hello["features"].as_array_mut() {
+        features.extend([json!("fork"), json!("engine_probe")]);
+    }
     for frame in [
-        protocol::hello_json(hub.version),
+        hello,
         hub.sessions_json(),
         projects::workspaces_json(hub),
         hub.agents_json(),
@@ -542,7 +548,7 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     }
     // A program to run (an ACP agent, an engine binary, its environment):
     // only the desktop names one.
-    if matches!(name, "session_create" | "session_open") {
+    if matches!(name, "session_create" | "session_open" | "engine_probe") {
         let options = engines::Options::from_json(&op["options"]);
         let acp = op["engine"] == "acp";
         if (acp || options.runs_programs()) && !hub.is_local(client) {
@@ -561,6 +567,32 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             reply(json!({ "type": "error", "message": message }));
             return;
         }
+    }
+    // What an engine says of itself before any conversation (its models,
+    // commands, options), from a run of it that no list shows. It takes
+    // seconds, so it answers from a thread of its own.
+    if name == "engine_probe" {
+        let options = engines::Options::from_json(&op["options"]);
+        let cwd = op["cwd"]
+            .as_str()
+            .filter(|cwd| !cwd.is_empty())
+            .map_or_else(engines::home, PathBuf::from);
+        let engine = op["engine"].as_str().unwrap_or_default().to_string();
+        let force = op["force"] == true;
+        let hub = Arc::clone(hub);
+        thread::spawn(move || {
+            let result = engines::Kind::parse(&engine).and_then(|kind| match kind {
+                _ if !cwd.is_dir() => Err(format!("not a directory: {}", cwd.display())),
+                Some(kind) => engines::probe_cached(kind, &cwd, &options, force).map(
+                    |(events, at, cached)| {
+                        json!({ "type": "engine_probed", "engine": kind.name(), "events": events, "at": at, "cached": cached })
+                    },
+                ),
+                None => Err("the lynshen engine needs no probe: its sessions report all of this".to_string()),
+            });
+            respond(&hub, client, &request, result);
+        });
+        return;
     }
     let result = match (name, session) {
         ("ping", _) => Ok(json!({ "type": "pong" })),

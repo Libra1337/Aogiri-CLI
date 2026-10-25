@@ -172,16 +172,25 @@ pub fn command(id: &str, options: &Options) -> Command {
     } else {
         command.args(["--permission-mode", mode]);
     }
-    match &options.resume {
-        Some(resume) => {
+    match (&options.resume, &options.fork_from) {
+        (Some(resume), _) => {
             command.args(["--resume", resume]);
         }
-        None => {
+        // A fork: the conversation so far (to `resume_at`) as a new one,
+        // under the id the daemon picked; the original stays as it is.
+        (None, Some(from)) => {
+            command.args(["--resume", from, "--fork-session", "--session-id", id]);
+        }
+        (None, None) => {
             command.args(["--session-id", id]);
         }
     }
     if let Some(at) = &options.resume_at {
         command.args(["--resume-session-at", at]);
+    }
+    // A probe's run leaves no conversation behind.
+    if options.probe {
+        command.arg("--no-session-persistence");
     }
     if let Some(model) = &options.model {
         command.args(["--model", model]);
@@ -3541,34 +3550,50 @@ fn transcript_in(config: &Path, cwd: &Path, id: &str, images: &Path) -> Vec<Valu
     if !is_conversation_id(id) {
         return vec![];
     }
-    let mut calls = HashMap::new();
-    let mut items: Vec<Value> = rows(
-        &project_dir(config, cwd).join(format!("{id}.jsonl")),
-        64 * 1024 * 1024,
+    transcript_items(
+        rows(
+            &project_dir(config, cwd).join(format!("{id}.jsonl")),
+            CONVERSATION_LIMIT,
+        ),
+        images,
     )
-    .filter(|row| !is_synthetic(row))
-    .flat_map(|row| {
-        // A user row's tool results come before any text it holds.
-        let mut items = tool_rows(&row, &mut calls);
-        items.extend(match text(&row["type"]) {
-            "user" => user_item(&row["message"]["content"], images),
-            // The usage-limit notice Claude Code saves as a reply is none.
-            "assistant" if row["error"] == "rate_limit" => None,
-            "assistant" => {
-                row_text(&row).map(|content| json!({ "role": "assistant", "content": content }))
+}
+
+/// How much of a saved conversation is read.
+const CONVERSATION_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// Saved rows as transcript items (the newest 500).
+fn transcript_items(rows: impl Iterator<Item = Value>, images: &Path) -> Vec<Value> {
+    let mut calls = HashMap::new();
+    let mut items: Vec<Value> = rows
+        .filter(|row| !is_synthetic(row))
+        .flat_map(|row| {
+            // A user row's tool results come before any text it holds.
+            let mut items = tool_rows(&row, &mut calls);
+            items.extend(match text(&row["type"]) {
+                "user" => user_item(&row["message"]["content"], images),
+                // The usage-limit notice Claude Code saves as a reply is none.
+                "assistant" if row["error"] == "rate_limit" => None,
+                // Its uuid: where a rewind or a fork resumes the conversation.
+                "assistant" => row_text(&row).map(|content| {
+                    let mut item = json!({ "role": "assistant", "content": content });
+                    if let Some(uuid) = row["uuid"].as_str() {
+                        item["uuid"] = json!(uuid);
+                    }
+                    item
+                }),
+                "attachment" => queued_prompt(&row).and_then(|prompt| user_item(prompt, images)),
+                _ => None,
+            });
+            // When each was said or ran: the time its row was written.
+            if let Some(at) = row_time(&row) {
+                for item in &mut items {
+                    item["at"] = json!(at);
+                }
             }
-            "attachment" => queued_prompt(&row).and_then(|prompt| user_item(prompt, images)),
-            _ => None,
-        });
-        // When each was said or ran: the time its row was written.
-        if let Some(at) = row_time(&row) {
-            for item in &mut items {
-                item["at"] = json!(at);
-            }
-        }
-        items
-    })
-    .collect();
+            items
+        })
+        .collect();
     let excess = items.len().saturating_sub(500);
     items.drain(..excess);
     items
@@ -3614,6 +3639,118 @@ fn tool_rows(row: &Value, calls: &mut HashMap<String, ToolMeta>) -> Vec<Value> {
         }
     }
     items
+}
+
+/// Where Claude Code saved conversation `id`, in config directory `config`:
+/// under `cwd`'s project directory, else under any project's (a fork in a
+/// worktree goes on from a conversation saved for the main checkout).
+pub fn find_conversation(config: &Path, cwd: &Path, id: &str) -> Option<PathBuf> {
+    if !is_conversation_id(id) {
+        return None;
+    }
+    let file = format!("{id}.jsonl");
+    let here = project_dir(config, cwd).join(&file);
+    if here.is_file() {
+        return Some(here);
+    }
+    fs::read_dir(config.join("projects"))
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path().join(&file))
+        .find(|path| path.is_file())
+}
+
+/// The rows of a saved conversation's active branch, oldest first, ending at
+/// row `at` (its uuid; None: the latest message). A rewind leaves the rows
+/// it cut in the file, so the branch is followed back through each row's
+/// parent (`logicalParentUuid` across a compaction).
+fn conversation_chain(path: &Path, at: Option<&str>) -> Vec<Value> {
+    let all: Vec<Value> = rows(path, CONVERSATION_LIMIT).collect();
+    let mut by_uuid: HashMap<&str, usize> = HashMap::new();
+    for (index, row) in all.iter().enumerate() {
+        if let Some(uuid) = row["uuid"].as_str() {
+            by_uuid.insert(uuid, index);
+        }
+    }
+    let start = match at {
+        Some(at) => by_uuid.get(at).copied(),
+        None => all.iter().rposition(|row| {
+            matches!(text(&row["type"]), "user" | "assistant") && !is_synthetic(row)
+        }),
+    };
+    // Rows without ids (no branches to follow): the file is the branch.
+    if start.is_some_and(|start| !all[start]["uuid"].is_string()) {
+        let mut all = all;
+        all.truncate(start.map_or(0, |start| start + 1));
+        return all;
+    }
+    let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut next = start;
+    while let Some(index) = next.filter(|index| seen.insert(*index)) {
+        chain.push(index);
+        let row = &all[index];
+        let parent = row["parentUuid"]
+            .as_str()
+            .or_else(|| row["logicalParentUuid"].as_str());
+        next = parent.and_then(|uuid| by_uuid.get(uuid).copied());
+    }
+    chain.reverse();
+    let mut all = all;
+    chain
+        .into_iter()
+        .map(|index| std::mem::take(&mut all[index]))
+        .collect()
+}
+
+/// A row the user's turn starts with, as the transcript shows it: a typed
+/// message (text, images or files) or one taken in mid-turn.
+fn is_prompt(row: &Value) -> bool {
+    if is_synthetic(row) {
+        return false;
+    }
+    match text(&row["type"]) {
+        "user" => {
+            let content = &row["message"]["content"];
+            content_text(content).is_some() || has_image(content)
+        }
+        "attachment" => queued_prompt(row).is_some(),
+        _ => false,
+    }
+}
+
+/// Where a fork of the conversation saved at `path` that keeps its first
+/// `keep` user turns resumes (`resume_at`): the last reply on its active
+/// branch before the next user turn. None: it keeps them all. An error when
+/// those turns have no reply to resume at.
+pub fn fork_point(path: &Path, keep: u64) -> Result<Option<String>, String> {
+    let chain = conversation_chain(path, None);
+    let Some(next) = chain
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| is_prompt(row))
+        .nth(usize::try_from(keep).unwrap_or(usize::MAX))
+        .map(|(index, _)| index)
+    else {
+        return Ok(None);
+    };
+    chain[..next]
+        .iter()
+        .rev()
+        .find(|row| row["type"] == "assistant" && !is_synthetic(row))
+        .and_then(|row| row["uuid"].as_str())
+        .map(|uuid| Some(uuid.to_string()))
+        .ok_or_else(|| format!("the first {keep} turn(s) have no reply to fork after"))
+}
+
+/// What a fork of the conversation saved at `path` holds, as transcript
+/// items: its active branch through row `at` (all of it when None). The
+/// fork shows it until its own file is written (at its first turn).
+pub fn fork_transcript(path: &Path, at: Option<&str>, uploads: &Path) -> Vec<Value> {
+    transcript_items(
+        conversation_chain(path, at).into_iter(),
+        &uploads.join("claude"),
+    )
 }
 
 /// When a saved row was written, ms since the epoch.
@@ -5470,6 +5607,104 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         #[cfg(unix)]
         assert_eq!(project_dir(&home, &link), project_dir(&home, &real));
+    }
+
+    #[test]
+    fn a_fork_resumes_the_conversation_as_a_new_one() {
+        let options = Options {
+            fork_from: Some("orig".into()),
+            resume_at: Some("u-9".into()),
+            ..Options::default()
+        };
+        let args: Vec<String> = command("new-id", &options)
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let at = args.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(
+            args[at..at + 5],
+            [
+                "--resume",
+                "orig",
+                "--fork-session",
+                "--session-id",
+                "new-id"
+            ]
+        );
+        assert!(args.windows(2).any(|w| w == ["--resume-session-at", "u-9"]));
+        assert!(!args.contains(&"--no-session-persistence".to_string()));
+        // Reopened later, it resumes itself, not the original.
+        let reopened = Options {
+            resume: Some("new-id".into()),
+            ..options
+        };
+        let args: Vec<String> = command("new-id", &reopened)
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(!args.contains(&"--fork-session".to_string()));
+        assert!(args.windows(2).any(|w| w == ["--resume", "new-id"]));
+    }
+
+    #[test]
+    fn a_fork_point_follows_the_branch_a_rewind_left() {
+        let home = std::env::temp_dir().join(format!("claude-fork-{}", std::process::id()));
+        let cwd = Path::new("/work/fork");
+        let dir = home.join("projects/-work-fork");
+        fs::create_dir_all(&dir).unwrap();
+        let row = |kind: &str, uuid: &str, parent: Option<&str>, content: Value| json!({ "type": kind, "uuid": uuid, "parentUuid": parent, "message": { "content": content } });
+        let reply = |text: &str| json!([{ "type": "text", "text": text }]);
+        // Turn three was rewound away; "again" went on from reply two.
+        fs::write(
+            dir.join("aa-bb.jsonl"),
+            [
+                row("user", "u1", None, json!("one")),
+                row("assistant", "a1", Some("u1"), reply("re one")),
+                row("user", "u2", Some("a1"), json!("two")),
+                json!({ "type": "attachment", "uuid": "x2", "parentUuid": "u2", "attachment": { "type": "skill_listing" } }),
+                row("assistant", "a2", Some("x2"), reply("re two")),
+                row("user", "u3", Some("a2"), json!("three")),
+                row("assistant", "a3", Some("u3"), reply("re three")),
+                row("user", "u4", Some("a2"), json!("again")),
+                row("user", "r4", Some("u4"), json!([{ "type": "tool_result", "tool_use_id": "t", "content": "x" }])),
+                row("assistant", "a4", Some("r4"), reply("re again")),
+            ]
+            .iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>(),
+        )
+        .unwrap();
+        let path = find_conversation(&home, cwd, "aa-bb").unwrap();
+        // Found from another directory too (a fork in a worktree).
+        assert_eq!(
+            find_conversation(&home, Path::new("/elsewhere"), "aa-bb"),
+            Some(path.clone())
+        );
+        assert_eq!(find_conversation(&home, cwd, "../aa-bb"), None);
+        assert_eq!(fork_point(&path, 1).unwrap().as_deref(), Some("a1"));
+        assert_eq!(fork_point(&path, 2).unwrap().as_deref(), Some("a2"));
+        // Two turns on this branch: keeping them all needs no point.
+        assert_eq!(fork_point(&path, 3).unwrap(), None);
+        assert!(fork_point(&path, 0).is_err());
+        let users = |items: Vec<Value>| -> Vec<String> {
+            items
+                .iter()
+                .filter(|item| item["role"] == "user")
+                .map(|item| text(&item["content"]).to_string())
+                .collect()
+        };
+        assert_eq!(
+            users(fork_transcript(&path, Some("a2"), &home)),
+            ["one", "two"]
+        );
+        assert_eq!(
+            users(fork_transcript(&path, None, &home)),
+            ["one", "two", "again"]
+        );
+        // Replies carry their uuid, where a rewind or a fork resumes.
+        let items = fork_transcript(&path, Some("a1"), &home);
+        assert_eq!(items.last().unwrap()["uuid"], "a1");
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]

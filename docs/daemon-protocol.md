@@ -168,7 +168,7 @@ handshake with HTTP 401. Local clients read the daemon token from
 Each WebSocket text message is one JSON frame. The daemon first sends:
 
 ```json
-{"type":"hello","protocol":2,"version":"0.3.0","features":["queue","files"]}
+{"type":"hello","protocol":2,"version":"0.3.0","features":["queue","files","fork","engine_probe"]}
 {"type":"sessions","sessions":[{"session":"...","cwd":"...","created_at":0,"updated_at":0,"entries":4,"title":"...","archived":false,"open":true,"watchers":0}]}
 {"type":"workspaces","rev":1,"workspaces":[...]}
 ```
@@ -176,7 +176,11 @@ Each WebSocket text message is one JSON frame. The daemon first sends:
 followed by the current `agents`, `schedules`, `questions`, `actions`,
 `dispatches`, `requirements` and `dev_servers` lists.
 
-A client that does not speak `protocol` 2 must disconnect.
+A client that does not speak `protocol` 2 must disconnect. `features` names
+what the daemon takes beyond the protocol version (an older daemon sends
+fewer, or none): `queue` and `files` as in `docs/serve-protocol.md`, `fork`
+for `session_create` with `fork_from` (see "Forks"), `engine_probe` for that
+op.
 
 ## Replies
 
@@ -189,12 +193,13 @@ every connected client.
 
 | Op | Fields | Reply |
 | --- | --- | --- |
-| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers`, `running` (a turn runs or messages wait; the list is sent again when it changes), `failed` (its latest turn ended on an error; cleared when the next turn starts, and the list is sent again when it changes), `project` (the id of the project it belongs to, else null), `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at`, `entries` (how many entries the engine saved for a LynShen session, null for other engines; 0 for one opened without a first message) |
+| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers`, `running` (a turn runs or messages wait; the list is sent again when it changes), `failed` (its latest turn ended on an error; cleared when the next turn starts, and the list is sent again when it changes), `project` (the id of the project it belongs to, else null), `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at`, `entries` (how many entries the engine saved for a LynShen session, null for other engines; 0 for one opened without a first message), `forked_from` (`{session, turns, at}` for a fork, see "Forks"; else null) |
 | `gateway_catalog` | — | `gateway_catalog`: `models` (the LynShen models the user chose to show, `lynshen_models` in config.json; one the gateway hides from pickers has `hidden: true`: it stays callable by name, and pickers list it only while a session runs it) and `groups` (the gateway's groups with their models and multipliers); empty when not signed in or offline. For clients that cannot read this machine's login (the remote page) |
 | `restart_when_idle` | — | none. Desktop only: this daemon exits once no session is running (after a `daemon_restarting` broadcast), so the desktop can start a newer one without cutting off a task |
 | `session_meta` | `session`, and any of `title`, `archived`, `hidden`, `group`, `project` | none; `project` moves the session into that project (an unknown id is an error) or, empty, out of any; every client receives the new `sessions` list. An empty title goes back to the engine's label; a hidden session leaves `session_list` and `session_history` (its conversation stays on disk). A session created here is titled after its first user message (first line, 40 characters) unless a client titled it first. After its 1st and 3rd turns, then every 5th, the title model (`title_model` in config.json, else the main `model`) renames it from the project name, the current title, the first and latest requests and the start of the latest reply. A title a client set with `session_meta` is never replaced |
 | `session_history` | `cwd` | `session_history`: every session saved in `cwd`, newest first, whoever ran it (daemon, TUI, `lynshen serve`), with `title`, `updated_at`, `entries`, `archived`, `agent`, `open` |
-| `session_create` | `cwd`, optional `engine` (`lynshen`, default, `claude`, `codex` or `acp`), `options` and `project` | `session_created` with `session`; the session's startup events follow. See "Other engines". `project`: the project it belongs to, whatever its `cwd` (an unknown id is an error); `""` or null: none; left out: the project whose `path` is `cwd`, if any. A chat belongs to none; a session started with `start_session` belongs to its parent's project |
+| `session_create` | `cwd`, optional `engine` (`lynshen`, default, `claude`, `codex` or `acp`), `options` and `project` | `session_created` with `session`; the session's startup events follow. See "Other engines"; with `options.fork_from` the session is a fork (see "Forks"). `project`: the project it belongs to, whatever its `cwd` (an unknown id is an error); `""` or null: none; left out: the project whose `path` is `cwd`, if any. A chat belongs to none; a session started with `start_session` belongs to its parent's project |
+| `engine_probe` | `engine` (`claude`, `codex` or `acp`), optional `options` (as `session_create`'s: `bin`, `env`, `lynshen_gateway`, `model`, `command`, `args`), `cwd` (default: the home directory), `force` | `engine_probed` with `engine`, `events`, `at` (ms, when the engine was run) and `cached`. See "Engine probe". `bin`, `env` and `acp` are local clients only, as for `session_create` |
 | `session_open` | `session`, optional `cwd`, `engine`, `options` | `session_opened`; with `cwd`, also opens a session saved there that the daemon never hosted. Reopens a closed session (or one from before a restart), resuming its transcript and its undecided deferred actions |
 | `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped (with `reason: "idle"` when the daemon closed an idle engine session; see "Differences from `lynshen serve`") |
 | `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` opens a closed session first, as `session_open` does (an error when it cannot), and also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `approval_mode_pending`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
@@ -261,6 +266,76 @@ every connected client.
 
 `decide_action` (a session op) also works for a session that is closed or
 was hosted before a restart: the daemon reopens it first.
+
+### Forks
+
+A fork is a `session_create` whose `options` carry `fork_from`: the engine's
+id of a conversation (a session id, which for Claude Code and Codex is the
+conversation's), on the same `engine`. The new session holds that
+conversation's first turns and goes on from there; the original stays as it
+is, and both can run at once.
+
+| Option | Meaning |
+| --- | --- |
+| `fork_from` | The conversation to fork |
+| `fork_turns` | How many of its user turns the fork keeps, counted on its active branch (at least 1; left out: all of them) |
+| `resume_at` | Claude Code: the uuid of the reply the fork goes on after, instead of `fork_turns`. Replayed replies carry it as `uuid` in `transcript`; live ones as `assistant_uuid` |
+| `fork_cwd` | LynShen: the directory `fork_from` is saved for, when the fork's `cwd` is another one (its own worktree). Claude Code and Codex find the conversation by id from any directory |
+
+How each engine forks:
+
+- LynShen copies the source session's first `fork_turns` user turns (and the
+  plan, reply style and system prompt they had) into a new session saved for
+  `cwd`, and opens it. The notes a left-out message was sent with stay out.
+- Claude Code: the daemon finds the reply that ends turn `fork_turns` on the
+  conversation's active branch (following each row's parent, so turns a
+  rewind cut stay out) and starts `claude --resume <fork_from>
+  --fork-session --session-id <new> --resume-session-at <reply>`. Claude Code
+  writes the fork's file with its first turn; until then a watcher's
+  `transcript` holds the copied turns. A fork closed, or restarted (a mode
+  switch), before its first turn is forked again from its record. Its own
+  TUI opens only after that first turn.
+- Codex reads the thread (`thread/read`) and forks it (`thread/fork` with
+  `lastTurnId`, the turn before the next user turn); the new thread's id is
+  the session id, and its history comes back as `transcript`.
+- ACP agents copy a whole conversation with `fork` (see "Other engines");
+  `fork_from` is an error for them.
+
+A fork that cannot be made (no such conversation, `fork_turns` 0, a
+relative `fork_cwd`, a Claude conversation with no reply in the kept turns)
+fails `session_create` with an `error`. The session list names the source as
+`forked_from: {session, turns, at}` (`turns` and `at` as asked or found;
+null when not used), kept through restarts. A fork starts with its source's
+title (`title_auto`, so the title model may still rename it).
+
+A fork in its own worktree: the client makes the worktree first (on the
+desktop, the parallel-task worktree under `.lynshen-worktrees`, branch
+`task/<slug>`), then creates the fork with `cwd` the worktree, `project` the
+original's project (so it is listed with it), and for LynShen `fork_cwd` the
+original's directory. The daemon itself makes no worktree.
+
+### Engine probe
+
+`engine_probe` tells a client what an engine offers before any session of it
+runs: its models, slash commands, capabilities and session options. The
+daemon starts the engine in `cwd` as a session of it would start (the same
+binary, environment and gateway from `options`), asks for its model list
+(`/model`), keeps the last event of each of these kinds and stops it:
+`model_status`, `model_view`, `engine_caps`, `command_list`,
+`session_options` (each as a session sends it; an engine sends only some).
+It waits 25 s at most, and 4 s for the rest once the engine said something.
+
+The run is no session: no list shows it, and it saves nothing (Claude Code
+runs with `--no-session-persistence`, Codex opens an `ephemeral` thread). An
+ACP agent opens a session of its own, as it always does. Nothing that waits
+for the user (approvals, a sign-in) is answered.
+
+Answers are cached per engine setup (engine, `cwd`, `bin`, `env`,
+`lynshen_gateway`, `model`, `command`, `args`) for 10 minutes; `cached` says
+whether this one came from the cache, `at` when the engine was run, and
+`force: true` runs it again. Two probes of one setup at once run it once.
+An engine that says nothing is an error (with its last stderr line). The
+LynShen engine needs no probe: an error.
 
 `session_create` also accepts `agent` instead of `cwd`: the session runs in
 the agent's directory as that agent. With `chat: true` instead, the session is
@@ -373,6 +448,7 @@ clients need nothing engine-specific. `options`:
 | `lynshen_gateway` | Claude Code / Codex / OpenCode: `true` runs this session through the LynShen gateway on the user's LynShen login; `false` on the provider in the user's own Claude Code / Codex / OpenCode config. The endpoint and key go to this process only (Claude: `--settings` file; Codex: `-c` overrides and an env var; OpenCode: `OPENCODE_CONFIG_CONTENT` and an env var), never to the user's config files. Omitted on `session_open`: as the session last ran |
 | `command`, `args` | ACP: the agent's command line |
 | `fork` | ACP, `session_create` only: a conversation of the agent's (its own session id) to copy into the new session with `session/fork`; the original stays as it is |
+| `fork_from`, `fork_turns`, `fork_cwd` | `session_create` only: a fork of a LynShen, Claude Code or Codex conversation (see "Forks") |
 | `acp_agent` | ACP: `{id, name}`, the desktop's registry entry for the agent, kept with the session (`session_list` returns it) |
 | `bin` | Claude Code / Codex: the engine binary to run instead of the one found on `PATH` |
 | `env` | Extra environment variables for the engine process (plain names; no `DYLD_*`/`LD_*`) |
