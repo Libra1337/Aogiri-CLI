@@ -399,7 +399,9 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             | "tool_provider_models"
     ) {
         if !hub.is_local(client) {
-            reply(json!({ "type": "error", "message": "only the desktop can manage custom providers" }));
+            reply(
+                json!({ "type": "error", "message": "only the desktop can manage custom providers" }),
+            );
             return;
         }
         let hub = Arc::clone(hub);

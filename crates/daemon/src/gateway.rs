@@ -348,18 +348,18 @@ fn dropped_request_header(name: &str) -> bool {
     name.starts_with("x-lynshen-")
         || matches!(
             name.as_str(),
-        "host"
-            | "authorization"
-            | "x-api-key"
-            | "content-length"
-            | "transfer-encoding"
-            | "connection"
-            | "keep-alive"
-            | "proxy-connection"
-            | "proxy-authorization"
-            | "te"
-            | "upgrade"
-            | "expect"
+            "host"
+                | "authorization"
+                | "x-api-key"
+                | "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "keep-alive"
+                | "proxy-connection"
+                | "proxy-authorization"
+                | "te"
+                | "upgrade"
+                | "expect"
                 | "accept-encoding"
         )
 }
@@ -1063,8 +1063,14 @@ mod tests {
         assert!(received.contains("authorization: bearer relay-key"));
         assert!(!received.contains("x-api-key") && !received.contains("x-lynshen-"));
         revoke(&key);
-        assert_eq!(custom_url("https://h/v1/", "/v1/models"), "https://h/v1/models");
-        assert_eq!(custom_url("https://h/api", "/v1/models"), "https://h/api/v1/models");
+        assert_eq!(
+            custom_url("https://h/v1/", "/v1/models"),
+            "https://h/v1/models"
+        );
+        assert_eq!(
+            custom_url("https://h/api", "/v1/models"),
+            "https://h/api/v1/models"
+        );
     }
 
     #[test]

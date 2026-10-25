@@ -53,12 +53,10 @@ mod keys {
     }
 
     #[cfg(test)]
-    fn map() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, String>> {
-        static KEYS: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
-            std::sync::Mutex::new(None);
-        std::sync::MutexGuard::map(KEYS.lock().unwrap_or_else(|p| p.into_inner()), |keys| {
-            keys.get_or_insert_with(Default::default)
-        })
+    fn map() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<String, String>> {
+        static KEYS: std::sync::Mutex<std::collections::BTreeMap<String, String>> =
+            std::sync::Mutex::new(std::collections::BTreeMap::new());
+        KEYS.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     #[cfg(test)]

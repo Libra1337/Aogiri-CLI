@@ -447,7 +447,11 @@ pub fn pin_tool_provider(store: &Store, kind: Kind, options: &mut Options) {
 /// The custom provider a session runs on (None: the LynShen gateway or the
 /// tool's own configuration), without its key. One that was removed fails
 /// the start rather than moving the conversation somewhere else.
-pub fn custom_provider(store: &Store, kind: Kind, options: &Options) -> Result<Option<Value>, String> {
+pub fn custom_provider(
+    store: &Store,
+    kind: Kind,
+    options: &Options,
+) -> Result<Option<Value>, String> {
     if !matches!(kind, Kind::Claude | Kind::Codex) || options.gateway == Some(true) {
         return Ok(None);
     }
@@ -1072,6 +1076,13 @@ pub fn spawn(
         .as_deref()
         .or(options.resume.as_deref())
         .is_some_and(|session| crate::requirements::gated(&hub, session));
+    // On a custom provider with no model named: its default one.
+    let model = options.model.clone().or_else(|| {
+        custom_provider(&hub.store, kind, &options)
+            .ok()
+            .flatten()
+            .and_then(|provider| provider["model"].as_str().map(str::to_string))
+    });
     let options = Options {
         approval_mode: if gated {
             Some("read-only".to_string())
@@ -1079,6 +1090,7 @@ pub fn spawn(
             options.approval_mode
         },
         app_tools: app_tools_for(kind),
+        model,
         ..options
     };
     let Start {
@@ -1633,10 +1645,11 @@ impl Session<'_> {
             resume_at: None,
             ..options
         };
-        let started = self::command(&self.hub.store, self.kind, &id, &next, &self.cwd).and_then(|start| {
-            self.gateway_key = start.key;
-            Process::spawn(start.command, &self.cwd)
-        });
+        let started =
+            self::command(&self.hub.store, self.kind, &id, &next, &self.cwd).and_then(|start| {
+                self.gateway_key = start.key;
+                Process::spawn(start.command, &self.cwd)
+            });
         match started {
             Ok(started) => {
                 let mut engine = self::adapter(self.kind, &self.cwd, &next);

@@ -2551,7 +2551,10 @@ fn a_custom_provider_gets_its_key_alone_and_its_turns_stay_off_the_gateway_ledge
         .to_string();
     let token = paired_token(&daemon, &mut desktop, &code);
     let mut phone = Client::connect_with(&daemon, &token);
-    let refused = request(&mut phone, json!({ "op": "tool_providers", "tool": "claude" }));
+    let refused = request(
+        &mut phone,
+        json!({ "op": "tool_providers", "tool": "claude" }),
+    );
     assert_eq!(refused["type"], "error", "{refused}");
 
     let saved = request(
@@ -2570,7 +2573,8 @@ fn a_custom_provider_gets_its_key_alone_and_its_turns_stay_off_the_gateway_ledge
     // The key is in auth.json's own block, not in the daemon's state.
     let home = PathBuf::from(std::env::var_os("HOME").unwrap());
     let auth: Value =
-        serde_json::from_str(&fs::read_to_string(home.join(".lynshen/auth.json")).unwrap()).unwrap();
+        serde_json::from_str(&fs::read_to_string(home.join(".lynshen/auth.json")).unwrap())
+            .unwrap();
     assert_eq!(auth["tool_providers"]["claude:own"], "sk-own-provider");
     assert!(auth["providers"].get("claude:own").is_none());
     assert!(!fs::read_to_string(daemon.state.join("settings.json"))
@@ -2592,12 +2596,21 @@ fn a_custom_provider_gets_its_key_alone_and_its_turns_stay_off_the_gateway_ledge
     assert_eq!(provider["provider"]["id"], "own");
     assert!(provider["provider"].get("base_url").is_none());
     let args = starts_after(&log, 1)[0].clone();
-    assert!(args.windows(2).any(|w| w == ["--model", "own-model"]), "{args:?}");
-    assert!(args.iter().all(|a| !a.contains("sk-own-provider")), "{args:?}");
+    assert!(
+        args.windows(2).any(|w| w == ["--model", "own-model"]),
+        "{args:?}"
+    );
+    assert!(
+        args.iter().all(|a| !a.contains("sk-own-provider")),
+        "{args:?}"
+    );
 
     desktop.send(json!({ "op": "user_message", "session": session, "content": "api call" }));
     let frames = desktop.until(turn_done(&session));
-    assert!(claude_reply(&frames, &session).contains("api call 200"), "{frames:#?}");
+    assert!(
+        claude_reply(&frames, &session).contains("api call 200"),
+        "{frames:#?}"
+    );
     let head = received
         .recv_timeout(Duration::from_secs(10))
         .unwrap()
@@ -2607,7 +2620,7 @@ fn a_custom_provider_gets_its_key_alone_and_its_turns_stay_off_the_gateway_ledge
     assert!(!head.contains("authorization:"), "{head}");
     assert!(!head.contains("jgw-"), "{head}");
     assert!(!head.contains("x-lynshen-"), "{head}");
-    assert!(head.contains("\"model\":\"own-model\""), "{head}");
+    assert!(head.contains("\"model\": \"own-model\""), "{head}");
 
     // The session keeps it; the list says so; its usage is this computer's.
     let listed = request(&mut desktop, json!({ "op": "session_list" }));
@@ -2647,9 +2660,15 @@ fn a_custom_provider_gets_its_key_alone_and_its_turns_stay_off_the_gateway_ledge
     );
     desktop.send(json!({ "op": "session_close", "session": session }));
     desktop.until(|f| f["type"] == "session_closed" && f["session"] == session.as_str());
-    request(&mut desktop, json!({ "op": "session_open", "session": session }));
+    request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": session }),
+    );
     let args = starts_after(&log, 2)[1].clone();
-    assert!(args.windows(2).any(|w| w == ["--model", "own-model"]), "{args:?}");
+    assert!(
+        args.windows(2).any(|w| w == ["--model", "own-model"]),
+        "{args:?}"
+    );
     desktop.send(json!({ "op": "session_close", "session": session }));
     desktop.until(|f| f["type"] == "session_closed" && f["session"] == session.as_str());
     request(
@@ -2657,9 +2676,13 @@ fn a_custom_provider_gets_its_key_alone_and_its_turns_stay_off_the_gateway_ledge
         json!({ "op": "tool_provider_remove", "tool": "claude", "provider_id": "own" }),
     );
     let auth: Value =
-        serde_json::from_str(&fs::read_to_string(home.join(".lynshen/auth.json")).unwrap()).unwrap();
+        serde_json::from_str(&fs::read_to_string(home.join(".lynshen/auth.json")).unwrap())
+            .unwrap();
     assert!(auth.get("tool_providers").is_none(), "{auth}");
-    let gone = request(&mut desktop, json!({ "op": "session_open", "session": session }));
+    let gone = request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": session }),
+    );
     assert_eq!(gone["type"], "error", "{gone}");
     assert!(gone["message"].as_str().unwrap().contains("own"), "{gone}");
     // Reopened on the tool's own configuration, it runs.

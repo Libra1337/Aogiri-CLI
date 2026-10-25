@@ -3989,7 +3989,14 @@ mod tests {
         assert!(!std::path::Path::new(&path).exists());
         // A custom provider's one model serves the background requests too.
         let mut command = Command::new("claude");
-        use_gateway(&mut command, "sess-2", "http://x/gw", "jgw-k2", Some("deepseek-chat")).unwrap();
+        use_gateway(
+            &mut command,
+            "sess-2",
+            "http://x/gw",
+            "jgw-k2",
+            Some("deepseek-chat"),
+        )
+        .unwrap();
         let path = command
             .get_args()
             .last()
@@ -3998,7 +4005,11 @@ mod tests {
             .to_string();
         let settings: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        for name in ["ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"] {
+        for name in [
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+        ] {
             assert_eq!(settings["env"][name], "deepseek-chat");
         }
         assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "jgw-k2");
@@ -5022,7 +5033,10 @@ mod tests {
             "env": { "CLAUDE_CONFIG_DIR": "/tmp/c" },
         }));
         assert!(options.runs_programs());
+        let dir = std::env::temp_dir().join(format!("lynshen-bin-test-{}", std::process::id()));
+        let store = crate::store::Store::open(dir.clone()).unwrap();
         let command = super::super::command(
+            &store,
             super::super::Kind::Claude,
             "x",
             &options,
@@ -5035,6 +5049,8 @@ mod tests {
             .get_envs()
             .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == Some("/tmp/c".as_ref())));
         assert!(!Options::from_json(&json!({ "model": "m" })).runs_programs());
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -148,5 +148,7 @@ while True:
     reply = "mode: " + mode if text == "which mode" else "ok: " + text
     out({"type": "stream_event", "event": {"type": "message_start", "message": {"usage": {"input_tokens": 5}}}})
     out({"type": "assistant", "uuid": "u-1", "message": {"content": [{"type": "text", "text": reply}]}})
+    if text.startswith("api"):
+        out({"type": "stream_event", "event": {"type": "message_delta", "usage": {"input_tokens": 11, "output_tokens": 2}}})
     save("assistant", reply)
     out({"type": "result", "subtype": "success", "total_cost_usd": 0.01})
