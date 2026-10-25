@@ -10,7 +10,7 @@
 mod fake_model;
 
 use fake_model::{requests, setup, temp_dir};
-use lynshen_agent_core::{AgentCore, AgentEvent, ApprovalMode};
+use lynshen_agent_core::{queue::QueuePick, AgentCore, AgentEvent, ApprovalMode};
 use std::{
     env, fs,
     path::Path,
@@ -808,7 +808,7 @@ fn a_steered_message_joins_the_running_turn_without_stopping_its_tool() {
         thread::sleep(Duration::from_millis(5));
     }
     core.submit_user_message("also check the weather".to_string());
-    events.extend(core.steer());
+    events.extend(core.steer(&QueuePick::default()));
     events.extend(pump(&mut core, is_ready));
 
     // The tool was not killed: its file exists.
@@ -874,7 +874,7 @@ fn a_steered_message_cuts_off_the_response_being_streamed() {
     let mut events = pump(&mut core, |e| matches!(e, AgentEvent::ReasoningDelta(_)));
     core.submit_user_message("do this instead".to_string());
     let steered_at = Instant::now();
-    events.extend(core.steer());
+    events.extend(core.steer(&QueuePick::default()));
     let cut = pump(&mut core, |e| matches!(e, AgentEvent::ResponseInterrupted));
     let waited = steered_at.elapsed();
     assert!(waited < Duration::from_secs(3), "cut after {waited:?}");
@@ -921,7 +921,7 @@ fn a_tool_call_a_steered_message_cut_off_never_runs() {
     }
     thread::sleep(Duration::from_millis(300));
     core.submit_user_message("never mind".to_string());
-    let mut events = core.steer();
+    let mut events = core.steer(&QueuePick::default());
     events.extend(pump(&mut core, is_ready));
 
     assert!(events
@@ -961,19 +961,33 @@ fn a_queued_message_taken_back_never_runs() {
     core.submit_user_message("second queued".to_string());
     // The client saw the second one at index 1; a stale index still finds it
     // by its text.
-    let taken = core.unqueue(0, Some("second queued"));
+    let taken = core.unqueue(
+        &QueuePick {
+            index: Some(0),
+            text: Some("second queued".to_string()),
+        },
+        false,
+    );
     assert!(taken.iter().any(
         |e| matches!(e, AgentEvent::PendingMessages(m) if m == &["first queued".to_string()])
     ));
     assert!(taken
         .iter()
-        .any(|e| matches!(e, AgentEvent::Unqueued(t) if t == "second queued")));
+        .any(|e| matches!(e, AgentEvent::Unqueued { content, .. } if content == "second queued")));
     // Text that is no longer queued changes nothing, and nothing comes back.
-    let gone = core.unqueue(0, Some("gone"));
+    let gone = core.unqueue(
+        &QueuePick {
+            index: Some(0),
+            text: Some("gone".to_string()),
+        },
+        false,
+    );
     assert!(gone.iter().any(
         |e| matches!(e, AgentEvent::PendingMessages(m) if m == &["first queued".to_string()])
     ));
-    assert!(!gone.iter().any(|e| matches!(e, AgentEvent::Unqueued(_))));
+    assert!(!gone
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Unqueued { .. })));
     // The turn, then the one queued message as a turn of its own, until
     // that turn is ready.
     let done = |events: &[AgentEvent]| {
@@ -1001,6 +1015,79 @@ fn a_queued_message_taken_back_never_runs() {
     assert!(users.iter().any(|m| *m == "first queued"), "{users:?}");
     assert!(!users.iter().any(|m| *m == "second queued"), "{users:?}");
     assert!(!assistant_text(&events).contains("second queued"));
+}
+
+#[test]
+fn queued_messages_move_drop_and_one_is_sent_now_by_interrupting() {
+    let _guard = setup();
+    let dir = temp_dir("queue-edits");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    let slow = if cfg!(windows) {
+        "RUN: Start-Sleep -Seconds 5; Set-Content done.txt ok".to_string()
+    } else {
+        "RUN: sleep 5 && printf ok > done.txt".to_string()
+    };
+    core.submit_user_message(slow);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut events = Vec::new();
+    while Instant::now() < deadline
+        && !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolStart { .. }))
+    {
+        events.extend(core.poll_events());
+        thread::sleep(Duration::from_millis(5));
+    }
+    for text in ["apple", "banana", "cherry", "date"] {
+        core.submit_user_message(text.to_string());
+    }
+    let pending = |events: &[AgentEvent]| {
+        events.iter().rev().find_map(|e| match e {
+            AgentEvent::PendingMessages(m) => Some(m.clone()),
+            _ => None,
+        })
+    };
+    let at = |index: i64| QueuePick {
+        index: Some(index),
+        text: None,
+    };
+    // The last to the front.
+    let moved = core.queue_move(&at(-1), Some(0));
+    assert_eq!(
+        pending(&moved).unwrap(),
+        ["date", "apple", "banana", "cherry"]
+    );
+    // Dropped: nothing comes back to the box.
+    let dropped = core.unqueue(&at(1), true);
+    assert_eq!(pending(&dropped).unwrap(), ["date", "banana", "cherry"]);
+    assert!(!dropped
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Unqueued { .. })));
+    // Interrupt and send `cherry` now: the slow command is stopped, cherry
+    // starts at once, the others wait behind it.
+    let sent = core.interrupt_send(&QueuePick {
+        index: Some(2),
+        text: Some("cherry".to_string()),
+    });
+    assert!(sent
+        .iter()
+        .any(|e| matches!(e, AgentEvent::UserMessage(m) if m == "cherry")));
+    assert_eq!(pending(&sent).unwrap(), ["date", "banana"]);
+    let mut events = sent;
+    events.extend(pump(&mut core, is_ready));
+    let users: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::UserMessage(m) => Some(m),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(users.first().map(|m| m.as_str()), Some("cherry"), "{users:?}");
+    assert!(assistant_text(&events).contains("user said: cherry"));
+    assert!(!dir.join("done.txt").exists(), "the interrupted command ran on");
+    // Nothing to send now when nothing runs.
+    let mut idle = open(&dir, ApprovalMode::FullAccess);
+    assert!(idle.interrupt_send(&at(0)).is_empty());
 }
 
 fn git(dir: &Path, args: &[&str]) {

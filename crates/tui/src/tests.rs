@@ -38,6 +38,7 @@ struct TestRuntime {
     submitted: Vec<String>,
     commands: Vec<String>,
     interrupts: usize,
+    queued: Vec<String>,
 }
 
 impl TuiRuntime for TestRuntime {
@@ -57,6 +58,19 @@ impl TuiRuntime for TestRuntime {
     fn interrupt(&mut self) -> Vec<AgentEvent> {
         self.interrupts += 1;
         vec![AgentEvent::Status("interrupted".to_string())]
+    }
+
+    fn unqueue_last(&mut self) -> Vec<AgentEvent> {
+        let Some(content) = self.queued.pop() else {
+            return Vec::new();
+        };
+        vec![
+            AgentEvent::PendingMessages(self.queued.clone()),
+            AgentEvent::Unqueued {
+                content,
+                images: Vec::new(),
+            },
+        ]
     }
 
     fn handle_command(&mut self, input: &str) -> (bool, Vec<AgentEvent>) {
@@ -242,6 +256,29 @@ fn esc_interrupts_active_turn_and_clears_draft_when_idle() {
     app.handle_key_at(KeyCode::Esc, KeyModifiers::empty(), now);
     assert_eq!(app.runtime.interrupts, 1);
     assert_eq!(app.input.text(), "");
+}
+
+#[test]
+fn up_on_an_empty_input_takes_back_the_last_queued_message() {
+    let mut app = TuiApp::new(TestRuntime {
+        queued: vec!["first".to_string(), "second".to_string()],
+        ..TestRuntime::default()
+    });
+    let now = Instant::now();
+    app.apply_events(vec![AgentEvent::PendingMessages(vec![
+        "first".to_string(),
+        "second".to_string(),
+    ])]);
+
+    // With a draft, Up moves in the draft; the queue is left alone.
+    app.input.push_char('x');
+    app.handle_key_at(KeyCode::Up, KeyModifiers::empty(), now);
+    assert_eq!(app.runtime.queued.len(), 2);
+
+    app.input.clear();
+    app.handle_key_at(KeyCode::Up, KeyModifiers::empty(), now);
+    assert_eq!(app.input.text(), "second");
+    assert_eq!(app.state.pending_messages, ["first"]);
 }
 
 #[test]

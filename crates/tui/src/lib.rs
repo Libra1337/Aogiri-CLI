@@ -416,6 +416,8 @@ pub trait TuiRuntime {
     fn model_status_event(&self) -> AgentEvent;
     fn submit_user_message(&mut self, message: String) -> Vec<AgentEvent>;
     fn interrupt(&mut self) -> Vec<AgentEvent>;
+    /// Takes the last queued message back (`unqueue` index -1).
+    fn unqueue_last(&mut self) -> Vec<AgentEvent>;
     fn handle_command(&mut self, input: &str) -> (bool, Vec<AgentEvent>);
     fn poll_events(&mut self) -> Vec<AgentEvent>;
 }
@@ -713,6 +715,10 @@ impl<R: TuiRuntime> TuiApp<R> {
                 let count = self.completion_rows_len();
                 if count > 0 {
                     self.state.completion_index = (self.state.completion_index + count - 1) % count;
+                } else if self.input.text().is_empty() && !self.state.pending_messages.is_empty() {
+                    // The last queued message comes back to edit (`unqueued`).
+                    let events = self.runtime.unqueue_last();
+                    self.apply_events(events);
                 } else {
                     self.input.move_up(modifiers.contains(KeyModifiers::SHIFT));
                 }

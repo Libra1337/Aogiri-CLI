@@ -156,15 +156,27 @@ In `manual` approval mode a `restore` asks first, like an edit; a `restore`
 with `force` asks in every mode but `full-access`, and "always allow" does
 not cover it; `list` and `create` never ask.
 
+### Picking a queued message
+
+`steer`, `unqueue`, `queue_move` and `interrupt` with `index` name a queued
+message by its place in the `pending_messages` the client saw: `index`
+counts from the first (0, the default), or from the last when negative (`-1`
+is the message just sent, so a client can send a message and steer it in at
+once without knowing the queue's length). With `text` too, the message at
+`index` counts only when its text is `text`, else the first queued message
+with that text (the queue may have moved on since the client saw it).
+Nothing there, nothing happens.
+
 ### `steer`
 
 ```json
 {"op":"steer"}
+{"op":"steer","index":-1}
 ```
 
-Sends the next queued message into the in-flight turn; running tools and
-subagents keep going. Emits `status:"steering"` and the updated
-`pending_messages`.
+Sends a queued message (the next one by default) into the in-flight turn;
+running tools and subagents keep going, and the other queued messages keep
+waiting. Emits `status:"steering"` and the updated `pending_messages`.
 
 - While the model's response streams (reasoning, text, or tool-call
   arguments with no tool running yet), the response is cut off as soon as
@@ -187,14 +199,25 @@ No-op when idle or when the queue is empty.
 
 ```json
 {"op":"unqueue","index":0,"text":"also check the tests"}
+{"op":"unqueue","index":-1,"discard":true}
 ```
 
-Takes a queued message back before it runs. Removes the message at `index`
-when its text equals `text`, else the first queued message with that text
-(the queue may have moved on since the client saw it); without `text`, the
-one at `index`. Emits the updated `pending_messages` either way, and
-`{"type":"unqueued","text":…}` when a message was taken back (a client
-returns its text to the message box; one that already started is not taken).
+Takes a queued message back before it runs. Emits the updated
+`pending_messages` either way, and
+`{"type":"unqueued","content":…,"text":…,"images":[…]}` when a message was
+taken back (a client returns it to the message box; one that already started
+is not taken; `text` repeats `content` for older clients). With
+`discard: true` the message is dropped and no `unqueued` follows. The TUI
+takes the last queued message back with ↑ on an empty input.
+
+### `queue_move`
+
+```json
+{"op":"queue_move","index":-1,"to":0}
+```
+
+Moves a queued message to place `to` (negative from the last). Emits the
+updated `pending_messages`.
 
 ### `interrupt`
 
@@ -207,6 +230,14 @@ closes subagents, clears pending approvals. Emits
 `info:"request interrupted"` and `status:"interrupted"`. Queued messages still
 auto-start as the next turn; send `interrupt` again (or avoid queueing) to
 stop those too. No-op when idle.
+
+```json
+{"op":"interrupt","index":-1}
+```
+
+With `index`: "interrupt and send". The turn stops and that queued message
+starts the next one at once, ahead of the others. The daemon's Claude Code,
+Codex and ACP sessions take the same field.
 
 ### `approve`
 

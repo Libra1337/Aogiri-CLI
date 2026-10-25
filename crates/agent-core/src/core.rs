@@ -883,26 +883,19 @@ impl AgentCore {
         self.queued.iter().map(|(text, _)| text.clone()).collect()
     }
 
-    /// Takes a queued message back before it runs: the one at `index`, when
-    /// its text is `text` (the queue may have moved on since the client saw
-    /// it), else the first one with that text. The updated queue comes back
-    /// either way, so the client shows what is really waiting.
-    pub fn unqueue(&mut self, index: usize, text: Option<&str>) -> Vec<AgentEvent> {
-        let at = match text {
-            None => (index < self.queued.len()).then_some(index),
-            Some(text) => self
-                .queued
-                .get(index)
-                .filter(|(queued, _)| queued == text)
-                .map(|_| index)
-                .or_else(|| self.queued.iter().position(|(queued, _)| queued == text)),
-        };
-        let taken = at.and_then(|at| self.queued.remove(at));
+    /// Takes a queued message back before it runs (`QueuePick`); with
+    /// `discard` it is dropped instead of going back to the client's box.
+    /// The updated queue comes back either way, so the client shows what is
+    /// really waiting.
+    pub fn unqueue(&mut self, pick: &QueuePick, discard: bool) -> Vec<AgentEvent> {
+        let taken = pick
+            .find(&self.pending_texts())
+            .and_then(|at| self.queued.remove(at));
         let mut events = vec![AgentEvent::PendingMessages(self.pending_texts())];
         // Only a message really taken back goes back to the client's box: one
         // that started running meanwhile is not there to take.
-        if let Some((text, _)) = taken {
-            events.push(AgentEvent::Unqueued(text));
+        if let Some((content, images)) = taken.filter(|_| !discard) {
+            events.push(AgentEvent::Unqueued { content, images });
         }
         if !self.running {
             events.push(self.model_status_event());
@@ -910,15 +903,33 @@ impl AgentCore {
         events
     }
 
-    /// Sends the next queued message into the running turn, and running
-    /// tools and subagents keep going. A model response still streaming
-    /// (reasoning, text, tool-call arguments) is cut off and sent again with
-    /// the message (`ResponseInterrupted`); while tools run, the model reads
-    /// it in the request after them. A message with images, or one sent
-    /// while nothing runs, starts a turn of its own as before.
-    pub fn steer(&mut self) -> Vec<AgentEvent> {
-        if !self.running || self.queued.is_empty() {
+    /// Queued message `pick` moves to place `to` (negative from the last).
+    pub fn queue_move(&mut self, pick: &QueuePick, to: Option<i64>) -> Vec<AgentEvent> {
+        let Some((from, to)) = queue_move_target(pick, to, &self.pending_texts()) else {
             return Vec::new();
+        };
+        if let Some(item) = self.queued.remove(from) {
+            self.queued.insert(to, item);
+        }
+        vec![AgentEvent::PendingMessages(self.pending_texts())]
+    }
+
+    /// Sends a queued message (`pick`, the next one by default) into the
+    /// running turn, and running tools and subagents keep going. A model
+    /// response still streaming (reasoning, text, tool-call arguments) is cut
+    /// off and sent again with the message (`ResponseInterrupted`); while
+    /// tools run, the model reads it in the request after them. A message
+    /// with images, or one sent while nothing runs, starts a turn of its own
+    /// as before.
+    pub fn steer(&mut self, pick: &QueuePick) -> Vec<AgentEvent> {
+        if !self.running {
+            return Vec::new();
+        }
+        let Some(at) = pick.find(&self.pending_texts()) else {
+            return Vec::new();
+        };
+        if let Some(chosen) = self.queued.remove(at) {
+            self.queued.push_front(chosen);
         }
         if self
             .queued
@@ -935,6 +946,26 @@ impl AgentCore {
                 AgentEvent::PendingMessages(self.pending_texts()),
             ];
         }
+        self.restart_with_first()
+    }
+
+    /// Stops the running turn and starts queued message `pick` now, ahead of
+    /// the others: the user's "interrupt and send".
+    pub fn interrupt_send(&mut self, pick: &QueuePick) -> Vec<AgentEvent> {
+        if !self.running {
+            return Vec::new();
+        }
+        let Some(at) = pick.find(&self.pending_texts()) else {
+            return Vec::new();
+        };
+        if let Some(chosen) = self.queued.remove(at) {
+            self.queued.push_front(chosen);
+        }
+        self.restart_with_first()
+    }
+
+    /// The running turn stops; the first queued message starts the next.
+    fn restart_with_first(&mut self) -> Vec<AgentEvent> {
         let mut events = self.stop_current_turn();
         let Some((next, images)) = self.queued.pop_front() else {
             return events;

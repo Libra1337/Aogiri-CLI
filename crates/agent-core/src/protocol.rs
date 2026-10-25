@@ -2,7 +2,7 @@
 //! events serialize to `{"type": ...}` objects and client ops arrive as
 //! `{"op": ...}` objects. See `docs/serve-protocol.md`.
 
-use crate::{event::AgentEvent, AgentCore, ApprovalMode, ApproveOptions};
+use crate::{event::AgentEvent, queue::QueuePick, AgentCore, ApprovalMode, ApproveOptions};
 use serde_json::{json, Value};
 
 /// Wire protocol version, announced in the `hello` event. Clients refuse to
@@ -54,14 +54,20 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
         }
         // A failed turn again, without a new user message (see continue_turn).
         "continue" => core.continue_turn(),
-        "steer" => core.steer(),
-        "unqueue" => core.unqueue(
-            value
-                .get("index")
-                .and_then(Value::as_u64)
-                .map_or(usize::MAX, |index| index as usize),
-            value.get("text").and_then(Value::as_str),
+        // A queued message (`index`, negative from the last; `text` to find
+        // it if the queue moved on, see `queue`) into the running turn.
+        "steer" => core.steer(&QueuePick::from_op(value)),
+        // Taken back to the client's box, or dropped with `discard`.
+        "unqueue" => core.unqueue(&QueuePick::from_op(value), value["discard"] == true),
+        // To another place: `index` to `to`.
+        "queue_move" => core.queue_move(
+            &QueuePick::from_op(value),
+            value.get("to").and_then(Value::as_i64),
         ),
+        // With `index`: stop the turn and send that queued message now.
+        "interrupt" if value.get("index").is_some_and(Value::is_i64) => {
+            core.interrupt_send(&QueuePick::from_op(value))
+        }
         "interrupt" => core.interrupt(),
         // Structured twin of the `/approve` text command (GUI convenience):
         // {"op":"approve","call_id":"...","decision":"allow|deny",
@@ -355,7 +361,10 @@ pub fn event_json(event: AgentEvent) -> Value {
         AgentEvent::PendingMessages(messages) => {
             json!({ "type": "pending_messages", "messages": messages })
         }
-        AgentEvent::Unqueued(text) => json!({ "type": "unqueued", "text": text }),
+        // `text` for clients that read only it (desktop 0.10 and older).
+        AgentEvent::Unqueued { content, images } => {
+            json!({ "type": "unqueued", "content": content, "text": content, "images": images })
+        }
         AgentEvent::UserMessage(content) => json!({ "type": "user_message", "content": content }),
         AgentEvent::FillInput(content) => json!({ "type": "fill_input", "content": content }),
         AgentEvent::Connecting => json!({ "type": "connecting" }),

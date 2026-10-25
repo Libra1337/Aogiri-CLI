@@ -30,6 +30,7 @@ mod prompt;
 #[cfg(test)]
 mod prompt_budget;
 pub mod protocol;
+pub mod queue;
 pub mod provider_login;
 mod providers;
 mod roles;
