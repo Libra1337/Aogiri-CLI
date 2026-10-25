@@ -203,11 +203,16 @@ pub fn catalog_json() -> Value {
     let models: Vec<Value> = lynshen_agent_core::lynshen_visible_models()
         .into_iter()
         .map(|model| {
-            json!({
+            let mut entry = json!({
                 "name": model.name,
                 "display_name": model.display_name,
                 "context_window": model.context_window,
-            })
+            });
+            // Kept callable by name; pickers leave it out.
+            if model.hidden {
+                entry["hidden"] = json!(true);
+            }
+            entry
         })
         .collect();
     let groups = live_upstream()

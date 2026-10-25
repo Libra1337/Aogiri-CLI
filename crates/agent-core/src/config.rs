@@ -567,6 +567,9 @@ pub struct ModelConfig {
     /// What the model takes as input (`input_modalities`: "text", "image").
     /// None: not stated, which accepts images as before.
     pub input_modalities: Option<Vec<String>>,
+    /// LynShen: the gateway leaves it out of model pickers; still callable
+    /// by name (a helper, subagent or image model names it).
+    pub hidden: bool,
 }
 
 /// Input kinds a model entry may list in `input_modalities`.
@@ -1844,6 +1847,7 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
             group_windows: read_group_windows(model.get("group_context_windows")),
             reasoning,
             input_modalities: read_input_modalities(model.get("input_modalities")),
+            hidden: model.get("hidden").and_then(Value::as_bool).unwrap_or(false),
         });
     }
 
@@ -2038,6 +2042,9 @@ fn model_config_value(model: &ModelConfig) -> Value {
     }
     if let Some(kinds) = &model.input_modalities {
         value["input_modalities"] = json!(kinds);
+    }
+    if model.hidden {
+        value["hidden"] = json!(true);
     }
     value
 }
@@ -2263,6 +2270,7 @@ fn model_config_from_catalog(
         // settings at all ("none" is a 400 on some).
         reasoning: (!model.reasoning).then_some(false),
         input_modalities: None,
+        hidden: false,
     }
 }
 
@@ -2288,6 +2296,7 @@ pub fn provider_model_value(model: &ModelConfig) -> Value {
             .reasoning
             .unwrap_or_else(|| !is_thinking_disabled(&model.reasoning_efforts)),
         "reasoning_efforts": model.reasoning_efforts,
+        "hidden": model.hidden,
     })
 }
 
@@ -2309,6 +2318,7 @@ fn model_config_from_template(model: &llm_provider_kit::ModelTemplate) -> ModelC
         group_windows: BTreeMap::new(),
         reasoning: None,
         input_modalities: None,
+        hidden: false,
     }
 }
 
@@ -2484,6 +2494,7 @@ fn default_model_config(name: &str) -> ModelConfig {
             group_windows: BTreeMap::new(),
             reasoning: None,
             input_modalities: None,
+            hidden: false,
         })
 }
 
@@ -2868,6 +2879,7 @@ mod tests {
             group_windows: BTreeMap::new(),
             reasoning: None,
             input_modalities: None,
+            hidden: false,
         };
         let overrides = BTreeMap::from([("gpt-6-sol".to_string(), 2_000_000)]);
         // Raised toward, but never past, the largest account window.
@@ -2896,6 +2908,7 @@ mod tests {
             group_windows: BTreeMap::from([("g-big".to_string(), (1_050_000, 1_050_000))]),
             reasoning: None,
             input_modalities: None,
+            hidden: false,
         };
         // Saved and read back with its label and group windows.
         let read = read_model_configs(
@@ -2904,6 +2917,17 @@ mod tests {
         );
         assert_eq!(read[0].display_name.as_deref(), Some("GPT-6 Sol"));
         assert_eq!(read[0].group_windows, model.group_windows);
+        assert!(!read[0].hidden);
+        // The hidden flag survives config.json; entries saved without it
+        // (every older config) load as shown.
+        let hidden = ModelConfig {
+            hidden: true,
+            ..model.clone()
+        };
+        let saved = model_config_value(&hidden);
+        assert_eq!(saved["hidden"], json!(true));
+        assert!(model_config_value(&model).get("hidden").is_none());
+        assert!(read_model_configs(&json!({ "models": [saved] }), "lynshen")[0].hidden);
         // Pinned to the big group: its window. Unpinned or another group:
         // the range over all groups.
         let pinned = BTreeMap::from([("gpt-6-sol".to_string(), "g-big".to_string())]);
@@ -2948,6 +2972,7 @@ mod tests {
             group_windows: BTreeMap::new(),
             reasoning: None,
             input_modalities: None,
+            hidden: false,
         };
         // 1M non-cached input @2 + 1M cached @0.5 + 1M output @8 = 10.5
         let cost = model.cost_for(2_000_000, 1_000_000, 1_000_000);
@@ -3391,6 +3416,7 @@ mod tests {
                     group_windows: BTreeMap::new(),
                     reasoning: None,
                     input_modalities: None,
+                    hidden: false,
                 },
                 ModelConfig {
                     name: "compact-model".to_string(),
@@ -3405,6 +3431,7 @@ mod tests {
                     group_windows: BTreeMap::new(),
                     reasoning: None,
                     input_modalities: None,
+                    hidden: false,
                 },
             ],
             base_url: "https://api.openai.com/v1".to_string(),

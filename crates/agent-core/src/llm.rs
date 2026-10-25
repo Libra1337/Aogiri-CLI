@@ -5197,6 +5197,7 @@ mod tests {
             group_windows: BTreeMap::new(),
             reasoning: None,
             input_modalities: None,
+            hidden: false,
         }
     }
 
