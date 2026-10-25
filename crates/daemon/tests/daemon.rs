@@ -2194,6 +2194,19 @@ fn fake_claude() -> PathBuf {
     log
 }
 
+/// The fake engine's starts once there are at least `count` (an engine is
+/// named before its process has started).
+fn starts_after(log: &PathBuf, count: usize) -> Vec<Vec<String>> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let started = starts(log);
+        if started.len() >= count || Instant::now() > deadline {
+            return started;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn starts(log: &PathBuf) -> Vec<Vec<String>> {
     fs::read_to_string(log)
         .unwrap_or_default()
@@ -2643,7 +2656,7 @@ fn full_access_restarts_claude_on_the_same_conversation_and_reopening_resumes_it
     client.send(json!({ "op": "watch", "session": session }));
     let frames = client.until(|f| f["session"] == session.as_str() && f["type"] == "transcript");
     assert_eq!(
-        frames.last().unwrap()["items"],
+        without_uuids(&frames.last().unwrap()["items"]),
         json!([
             { "role": "user", "content": "first" },
             { "role": "assistant", "content": "ok: first" },
@@ -2683,7 +2696,25 @@ fn reopened_claude(daemon: &Daemon, dir: &PathBuf, options: &Value) -> (String, 
     assert_eq!(opened["type"], "session_opened", "{opened}");
     client.send(json!({ "op": "watch", "session": session }));
     let frames = client.until(|f| f["session"] == session.as_str() && f["type"] == "transcript");
-    (session, frames.last().unwrap()["items"].clone())
+    (session, without_uuids(&frames.last().unwrap()["items"]))
+}
+
+/// Transcript items without the uuid each replayed Claude reply carries
+/// (where a rewind or a fork resumes); every reply has one.
+fn without_uuids(items: &Value) -> Value {
+    json!(items
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            let mut item = item.clone();
+            if item["role"] == "assistant" {
+                assert!(item["uuid"].is_string(), "{item}");
+                item.as_object_mut().unwrap().remove("uuid");
+            }
+            item
+        })
+        .collect::<Vec<_>>())
 }
 
 /// The desktop may set `CLAUDE_CONFIG_DIR` for the engine only: the daemon
@@ -5147,6 +5178,7 @@ fn a_claude_fork_resumes_at_the_kept_turns_reply_as_a_new_conversation() {
         desktop.send(json!({ "op": "user_message", "session": original, "content": message }));
         desktop.until(turn_done(&original));
     }
+    let before = starts(&log).len();
     let created = request(
         &mut desktop,
         json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": { "approval_mode": "auto-edit", "fork_from": original, "fork_turns": 2 } }),
@@ -5158,7 +5190,7 @@ fn a_claude_fork_resumes_at_the_kept_turns_reply_as_a_new_conversation() {
     assert_ne!(fork, original);
     // Claude Code resumes the original at turn two's reply, as a new
     // conversation under the fork's id.
-    let args = starts(&log).last().unwrap().clone();
+    let args = starts_after(&log, before + 1).last().unwrap().clone();
     let at = args.iter().position(|a| a == "--resume").unwrap();
     assert_eq!(
         args[at..at + 5],
@@ -5189,12 +5221,13 @@ fn a_claude_fork_resumes_at_the_kept_turns_reply_as_a_new_conversation() {
     // Closed before its first turn (nothing saved), it is forked again.
     desktop.send(json!({ "op": "session_close", "session": fork }));
     desktop.until(|f| f["type"] == "session_closed" && f["session"] == fork.as_str());
+    let before = starts(&log).len();
     let reopened = request(
         &mut desktop,
         json!({ "op": "session_open", "session": fork }),
     );
     assert_eq!(reopened["type"], "session_opened", "{reopened}");
-    let args = starts(&log).last().unwrap().clone();
+    let args = starts_after(&log, before + 1).last().unwrap().clone();
     assert!(args.contains(&"--fork-session".to_string()), "{args:?}");
     desktop.until(is_ready(&fork));
     desktop.send(json!({ "op": "user_message", "session": fork, "content": "four" }));
@@ -5203,11 +5236,12 @@ fn a_claude_fork_resumes_at_the_kept_turns_reply_as_a_new_conversation() {
     // Saved now: a reopen resumes the fork itself.
     desktop.send(json!({ "op": "session_close", "session": fork }));
     desktop.until(|f| f["type"] == "session_closed" && f["session"] == fork.as_str());
+    let before = starts(&log).len();
     request(
         &mut desktop,
         json!({ "op": "session_open", "session": fork }),
     );
-    let args = starts(&log).last().unwrap().clone();
+    let args = starts_after(&log, before + 1).last().unwrap().clone();
     assert!(!args.contains(&"--fork-session".to_string()), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--resume", fork.as_str()]));
     assert_eq!(
@@ -5264,6 +5298,13 @@ fn a_codex_fork_forks_the_thread_through_the_kept_turn() {
     assert_eq!(
         user_texts(&watched_transcript(&mut desktop, &fork)),
         ["one", "two"]
+    );
+    // The original's thread is as it was (a reopen replays it).
+    desktop.send(json!({ "op": "session_close", "session": original }));
+    desktop.until(|f| f["type"] == "session_closed" && f["session"] == original.as_str());
+    request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": original }),
     );
     assert_eq!(
         user_texts(&watched_transcript(&mut desktop, &original)),
