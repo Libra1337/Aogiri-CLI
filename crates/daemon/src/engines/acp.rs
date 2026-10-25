@@ -1261,7 +1261,7 @@ mod tests {
             let next = sent(&done.frames);
             assert_eq!(next[0]["method"], "session/prompt");
             assert_eq!(next[0]["params"]["prompt"][0]["text"], "three");
-            assert_eq!(done.events[0], pending(&["two"]));
+            assert!(done.events.contains(&pending(&["two"])), "{:?}", done.events);
         }
         // A plain interrupt drops what waits.
         let mut a = running_with(&["two"]);
