@@ -506,6 +506,19 @@ For billing the local gateway charges a session's requests to its last turn
 until the next one opens, so background work after a turn ends is that
 turn's cost.
 
+A usage limit comes as `rate_limit`, never as a reply or an `error`:
+`level` (`ok`, `warning` or `limited`), `message` (the engine's words for
+the user, or empty), `resets_at` (ms), `window` (which limit:
+`five_hour`, `seven_day`, `seven_day_opus`, `overage`…, when known), `used`
+(percent of it, when known) and, from Claude Code, `overage` (extra usage
+is on). Claude Code sends one when its limits change; the "You've hit your
+limit" reply it makes up for a turn stopped by a limit is that turn's
+`limited` notice, with no `error` after it, and a reopened conversation
+leaves it out. Codex has no warning of its own: from 90% of its fullest
+plan window the notice is a `warning`, at 100% `limited`, and a turn that
+fails for usage ends with a `limited` notice. `plan_usage` (`plan`,
+`windows: [{key, used, resets_at, minutes}]`) comes with it.
+
 And sends more events: `background_tasks` (`tasks: [{id, kind,
 description}]`, the live set: replace yours), `task_progress` (`task_id`,
 `message`), `task_done` (`task_id`, `kind`, `status`, `summary`: a background
