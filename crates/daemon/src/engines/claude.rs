@@ -3566,34 +3566,34 @@ const CONVERSATION_LIMIT: u64 = 64 * 1024 * 1024;
 fn transcript_items(rows: impl Iterator<Item = Value>, images: &Path) -> Vec<Value> {
     let mut calls = HashMap::new();
     let mut items: Vec<Value> = rows
-    .filter(|row| !is_synthetic(row))
-    .flat_map(|row| {
-        // A user row's tool results come before any text it holds.
-        let mut items = tool_rows(&row, &mut calls);
-        items.extend(match text(&row["type"]) {
-            "user" => user_item(&row["message"]["content"], images),
-            // The usage-limit notice Claude Code saves as a reply is none.
-            "assistant" if row["error"] == "rate_limit" => None,
-            // Its uuid: where a rewind or a fork resumes the conversation.
-            "assistant" => row_text(&row).map(|content| {
-                let mut item = json!({ "role": "assistant", "content": content });
-                if let Some(uuid) = row["uuid"].as_str() {
-                    item["uuid"] = json!(uuid);
+        .filter(|row| !is_synthetic(row))
+        .flat_map(|row| {
+            // A user row's tool results come before any text it holds.
+            let mut items = tool_rows(&row, &mut calls);
+            items.extend(match text(&row["type"]) {
+                "user" => user_item(&row["message"]["content"], images),
+                // The usage-limit notice Claude Code saves as a reply is none.
+                "assistant" if row["error"] == "rate_limit" => None,
+                // Its uuid: where a rewind or a fork resumes the conversation.
+                "assistant" => row_text(&row).map(|content| {
+                    let mut item = json!({ "role": "assistant", "content": content });
+                    if let Some(uuid) = row["uuid"].as_str() {
+                        item["uuid"] = json!(uuid);
+                    }
+                    item
+                }),
+                "attachment" => queued_prompt(&row).and_then(|prompt| user_item(prompt, images)),
+                _ => None,
+            });
+            // When each was said or ran: the time its row was written.
+            if let Some(at) = row_time(&row) {
+                for item in &mut items {
+                    item["at"] = json!(at);
                 }
-                item
-            }),
-            "attachment" => queued_prompt(&row).and_then(|prompt| user_item(prompt, images)),
-            _ => None,
-        });
-        // When each was said or ran: the time its row was written.
-        if let Some(at) = row_time(&row) {
-            for item in &mut items {
-                item["at"] = json!(at);
             }
-        }
-        items
-    })
-    .collect();
+            items
+        })
+        .collect();
     let excess = items.len().saturating_sub(500);
     items.drain(..excess);
     items
@@ -5623,7 +5623,13 @@ mod tests {
         let at = args.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(
             args[at..at + 5],
-            ["--resume", "orig", "--fork-session", "--session-id", "new-id"]
+            [
+                "--resume",
+                "orig",
+                "--fork-session",
+                "--session-id",
+                "new-id"
+            ]
         );
         assert!(args.windows(2).any(|w| w == ["--resume-session-at", "u-9"]));
         assert!(!args.contains(&"--no-session-persistence".to_string()));
@@ -5646,9 +5652,7 @@ mod tests {
         let cwd = Path::new("/work/fork");
         let dir = home.join("projects/-work-fork");
         fs::create_dir_all(&dir).unwrap();
-        let row = |kind: &str, uuid: &str, parent: Option<&str>, content: Value| {
-            json!({ "type": kind, "uuid": uuid, "parentUuid": parent, "message": { "content": content } })
-        };
+        let row = |kind: &str, uuid: &str, parent: Option<&str>, content: Value| json!({ "type": kind, "uuid": uuid, "parentUuid": parent, "message": { "content": content } });
         let reply = |text: &str| json!([{ "type": "text", "text": text }]);
         // Turn three was rewound away; "again" went on from reply two.
         fs::write(
@@ -5693,7 +5697,10 @@ mod tests {
             users(fork_transcript(&path, Some("a2"), &home)),
             ["one", "two"]
         );
-        assert_eq!(users(fork_transcript(&path, None, &home)), ["one", "two", "again"]);
+        assert_eq!(
+            users(fork_transcript(&path, None, &home)),
+            ["one", "two", "again"]
+        );
         // Replies carry their uuid, where a rewind or a fork resumes.
         let items = fork_transcript(&path, Some("a1"), &home);
         assert_eq!(items.last().unwrap()["uuid"], "a1");

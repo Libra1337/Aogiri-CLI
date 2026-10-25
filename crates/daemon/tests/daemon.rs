@@ -5170,7 +5170,12 @@ fn a_claude_fork_resumes_at_the_kept_turns_reply_as_a_new_conversation() {
             fork.as_str()
         ]
     );
-    let point = args[args.iter().position(|a| a == "--resume-session-at").unwrap() + 1].clone();
+    let point = args[args
+        .iter()
+        .position(|a| a == "--resume-session-at")
+        .unwrap()
+        + 1]
+    .clone();
     // Until its first turn it shows the copied turns.
     let items = watched_transcript(&mut desktop, &fork);
     assert_eq!(user_texts(&items), ["one", "two"]);
@@ -5184,7 +5189,10 @@ fn a_claude_fork_resumes_at_the_kept_turns_reply_as_a_new_conversation() {
     // Closed before its first turn (nothing saved), it is forked again.
     desktop.send(json!({ "op": "session_close", "session": fork }));
     desktop.until(|f| f["type"] == "session_closed" && f["session"] == fork.as_str());
-    let reopened = request(&mut desktop, json!({ "op": "session_open", "session": fork }));
+    let reopened = request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": fork }),
+    );
     assert_eq!(reopened["type"], "session_opened", "{reopened}");
     let args = starts(&log).last().unwrap().clone();
     assert!(args.contains(&"--fork-session".to_string()), "{args:?}");
@@ -5195,7 +5203,10 @@ fn a_claude_fork_resumes_at_the_kept_turns_reply_as_a_new_conversation() {
     // Saved now: a reopen resumes the fork itself.
     desktop.send(json!({ "op": "session_close", "session": fork }));
     desktop.until(|f| f["type"] == "session_closed" && f["session"] == fork.as_str());
-    request(&mut desktop, json!({ "op": "session_open", "session": fork }));
+    request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": fork }),
+    );
     let args = starts(&log).last().unwrap().clone();
     assert!(!args.contains(&"--fork-session".to_string()), "{args:?}");
     assert!(args.windows(2).any(|w| w == ["--resume", fork.as_str()]));
@@ -5206,7 +5217,10 @@ fn a_claude_fork_resumes_at_the_kept_turns_reply_as_a_new_conversation() {
     // The original is as it was.
     desktop.send(json!({ "op": "session_close", "session": original }));
     desktop.until(|f| f["type"] == "session_closed" && f["session"] == original.as_str());
-    request(&mut desktop, json!({ "op": "session_open", "session": original }));
+    request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": original }),
+    );
     assert_eq!(
         user_texts(&watched_transcript(&mut desktop, &original)),
         ["one", "two", "three"]
@@ -5256,7 +5270,10 @@ fn a_codex_fork_forks_the_thread_through_the_kept_turn() {
         ["one", "two", "three"]
     );
     let list = request(&mut desktop, json!({ "op": "session_list" }));
-    assert_eq!(listed(&list, &fork)["forked_from"]["session"], original.as_str());
+    assert_eq!(
+        listed(&list, &fork)["forked_from"]["session"],
+        original.as_str()
+    );
     assert!(fs::read_to_string(&log).unwrap().lines().count() >= 2);
 }
 
@@ -5284,7 +5301,10 @@ fn an_engine_probe_reports_models_and_commands_and_is_cached() {
     assert!(kinds.contains(&"model_view"), "{probed}");
     assert!(kinds.contains(&"command_list"), "{probed}");
     let args = starts(&log).last().unwrap().clone();
-    assert!(args.contains(&"--no-session-persistence".to_string()), "{args:?}");
+    assert!(
+        args.contains(&"--no-session-persistence".to_string()),
+        "{args:?}"
+    );
     // It is no session: none listed, nothing saved.
     let list = request(&mut desktop, json!({ "op": "session_list" }));
     assert!(
@@ -5311,6 +5331,9 @@ fn an_engine_probe_reports_models_and_commands_and_is_cached() {
     assert_eq!(forced["cached"], false);
     assert_eq!(starts(&log).len(), before + 2);
     // The LynShen engine needs none.
-    let refused = request(&mut desktop, json!({ "op": "engine_probe", "engine": "lynshen" }));
+    let refused = request(
+        &mut desktop,
+        json!({ "op": "engine_probe", "engine": "lynshen" }),
+    );
     assert_eq!(refused["type"], "error", "{refused}");
 }

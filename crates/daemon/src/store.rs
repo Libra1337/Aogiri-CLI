@@ -1647,7 +1647,14 @@ mod tests {
         let dir = store.dir.clone();
         for (id, engine) in [("f", "claude"), ("a", "acp")] {
             store
-                .record_engine_session(id, std::path::Path::new("/p"), None, Some(engine), false, None)
+                .record_engine_session(
+                    id,
+                    std::path::Path::new("/p"),
+                    None,
+                    Some(engine),
+                    false,
+                    None,
+                )
                 .unwrap();
         }
         let source = json!({ "session": "orig", "turns": 2, "at": "u-1" });
@@ -1655,19 +1662,32 @@ mod tests {
             .record_session_meta("f", &json!({ "forked_from": source }))
             .unwrap());
         store
-            .record_session_meta("a", &json!({ "conversation": "ses_1", "acp_agent": { "id": "x", "name": "X" } }))
+            .record_session_meta(
+                "a",
+                &json!({ "conversation": "ses_1", "acp_agent": { "id": "x", "name": "X" } }),
+            )
             .unwrap();
         // Closing and reopening adds lines the compaction folds away.
         store.record_session_closed("f").unwrap();
         store
-            .record_engine_session("f", std::path::Path::new("/p"), None, Some("claude"), false, None)
+            .record_engine_session(
+                "f",
+                std::path::Path::new("/p"),
+                None,
+                Some("claude"),
+                false,
+                None,
+            )
             .unwrap();
         drop(store);
         let reopened = reopen(dir).unwrap();
         let sessions = reopened.sessions();
         assert_eq!(sessions[0].forked_from, Some(source));
         assert_eq!(sessions[1].conversation.as_deref(), Some("ses_1"));
-        assert_eq!(sessions[1].acp_agent, Some(json!({ "id": "x", "name": "X" })));
+        assert_eq!(
+            sessions[1].acp_agent,
+            Some(json!({ "id": "x", "name": "X" }))
+        );
     }
 
     #[test]

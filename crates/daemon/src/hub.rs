@@ -741,10 +741,15 @@ impl Hub {
                 )
             }
             Some(engines::Kind::Claude) => {
-                let source_cwd = options.fork_cwd.clone().unwrap_or_else(|| cwd.to_path_buf());
+                let source_cwd = options
+                    .fork_cwd
+                    .clone()
+                    .unwrap_or_else(|| cwd.to_path_buf());
                 let config = engines::claude::config_with(options, &source_cwd, from);
                 let path = engines::claude::find_conversation(&config, &source_cwd, from)
-                    .ok_or_else(|| format!("cannot fork {from}: no saved Claude Code conversation"))?;
+                    .ok_or_else(|| {
+                        format!("cannot fork {from}: no saved Claude Code conversation")
+                    })?;
                 if options.resume_at.is_none() {
                     if let Some(turns) = options.fork_turns {
                         options.resume_at = engines::claude::fork_point(&path, turns)
@@ -759,7 +764,8 @@ impl Hub {
             }
             Some(engines::Kind::Codex) | None => {}
         }
-        let source = json!({ "session": from, "turns": options.fork_turns, "at": options.resume_at });
+        let source =
+            json!({ "session": from, "turns": options.fork_turns, "at": options.resume_at });
         Ok((Some(source), seed))
     }
 
