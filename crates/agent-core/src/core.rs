@@ -883,13 +883,22 @@ impl AgentCore {
         self.queued.iter().map(|(text, _)| text.clone()).collect()
     }
 
+    /// The queued texts as a client sees them in `pending_messages`
+    /// (without attached-file lines), for finding the one an op picks.
+    fn queue_texts(&self) -> Vec<String> {
+        self.queued
+            .iter()
+            .map(|(text, _)| crate::attachments::split_files(text).0)
+            .collect()
+    }
+
     /// Takes a queued message back before it runs (`QueuePick`); with
     /// `discard` it is dropped instead of going back to the client's box.
     /// The updated queue comes back either way, so the client shows what is
     /// really waiting.
     pub fn unqueue(&mut self, pick: &QueuePick, discard: bool) -> Vec<AgentEvent> {
         let taken = pick
-            .find(&self.pending_texts())
+            .find(&self.queue_texts())
             .and_then(|at| self.queued.remove(at));
         let mut events = vec![AgentEvent::PendingMessages(self.pending_texts())];
         // Only a message really taken back goes back to the client's box: one
@@ -905,7 +914,7 @@ impl AgentCore {
 
     /// Queued message `pick` moves to place `to` (negative from the last).
     pub fn queue_move(&mut self, pick: &QueuePick, to: Option<i64>) -> Vec<AgentEvent> {
-        let Some((from, to)) = queue_move_target(pick, to, &self.pending_texts()) else {
+        let Some((from, to)) = queue_move_target(pick, to, &self.queue_texts()) else {
             return Vec::new();
         };
         if let Some(item) = self.queued.remove(from) {
@@ -925,7 +934,7 @@ impl AgentCore {
         if !self.running {
             return Vec::new();
         }
-        let Some(at) = pick.find(&self.pending_texts()) else {
+        let Some(at) = pick.find(&self.queue_texts()) else {
             return Vec::new();
         };
         if let Some(chosen) = self.queued.remove(at) {
@@ -955,7 +964,7 @@ impl AgentCore {
         if !self.running {
             return Vec::new();
         }
-        let Some(at) = pick.find(&self.pending_texts()) else {
+        let Some(at) = pick.find(&self.queue_texts()) else {
             return Vec::new();
         };
         if let Some(chosen) = self.queued.remove(at) {
