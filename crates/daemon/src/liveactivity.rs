@@ -535,9 +535,10 @@ impl LiveActivities {
             {
                 return Vec::new();
             }
-            let lines = state.lines.iter().map(|(id, line)| (id, line));
             let ended = state.ended.iter().map(|(id, line, _)| (id, line));
-            lines
+            state
+                .lines
+                .iter()
                 .chain(ended)
                 .filter(|(_, line)| line.title.is_none())
                 .map(|(id, _)| id.clone())
