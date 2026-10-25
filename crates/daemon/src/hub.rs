@@ -685,12 +685,29 @@ impl Hub {
         }
         // Where a fork comes from, kept with it: the list names it, and a
         // Claude fork closed before its first turn is made again from it.
+        // A fork starts with its source's title (the daemon's own, which the
+        // title model may refine), not one from its next message.
+        let mut untitled = true;
         if let Some(source) = forked {
             self.store
                 .record_session_meta(&id, &json!({ "forked_from": source }))
                 .map_err(|error| error.to_string())?;
+            let title = self
+                .store
+                .sessions()
+                .into_iter()
+                .find(|record| Some(record.id.as_str()) == source["session"].as_str())
+                .and_then(|record| shown_title(&record, None));
+            if let Some(title) = title {
+                untitled = false;
+                self.store
+                    .record_session_meta(&id, &json!({ "title": title, "title_auto": true }))
+                    .map_err(|error| error.to_string())?;
+            }
         }
-        lock(&self.untitled).insert(id.clone());
+        if untitled {
+            lock(&self.untitled).insert(id.clone());
+        }
         self.host(id.clone(), ops, cwd, generation);
         self.set_hook_stopper(&id, hook_stopper);
         self.broadcast(&self.agents_json());

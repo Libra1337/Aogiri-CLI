@@ -72,6 +72,13 @@ impl Client {
         let mut client = Self { socket };
         let hello = client.until(|frame| frame["type"] == "hello");
         assert_eq!(hello.last().unwrap()["protocol"], 2);
+        let features = &hello.last().unwrap()["features"];
+        for feature in ["queue", "files", "fork", "engine_probe"] {
+            assert!(
+                features.as_array().unwrap().contains(&json!(feature)),
+                "{features}"
+            );
+        }
         client
     }
 

@@ -247,8 +247,14 @@ fn pump(
     link: &mut impl Link,
     inbox: &hub::Inbox,
 ) -> Result<(), String> {
+    // The daemon also forks conversations and probes engines (B08); a
+    // client checks for them before it offers either.
+    let mut hello = protocol::hello_json(hub.version);
+    if let Some(features) = hello["features"].as_array_mut() {
+        features.extend([json!("fork"), json!("engine_probe")]);
+    }
     for frame in [
-        protocol::hello_json(hub.version),
+        hello,
         hub.sessions_json(),
         projects::workspaces_json(hub),
         hub.agents_json(),

@@ -1117,14 +1117,10 @@ impl Session<'_> {
             json!({ "type": "background_tasks", "tasks": [] }),
             json!({ "type": "pending_messages", "messages": [] }),
         ]);
-        // What the process runs as now (a restart changes it). A fork is made
-        // once: a restart goes on with the forked conversation.
-        let mut current = Options {
-            fork_from: None,
-            fork_turns: None,
-            fork_cwd: None,
-            ..options.clone()
-        };
+        // What the process runs as now (a restart changes it). A fork's
+        // fields stay until it is saved: the engine only forks while it has
+        // no conversation of its own (`claude::command`, `Codex::new`).
+        let mut current = options.clone();
         // Session tools answer from their own threads (they may wait).
         let (answers_tx, answers) = mpsc::channel::<Answer>();
         self.app_answers = Some(answers_tx);
@@ -1366,6 +1362,15 @@ impl Session<'_> {
             self.refuse(request, "the conversation has not started yet".to_string());
             return None;
         };
+        // Claude Code writes a fork with its first turn; its TUI would start
+        // the conversation empty.
+        if self.kind == Kind::Claude && options.fork_from.is_some() && !self.saved(&id, options) {
+            self.refuse(
+                request,
+                "send the fork its first message before opening it in its terminal".to_string(),
+            );
+            return None;
+        }
         match tui_command(self.kind, &id, options, &self.cwd, self.saved(&id, options)) {
             Ok(start) => Some((id, start.command, start.key)),
             Err(error) => {
