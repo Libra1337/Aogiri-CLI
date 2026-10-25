@@ -187,6 +187,54 @@ answer an approval from the notification (`call_id` for `approve`,
   `SENDER_ID_MISMATCH` or `404`. The reply text names the provider's status
   and reason code. `501` when that provider is not configured.
 
+### Live Activity push (APNs)
+
+The Aogiri app shows one Live Activity per computer in the Dynamic Island
+(`ComputerActivityAttributes`). A daemon starts, updates and ends it with
+the same signed `POST /relay/v1/push`, with an APNs Live Activity token in
+`subscription` and a `liveactivity` object instead of `payload`:
+
+```
+{"pub","ts","nonce","ttl"?,
+ "subscription":{"provider":"apns","token":"<hex>","environment":"production"|"sandbox"},
+ "liveactivity":{"event":"start"|"update"|"end","content_state":{…},
+   "stale_date"?,"dismissal_date"?,"relevance_score"?,"timestamp"?,
+   "attributes_type"?,"attributes"?,"alert"?:{"title","body"}}}
+```
+
+- `token`: a push-to-start token (`start`) or an activity's push token
+  (`update`, `end`), hex, 32-512 characters (current iOS gives 128 bytes).
+- `content_state`: exactly the ContentState fields, all present:
+  `phase` (`waiting`, `running`, `done`, `failed`), `title`, `detail`,
+  `session` (an id, may be empty), `sessionTitle`, `ember` (`calm`,
+  `thinking`, `done`, `attention`) strings of at most 200 characters;
+  `tasks`, `waiting`, `done`, `total` counts (integers 0-100000); `since`
+  (seconds since 1970, a number). Another field, or a field of another type,
+  is refused. As for native notices, the daemon puts no command, path or
+  reply in it.
+- `stale_date`, `dismissal_date` (`end` only), `timestamp`: Unix seconds.
+  `timestamp` defaults to now and must be within the last hour (and not
+  ahead by more than 5 minutes); the dates within 12 hours before and
+  12 hours (`dismissal_date`: 4 hours) after now.
+- `relevance_score`: 0-100.
+- `attributes_type` and `attributes` for `start` only: `attributes_type`
+  must be `ComputerActivityAttributes`, `attributes` exactly
+  `{"host":<id>,"hostName":<at most 64 characters>}`.
+- `alert` (`title` at most 80 characters, `body` 200) only for `start` or
+  `update` with `phase` `waiting`.
+
+The relay sends `POST /3/device/<token>` with `apns-push-type: liveactivity`,
+`apns-topic` the app topic plus `.push-type.liveactivity`
+(`com.lynshen.aogiri.push-type.liveactivity`), `apns-priority` 10 for
+`start`, `end` and an update with `phase` `waiting`, `done` or `failed` (or
+an alert), 5 for a plain step update, and `apns-expiration` now + `ttl`
+(default 600 s, at most 3600). Body:
+`{"aps":{"timestamp","event","content-state","stale-date"?,"dismissal-date"?,"relevance-score"?,"attributes-type"?,"attributes"?,"alert"?}}`,
+at most 4096 bytes (else `413`). Replies as for native push (`410`: forget
+the token). `liveactivity` with any other provider or with a browser
+subscription is `400`; without APNs configured, `501`. The relay keeps
+nothing.
+
 Credentials stay on the relay's server in root-only files, passed in by
 systemd like the VAPID key: `LoadCredential=apns:/etc/lynshen-relay/apns.p8`
 (the `.p8` key from Apple, with `-apns-key-id` and `-apns-team-id` or
