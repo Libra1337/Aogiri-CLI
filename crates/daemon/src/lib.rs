@@ -34,6 +34,7 @@ mod store;
 mod styles;
 mod terminal;
 mod titles;
+mod tool_providers;
 mod uploads;
 mod usage;
 mod webpush;
@@ -247,11 +248,18 @@ fn pump(
     link: &mut impl Link,
     inbox: &hub::Inbox,
 ) -> Result<(), String> {
-    // The daemon also forks conversations and probes engines (B08); a
-    // client checks for them before it offers either.
+    // The daemon also forks conversations and probes engines (B08), runs
+    // custom providers, built-in ACP agents and session terminals any client
+    // attaches to (B10); a client checks for them before it offers any.
     let mut hello = protocol::hello_json(hub.version);
     if let Some(features) = hello["features"].as_array_mut() {
-        features.extend([json!("fork"), json!("engine_probe")]);
+        features.extend([
+            json!("fork"),
+            json!("engine_probe"),
+            json!("tool_providers"),
+            json!("acp_presets"),
+            json!("term_attach"),
+        ]);
     }
     for frame in [
         hello,
@@ -384,6 +392,34 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     // What every session is given is the desktop's setting.
     if name == "app_tools_set" && !hub.is_local(client) {
         reply(json!({ "type": "error", "message": "only the desktop can change the app tools" }));
+        return;
+    }
+    // Custom providers for Claude Code and Codex: where their sessions'
+    // requests go and with which key. Only the desktop manages them; the
+    // model list waits on the provider's API.
+    if matches!(
+        name,
+        "tool_providers"
+            | "tool_provider_save"
+            | "tool_provider_remove"
+            | "tool_provider_select"
+            | "tool_provider_models"
+    ) {
+        if !hub.is_local(client) {
+            reply(
+                json!({ "type": "error", "message": "only the desktop can manage custom providers" }),
+            );
+            return;
+        }
+        let hub = Arc::clone(hub);
+        let name = name.to_string();
+        thread::spawn(move || {
+            let result = match name.as_str() {
+                "tool_provider_models" => tool_providers::models(&hub.store, &op),
+                _ => tool_providers::handle(&hub.store, &op),
+            };
+            respond(&hub, client, &request, result);
+        });
         return;
     }
     // An MCP server is a command to run or a place to send credentials.
@@ -540,33 +576,87 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     // Input is written in the order it arrives, so these stay on this thread.
     if matches!(
         name,
-        "term_open" | "term_input" | "term_resize" | "term_close"
+        "term_open"
+            | "term_attach"
+            | "term_detach"
+            | "term_input"
+            | "term_resize"
+            | "term_ack"
+            | "term_close"
     ) {
+        // A device without the terminal scope only looks: its window does
+        // not resize the session's TUI.
+        let mut op = op.clone();
+        if name == "term_attach" {
+            if let Some(device) = hub.device_of(client) {
+                if scopes::check(hub, &device, "term_resize", &op).is_err() {
+                    if let Some(fields) = op.as_object_mut() {
+                        fields.remove("cols");
+                        fields.remove("rows");
+                    }
+                }
+            }
+        }
         let result = terminal::handle(hub, client, name, &op);
         respond(hub, client, &request, result);
         return;
     }
-    // A program to run (an ACP agent, an engine binary, its environment):
-    // only the desktop names one.
+    // A program to run (an ACP agent's command line, an engine binary, its
+    // environment): only the desktop names one. A built-in ACP agent
+    // (`options.agent`) is the daemon's own, so a phone may start it too.
     if matches!(name, "session_create" | "session_open" | "engine_probe") {
         let options = engines::Options::from_json(&op["options"]);
         let acp = op["engine"] == "acp";
-        if (acp || options.runs_programs()) && !hub.is_local(client) {
+        if options.runs_programs() && !hub.is_local(client) {
             reply(
                 json!({ "type": "error", "message": "only the desktop can choose what an engine runs" }),
             );
             return;
         }
-        let checked = options
-            .check_env()
-            .and_then(|()| match acp && options.command.is_none() {
-                true => Err("an ACP session needs options.command".to_string()),
-                false => Ok(()),
-            });
+        let checked = options.check_env().and_then(|()| match acp {
+            true if name == "session_create"
+                && options.command.is_none()
+                && options.agent.is_none() =>
+            {
+                Err("an ACP session needs options.agent or options.command".to_string())
+            }
+            true => engines::acp::preset(&options).map(|_| ()),
+            false => Ok(()),
+        });
         if let Err(message) = checked {
             reply(json!({ "type": "error", "message": message }));
             return;
         }
+        // Pi asks nothing before running tools: a phone starts it only with
+        // the scope 全自动 needs.
+        let never_asks = acp
+            && options
+                .agent
+                .as_deref()
+                .and_then(engines::acp_presets::find)
+                .is_some_and(|preset| !preset.approvals);
+        if never_asks {
+            if let Some(device) = hub.device_of(client) {
+                let full = json!({ "mode": "full-access" });
+                if let Err(message) = scopes::check(hub, &device, "set_approval_mode", &full) {
+                    reply(json!({ "type": "error", "message": message }));
+                    return;
+                }
+            }
+        }
+    }
+    // Each built-in ACP agent's version is asked of the agent (seconds).
+    if name == "acp_presets" {
+        let hub = Arc::clone(hub);
+        thread::spawn(move || {
+            respond(
+                &hub,
+                client,
+                &request,
+                Ok(engines::acp_presets::presets_json()),
+            )
+        });
+        return;
     }
     // What an engine says of itself before any conversation (its models,
     // commands, options), from a run of it that no list shows. It takes
@@ -583,7 +673,7 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         thread::spawn(move || {
             let result = engines::Kind::parse(&engine).and_then(|kind| match kind {
                 _ if !cwd.is_dir() => Err(format!("not a directory: {}", cwd.display())),
-                Some(kind) => engines::probe_cached(kind, &cwd, &options, force).map(
+                Some(kind) => engines::probe_cached(&hub.store, kind, &cwd, &options, force).map(
                     |(events, at, cached)| {
                         json!({ "type": "engine_probed", "engine": kind.name(), "events": events, "at": at, "cached": cached })
                     },
@@ -1003,8 +1093,9 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 json!({ "type": "mcp_saved" })
             })
         }
-        // The session's engine stops and its own TUI runs on a terminal for
-        // this client; the engine resumes when the TUI exits.
+        // The session's engine stops and its own TUI runs on a terminal
+        // that belongs to the session: this client views it first, others
+        // attach (`term_attach`); the engine resumes when the TUI exits.
         ("session_tui", Some(session)) => hub
             .forward(
                 &session,

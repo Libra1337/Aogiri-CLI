@@ -390,6 +390,7 @@ mod tests {
             conversation: None,
             acp_agent: None,
             forked_from: None,
+            tool_provider: None,
         }
     }
 

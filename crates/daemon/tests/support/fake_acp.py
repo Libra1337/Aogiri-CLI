@@ -83,6 +83,23 @@ def agents():
 def unknown_method(msg):
     out({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "Method not found"}})
 
+# Run as `omp` (tests/support/fake_omp.sh starts it with `acp ...`), it plays
+# oh-my-pi: its config options (model, effort, a boolean), a sign-in it needs
+# until `authenticate` ($FAKE_ACP_AUTH set), the MCP servers it was given
+# (named in its reply), form elicitations ("form" in a prompt) and its
+# approval mode from --approval-mode.
+OMP = "--approval-mode" in sys.argv
+AUTH = os.environ.get("FAKE_ACP_AUTH")
+signed_in = [not AUTH]
+omp_config = [
+    {"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "lynshen/one",
+     "options": [{"value": "lynshen/one", "name": "One"}, {"value": "lynshen/two", "name": "Two"}]},
+    {"id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "currentValue": "auto",
+     "options": [{"value": "low", "name": "Low"}, {"value": "auto", "name": "Auto"}, {"value": "high", "name": "High"}]},
+    {"id": "compact", "name": "Auto compact", "type": "boolean", "currentValue": True},
+]
+mcp_names = []
+
 if OPENCODE and STORE and sys.argv[1:2] == ["acp"]:
     with open(os.path.join(STORE, "opencode-config.json"), "w") as f:
         f.write(os.environ.get("OPENCODE_CONFIG_CONTENT", "{}"))
@@ -95,8 +112,27 @@ while True:
     if msg is None:
         break
     method = msg.get("method")
+    if OMP and method in ("session/new", "session/load", "session/resume") and not signed_in[0]:
+        out({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32000, "message": "Authentication required"}})
+        continue
+    if OMP and method in ("session/new", "session/load", "session/resume"):
+        mcp_names = [m.get("name") for m in msg["params"].get("mcpServers", [])]
+    if method == "authenticate":
+        signed_in[0] = True
+        out({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+        continue
+    if OMP and method == "session/set_config_option":
+        for option in omp_config:
+            if option["id"] == msg["params"]["configId"]:
+                option["currentValue"] = msg["params"]["value"]
+        out({"jsonrpc": "2.0", "id": msg["id"], "result": {"configOptions": omp_config}})
+        continue
     if method == "initialize":
         result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": bool(STORE)}}
+        if OMP:
+            result["agentInfo"] = {"name": "omp", "title": "oh-my-pi", "version": "18.1.21"}
+            result["authMethods"] = [{"id": "agent", "name": "omp login", "description": "Run omp login"}]
+            result["agentCapabilities"]["mcpCapabilities"] = {"http": False}
         if STORE:
             result["agentCapabilities"]["sessionCapabilities"] = {"fork": {}, "resume": {}}
         if OPENCODE:
@@ -105,7 +141,10 @@ while True:
     elif method == "session/new":
         if STORE:
             save(session, [])
-        out({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": session}})
+        result = {"sessionId": session}
+        if OMP:
+            result["configOptions"] = omp_config
+        out({"jsonrpc": "2.0", "id": msg["id"], "result": result})
     elif method in ("session/load", "session/resume"):
         turns = history(msg["params"]["sessionId"]) if STORE else None
         if turns is None:
@@ -114,7 +153,7 @@ while True:
         session = msg["params"]["sessionId"]
         if method == "session/load":
             replay(session, turns)
-        out({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+        out({"jsonrpc": "2.0", "id": msg["id"], "result": {"configOptions": omp_config} if OMP else {}})
     elif method == "session/fork":
         turns = history(msg["params"]["sessionId"]) if STORE else None
         if turns is None:
@@ -152,12 +191,28 @@ while True:
             out({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session, "update": {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "ls", "kind": "execute", "status": status}}})
         if "edit" in text:
             text += " (edited)" if ask("edit", "a.txt") else " (not edited)"
+        if "form" in text:
+            out({"jsonrpc": "2.0", "id": 60, "method": "elicitation/create", "params": {"sessionId": session, "mode": "form",
+                 "message": "Allow tool: write\nFile: b.txt",
+                 "requestedSchema": {"type": "object", "properties": {"value": {"type": "string", "enum": ["Approve", "Deny"]}}}}})
+            while True:
+                answer = read()
+                if answer is None:
+                    sys.exit(0)
+                if answer.get("id") == 60:
+                    break
+            result = answer["result"]
+            text += " form=%s:%s" % (result.get("action"), (result.get("content") or {}).get("value"))
         if STORE:
             turns = history(session) or []
             reply = "ok: %s #%d" % (text, len(turns) + 1)
             save(session, turns + [[text, reply]])
         else:
             reply = "ok: %s %s %s" % (text, " ".join(sys.argv[1:]), os.environ.get("FAKE_ACP_GREETING", ""))
+        if OMP:
+            approval = sys.argv[sys.argv.index("--approval-mode") + 1]
+            model = [o["currentValue"] for o in omp_config if o["id"] == "model"][0]
+            reply += " omp=%s model=%s mcp=%s" % (approval, model, ",".join(mcp_names))
         if OPENCODE:
             reply += " mode=%s rm=%s" % (mode, rm_rule())
             if any((b.get("annotations") or {}).get("audience") == ["assistant"] for b in msg["params"]["prompt"]):

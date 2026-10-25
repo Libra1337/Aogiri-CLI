@@ -151,6 +151,32 @@ pub fn lynshen_logout() -> Result<(), String> {
     oauth::logout(&config.lynshen_api_url, config.encrypt_secrets)
 }
 
+/// The API key of `tool`'s custom provider `id` (the daemon's
+/// `tool_providers`), from auth.json's `tool_providers` block, decrypted.
+pub fn tool_provider_key(tool: &str, id: &str) -> Option<String> {
+    let encrypt = config::Config::load_existing()
+        .map(|config| config.encrypt_secrets)
+        .unwrap_or(false);
+    let auth = config::AuthStore::load_or_create(encrypt).ok()?;
+    auth.tool_key(tool, id)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+}
+
+/// Saves (`Some`) or removes (`None`) that key, encrypted as the rest of
+/// auth.json is (`docs/secrets.md`). Holds the lock logins hold, so a token
+/// refresh in another process does not write over it.
+pub fn set_tool_provider_key(tool: &str, id: &str, key: Option<&str>) -> Result<(), String> {
+    let encrypt = config::Config::load_existing()
+        .map(|config| config.encrypt_secrets)
+        .unwrap_or(false);
+    let _lock = oauth::lock_auth_refresh()?;
+    let mut auth = config::AuthStore::load_or_create(encrypt).map_err(|e| e.to_string())?;
+    auth.set_tool_key(tool, id, key.map(str::to_string));
+    auth.save().map_err(|error| error.to_string())
+}
+
 /// A daemon secret (a chat bot's token) as it is saved: a `jcenc1:` envelope
 /// when config.json's `encrypt_secrets` is on and a secret key exists, else
 /// the plaintext (`docs/secrets.md`).
@@ -188,6 +214,34 @@ fn gateway_credentials(config: config::Config) -> Result<(String, String, u64), 
         tokens.access_token.clone(),
         tokens.access_expires_at,
     ))
+}
+
+/// The user's enabled MCP servers as an ACP agent takes them with each
+/// session (`mcpServers`): stdio ones with their command, http ones with
+/// their URL. Servers that sign in with OAuth stay out (their tokens are
+/// this engine's, refreshed here).
+pub fn acp_mcp_servers() -> Vec<serde_json::Value> {
+    let Ok(config) = config::Config::load_existing() else {
+        return Vec::new();
+    };
+    let pairs = |map: &std::collections::BTreeMap<String, String>| {
+        map.iter()
+            .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+            .collect::<Vec<_>>()
+    };
+    config
+        .mcp_servers
+        .iter()
+        .filter(|server| server.enabled && server.oauth.is_none())
+        .map(|server| match server.transport {
+            config::McpTransportKind::Stdio => serde_json::json!({
+                "name": server.name, "command": server.command, "args": server.args, "env": pairs(&server.env),
+            }),
+            config::McpTransportKind::Http => serde_json::json!({
+                "type": "http", "name": server.name, "url": server.url, "headers": pairs(&server.headers),
+            }),
+        })
+        .collect()
 }
 
 /// Saves an MCP server change to config.json: `mcp_set` (`server`, a config
