@@ -574,11 +574,12 @@ impl Hub {
                         .map_err(|error| error.to_string())?
                         .iter()
                         .any(|summary| summary.id == id),
-                    Some(engines::Kind::Claude) => {
-                        engines::claude::saved(&engines::claude::config_with(&options, &cwd, id), &cwd)
-                            .iter()
-                            .any(|(saved, _, _)| saved == id)
-                    }
+                    Some(engines::Kind::Claude) => engines::claude::saved(
+                        &engines::claude::config_with(&options, &cwd, id),
+                        &cwd,
+                    )
+                    .iter()
+                    .any(|(saved, _, _)| saved == id),
                     Some(engines::Kind::Codex) => engines::codex::saved(&cwd)
                         .iter()
                         .any(|(saved, _, _)| saved == id),

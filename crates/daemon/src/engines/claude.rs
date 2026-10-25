@@ -2604,7 +2604,9 @@ impl Adapter for Claude {
             )],
             "mcp_list" => vec![self.control_request(json!({ "subtype": "mcp_status" }), "")],
             // What the context holds, by kind (Claude Code's /context).
-            "context_usage" => vec![self.control_request(json!({ "subtype": "get_context_usage" }), "")],
+            "context_usage" => {
+                vec![self.control_request(json!({ "subtype": "get_context_usage" }), "")]
+            }
             "mcp_toggle" | "mcp_reconnect" => {
                 let request = if op["op"] == "mcp_toggle" {
                     json!({ "subtype": "mcp_toggle", "serverName": op["name"], "enabled": op["enabled"] == true })
@@ -2628,15 +2630,18 @@ impl Adapter for Claude {
             "subagent_transcript" => {
                 let id = text(&op["agent_id"]);
                 let event = match runs::transcript(&self.session_dir(), id) {
-                    Ok(items) => json!({ "type": "subagent_transcript", "agent_id": id, "items": items }),
-                    Err(error) => json!({ "type": "subagent_transcript", "agent_id": id, "error": error }),
+                    Ok(items) => {
+                        json!({ "type": "subagent_transcript", "agent_id": id, "items": items })
+                    }
+                    Err(error) => {
+                        json!({ "type": "subagent_transcript", "agent_id": id, "error": error })
+                    }
                 };
                 return Ok(Output::events(vec![event]));
             }
-            "permission_rules" => vec![self.control_request(
-                json!({ "subtype": "list_permission_rules" }),
-                "",
-            )],
+            "permission_rules" => {
+                vec![self.control_request(json!({ "subtype": "list_permission_rules" }), "")]
+            }
             // The user's name for the session, so `claude --resume` shows it too.
             "rename" => vec![self.control_request(
                 json!({ "subtype": "rename_session", "title": op["title"], "source": "host" }),
@@ -2804,7 +2809,11 @@ pub fn config_dir() -> PathBuf {
 /// on top of the daemon's environment: the desktop's per-engine variables
 /// may set `CLAUDE_CONFIG_DIR` where the daemon's own environment does not.
 pub fn config_dir_in(env: &[(String, String)]) -> PathBuf {
-    match env.iter().rev().find(|(name, _)| name == "CLAUDE_CONFIG_DIR") {
+    match env
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+    {
         Some((_, dir)) if !dir.is_empty() => PathBuf::from(dir),
         Some(_) => home().join(".claude"),
         None => config_dir(),
@@ -2855,9 +2864,7 @@ pub fn config_with(options: &Options, cwd: &Path, id: &str) -> PathBuf {
     if is_saved(&plain, cwd, id) {
         return plain;
     }
-    reprobe(bin.clone(), &options.env)
-        .or(seen)
-        .unwrap_or(plain)
+    reprobe(bin.clone(), &options.env).or(seen).unwrap_or(plain)
 }
 
 /// Runs `probe` for `bin` with `env` and remembers what it found.
@@ -4525,7 +4532,10 @@ mod tests {
             ]
         );
         // Read again: the same file.
-        assert_eq!(transcript_in(&home.join(".claude"), cwd, "33-44", &images), items);
+        assert_eq!(
+            transcript_in(&home.join(".claude"), cwd, "33-44", &images),
+            items
+        );
         assert_eq!(fs::read_dir(&images).unwrap().count(), 1);
         let _ = fs::remove_dir_all(&home);
     }
@@ -4614,7 +4624,10 @@ mod tests {
             &mut c,
             json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": "r1", "content": "fn main() {}" }] } }),
         );
-        assert_eq!(done[0]["output"], json!({ "path": "/a.rs", "line": 120 }).to_string());
+        assert_eq!(
+            done[0]["output"],
+            json!({ "path": "/a.rs", "line": 120 }).to_string()
+        );
     }
 
     #[test]
@@ -4660,7 +4673,9 @@ mod tests {
         );
         assert_eq!(listed[0].0, "11-22");
         assert_eq!(listed[0].1, "hello there");
-        assert!(transcript_in(&home.join(".claude"), cwd, "../etc", &home.join("images")).is_empty());
+        assert!(
+            transcript_in(&home.join(".claude"), cwd, "../etc", &home.join("images")).is_empty()
+        );
 
         // A symlinked directory is saved under its real path.
         let real = home.join("real-dir");
@@ -4723,7 +4738,10 @@ mod tests {
             reported_config(&json!({ "user_output_styles_dir": "/u/alt/output-styles" })),
             Some(PathBuf::from("/u/alt"))
         );
-        assert_eq!(reported_config(&json!({ "user_output_styles_dir": "rel/output-styles" })), None);
+        assert_eq!(
+            reported_config(&json!({ "user_output_styles_dir": "rel/output-styles" })),
+            None
+        );
         assert_eq!(reported_config(&json!({})), None);
         let mut c = Claude::new(&Options {
             env: env("/tmp/c"),

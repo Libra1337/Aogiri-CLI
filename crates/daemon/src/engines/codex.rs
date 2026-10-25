@@ -333,7 +333,13 @@ fn transcript(turns: &Value) -> Vec<Value> {
                 rows.push(json!({ "role": "assistant", "content": item["text"] }));
             }
             "reasoning" => {
-                let summary = item["summary"].as_array().into_iter().flatten().map(text).collect::<Vec<_>>().join("\n\n");
+                let summary = item["summary"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(text)
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
                 if !summary.is_empty() {
                     rows.push(json!({ "role": "reasoning", "content": summary }));
                 }
@@ -969,9 +975,7 @@ impl Codex {
             }
             "thread/start" => self.thread_opened(result, false),
             "thread/resume" => self.thread_opened(result, true),
-            "account/rateLimits/read" => {
-                Output::events(usage_events(&result["rateLimits"]))
-            }
+            "account/rateLimits/read" => Output::events(usage_events(&result["rateLimits"])),
             "model/list" => {
                 self.catalog = result["data"]
                     .as_array()
