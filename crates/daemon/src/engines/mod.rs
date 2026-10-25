@@ -24,7 +24,7 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// How long a retired engine gets to exit on its own after its stdin closes.
@@ -392,6 +392,170 @@ pub(crate) fn plan_window(
         "resets_at": resets_secs.as_f64().map(|s| (s * 1000.0) as u64),
         "minutes": minutes,
     })
+}
+
+/// The events a probe keeps (the last of each kind): what a client shows of
+/// an engine before any conversation of it.
+const PROBE_KEEPS: &[&str] = &[
+    "model_status",
+    "model_view",
+    "engine_caps",
+    "command_list",
+    "session_options",
+];
+/// A probe gives up after this long, and waits this long for the rest once
+/// the engine has said something (and again once its models were asked for).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(25);
+const PROBE_SETTLE: Duration = Duration::from_secs(4);
+/// A probe's answer is reused for this long (`force` asks again): models
+/// and commands change with a release or a setting, not from one minute to
+/// the next, and each probe starts a process.
+const PROBE_FRESH: Duration = Duration::from_secs(10 * 60);
+
+/// One probe answer per engine setup (`probe_key`): when it was made and
+/// the events. Its own lock also makes a second probe of the same setup
+/// wait for the first and take its answer.
+type ProbeSlot = Arc<std::sync::Mutex<Option<(Instant, u64, Vec<Value>)>>>;
+static PROBES: std::sync::Mutex<Option<HashMap<String, ProbeSlot>>> = std::sync::Mutex::new(None);
+
+/// What makes two probes the same: the engine, where it runs and what runs.
+fn probe_key(kind: Kind, cwd: &Path, options: &Options) -> String {
+    json!([
+        kind.name(),
+        cwd,
+        options.bin,
+        options.env,
+        options.gateway,
+        options.command,
+        options.args,
+        options.model,
+    ])
+    .to_string()
+}
+
+/// `probe`, answered from the cache while it is fresh (`force`: run it
+/// anyway): the events, when they were found (ms) and whether they came
+/// from the cache.
+pub fn probe_cached(
+    kind: Kind,
+    cwd: &Path,
+    options: &Options,
+    force: bool,
+) -> Result<(Vec<Value>, u64, bool), String> {
+    let slot = {
+        let mut probes = PROBES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(
+            probes
+                .get_or_insert_with(HashMap::new)
+                .entry(probe_key(kind, cwd, options))
+                .or_default(),
+        )
+    };
+    let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((at, ms, events)) = slot.as_ref() {
+        if !force && at.elapsed() < PROBE_FRESH {
+            return Ok((events.clone(), *ms, true));
+        }
+    }
+    let events = probe(kind, cwd, options)?;
+    let ms = now_ms();
+    *slot = Some((Instant::now(), ms, events.clone()));
+    Ok((events, ms, false))
+}
+
+/// What an engine says of itself before any conversation: started in `cwd`
+/// as a session of it would be, but out of every list and saving nothing
+/// (Claude Code `--no-session-persistence`, a Codex `ephemeral` thread),
+/// asked for its models, then stopped. Returns the last event of each
+/// PROBE_KEEPS kind it sent.
+pub fn probe(kind: Kind, cwd: &Path, options: &Options) -> Result<Vec<Value>, String> {
+    let options = Options {
+        probe: true,
+        resume: None,
+        resume_at: None,
+        fork: None,
+        fork_from: None,
+        fork_turns: None,
+        fork_cwd: None,
+        app_tools: Vec::new(),
+        ..options.clone()
+    };
+    let id = new_uuid()?;
+    let Start { command, key, .. } = command(kind, &id, &options, cwd)?;
+    let release = |key: &Option<String>| {
+        if let Some(key) = key {
+            release_key(kind, key);
+        }
+    };
+    let process = match Process::spawn(command, cwd) {
+        Ok(process) => process,
+        Err(error) => {
+            release(&key);
+            return Err(error);
+        }
+    };
+    let mut engine = adapter(kind, cwd, &options);
+    process.write(engine.start());
+    let mut kept: HashMap<String, Value> = HashMap::new();
+    let keep = |events: Vec<Value>, kept: &mut HashMap<String, Value>| {
+        for event in events {
+            if let Some(kind) = event["type"].as_str().filter(|t| PROBE_KEEPS.contains(t)) {
+                kept.insert(kind.to_string(), event);
+            }
+        }
+    };
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let mut settle: Option<Instant> = None;
+    let mut asked = false;
+    let mut said = None;
+    loop {
+        let until = settle.map_or(deadline, |at| at.min(deadline));
+        let Some(wait) = until.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match process.lines.recv_timeout(wait) {
+            Ok(Ok(line)) => {
+                if let Line::Stderr(text) = &line {
+                    said = Some(text.clone()).filter(|text| !text.trim().is_empty());
+                }
+                let out = engine.translate(line);
+                process.write(out.frames);
+                keep(out.events, &mut kept);
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+        // Talking: it has a little longer to say the rest. Its conversation
+        // open (it said which model it is on): its models, asked for.
+        if settle.is_none() && !kept.is_empty() {
+            settle = Some(Instant::now() + PROBE_SETTLE);
+        }
+        if !asked && kept.contains_key("model_status") {
+            asked = true;
+            settle = Some(Instant::now() + PROBE_SETTLE);
+            if let Ok(out) = engine.encode(&json!({ "op": "command", "input": "/model" })) {
+                process.write(out.frames);
+                keep(out.events, &mut kept);
+            }
+        }
+        if kept.contains_key("model_view") && kept.contains_key("command_list") {
+            break;
+        }
+    }
+    process.kill();
+    release(&key);
+    if kept.is_empty() {
+        return Err(match said {
+            Some(line) => format!("{} said nothing about itself: {line}", kind.name()),
+            None => format!("{} said nothing about itself", kind.name()),
+        });
+    }
+    // In a steady order, as a session sends them.
+    Ok(PROBE_KEEPS
+        .iter()
+        .filter_map(|name| kept.remove(*name))
+        .collect())
 }
 
 /// A local gateway key is done with: no request may use it again.

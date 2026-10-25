@@ -5030,3 +5030,280 @@ fn a_closed_pairing_code_pairs_nobody() {
     let (status, _) = http(&daemon, &pair_request(&code));
     assert_eq!(status, 403);
 }
+
+/// The user messages a `transcript` names, in order.
+fn user_texts(items: &[Value]) -> Vec<String> {
+    items
+        .iter()
+        .filter(|item| item["role"] == "user")
+        .map(|item| item["content"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// The conversation `session` shows to a client that starts watching it.
+fn watched_transcript(client: &mut Client, session: &str) -> Vec<Value> {
+    client.send(json!({ "op": "watch", "session": session }));
+    let frames = client.until(|f| f["session"] == session && f["type"] == "transcript");
+    frames.last().unwrap()["items"].as_array().unwrap().clone()
+}
+
+fn listed<'a>(list: &'a Value, session: &str) -> &'a Value {
+    list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session"] == session)
+        .unwrap_or_else(|| panic!("{list}"))
+}
+
+#[test]
+fn a_lynshen_fork_copies_the_first_turns_and_leaves_the_original() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-fork");
+    let mut client = Client::connect(&daemon);
+    let original = client.create_session(&dir);
+    for message in ["one", "two", "three"] {
+        client.send(json!({ "op": "user_message", "session": original, "content": message }));
+        client.until(ready(&original));
+    }
+    let created = request(
+        &mut client,
+        json!({ "op": "session_create", "cwd": dir, "options": { "fork_from": original, "fork_turns": 2 } }),
+    );
+    let fork = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    assert_ne!(fork, original);
+    assert_eq!(
+        user_texts(&watched_transcript(&mut client, &fork)),
+        ["one", "two"]
+    );
+    // It goes on from there; the original keeps its three turns.
+    client.send(json!({ "op": "user_message", "session": fork, "content": "four" }));
+    client.until(ready(&fork));
+    assert_eq!(
+        user_texts(&watched_transcript(&mut client, &original)),
+        ["one", "two", "three"]
+    );
+    let list = request(&mut client, json!({ "op": "session_list" }));
+    assert_eq!(
+        listed(&list, &fork)["forked_from"],
+        json!({ "session": original, "turns": 2, "at": null })
+    );
+    assert!(listed(&list, &original)["forked_from"].is_null());
+
+    // A fork that works in another directory (its own worktree) reads the
+    // original from where it was saved.
+    let tree = temp_dir("daemon-fork-tree");
+    let created = request(
+        &mut client,
+        json!({ "op": "session_create", "cwd": tree, "options": { "fork_from": original, "fork_turns": 1, "fork_cwd": dir } }),
+    );
+    let elsewhere = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    assert_eq!(
+        user_texts(&watched_transcript(&mut client, &elsewhere)),
+        ["one"]
+    );
+    // Not found there without fork_cwd; nothing kept is refused.
+    for options in [
+        json!({ "fork_from": original, "fork_turns": 1 }),
+        json!({ "fork_from": original, "fork_turns": 0, "fork_cwd": dir }),
+    ] {
+        let refused = request(
+            &mut client,
+            json!({ "op": "session_create", "cwd": tree, "options": options }),
+        );
+        assert_eq!(refused["type"], "error", "{refused}");
+    }
+}
+
+#[test]
+fn a_claude_fork_resumes_at_the_kept_turns_reply_as_a_new_conversation() {
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-claude-fork");
+    let mut desktop = Client::connect(&daemon);
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": { "approval_mode": "auto-edit" } }),
+    );
+    let original = created["session"].as_str().unwrap().to_string();
+    desktop.send(json!({ "op": "watch", "session": original }));
+    desktop.until(is_ready(&original));
+    for message in ["one", "two", "three"] {
+        desktop.send(json!({ "op": "user_message", "session": original, "content": message }));
+        desktop.until(turn_done(&original));
+    }
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": { "approval_mode": "auto-edit", "fork_from": original, "fork_turns": 2 } }),
+    );
+    let fork = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    assert_ne!(fork, original);
+    // Claude Code resumes the original at turn two's reply, as a new
+    // conversation under the fork's id.
+    let args = starts(&log).last().unwrap().clone();
+    let at = args.iter().position(|a| a == "--resume").unwrap();
+    assert_eq!(
+        args[at..at + 5],
+        [
+            "--resume",
+            original.as_str(),
+            "--fork-session",
+            "--session-id",
+            fork.as_str()
+        ]
+    );
+    let point = args[args.iter().position(|a| a == "--resume-session-at").unwrap() + 1].clone();
+    // Until its first turn it shows the copied turns.
+    let items = watched_transcript(&mut desktop, &fork);
+    assert_eq!(user_texts(&items), ["one", "two"]);
+    assert_eq!(items.last().unwrap()["uuid"], point.as_str());
+    let list = request(&mut desktop, json!({ "op": "session_list" }));
+    assert_eq!(
+        listed(&list, &fork)["forked_from"],
+        json!({ "session": original, "turns": 2, "at": point })
+    );
+
+    // Closed before its first turn (nothing saved), it is forked again.
+    desktop.send(json!({ "op": "session_close", "session": fork }));
+    desktop.until(|f| f["type"] == "session_closed" && f["session"] == fork.as_str());
+    let reopened = request(&mut desktop, json!({ "op": "session_open", "session": fork }));
+    assert_eq!(reopened["type"], "session_opened", "{reopened}");
+    let args = starts(&log).last().unwrap().clone();
+    assert!(args.contains(&"--fork-session".to_string()), "{args:?}");
+    desktop.until(is_ready(&fork));
+    desktop.send(json!({ "op": "user_message", "session": fork, "content": "four" }));
+    desktop.until(turn_done(&fork));
+
+    // Saved now: a reopen resumes the fork itself.
+    desktop.send(json!({ "op": "session_close", "session": fork }));
+    desktop.until(|f| f["type"] == "session_closed" && f["session"] == fork.as_str());
+    request(&mut desktop, json!({ "op": "session_open", "session": fork }));
+    let args = starts(&log).last().unwrap().clone();
+    assert!(!args.contains(&"--fork-session".to_string()), "{args:?}");
+    assert!(args.windows(2).any(|w| w == ["--resume", fork.as_str()]));
+    assert_eq!(
+        user_texts(&watched_transcript(&mut desktop, &fork)),
+        ["one", "two", "four"]
+    );
+    // The original is as it was.
+    desktop.send(json!({ "op": "session_close", "session": original }));
+    desktop.until(|f| f["type"] == "session_closed" && f["session"] == original.as_str());
+    request(&mut desktop, json!({ "op": "session_open", "session": original }));
+    assert_eq!(
+        user_texts(&watched_transcript(&mut desktop, &original)),
+        ["one", "two", "three"]
+    );
+
+    // A fork of a conversation that is not saved is refused.
+    let refused = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": { "fork_from": "00000000-0000-0000-0000-000000000000", "fork_turns": 1 } }),
+    );
+    assert_eq!(refused["type"], "error", "{refused}");
+}
+
+#[test]
+fn a_codex_fork_forks_the_thread_through_the_kept_turn() {
+    let _guard = setup();
+    let log = fake_codex();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-codex-fork");
+    let mut desktop = Client::connect(&daemon);
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "codex" }),
+    );
+    let original = created["session"].as_str().unwrap().to_string();
+    desktop.send(json!({ "op": "watch", "session": original }));
+    desktop.until(|f| f["session"] == original.as_str() && f["type"] == "attended");
+    for message in ["one", "two", "three"] {
+        desktop.send(json!({ "op": "user_message", "session": original, "content": message }));
+        desktop.until(turn_done(&original));
+    }
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "codex", "options": { "fork_from": original, "fork_turns": 2 } }),
+    );
+    let fork = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    assert!(fork.starts_with("th-") && fork != original, "{fork}");
+    assert_eq!(
+        user_texts(&watched_transcript(&mut desktop, &fork)),
+        ["one", "two"]
+    );
+    assert_eq!(
+        user_texts(&watched_transcript(&mut desktop, &original)),
+        ["one", "two", "three"]
+    );
+    let list = request(&mut desktop, json!({ "op": "session_list" }));
+    assert_eq!(listed(&list, &fork)["forked_from"]["session"], original.as_str());
+    assert!(fs::read_to_string(&log).unwrap().lines().count() >= 2);
+}
+
+#[test]
+fn an_engine_probe_reports_models_and_commands_and_is_cached() {
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let mut desktop = Client::connect(&daemon);
+    let before = starts(&log).len();
+    let dir = temp_dir("daemon-probe");
+    let probed = request(
+        &mut desktop,
+        json!({ "op": "engine_probe", "engine": "claude", "cwd": dir }),
+    );
+    assert_eq!(probed["type"], "engine_probed", "{probed}");
+    assert_eq!(probed["cached"], false);
+    let kinds: Vec<&str> = probed["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["type"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"model_status"), "{probed}");
+    assert!(kinds.contains(&"model_view"), "{probed}");
+    assert!(kinds.contains(&"command_list"), "{probed}");
+    let args = starts(&log).last().unwrap().clone();
+    assert!(args.contains(&"--no-session-persistence".to_string()), "{args:?}");
+    // It is no session: none listed, nothing saved.
+    let list = request(&mut desktop, json!({ "op": "session_list" }));
+    assert!(
+        !list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["cwd"] == dir.display().to_string()),
+        "{list}"
+    );
+    // Asked again soon: the same answer, without running it.
+    let again = request(
+        &mut desktop,
+        json!({ "op": "engine_probe", "engine": "claude", "cwd": dir }),
+    );
+    assert_eq!(again["cached"], true);
+    assert_eq!(again["events"], probed["events"]);
+    assert_eq!(starts(&log).len(), before + 1);
+    // `force` runs it again.
+    let forced = request(
+        &mut desktop,
+        json!({ "op": "engine_probe", "engine": "claude", "cwd": dir, "force": true }),
+    );
+    assert_eq!(forced["cached"], false);
+    assert_eq!(starts(&log).len(), before + 2);
+    // The LynShen engine needs none.
+    let refused = request(&mut desktop, json!({ "op": "engine_probe", "engine": "lynshen" }));
+    assert_eq!(refused["type"], "error", "{refused}");
+}
