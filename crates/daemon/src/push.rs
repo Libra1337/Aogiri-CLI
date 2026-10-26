@@ -37,6 +37,8 @@ pub struct Push {
     /// The session each connected device has on screen now and when it
     /// said so (`push_viewing`): nothing about it is sent to that device.
     viewing: Mutex<HashMap<String, (String, u64)>>,
+    /// The iPhones' Live Activity tokens and what their activity shows.
+    pub live: crate::liveactivity::LiveActivities,
 }
 
 impl Push {
@@ -52,6 +54,7 @@ impl Push {
             subscriptions: Mutex::new(subscriptions),
             policy: Mutex::new(Policy::new(Rules::from_json(&store.setting(SETTING)))),
             viewing: Mutex::new(HashMap::new()),
+            live: crate::liveactivity::LiveActivities::load(dir),
         }
     }
 
@@ -131,11 +134,12 @@ impl Push {
         self.save(&list)
     }
 
-    /// A revoked device's browsers get nothing more.
+    /// A revoked device's browsers and Live Activities get nothing more.
     pub fn forget_device(&self, device: &str) {
         let mut list = lock(&self.subscriptions);
         list.retain(|s| s["device"] != device);
         let _ = self.save(&list);
+        self.live.forget_device(device);
     }
 
     fn save(&self, list: &[Value]) -> Result<(), String> {
@@ -261,6 +265,7 @@ fn outgoing(hub: &Hub, notice: Notice) -> Outgoing {
 
 /// Sends what waited to merge and is due now (from the scheduler tick).
 pub fn tick(hub: &Arc<Hub>) {
+    crate::liveactivity::tick(hub);
     let ready = {
         let mut policy = lock(&hub.push.policy);
         if !policy.has_waiting() {
@@ -332,6 +337,8 @@ pub const DESKTOP_FIRST_MS: u64 = 45_000;
 /// (`dispatch`, `requirements`); an agent's failed turn becomes a report.
 /// `failed`: the error that ended the turn just now; `ended`: a turn ended.
 pub fn observe(hub: &Arc<Hub>, session: &str, event: &Value, ended: bool, failed: Option<&str>) {
+    // The Dynamic Island follows every session, dispatched ones too.
+    crate::liveactivity::observe(hub, session, event, failed.is_some());
     let kind = event["type"].as_str().unwrap_or_default();
     let waiting = matches!(kind, "approval_request" | "action_deferred");
     // A call that ran or was answered settles a held approval.

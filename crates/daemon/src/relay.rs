@@ -541,14 +541,7 @@ impl Relay {
         native: &Value,
         delivery: &Delivery,
     ) -> Result<u16, String> {
-        let url = self.url.as_deref().ok_or("the relay is disabled")?;
-        let identity = self.identity()?;
-        let mut nonce = [0u8; 12];
-        getrandom::getrandom(&mut nonce).map_err(|error| error.to_string())?;
         let mut body = json!({
-            "pub": URL_SAFE_NO_PAD.encode(identity.signing.verifying_key().as_bytes()),
-            "ts": crate::store::now(),
-            "nonce": URL_SAFE_NO_PAD.encode(nonce),
             "urgency": delivery.urgency,
             "ttl": delivery.ttl,
         });
@@ -589,6 +582,37 @@ impl Relay {
                 body["encrypted"] = json!(URL_SAFE_NO_PAD.encode(message));
             }
         }
+        self.post_push(body)
+    }
+
+    /// Asks the relay to start, update or end a Live Activity on an
+    /// iPhone (relay-protocol.md, "Live Activity push"): `token` is the
+    /// app's push-to-start token or an activity's token, `request` the
+    /// `liveactivity` object. Returns the relay's HTTP status (410: the
+    /// token is gone).
+    pub fn live_activity(
+        &self,
+        token: &str,
+        environment: &str,
+        request: &Value,
+        ttl: u64,
+    ) -> Result<u16, String> {
+        self.post_push(json!({
+            "subscription": { "provider": "apns", "token": token, "environment": environment },
+            "liveactivity": request,
+            "ttl": ttl,
+        }))
+    }
+
+    /// Signs a push request with the host key and posts it to the relay.
+    fn post_push(&self, mut body: Value) -> Result<u16, String> {
+        let url = self.url.as_deref().ok_or("the relay is disabled")?;
+        let identity = self.identity()?;
+        let mut nonce = [0u8; 12];
+        getrandom::getrandom(&mut nonce).map_err(|error| error.to_string())?;
+        body["pub"] = json!(URL_SAFE_NO_PAD.encode(identity.signing.verifying_key().as_bytes()));
+        body["ts"] = json!(crate::store::now());
+        body["nonce"] = json!(URL_SAFE_NO_PAD.encode(nonce));
         let body = body.to_string();
         let mut signed = PUSH_CONTEXT.to_vec();
         signed.extend_from_slice(body.as_bytes());
@@ -1676,8 +1700,18 @@ mod tests {
             hub.store.device(&device.id).is_some(),
             "the same account changes nothing"
         );
+        // The device's Dynamic Island token is bound to it, so it goes too.
+        hub.push
+            .live
+            .register(
+                &device.id,
+                &json!({ "kind": "start", "token": "ab".repeat(128), "environment": "sandbox" }),
+                now(),
+            )
+            .unwrap();
         hub.relay.register(&hub, "u2").unwrap();
         assert!(hub.store.device(&device.id).is_none());
+        assert!(!hub.push.live.has_tokens());
         assert_eq!(hub.store.setting(USER_SETTING), json!("u2"));
         assert_eq!(hub.relay.status_json()["user"], "u2");
     }

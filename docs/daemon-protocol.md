@@ -1601,6 +1601,63 @@ device's browsers and apps now (not counted) and replies `push_tested` with
 browser, `apns`, `apns-sandbox` or `fcm` for the app, and its answer as the
 relay passed it on (`501`: the relay has no credentials for it).
 
+### Live Activities
+
+The Aogiri app on an iPhone shows this computer in the Dynamic Island: one
+Live Activity (`ComputerActivityAttributes`) for the whole computer. A
+paired device registers its tokens with
+
+```
+{"op":"liveactivity_token","kind":"start"|"activity","token":"<hex>",
+ "environment":"production"|"sandbox","host_name":"…","activity"?:"…","session"?:"…"}
+```
+
+- `kind: "start"`: the app's push-to-start token (one per device). Kept in
+  `liveactivity.json` across restarts, so an approval lights the island up
+  while the app is not running. The same token registered by another
+  device moves to it.
+- `kind: "activity"`: the update token of an activity the app runs
+  (`activity`: its id; `session`: the session it was started for, shown
+  first while it runs). It replaces the device's earlier one and is kept in
+  memory only: the app sends it again when it connects. It is dropped once
+  the activity's `end` went out, or when APNs says it is gone.
+- `token`: hex, 32-512 characters; `environment` defaults to `production`;
+  `host_name` (at most 64 characters) is the computer's name in the
+  activity. Both kinds are forgotten when the device is revoked.
+
+Replies `{"type":"liveactivity_token_ok"}`; a malformed token, kind or id is
+an `error`; only paired devices.
+
+The daemon sends through the relay (relay-protocol.md, "Live Activity
+push") a ContentState of
+`{phase, title, detail, session, sessionTitle, tasks, waiting, done, total, since, ember}`:
+
+- `phase` `waiting`: a request waits (an `approval_request`, a question, an
+  `action_deferred`); `title` says what in general (「电脑想运行命令」,
+  「电脑想修改文件」, 「电脑在等你回答」, 「电脑在等你批准」), `detail` is
+  `""` (the phone fills in the command itself), `ember` `attention`,
+  `relevance_score` 100, with an alert naming the session.
+- `running`: a turn runs; `title` the session's title, `detail` its
+  current step as a word (「思考中」「运行命令」「修改文件」「读取文件」「搜索」
+  「查资料」「派出子任务」「更新计划」「写回复」, else 「使用工具」), `ember`
+  `thinking`.
+- `done` (「做完了」, `ember` `done`) or `failed` (「出错了」, `attention`):
+  nothing runs or waits any more; sent as `end`, dismissed 15 minutes later.
+- `tasks`: sessions running a turn; `waiting`: requests waiting; `done` /
+  `total`: the shown session's `plan` steps completed and in all (0 without
+  a plan); `since`: when its turn (or its request) started, in seconds
+  since 1970; `session` / `sessionTitle`: the session shown (the request's,
+  else the newest running one). Never a command, a path or a reply.
+
+When: with an activity token, an update into `waiting` and the `end` go at
+once; other updates at most once per 10 s per device, carrying the latest
+state when the window opens (from the scheduler tick). Without an activity
+token but with a push-to-start token, a `start` goes only for `waiting`, and
+once until the work is over. A session whose engine stops during a turn
+ends that turn as `failed`. A `410` from the relay forgets that token.
+Live Activities are independent of the notification rules (no budget or
+quiet hours: the island is silent except for the alert of a request).
+
 ## Session ops
 
 Every op from `docs/serve-protocol.md` (`user_message`, `command`, `steer`,
