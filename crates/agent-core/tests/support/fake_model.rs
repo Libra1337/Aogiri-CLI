@@ -98,7 +98,8 @@ pub fn temp_dir(label: &str) -> PathBuf {
 /// 50 ms apart (about a second in all). A network that went quiet:
 /// `STALL` is never answered, `STALL_MIDWAY` streams "partial" and then
 /// nothing (the connection stays open for a minute either way); `BUSY` is
-/// answered 503 with Retry-After: 2.
+/// answered 503 with Retry-After: 2. A user message with a line `FAIL_TURN`
+/// is refused (400), which fails its turn.
 fn start_fake_model() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -254,6 +255,11 @@ fn script(request: &Value) -> String {
     }
     if let Some(reply) = thinking_only_reply(&messages) {
         return reply;
+    }
+    // A turn that fails at the model (a scheduled run's failure): any user
+    // message with a line `FAIL_TURN`.
+    if last["role"] == "user" && text.lines().any(|line| line.trim() == "FAIL_TURN") {
+        return "ERROR scripted failure".to_string();
     }
     if last["role"] == "user" {
         match text.as_str() {

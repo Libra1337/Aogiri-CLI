@@ -3186,6 +3186,28 @@ impl ToolState {
         })
     }
 
+    /// Ends every background shell this engine started (a scheduled run
+    /// stopped for its budget or its time). Returns how many it ended.
+    pub fn stop_shells(&self) -> usize {
+        let owned: Vec<u64> = match self.inner.lock() {
+            Ok(mut inner) => inner.shells.drain().collect(),
+            Err(_) => return 0,
+        };
+        let Ok(mut sessions) = shell_sessions().lock() else {
+            return 0;
+        };
+        let mut ended = 0;
+        for id in owned {
+            if let Some(mut session) = sessions.remove(&id) {
+                kill_child(&mut session.child);
+                let _ = fs::remove_file(&session.stdout_path);
+                let _ = fs::remove_file(&session.stderr_path);
+                ended += 1;
+            }
+        }
+        ended
+    }
+
     fn own_shell(&self, session_id: u64) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.shells.insert(session_id);

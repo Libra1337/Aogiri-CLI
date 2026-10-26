@@ -210,6 +210,9 @@ fn run(hub: &Hub, mut core: AgentCore, id: &str, ops: Receiver<Value>, generatio
         hub.set_busy(id, !ready);
         // A daemon update waits for it (`restart_when_idle`).
         hub.set_held(id, core.has_background_work());
+        // Background agents come back to the conversation; shells do not.
+        let awaited = core.awaits_background_work();
+        hub.set_background(id, core.has_background_work() || awaited, awaited);
         if !ready {
             active = Instant::now();
         }

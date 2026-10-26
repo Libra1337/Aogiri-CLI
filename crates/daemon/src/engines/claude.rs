@@ -2505,6 +2505,9 @@ impl Claude {
                 if event["type"] == "tool_start" && !label.is_empty() {
                     event["subagent"] = json!(label);
                 }
+                // A subagent's work, not the conversation's own: a background
+                // one goes on after the turn (a scheduled run's turn ended).
+                event["nested"] = json!(true);
             }
             return Output::events(events);
         }
@@ -2917,6 +2920,22 @@ impl Claude {
                 json!({ "subtype": "stop_task", "task_id": op["task_id"] }),
                 "",
             )],
+            // Every background task (a scheduled run stopped for its budget
+            // or its time).
+            "stop_background" => {
+                let mut ids: Vec<String> = self
+                    .tasks
+                    .iter()
+                    .filter(|(_, task)| task.background)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                ids.sort();
+                ids.into_iter()
+                    .map(|id| {
+                        self.control_request(json!({ "subtype": "stop_task", "task_id": id }), "")
+                    })
+                    .collect()
+            }
             // Background shell / Monitor output (its last 8 KiB).
             "task_output" => vec![self.control_request(
                 json!({ "subtype": "get_task_output", "task_id": op["task_id"] }),
@@ -4590,6 +4609,23 @@ mod tests {
         assert_eq!(ended[0]["path"], "old");
         assert_eq!(ended[0]["status"], "stopped");
         assert_eq!(ended[0]["label"], "");
+    }
+
+    #[test]
+    fn stopping_the_background_stops_background_tasks_only() {
+        let mut c = claude();
+        for (id, kind, background) in [("b1", "local_bash", true), ("a1", "local_agent", false)] {
+            frame(
+                &mut c,
+                json!({ "type": "system", "subtype": "task_started", "task_id": id, "task_type": kind, "description": "d", "is_backgrounded": background }),
+            );
+        }
+        let stop = c
+            .encode(&json!({ "op": "stop_background" }))
+            .unwrap()
+            .frames;
+        assert_eq!(stop.len(), 1);
+        assert!(stop[0].contains(r#""subtype":"stop_task""#) && stop[0].contains("b1"));
     }
 
     #[test]
