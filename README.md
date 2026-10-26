@@ -1,38 +1,34 @@
-# LynShen CLI
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="design/brand/aogiri-horizontal-dark.svg">
+    <img src="design/brand/aogiri-horizontal-light.svg" alt="Aogiri · 梧桐" width="440">
+  </picture>
 
-LynShen CLI 是一个在终端里运行的编程智能体，命令是 `lynshen`，用 Rust 写成。你在项目目录里启动它，用自然语言让它读代码、改代码、跑命令和测试。
+  <h3>LynShen CLI</h3>
 
-它也是 [LynShen Desktop](https://github.com/Libra1337/LynShen_Agent) 的引擎。桌面端的每个会话都运行在 `lynshen daemon` 里，这个后台服务也在本仓库。
+  <p>在终端里运行的编程智能体，也是 Aogiri 桌面端和手机端的引擎。</p>
 
-[English](#english)
+  <p>
+    <a href="https://github.com/Libra1337/LynShen-CLI/releases/latest">下载</a> ·
+    <a href="https://github.com/Libra1337/LynShen-CLI/releases">全部版本</a> ·
+    <a href="https://github.com/Libra1337/LynShen-CLI/issues">问题反馈</a>
+  </p>
 
-## 本仓库有什么
+  <p><strong>简体中文</strong> · <a href="README.en-US.md">English</a></p>
+</div>
 
-| 命令或目录 | 作用 |
-| --- | --- |
-| `lynshen` | 交互式终端界面（TUI），日常使用 |
-| `lynshen --headless` | 无界面运行一个任务，输出 JSONL，用于脚本、CI 和评测 |
-| `lynshen serve` | 通过标准输入输出收发 JSON 的协议，给图形界面和 IDE 用 |
-| `lynshen acp` | [Agent Client Protocol](https://agentclientprotocol.com) 适配，给 Zed 等编辑器用 |
-| `lynshen daemon` | 后台服务，同时托管多个会话，桌面端和手机都连接它 |
-| `relay/` | 中继服务（Go），手机通过它连接电脑上的 daemon |
-| `npm/` | npm 包 `@lynshen/cli` 的打包文件 |
-| `evals/` | 一个小的冒烟测试集，跑 `--headless` |
+命令是 `lynshen`，用 Rust 写成。在项目目录里启动它，用自然语言让它读代码、改代码、运行命令和测试。同一个可执行文件还提供后台服务 `lynshen daemon`：[Aogiri 桌面端](https://github.com/Libra1337/LynShen_Agent)和手机上的每个会话都在里面运行，可以是 LynShen、Claude Code、Codex 或 [ACP](https://agentclientprotocol.com) 智能体。支持 macOS、Linux 和 Windows。
 
 ## 安装
 
-**用 LynShen Desktop。** 桌面端自带一份 CLI，放在 `~/.lynshen/bin`，随应用一起更新。要在终端里用 `lynshen` 命令，到桌面端的「设置 → 编码智能体」里把它加成终端命令。
-
-**下载二进制。** 每个版本的可执行文件在 [GitHub Releases](https://github.com/Libra1337/LynShen-CLI/releases)，同时也发布在 LynShen 软件库 `https://software.lynshen.org/cli/<版本>/<文件名>`。
-
-| 系统 | 文件名 |
+| 平台 | GitHub Releases 文件 |
 | --- | --- |
 | macOS（Apple 芯片） | `lynshen-aarch64-apple-darwin` |
 | macOS（Intel） | `lynshen-x86_64-apple-darwin` |
 | Linux x64 | `lynshen-x86_64-unknown-linux-gnu` |
 | Windows x64 | `lynshen-x86_64-pc-windows-msvc.exe` |
 
-例如在 Apple 芯片的 Mac 上：
+下载后放进 PATH 里的目录。例如 Apple 芯片的 Mac：
 
 ```sh
 curl -fLo lynshen https://github.com/Libra1337/LynShen-CLI/releases/latest/download/lynshen-aarch64-apple-darwin
@@ -41,158 +37,72 @@ mkdir -p ~/.local/bin && mv lynshen ~/.local/bin/
 lynshen --version
 ```
 
-`~/.local/bin` 要在你的 PATH 里。
+同样的文件也在 LynShen 软件库：`https://software.lynshen.org/cli/<版本>/<文件名>`。
 
-发布流程也会打包 npm 包 `@lynshen/cli`，但目前 npm 上还没有这个包，请先用上面的二进制。
+- **已经装了 Aogiri 桌面端：** 桌面端自带一份 CLI（`~/.lynshen/bin`），随应用更新。在「设置 → 编码智能体」里点「在终端中使用 lynshen 命令」即可。
+- **Linux：** 先安装 `bubblewrap`（例如 `sudo apt install bubblewrap`）。智能体的 shell 命令在它的沙箱里运行，没有它命令会失败；LynShen 不会退回到无沙箱运行。
+- **npm：** 发布流程已经会打包 `@lynshen/cli`，但 npm 上还没有这个包。上架前请用上面的二进制。
 
-**从源码构建。** 需要 Rust 稳定版。`crates/llm-provider-kit` 是 git 子模块，克隆时要带上 `--recurse-submodules`：
+**更新。** `lynshen`（TUI）和 `lynshen serve` 启动时检查软件库。有新版本时，release 构建会在后台下载并替换自己，下次启动生效；debug 构建只提示。版本清单有 Ed25519 签名，文件按 sha256 校验后才替换。手动更新用 `lynshen update`。在 `~/.lynshen/config.json` 里设 `"auto_update": false` 后只提示，不自动安装。桌面端那份 CLI 随桌面端更新。
 
-```sh
-git clone --recurse-submodules https://github.com/Libra1337/LynShen-CLI.git
-cd LynShen-CLI
-cargo build --release
-./target/release/lynshen --version
-```
+## 开始使用
 
-`scripts/install-local.sh` 会构建 release 版本并装到 `~/.local/bin/lynshen`（用 `PREFIX` 改位置）。
+1. **启动。** 在项目目录里运行 `lynshen`。第一次运行会创建 `~/.lynshen/config.json`，默认服务商是 LynShen 网关，默认模型 `gpt-5.5`。
+2. **登录或配置模型。** 在 TUI 里输入 `/login`，从列表里选一个服务商：
+   - **LynShen 账号：** `/login lynshen`。浏览器打开 [LynShen 官网](https://www.lynshen.org)，同意授权后回到终端。之后用账号余额调用模型，`/usage` 查看套餐、余额和用量。
+   - **自己的 API Key：** `/login <服务商> <key>`，例如 `/login deepseek sk-...`。`/login list` 列出全部服务商，`lynshen providers` 以 JSON 打印它们和模型。
+   - **订阅账号：** 部分服务商支持浏览器登录，例如 `/login openai-codex` 用 ChatGPT 订阅。
+3. **发送任务。** 直接用中文或英文描述，例如「修复 `cargo test` 里失败的那个测试，并说明原因」。
 
-**Linux 用户注意：** 智能体的 shell 命令在 bubblewrap 沙箱里运行。先安装 `bubblewrap`（例如 `sudo apt install bubblewrap`）。没有它，shell 命令会失败，直到你装上它或把沙箱切到 `full-access`。LynShen 不会自己退回到不加沙箱运行。
+用 LynShen 账号登录时，CLI 只取得这台设备的授权凭据，不会取得账号密码。`lynshen logout` 退出登录并吊销这份凭据。
 
-## 第一次使用
+## 日常使用
 
-```sh
-cd path/to/project
-lynshen
-```
-
-第一次运行会创建 `~/.lynshen/config.json`。默认的模型服务是 LynShen 网关（`provider` 为 `lynshen`），默认模型是 `gpt-5.5`。LynShen 网关用 LynShen 账号的额度调用模型，账号在 [LynShen Console](https://www.lynshen.org)（LynShen 官网）注册和管理。
-
-然后接入模型。在 TUI 里输入 `/login`，会列出可以登录的服务商，LynShen 排在第一个。
-
-- **LynShen 账号。** 选 LynShen，或直接输入 `/login lynshen`。浏览器会打开 [LynShen 官网](https://www.lynshen.org)，登录并同意授权后回到终端。之后用账号的余额调用模型，`/usage` 查看套餐、余额和用量。
-- **自己的 API Key。** 输入 `/login <服务商> <key>`，LynShen 保存 key 并切换到这个服务商，例如 `/login deepseek sk-...`。`/login list` 以文字列出全部服务商。
-- **订阅账号。** 部分服务商支持浏览器登录，例如 `/login openai-codex` 用 ChatGPT 订阅登录。
-
-`lynshen providers` 以 JSON 打印全部内置服务商和它们的模型。
-
-登录以后直接用中文或英文描述任务，例如「修复 `cargo test` 里失败的那个测试，并说明原因」。
+- **掌握操作权限：** 按 `Shift+Tab` 依次切换审批模式 `manual` → `plan` → `auto-edit` → `auto` → `full-access`，或用 `/permissions <模式>`。收到审批请求时，可以允许一次、本会话内始终允许或拒绝。详见下方「审批和沙箱」。
+- **终端界面（TUI）：** `!` 开头的输入直接在本机 shell 执行（不发给模型），`@` 加几个字符模糊选择文件，`/image <路径>` 附图片，`Ctrl+T` 切换推理强度，`Shift+Enter` 换行，`PageUp`/`PageDown` 翻看历史。`~/.lynshen/commands/*.md` 里的每个文件变成一个 `/文件名` 命令，文件里的 `$ARGUMENTS` 换成命令后面的文字。
+- **智能体工作时继续说：** 回合进行中发出的消息会排队，在下一回合开始。输入框为空时按 `↑` 把最后一条排队消息取回来修改；`Esc` 中断当前回合，排队的消息照常运行。桌面端和 `serve` 协议还可以把排队消息插入当前回合（steer），不打断正在运行的工具。
+- **回退和分叉：** `/rewind` 把对话和本会话改过的文件退回到之前某一回合；`/tree` 查看对话分支树，`/fork`、`/checkout` 在同一会话里开分支和切换。桌面端的「从这里分叉」由 daemon 把对话复制成一个独立的新会话，可以放进新的 git worktree。
+- **多种引擎：** daemon 托管 LynShen、Claude Code、Codex 和 ACP 智能体的会话，并转成同一种事件流。OpenCode（1.x）、oh-my-pi 和 Pi 是内置 ACP 智能体，装好就能用，不用注册命令；缺少或版本不对时，错误会写明要装什么。Pi 从不询问，只能在全自动模式下运行。其他 ACP 智能体可以自己注册。
+- **后台服务：** `lynshen daemon` 在 `ws://127.0.0.1:7788` 上同时托管多个会话，客户端都断开后会话继续运行。`lynshen daemon install` 让它登录时自动启动（macOS 用 launchd，Linux 用 systemd 用户服务），`uninstall` 取消。令牌在 `~/.lynshen/daemon/token`，日志在 `~/.lynshen/daemon/daemon.log`。
+- **定时任务：** 长期 Agent（`~/.lynshen/agents/<id>/`）可以按时间自动收到任务：一次、每小时、每天、工作日或每周。在桌面端创建和管理，手机上可以查看和立即运行。每次运行可以开新会话（可以放进新的 git worktree），也可以接着上次的会话，还可以设花费上限；连续失败 3 次自动关闭，保留最近 20 次运行记录。有任务在运行时，daemon 阻止电脑空闲休眠。Agent 自己提议的任务要你打开后才生效。
+- **技能和 MCP：** 技能从 `~/.lynshen/skills`、`~/.agents/skills` 和已信任项目的 `.lynshen/skills`、`.agents/skills` 读取，用 `/skills` 列出、安装、更新、启用或停用（见 [docs/skills.md](docs/skills.md)）。MCP 服务器写在 `config.json` 的 `mcp_servers` 里，支持 stdio 和 HTTP，用 `/mcp` 管理（见 [docs/mcp.md](docs/mcp.md)）。项目里的本地资源要先用 `/trust yes` 信任这个项目才会加载。
+- **用自己的 API 跑 Claude Code 和 Codex：** daemon 可以让 Claude Code 或 Codex 会话使用你提供的 API（地址、密钥、模型），在桌面端「设置 → 编码智能体」添加。请求只发到这个提供商，只带它自己的密钥，不带 LynShen 令牌或任何 `X-LynShen-*` 请求头，也不计入 LynShen 账号的用量。会话一直使用开始时选定的提供商。见 [docs/daemon-protocol.md](docs/daemon-protocol.md) 的 "Custom providers"。
+- **无界面和协议模式：** `lynshen --headless "<任务>"` 运行一个任务并输出 JSONL，最后一个事件是 `final_result`；默认 `manual`，需要审批的操作会被拒绝，要改文件或运行命令就传 `--approval-mode`。`lynshen serve` 通过标准输入输出收发 JSON（[docs/serve-protocol.md](docs/serve-protocol.md)），`lynshen acp` 把 LynShen 接到 Zed 等支持 ACP 的编辑器（[docs/serve-vs-acp.md](docs/serve-vs-acp.md)）。
 
 ### 常用命令
 
 | 命令 | 作用 |
 | --- | --- |
-| `/model [模型] [强度]` | 查看或切换模型和推理强度。`Ctrl+T` 切换当前模型的推理强度 |
-| `/permissions [模式]` | 查看或切换审批模式。`Shift+Tab` 循环切换 |
+| `/model [模型] [强度]` | 查看或切换模型和推理强度 |
+| `/permissions [模式]` | 查看或切换审批模式 |
 | `/sandbox [模式]` | 查看或切换 shell 命令的沙箱 |
-| `/style [风格] [--global]` | 查看或切换回复风格。`--global` 同时设为新对话的默认风格 |
-| `/resume [会话 ID]` | 列出或恢复以前的会话。也可以用 `lynshen --resume <id>` 启动 |
-| `/rewind [回合 ID]` | 把对话和文件退回到之前的某一回合。只退回本会话改过的文件；之后被别的会话、你或命令改过的文件保持不动，并在结果里列出 |
-| `/tree` | 查看对话分支树 |
+| `/style [风格] [--global]` | 查看或切换回复风格；`--global` 同时设为新对话的默认 |
+| `/resume [会话 ID]` | 列出或恢复以前的会话（也可以 `lynshen --resume <id>`） |
+| `/rewind [回合 ID]` | 把对话和文件退回到之前的某一回合 |
 | `/context`、`/compact` | 查看上下文用量；立即压缩上下文 |
-| `/skills`、`/mcp` | 管理技能和 MCP 服务器 |
 | `/goal <目标>` | 设置一个跨回合的目标 |
-| `/image <路径>` | 给下一条消息附一张图片 |
+| `/skills`、`/mcp` | 管理技能和 MCP 服务器 |
+| `/usage` | LynShen 账号的套餐、余额和用量 |
 | `/doctor` | 检查运行环境 |
 | `/new`、`/quit` | 新会话；退出 |
 
-输入框里的其他用法：
+### 审批和沙箱
 
-- `!` 开头的输入直接在本机 shell 里执行，例如 `!git log -3`，不发给模型。
-- 输入 `@` 加几个字符，可以模糊选择项目里的文件。
-- `~/.lynshen/commands/*.md` 里的每个 Markdown 文件都会变成一个 `/文件名` 命令。文件里的 `$ARGUMENTS` 会换成命令后面的文字。
-
-## 审批和沙箱
-
-审批模式决定智能体改文件、跑命令前是否先问你。在 `config.json` 的 `approval_mode` 里设置，或在会话里用 `/permissions` 切换。
-
-| 模式 | 改文件 | 跑 shell 命令 |
+| 模式 | 改文件 | 运行 shell 命令 |
 | --- | --- | --- |
 | `manual`（默认） | 询问 | 询问 |
+| `plan` | 不改，只读调研后交一份计划 | 只读 |
 | `auto-edit` | 直接改 | 询问 |
 | `auto` | 直接改 | 安全模型判断为安全的直接运行，其余询问 |
 | `full-access` | 直接改 | 直接运行，不询问 |
 
-还有一个 `plan` 模式，只允许只读操作，智能体最后交一份计划。桌面端的计划模式用的就是它。在终端界面里，`Shift+Tab` 也能切到 `plan`；计划出来后，可以批准并选 `auto-edit`、`manual` 或 `auto` 开始执行，也可以直接输入要改的地方，让它重新出一版。按 Esc 先放着，之后用 `/plan` 再调出来。
+计划出来后，可以批准并选 `auto-edit`、`manual` 或 `auto` 开始执行，也可以写下要改的地方让它重出一版；按 `Esc` 先放着，之后用 `/plan` 调出来。
 
-在 macOS（Seatbelt）和 Linux（bubblewrap）上，shell 命令在沙箱里运行。默认模式 `workspace-write` 只允许写工作目录、你配置的目录、临时目录和包缓存目录，其中 `.git` 只读。`~/.ssh`、`~/.aws`、`~/.lynshen/auth.json` 等路径在沙箱里不可读。需要离开沙箱的命令（例如写工作目录以外的文件）按审批模式处理。默认规则下，`git add` 和 `git commit` 可以直接离开沙箱，`git push` 总是先问你。Windows 目前没有沙箱，默认是 `full-access`。详见 [docs/sandbox.md](docs/sandbox.md)。
-
-`full-access` 下，模型以你的用户权限运行命令和写文件，而且不受工作目录限制。只在你信任的仓库和任务上使用它。
-
-## 无界面模式
-
-```sh
-lynshen --headless "列出仓库结构后停止"
-cat task.md | lynshen --headless
-lynshen --headless --approval-mode full-access "修复失败的测试并运行相关测试"
-```
-
-输出是一行一个 JSON 事件，最后一个是 `final_result`，包含状态、token 用量、工具调用次数和耗时。无界面模式默认用 `manual`：需要审批的操作会被自动拒绝，不会卡住等输入。要让它改文件或跑命令，显式传 `--approval-mode`。
-
-## daemon、serve 和 acp
-
-**`lynshen daemon`** 监听 `ws://127.0.0.1:7788`，客户端令牌在 `~/.lynshen/daemon/token`。它同时托管 LynShen、Claude Code、Codex 和 ACP 智能体的会话，把它们转成同一种事件流。客户端都断开后，会话继续运行。
-
-```sh
-lynshen daemon                   # 前台运行
-lynshen daemon install           # 登录时自动启动（macOS 用 launchd，Linux 用 systemd 用户服务）
-lynshen daemon relay on          # 打开中继连接（off 关闭，status 查看）
-lynshen daemon pair              # 打印一次性配对链接，5 分钟内在手机上打开
-```
-
-手机通过中继 `wss://app.lynshen.org/relay/v1` 连接 daemon，内容端到端加密，中继看不到内容。中继默认关闭，可以在桌面端打开，也可以用上面的 `relay on`。协议见 [docs/daemon-protocol.md](docs/daemon-protocol.md) 和 [docs/relay-protocol.md](docs/relay-protocol.md)。
-
-**`lynshen serve`** 从标准输入读命令、向标准输出写事件，都是一行一个 JSON，事件格式和 `--headless` 相同。见 [docs/serve-protocol.md](docs/serve-protocol.md)。
-
-**`lynshen acp`** 把 LynShen 接到支持 ACP 的编辑器，例如 Zed。ACP 表达不了的功能（会话加载、对话树等）会明确拒绝。两种协议的区别见 [docs/serve-vs-acp.md](docs/serve-vs-acp.md)。
-
-## 文件位置
-
-所有用户数据在 `~/.lynshen/` 下：
-
-| 路径 | 内容 |
-| --- | --- |
-| `config.json` | 设置：服务商、模型、审批模式、沙箱、MCP 服务器等 |
-| `auth.json` | API key 和登录凭据。默认明文，`config.json` 里设 `"encrypt_secrets": true` 后加密，见 [docs/secrets.md](docs/secrets.md) |
-| `prompt.txt` | 系统提示词，可以自己改。没改过的文件在升级后会换成新的默认提示词，改过的保持不变 |
-| `sessions/` | 保存的会话，按项目分开 |
-| `skills/` | 安装的技能 |
-| `styles/` | 自定义回复风格，一个风格一个 Markdown 文件 |
-| `commands/` | 自定义斜杠命令 |
-| `logs/lynshen.log` | 日志 |
-| `daemon/` | 后台服务的状态、令牌、已配对设备和日志 |
-| `agents/` | 长期 Agent 的角色、记忆和定时任务 |
-| `bin/` | 桌面端管理的那份 CLI |
-
-项目里的 `AGENTS.md` 或 `CLAUDE.md` 会作为项目说明发给模型。项目目录下的 `.lynshen/skills`、`.lynshen/commands` 等本地资源，要先用 `/trust yes` 信任这个项目才会加载。
-
-一个简单的 `config.json` 片段：
-
-```json
-{
-  "provider": "lynshen",
-  "model": "gpt-5.5",
-  "reasoning_effort": "medium",
-  "approval_mode": "manual",
-  "sandbox": "workspace-write",
-  "auto_update": true
-}
-```
+在 macOS（Seatbelt）和 Linux（bubblewrap）上，shell 命令在沙箱里运行。默认 `workspace-write` 只允许写工作目录、你配置的目录、临时目录和包缓存目录，其中 `.git` 只读；`~/.ssh`、`~/.aws`、`~/.lynshen/auth.json` 等路径不可读。默认规则下 `git add`、`git commit` 可以离开沙箱，`git push` 总是先问你。Windows 默认没有系统沙箱，有一个可选的预览版。`full-access` 以你的用户权限运行，不受工作目录限制，只在信任的仓库里使用。详见 [docs/sandbox.md](docs/sandbox.md)。
 
 ### 自己的服务商和模型
 
-`provider`、`base_url`、`protocol`（`responses`、`anthropic` 或 `chat`）和 `models` 描述当前用的服务商。桌面端在 设置 → 提供商 里编辑这些值，切换默认服务商时写进 `config.json`。`models` 里每个模型可以写这些字段：
-
-| 字段 | 含义 | 不写时 |
-| --- | --- | --- |
-| `name` | 发给服务商的模型 ID | 必填 |
-| `display_name` | 界面显示的名字 | 用 `name` |
-| `context_window` | 上下文窗口，单位 token。自动压缩在用量超过它的 `compaction_threshold_percent` 时开始 | 0：不按窗口压缩 |
-| `max_output_tokens` | 一次回复最多输出的 token 数，作为请求的 `max_output_tokens`（Responses）或 `max_tokens`（Chat、Anthropic）发出 | 0：Responses 和 Chat 不发上限，Anthropic 用默认值 |
-| `reasoning` | 模型会不会思考。`false`：请求不带思考参数，客户端不显示思考强度 | 由 `reasoning_efforts` 决定 |
-| `reasoning_efforts` | 模型接受的思考强度，从低到高：`none`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`。客户端只显示这些档位 | `none` 到 `xhigh` |
-| `input_modalities` | 模型接受的输入：`text`、`image`。没有 `image` 时，发给模型的图片换成一行文字说明 | 文本和图片 |
-
-`ultra` 是 GPT 对最高档的叫法，接口不接受这个值。请求里发的是这个模型列出的其他档位中最高的一档；只列了 `none` 和 `ultra` 时发 `max`。
+`config.json` 里的 `provider`、`base_url`、`protocol`（`responses`、`anthropic` 或 `chat`）和 `models` 描述 LynShen 引擎当前使用的服务商：
 
 ```json
 {
@@ -205,42 +115,58 @@ lynshen daemon pair              # 打印一次性配对链接，5 分钟内在�
       "name": "my-model",
       "context_window": 200000,
       "max_output_tokens": 32000,
-      "reasoning": true,
       "reasoning_efforts": ["low", "medium", "high"],
       "input_modalities": ["text", "image"]
-    },
-    { "name": "my-small-model", "context_window": 64000, "max_output_tokens": 8192, "reasoning": false, "input_modalities": ["text"] }
+    }
   ]
 }
 ```
 
-内置目录里有些服务商按协议分开地址，例如 zenmux 的 Chat Completions 在 `https://zenmux.ai/api/v1`，Anthropic Messages 在 `https://zenmux.ai/api/anthropic`。这类服务商的 `base_url` 可以填它在目录里的任一个地址（Cloudflare 地址里的 `<account>`、`<gateway>` 换成自己的值）。每个请求按所用模型的协议换到对应地址：`/model` 切换后的主代理、子代理和压缩、标题、安全检查用的模型都一样，密钥不变。`base_url` 不是这个服务商的目录地址时（例如自己的代理），所有模型都发到它。
+每个模型还可以写 `display_name` 和 `reasoning`（`false` 时请求不带思考参数）。`reasoning_efforts` 可选 `none`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`；没有 `image` 时，发给模型的图片换成一行文字说明。字段说明见 [docs/serve-protocol.md](docs/serve-protocol.md)。
 
-## 工具、技能和 MCP
+## 远程访问
 
-模型能用的工具不多：`read`、`hashline_edit`（默认唯一开启的编辑工具）、`bash`、`ripgrep`、`ls`、`outline`、`checkpoint`、`web_fetch`、`generate_image`，以及子智能体相关的 `spawn_agent` 等。`str_replace`、`write`、`apply_patch` 默认关闭，用 `config.json` 的 `edit_tools` 打开。编辑工具改一个已有文件前，智能体必须先 `read` 过它，而且读过之后文件没有被别人改过（`apply_patch` 也一样，包括只改名的补丁，新建的文件除外）。编辑只给新写入的行加换行符：用 CRLF 的文件新行用 CRLF，两种换行混用的文件新行用占多数的那种，没改的行保持原样。`web_search` 按顺序试三步，哪一步找到网页就用哪一步：先让当前对话的模型用它自己服务商那边的联网搜索（Claude 走 Messages 的 `web_search` 服务端工具，GPT 走 Responses 的 `web_search` 工具，经过 LynShen 或 Monoize 网关；`web_search_model` 可以指定另一个模型来搜，默认空字符串，即当前对话的模型）；模型不能搜或搜失败时，用网关的搜索（`POST /tools/v1/search`，用对话已经在用的密钥，搜索服务的密钥只在网关上）；都不行时，从本机搜 Bing、DuckDuckGo、搜狗的网页结果。结果里写明是哪一步搜的。`config.json` 里把 `web_search_engine` 设成 `gateway` 则只走 LynShen 网关的搜索，那条路要登录。文件工具只访问工作目录，以及技能目录和 `sandbox_directories` 里配置的目录。
+远程访问默认关闭。手机通过以下方式连接电脑上的 daemon：
 
-技能从 `~/.lynshen/skills`、`~/.agents/skills` 和已信任项目的 `.lynshen/skills`、`.agents/skills` 读取。在 `config.json` 里设 `"extra_skills_source": "anthropic"`，`/skills` 就能列出和安装 [anthropics/skills](https://github.com/anthropics/skills) 里的技能。详见 [docs/skills.md](docs/skills.md)。
+- **中继 v2（账号）：** 这台电脑的桌面端登录了 LynShen 账号时，daemon 打开中继后注册为账号下的一台电脑，只有登录同一账号的手机能连接。新手机可以用配对码，也可以发起连接请求，在桌面端确认。连不上 v2 时，daemon 暂时退回 v1，10 分钟后再试。
+- **中继 v1（配对）：** `lynshen daemon relay on` 打开中继（`off` 关闭，`status` 查看），`lynshen daemon pair` 打印一次性配对链接，5 分钟内在手机上打开。然后在电脑上核对两边显示的 6 位校验码并确认（桌面端完成）。
+- **局域网和 Tailscale 直连（高级）：** daemon 保持监听 `127.0.0.1`，用 `tailscale serve` 或反向代理以 HTTPS 暴露端口。新的直连配对需要电脑已登录 LynShen 账号。
 
-MCP 服务器写在 `config.json` 的 `mcp_servers` 里，支持 stdio 和 HTTP。详见 [docs/mcp.md](docs/mcp.md)。
+中继连接端到端加密（Noise），中继服务读不到内容。已配对的设备可以随时吊销；设备默认只能查看、发消息和处理普通审批，全自动、离开沙箱等权限要在电脑上单独授予。协议见 [docs/daemon-protocol.md](docs/daemon-protocol.md) 和 [docs/relay-protocol.md](docs/relay-protocol.md)。daemon 还可以接 Telegram、Discord 和 QQ 机器人，见 [docs/chat-connectors.md](docs/chat-connectors.md)。
 
-钩子（hooks）写在 `~/.lynshen/hooks.json` 和已信任项目的 `.lynshen/hooks.json` 里。每个钩子可以用 `timeout` 设超时秒数。不设时，每次工具调用或提问前后跑的钩子（`pre_tool_use`、`post_tool_use`、`user_prompt_submit`）最多跑 60 秒，`session_start`、`stop`、`task_completed`、`agent_idle` 最多跑 600 秒。超时的钩子连同它启动的进程一起被停掉，按失败处理。在桌面端、`serve` 或 ACP 里中断，也会停掉正在跑的 `session_start`、`user_prompt_submit`、`stop` 钩子；TUI 里暂时不能。详见 [docs/serve-protocol.md](docs/serve-protocol.md) 的 "Hooks"。
+## 数据与隐私
 
-回复风格决定模型怎么写回复：语气、长短、结构、讲解多少。它不改变智能体做事的规则：安全、工具、审批、沙箱、验证和项目说明都照旧，代码和提交信息也照项目的约定写。内置 `default`（默认，不加风格）、`concise`（简洁）、`explanatory`（详细讲解）、`learning`（教学引导）、`formal`（正式汇报）。自定义风格是 `~/.lynshen/styles/<id>.md`（已信任项目也可以放在 `.lynshen/styles/`）：frontmatter 写 `name` 和 `description`，正文写要求。新对话的默认风格是 `config.json` 的 `reply_style`；单个对话用 `/style <id>` 或启动参数 `--style <id>` 换。对话中途换风格不会重建系统提示词，提示缓存保留。详见 [docs/serve-protocol.md](docs/serve-protocol.md) 的 "Reply styles"。
+- 提示词、代码和附件发给当前会话使用的模型服务商：LynShen 网关，或你配置的服务商。Claude Code 和 Codex 使用自定义提供商时，请求只发给那个提供商，不带 LynShen 账号信息。
+- 凭据默认以明文保存在 `~/.lynshen/auth.json`（权限 0600）。在 `config.json` 里设 `"encrypt_secrets": true` 可启用静态加密，但它不能防御以你的身份运行的程序，启用前请阅读 [docs/secrets.md](docs/secrets.md)。
+- 登录 LynShen 账号后，daemon 会把每一轮的会话 ID、引擎、模型、请求数、Token 用量和起止时间上传到账号，用于在各台电脑上显示同样的统计；不上传提示词、代码或项目路径。自定义提供商的轮次只记在本机，不上传，也不算作网关用量。
+- 发给 LynShen 账号接口的部分请求（中继 v2、反馈，以及桌面端登录后的网关请求）带一个设备标识，用于按电脑计算账号的设备数。它是硬件 ID 的 HMAC 哈希，不含原始 ID。
+- `web_search` 依次尝试：模型服务商自带的搜索、LynShen 网关的搜索，最后从本机请求 Bing、DuckDuckGo、搜狗的网页结果。
+- CLI 从 `software.lynshen.org` 检查和下载更新。聊天机器人的消息由 daemon 直接与聊天平台收发，不经过 LynShen 服务器。
 
-子智能体可以按角色启动。内置三个角色：`explorer` 只读调研，`worker` 在自己的 git worktree 里写代码、用 `merge_agent` 合并回来，`reviewer` 只读审查 diff。`~/.lynshen/roles/<名字>.md` 和已信任项目的 `.lynshen/roles/<名字>.md` 可以覆盖或新增角色。同时运行的数量、嵌套层数、每轮 token 预算和分派策略写在 `config.json` 的 `agents` 里，见 [docs/serve-protocol.md](docs/serve-protocol.md) 的 "Agent team"。
+## 遇到问题
 
-## 更新
+- 先运行 `/doctor` 检查运行环境。日志在 `~/.lynshen/logs/lynshen.log`，daemon 日志在 `~/.lynshen/daemon/daemon.log`。
+- **Linux 上 shell 命令全部失败：** 安装 `bubblewrap`。Ubuntu 24.04 及以后版本还要允许非特权用户命名空间（`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`，或为 bwrap 配置 AppArmor 规则），或者切到 `full-access`。
+- **macOS 拦截用浏览器下载的二进制：** 运行 `xattr -d com.apple.quarantine <文件>`。用 `curl` 下载不会被拦截。
 
-`lynshen`（TUI）和 `lynshen serve` 启动时检查软件库。有新版本时，release 构建的二进制会在后台下载新版本替换自己，下次启动生效。你自己用 `cargo build --release` 编出来的二进制也会这样做；debug 构建只提示。版本清单用 Ed25519 签名，文件按 sha256 校验后才替换。`config.json` 里设 `"auto_update": false` 后只提示，不自动安装。手动更新：
+其他问题请到 [GitHub Issues](https://github.com/Libra1337/LynShen-CLI/issues) 提交，附上 `lynshen --version` 的输出、系统和日志中相关的部分；不要粘贴 API Key 或访问令牌。桌面端用户也可以在「设置 → 通用 → 反馈问题」里提交。
+
+## 从源码构建
+
+需要 Rust 稳定版。`crates/llm-provider-kit` 是 git 子模块，克隆时带上 `--recurse-submodules`：
 
 ```sh
-lynshen update
+git clone --recurse-submodules https://github.com/Libra1337/LynShen-CLI.git
+cd LynShen-CLI
+cargo build --release
+./target/release/lynshen --version
 ```
 
-桌面端管理的那份 CLI 随桌面端更新。
+设置了 `CARGO_TARGET_DIR` 时，产物在 `$CARGO_TARGET_DIR/release/`，不在 `./target/`。多个工作树共用一个 `CARGO_TARGET_DIR` 可以省下重复编译。
 
-## 开发
+中继服务在 `relay/`，用 Go 编写：`cd relay && go build -o lynshen-relay .`，见 [relay/README.md](relay/README.md)。
+
+常用检查：
 
 ```sh
 cargo fmt --check
@@ -248,54 +174,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-在 Linux 上跑全部测试需要 `ripgrep` 和 `bubblewrap`，并且系统允许非特权用户命名空间（CI 里用 `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`）。
-
-代码结构：
-
-- `src/main.rs`：命令行入口和子命令
-- `crates/agent-core`：智能体循环、工具、会话、配置、沙箱、技能、MCP
-- `crates/tui`：终端界面
-- `crates/daemon`：后台服务
-- `crates/llm-provider-kit`：git 子模块，各服务商的协议和模型目录
-- `crates/software-release`：软件库的签名工具
-
-## 发布
-
-1. 改 `Cargo.toml` 里 `[workspace.package]` 的 `version`。
-2. 写更新公告 `release-notes/<版本>.md`，中文，每行以「新增」「优化」或「修复」开头。
-3. 推送 tag `v<版本>`。两个工作流并行运行：`Release CLI` 构建 Linux 和 Windows，`Release CLI (macOS)` 构建 Apple 芯片和 Intel 两种 Mac。它们检查二进制报告的版本和 tag 一致，然后把文件传到 GitHub Release。配置了 `NPM_TOKEN` 时还会发布 npm 包。
-4. 在持有签名密钥的机器上运行 `deploy/software-library/publish.sh`，把这个版本发布到软件库。已安装的 CLI 从软件库更新。见 [docs/software-library.md](docs/software-library.md)。
-
-桌面端固定使用某个 CLI 版本，升级 CLI 后要改桌面仓库里的 `src-tauri/lynshen-cli.ref` 和 `src-tauri/lynshen-cli.version`。
-
-## 反馈问题
-
-在 [GitHub Issues](https://github.com/Libra1337/LynShen-CLI/issues) 提交。请写上 `lynshen --version` 的输出、系统，以及 `~/.lynshen/logs/lynshen.log` 里相关的部分。桌面端用户也可以在应用的「设置 → 通用 → 反馈问题」里提交。
+在 Linux 上运行全部测试需要 `ripgrep`、`bubblewrap`，并允许非特权用户命名空间。代码结构：`src/main.rs` 是命令行入口；`crates/agent-core` 是智能体循环、工具、配置、沙箱、技能和 MCP；`crates/tui` 是终端界面；`crates/daemon` 是后台服务；`crates/llm-provider-kit` 是各服务商的协议和模型目录。开发约定见 [AGENTS.md](AGENTS.md)，发布流程见 [docs/releasing.md](docs/releasing.md) 和 [docs/software-library.md](docs/software-library.md)。
 
 ## 许可证
 
-Apache License 2.0，见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。Copyright 2026 LynShen Innovations INC.
-
-`crates/llm-provider-kit` 包含来自 [oh-my-pi](https://github.com/can1357/oh-my-pi) 的代码和数据，使用 MIT 许可证，见[它的 NOTICE](crates/llm-provider-kit/NOTICE)。LynShen 名称和图标是 LynShen Innovations INC. 的商标，不授权给分支项目使用。
-
----
-
-## English
-
-LynShen CLI is a terminal coding agent written in Rust. The command is `lynshen`. It is also the engine behind [LynShen Desktop](https://github.com/Libra1337/LynShen_Agent): every Desktop session runs in `lynshen daemon`, which lives in this repository too.
-
-**Install.** Download the binary for your platform from [GitHub Releases](https://github.com/Libra1337/LynShen-CLI/releases) (`lynshen-aarch64-apple-darwin`, `lynshen-x86_64-apple-darwin`, `lynshen-x86_64-unknown-linux-gnu`, `lynshen-x86_64-pc-windows-msvc.exe`), or build it with `cargo build --release` from a clone made with `--recurse-submodules`. LynShen Desktop ships its own copy in `~/.lynshen/bin`. The npm package `@lynshen/cli` is not on npm yet. On Linux, install `bubblewrap`: shell commands run in its sandbox and fail without it.
-
-**First run.** Run `lynshen` in a project. Type `/login` to sign in to LynShen in the browser, or `/login <provider> <key>` to use your own key (`/login list` shows the providers). Settings are in `~/.lynshen/config.json`, credentials in `~/.lynshen/auth.json`.
-
-**Your own provider.** `provider`, `base_url`, `protocol` and `models` in `config.json` describe the provider in use. Each model entry takes `name`, `display_name`, `context_window` (sets the compaction point), `max_output_tokens` (sent as the request's output cap), `reasoning` (`false`: no reasoning settings are sent and clients show no effort), `reasoning_efforts` (the tiers clients offer: `none`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`) and `input_modalities` (`text`, `image`; without `image`, images are replaced by a note). A missing field keeps the earlier behavior. `ultra` is GPT's name for the top tier: requests send the model's highest other listed tier, or `max`. Some catalog providers serve each protocol at a URL of its own (zenmux: Chat Completions under `/api/v1`, Messages under `/api/anthropic`). Their `base_url` can be any of their catalog URLs, with placeholders such as Cloudflare's `<account>` filled in. Each request then goes to the URL of its model's protocol, with the same key: after `/model`, in subagents, and for the compaction, title and safety models. A `base_url` that is none of the provider's catalog URLs (a proxy of your own) is used for every model.
-
-**Modes.** `lynshen --headless "<task>"` runs one task and prints JSONL events. It denies approvals unless you pass `--approval-mode`. `lynshen serve` speaks newline JSON over stdio for GUIs, `lynshen acp` speaks ACP for editors such as Zed, and `lynshen daemon` hosts many sessions on `ws://127.0.0.1:7788` for Desktop and paired phones.
-
-**Safety.** The approval modes are `manual` (default), `auto-edit`, `auto` (a safety model approves safe commands) and `full-access`. On macOS and Linux, shell commands run in an OS sandbox ([docs/sandbox.md](docs/sandbox.md)). Windows has no sandbox yet.
-
-**Develop.** `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
-
-**Problems.** Open a [GitHub issue](https://github.com/Libra1337/LynShen-CLI/issues) with `lynshen --version`, your OS and the relevant part of `~/.lynshen/logs/lynshen.log`.
-
-**License.** Apache License 2.0. The LynShen name and logo are trademarks of LynShen Innovations INC. and are not licensed for use by forks.
+代码采用 [Apache License 2.0](LICENSE)，另见 [NOTICE](NOTICE)。`crates/llm-provider-kit` 包含来自 [oh-my-pi](https://github.com/can1357/oh-my-pi) 的代码和数据，使用 MIT 许可证，见[它的 NOTICE](https://github.com/Libra1337/llm-provider-kit/blob/main/NOTICE)。LynShen 名称和图标的商标权归 LynShen Innovations INC. 所有；第三方智能体及工具归各自所有者所有。
