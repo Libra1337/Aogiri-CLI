@@ -128,7 +128,7 @@ A model entry can also set `display_name` and `reasoning` (`false`: requests car
 
 Remote access is off by default. A phone reaches the daemon on your computer in one of these ways:
 
-- **Relay v2 (account):** when the desktop app on this computer is signed in to a LynShen account, the daemon registers as one of the account's computers once the relay is on. Only phones signed in to the same account can connect. A new phone uses a pairing code or sends a connect request that you confirm in the desktop app. When v2 cannot be reached, the daemon uses v1 for 10 minutes, then tries v2 again.
+- **Relay v2 (account):** when this computer is signed in to a LynShen account (in the desktop app, or on a computer with only the CLI with `lynshen login --device`: approve the device code in a browser; `lynshen logout --device` signs out), the daemon registers as one of the account's computers once the relay is on. Only phones and browsers signed in to the same account can connect. A new phone uses a pairing code or sends a connect request that you confirm in the desktop app. When v2 cannot be reached, the daemon uses v1 for 10 minutes, then tries v2 again.
 - **Relay v1 (pairing):** `lynshen daemon relay on` turns the relay on (`off` turns it off, `status` shows it), and `lynshen daemon pair` prints a one-time pairing link to open on the phone within 5 minutes. Then compare the 6-digit check code both sides show and confirm it on the computer (in the desktop app).
 - **LAN and Tailscale direct (advanced):** keep the daemon on `127.0.0.1` and expose the port over HTTPS with `tailscale serve` or a reverse proxy. New direct pairings need the computer to be signed in to LynShen.
 

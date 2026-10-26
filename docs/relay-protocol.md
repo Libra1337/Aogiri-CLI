@@ -343,6 +343,12 @@ claims: {"aud":"lynshen-relay","kid","sub":<user id>,"authz":<device authorizati
 
 - A device gets a token with its device key: `POST /api/desktop/oauth/relay-token`.
   The token is valid for 10 minutes. Clients get a new one for each connection.
+- Device keys come from the gateway's device flow (`POST /api/desktop/oauth/device`,
+  then `…/token`), one client id per app. The desktop signs the computer in as
+  `lynshen-desktop`. A computer without the desktop signs in with
+  `lynshen login --device` (client `lynshen-cli`, key in auth.json
+  `providers.lynshen-cli`); the daemon picks it up without a restart.
+  `lynshen logout --device` forgets it.
 - The relay verifies tokens without a call to the gateway. It reads the public
   keys from `GET /api/desktop/oauth/relay-key` (every 10 minutes; `-relay-keys`
   is the fallback until the gateway answers). A token is valid when its

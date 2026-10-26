@@ -128,7 +128,7 @@ lynshen --version
 
 远程访问默认关闭。手机通过以下方式连接电脑上的 daemon：
 
-- **中继 v2（账号）：** 这台电脑的桌面端登录了 LynShen 账号时，daemon 打开中继后注册为账号下的一台电脑，只有登录同一账号的手机能连接。新手机可以用配对码，也可以发起连接请求，在桌面端确认。连不上 v2 时，daemon 暂时退回 v1，10 分钟后再试。
+- **中继 v2（账号）：** 这台电脑登录了 LynShen 账号时（桌面端登录，或只装了 CLI 的电脑运行 `lynshen login --device`：在浏览器里确认设备码，`lynshen logout --device` 退出），daemon 打开中继后注册为账号下的一台电脑，只有登录同一账号的手机和网页能连接。新手机可以用配对码，也可以发起连接请求，在桌面端确认。连不上 v2 时，daemon 暂时退回 v1，10 分钟后再试。
 - **中继 v1（配对）：** `lynshen daemon relay on` 打开中继（`off` 关闭，`status` 查看），`lynshen daemon pair` 打印一次性配对链接，5 分钟内在手机上打开。然后在电脑上核对两边显示的 6 位校验码并确认（桌面端完成）。
 - **局域网和 Tailscale 直连（高级）：** daemon 保持监听 `127.0.0.1`，用 `tailscale serve` 或反向代理以 HTTPS 暴露端口。新的直连配对需要电脑已登录 LynShen 账号。
 

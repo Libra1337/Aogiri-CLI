@@ -221,6 +221,35 @@ fn main() -> io::Result<()> {
             }
         }
     }
+    // `login --device` / `logout --device`: this computer's LynShen device
+    // key for remote access through the account (relay v2), without the
+    // desktop. The model sign-in stays `/login` in the TUI.
+    if args.first().map(String::as_str) == Some("login") {
+        if !args.iter().skip(1).any(|arg| arg == "--device") {
+            eprintln!("usage: lynshen login --device   (sign this computer in for remote access; sign in for models with /login in the TUI)");
+            std::process::exit(2);
+        }
+        let mut say = |line: &str| println!("{line}");
+        match lynshen_agent_core::device_login::login(&mut say) {
+            Ok(_) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("lynshen: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.first().map(String::as_str) == Some("logout")
+        && args.iter().skip(1).any(|arg| arg == "--device")
+    {
+        let mut say = |line: &str| println!("{line}");
+        match lynshen_agent_core::device_login::logout(&mut say) {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("lynshen: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.first().map(String::as_str) == Some("logout") {
         match lynshen_agent_core::lynshen_logout() {
             Ok(()) => std::process::exit(0),
@@ -305,6 +334,10 @@ USAGE:
                                          JSON-RPC adapter over stdio, for
                                          ACP-capable editors like Zed
     lynshen auth-login <provider>         browser OAuth without starting a session
+    lynshen login --device                sign this computer in to the LynShen
+                                         account (device code in the browser)
+                                         for remote access through the account
+    lynshen logout --device               forget that sign-in
     lynshen providers                     print built-in providers as JSON
     lynshen token                         print a LynShen access token as JSON (refreshed when needed)
     lynshen device-id                     print this computer's gateway device header as JSON
