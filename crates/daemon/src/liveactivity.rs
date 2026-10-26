@@ -385,7 +385,7 @@ impl LiveActivities {
         }
     }
 
-    fn has_tokens(&self) -> bool {
+    pub(crate) fn has_tokens(&self) -> bool {
         lock(&self.state)
             .devices
             .values()

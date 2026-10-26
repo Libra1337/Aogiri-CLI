@@ -1700,8 +1700,18 @@ mod tests {
             hub.store.device(&device.id).is_some(),
             "the same account changes nothing"
         );
+        // The device's Dynamic Island token is bound to it, so it goes too.
+        hub.push
+            .live
+            .register(
+                &device.id,
+                &json!({ "kind": "start", "token": "ab".repeat(128), "environment": "sandbox" }),
+                now(),
+            )
+            .unwrap();
         hub.relay.register(&hub, "u2").unwrap();
         assert!(hub.store.device(&device.id).is_none());
+        assert!(!hub.push.live.has_tokens());
         assert_eq!(hub.store.setting(USER_SETTING), json!("u2"));
         assert_eq!(hub.relay.status_json()["user"], "u2");
     }

@@ -678,3 +678,48 @@ func TestPushStillGoesThroughForAV2Host(t *testing.T) {
 		t.Fatalf("push for a v2 host: %d %s", status, body)
 	}
 }
+
+// A Live Activity push goes through for a host connected over v2, like a
+// notification: the push endpoint knows hosts by their key, not by version.
+func TestALiveActivityGoesThroughForAV2Host(t *testing.T) {
+	f := newV2Fixture(t)
+	pf, rec, _, _ := apnsFixture(t)
+	pf.relay.mu.Lock()
+	delete(pf.relay.hosts, hostID(pf.hostPub))
+	pf.relay.mu.Unlock()
+	pf.relay.accounts = f.relay.accounts
+	server := httptest.NewServer(routes(pf.relay, pf.push))
+	defer server.Close()
+	pf.server = server
+	activity := map[string]any{
+		"subscription": activitySub(),
+		"liveactivity": map[string]any{"event": "update", "content_state": runningState(), "timestamp": time.Now().Unix()},
+	}
+	if status, body := pf.post(activity, nil); status != http.StatusForbidden {
+		t.Fatalf("before the host connects: %d %s", status, body)
+	}
+	ws := "ws" + strings.TrimPrefix(server.URL, "http")
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+f.gateway.token("u1", "dev-mac", "lynshen-cli", "Mac"))
+	conn, _, err := websocket.Dial(f.ctx, ws+"/relay/v2/host?host="+hostID(pf.hostPub), &websocket.DialOptions{HTTPHeader: header})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	_, text, _ := conn.Read(f.ctx)
+	var challenge struct{ Nonce string }
+	json.Unmarshal(text, &challenge)
+	signature := ed25519.Sign(pf.hostKey, append([]byte("lynshen-relay-v1:"), unb64(t, challenge.Nonce)...))
+	auth, _ := json.Marshal(map[string]string{"t": "auth", "pub": b64.EncodeToString(pf.hostPub), "sig": b64.EncodeToString(signature), "static": b64.EncodeToString(make([]byte, 32)), "platform": "linux"})
+	conn.Write(f.ctx, websocket.MessageText, auth)
+	if _, text, _ := conn.Read(f.ctx); !strings.Contains(string(text), `"user":"u1"`) {
+		t.Fatalf("ready %s", text)
+	}
+	activity["liveactivity"].(map[string]any)["timestamp"] = time.Now().Unix()
+	if status, body := pf.post(activity, nil); status != http.StatusNoContent {
+		t.Fatalf("live activity for a v2 host: %d %s", status, body)
+	}
+	if h := rec.last(t).r.Header; h.Get("apns-push-type") != "liveactivity" || h.Get("apns-topic") != "com.lynshen.aogiri.push-type.liveactivity" {
+		t.Fatalf("headers %v", h)
+	}
+}
