@@ -7,6 +7,7 @@
 mod agent_tools;
 mod agents;
 mod app_tools;
+mod awake;
 mod connectors;
 mod devservers;
 mod dispatch;
@@ -37,6 +38,7 @@ mod titles;
 mod uploads;
 mod usage;
 mod webpush;
+mod worktrees;
 
 pub use agents::Agents;
 pub use hub::check_code;
@@ -90,6 +92,10 @@ pub fn serve(
         gateway::set_group(&record.id, record.group.as_deref());
     }
     let hub = Hub::new(store, agents, version, relay);
+    // Runs left going by the last daemon ended with it; the worktrees of
+    // archived runs it left behind go when nothing is in them.
+    hub.interrupt_schedule_runs();
+    hub.clean_run_worktrees();
     // A bot answers one computer: the copy leaves it to the original.
     if copied {
         connectors::turn_all_off(&hub);
@@ -247,11 +253,12 @@ fn pump(
     link: &mut impl Link,
     inbox: &hub::Inbox,
 ) -> Result<(), String> {
-    // The daemon also forks conversations and probes engines (B08); a
-    // client checks for them before it offers either.
+    // The daemon also forks conversations and probes engines (B08), and
+    // keeps scheduled runs with failures, budgets and worktrees (B12); a
+    // client checks for them before it offers any.
     let mut hello = protocol::hello_json(hub.version);
     if let Some(features) = hello["features"].as_array_mut() {
-        features.extend([json!("fork"), json!("engine_probe")]);
+        features.extend([json!("fork"), json!("engine_probe"), json!("schedule_runs")]);
     }
     for frame in [
         hello,
@@ -510,9 +517,27 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                     let sessions = if key == "session" {
                         vec![id.to_string()]
                     } else {
-                        hub.store.sessions_reached_from(&format!("schedule:{id}"))
+                        // The runs and the sessions they started.
+                        hub.with_children(
+                            hub.store.sessions_reached_from(&format!("schedule:{id}")),
+                        )
                     };
                     let mut usage = hub.usage.sessions_json(&sessions);
+                    if key == "schedule" {
+                        let parents: std::collections::HashMap<String, String> = hub
+                            .store
+                            .sessions()
+                            .into_iter()
+                            .filter_map(|r| Some((r.id, r.parent?)))
+                            .collect();
+                        for row in usage["sessions"].as_array_mut().into_iter().flatten() {
+                            if let Some(parent) =
+                                row["session"].as_str().and_then(|s| parents.get(s))
+                            {
+                                row["parent"] = json!(parent);
+                            }
+                        }
+                    }
                     usage["type"] = json!(name);
                     usage[key] = json!(id);
                     Ok(usage)

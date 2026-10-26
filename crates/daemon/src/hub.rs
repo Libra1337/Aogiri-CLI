@@ -124,6 +124,15 @@ pub struct Hub {
     pub connectors: crate::connectors::Connectors,
     /// Dev servers the sessions' commands started (see `devservers`).
     pub dev_servers: crate::devservers::DevServers,
+    /// Keeps the computer from idle sleep while any feature needs it.
+    pub awake: crate::awake::Awake,
+    /// Sessions with background work their turn left going (background
+    /// commands, subagents, workflows): not a turn, so not `busy`. True
+    /// when some of it comes back to the conversation (subagents,
+    /// workflows; a dev server never does).
+    background: Mutex<HashMap<String, bool>>,
+    /// A scheduled runs' budget check is going (`check_budgets`).
+    pub(crate) budget_check: AtomicBool,
     /// When each device was last heard from (ms), since the daemon started.
     seen: Mutex<HashMap<String, u64>>,
 }
@@ -259,6 +268,9 @@ impl Hub {
             push: crate::push::Push::load(store.dir(), &store),
             connectors: crate::connectors::Connectors::load(store.dir()),
             dev_servers: Default::default(),
+            awake: Default::default(),
+            background: Mutex::new(HashMap::new()),
+            budget_check: AtomicBool::new(false),
             seen: Mutex::new(HashMap::new()),
             terminals: Default::default(),
             store,
@@ -596,6 +608,7 @@ impl Hub {
         if engine.is_some() && agent.is_some() {
             return Err("agents run on the lynshen engine".to_string());
         }
+        let mut agent_project: Option<String> = None;
         let cwd = match agent {
             None if chat => {
                 lynshen_agent_core::chat::ensure_chats_dir().map_err(|error| error.to_string())?
@@ -608,7 +621,15 @@ impl Hub {
                 if !agent.enabled {
                     return Err(format!("agent {id} is disabled"));
                 }
-                agent.cwd
+                // An agent works in its folder, or in a task worktree of it
+                // (a scheduled run's), still in the agent's project.
+                match cwd.filter(|cwd| crate::worktrees::in_worktree_of(cwd, &agent.cwd)) {
+                    Some(tree) => {
+                        agent_project = agent.project.clone();
+                        tree
+                    }
+                    None => agent.cwd,
+                }
             }
             None => cwd.ok_or_else(|| "session_create requires cwd or agent".to_string())?,
         };
@@ -618,7 +639,9 @@ impl Hub {
         // A chat belongs to no project.
         let project = match chat {
             true => String::new(),
-            false => crate::projects::for_new_session(self, &cwd, project)?,
+            false => {
+                crate::projects::for_new_session(self, &cwd, project.or(agent_project.as_deref()))?
+            }
         };
         let dirs = crate::projects::extra_dirs(self, &cwd, &project);
         let mut options = engines::Options {
@@ -845,6 +868,8 @@ impl Hub {
                     conversation: None,
                     acp_agent: None,
                     forked_from: None,
+                    worktree: None,
+                    parent: None,
                 }
             }
             (None, None) => return Err(format!("unknown session {id}")),
@@ -1240,6 +1265,8 @@ impl Hub {
         crate::session_messages::ended(self, id);
         self.connectors.session_closed(id);
         lock(&self.busy).remove(id);
+        lock(&self.background).remove(id);
+        self.run_session_ended(id);
         lock(&self.claims).remove(id);
         // Images waiting for an echo the closed engine will not send.
         lock(&self.sent_images).remove(id);
@@ -1379,6 +1406,34 @@ impl Hub {
     /// A session is running a turn or has messages waiting.
     pub fn is_busy(&self, session: &str) -> bool {
         lock(&self.busy).contains(session)
+    }
+
+    /// Called by a session thread every tick: whether background work the
+    /// turn left going runs (`any`), and whether some of it comes back to
+    /// the conversation (`awaited`). Clients follow `any` in the session
+    /// list; a scheduled run waits on `awaited`.
+    pub fn set_background(&self, session: &str, any: bool, awaited: bool) {
+        let before = if any {
+            lock(&self.background).insert(session.to_string(), awaited)
+        } else {
+            lock(&self.background).remove(session)
+        };
+        if before != any.then_some(awaited) {
+            if before.is_none() || !any {
+                self.broadcast(&self.sessions_json());
+            }
+            self.run_activity(session);
+        }
+    }
+
+    /// A session has background work going (`set_background`).
+    pub fn is_background(&self, session: &str) -> bool {
+        lock(&self.background).contains_key(session)
+    }
+
+    /// A session has background work going that comes back to it.
+    pub fn is_awaited(&self, session: &str) -> bool {
+        lock(&self.background).get(session) == Some(&true)
     }
 
     /// The end of a session's latest reply, as far as this daemon saw it.
@@ -1535,6 +1590,8 @@ impl Hub {
         let mut schedules = lock(&self.schedules);
         self.agents.delete(id)?;
         schedules.retain(|schedule| schedule.agent != id);
+        // Its runs no longer keep the computer awake.
+        self.sync_awake(&schedules);
         drop(schedules);
         for session in &own {
             let _ = self.close_session(session);
@@ -1606,6 +1663,7 @@ impl Hub {
     pub fn tick(self: &Arc<Self>) {
         self.fire_due_timers();
         self.fire_due_schedules();
+        self.sweep_schedule_runs();
         self.expire_questions();
         self.deliver_pending();
         crate::push::tick(self);
@@ -1930,6 +1988,12 @@ impl Hub {
                     .store
                     .record_session_meta(&record.id, &json!({ "archived": true }))
                     .unwrap_or(false);
+                // Its worktree goes if nothing is in it; while its engine is
+                // still open, once it closes (`run_session_ended`).
+                let tree = record.worktree.filter(|tree| tree["gone"] != true);
+                if let Some(tree) = tree.filter(|_| !self.is_open(&record.id)) {
+                    self.drop_worktree(&record.id, tree);
+                }
             }
         }
         if archived {
@@ -1979,6 +2043,10 @@ impl Hub {
     pub fn deliver_pending(self: &Arc<Self>) {
         let _guard = lock(&self.delivering);
         for message in self.store.pending_messages() {
+            // A scheduled run's worktree is still being made.
+            if self.run_preparing(&message) {
+                continue;
+            }
             match self.route(&message) {
                 Ok(target) => {
                     let busy = target
@@ -1989,10 +2057,17 @@ impl Hub {
                     }
                     if let Err(error) = self.deliver(&message, target) {
                         lynshen_agent_core::log_warn!("daemon", "delivery failed", error = error);
+                        // A scheduled run that cannot start fails, rather
+                        // than wait for a session that never opens.
+                        if message.from.starts_with("schedule:") {
+                            let _ = self.store.record_undeliverable(&message.id, &error);
+                            self.run_undeliverable(&message, &error);
+                        }
                     }
                 }
                 Err(reason) => {
                     let _ = self.store.record_undeliverable(&message.id, &reason);
+                    self.run_undeliverable(&message, &reason);
                 }
             }
         }
@@ -2038,7 +2113,8 @@ impl Hub {
                 self.open_session(&session, None)?;
                 session
             }
-            None => self.create_session(None, Some(&message.to), false)?,
+            // A scheduled run may start in a worktree of its own.
+            None => self.create_session(self.run_cwd(message), Some(&message.to), false)?,
         };
         // A delivered message starts (or queues) a run: claim the slot before
         // forwarding, so the next message sees it taken.
@@ -2055,7 +2131,7 @@ impl Hub {
             .record_delivered(&message.id, &session)
             .map_err(|error| error.to_string())?;
         if let Some(schedule) = message.from.strip_prefix("schedule:") {
-            self.schedule_delivered(schedule, &session);
+            self.schedule_delivered(schedule, &session, &message.id);
         }
         self.broadcast(&json!({
             "type": "message_delivered",
@@ -2124,6 +2200,7 @@ impl Hub {
                 self.broadcast(&self.sessions_json());
             }
         }
+        self.observe_run(session, event, over, failed.as_deref());
         if due {
             self.retitle(session);
         }
@@ -2379,9 +2456,12 @@ impl Hub {
         let records = self.store.sessions();
         let saved = saved_by_id(records.iter().map(|record| record.cwd.as_path()));
         let projects = crate::projects::projects(self);
+        // Before the sessions lock: never held with the schedules'.
+        let runs = self.run_sessions();
         let sessions = lock(&self.sessions);
         let busy = lock(&self.busy).clone();
         let failed = lock(&self.failed).clone();
+        let background = lock(&self.background).clone();
         let list: Vec<Value> = records
             .into_iter()
             // An agent's session stays on its agent's page even when a
@@ -2419,6 +2499,16 @@ impl Hub {
                     "running": busy.contains(&record.id),
                     // Its latest turn ended on an error.
                     "failed": failed.contains(&record.id),
+                    // Background work its turn left going runs (后台任务运行中):
+                    // not a turn, so not `running`.
+                    "background": background.contains_key(&record.id),
+                    // The scheduled task it is a run of, or null.
+                    "schedule": runs.get(&record.id),
+                    // The worktree the daemon made for it (a scheduled run's):
+                    // {repo, path, branch, base, slug}, gone: true once removed.
+                    "worktree": record.worktree,
+                    // The session that started it (start_session), or null.
+                    "parent": record.parent,
                 })
             })
             .collect();
@@ -2709,6 +2799,8 @@ mod tests {
             conversation: None,
             acp_agent: None,
             forked_from: None,
+            worktree: None,
+            parent: None,
         };
         assert_eq!(
             shown_title(&record, Some(&scheduled)).as_deref(),
