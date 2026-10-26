@@ -9,9 +9,9 @@
   <p>在终端里运行的编程智能体，也是 Aogiri 桌面端和手机端的引擎。</p>
 
   <p>
-    <a href="https://github.com/Libra1337/LynShen-CLI/releases/latest">下载</a> ·
-    <a href="https://github.com/Libra1337/LynShen-CLI/releases">全部版本</a> ·
-    <a href="https://github.com/Libra1337/LynShen-CLI/issues">问题反馈</a>
+    <a href="https://github.com/Libra1337/Aogiri-CLI/releases/latest">下载</a> ·
+    <a href="https://github.com/Libra1337/Aogiri-CLI/releases">全部版本</a> ·
+    <a href="https://github.com/Libra1337/Aogiri-CLI/issues">问题反馈</a>
   </p>
 
   <p><strong>简体中文</strong> · <a href="README.en-US.md">English</a></p>
@@ -31,7 +31,7 @@
 下载后放进 PATH 里的目录。例如 Apple 芯片的 Mac：
 
 ```sh
-curl -fLo lynshen https://github.com/Libra1337/LynShen-CLI/releases/latest/download/lynshen-aarch64-apple-darwin
+curl -fLo lynshen https://github.com/Libra1337/Aogiri-CLI/releases/latest/download/lynshen-aarch64-apple-darwin
 chmod +x lynshen
 mkdir -p ~/.local/bin && mv lynshen ~/.local/bin/
 lynshen --version
@@ -149,15 +149,15 @@ lynshen --version
 - **Linux 上 shell 命令全部失败：** 安装 `bubblewrap`。Ubuntu 24.04 及以后版本还要允许非特权用户命名空间（`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`，或为 bwrap 配置 AppArmor 规则），或者切到 `full-access`。
 - **macOS 拦截用浏览器下载的二进制：** 运行 `xattr -d com.apple.quarantine <文件>`。用 `curl` 下载不会被拦截。
 
-其他问题请到 [GitHub Issues](https://github.com/Libra1337/LynShen-CLI/issues) 提交，附上 `lynshen --version` 的输出、系统和日志中相关的部分；不要粘贴 API Key 或访问令牌。桌面端用户也可以在「设置 → 通用 → 反馈问题」里提交。
+其他问题请到 [GitHub Issues](https://github.com/Libra1337/Aogiri-CLI/issues) 提交，附上 `lynshen --version` 的输出、系统和日志中相关的部分；不要粘贴 API Key 或访问令牌。桌面端用户也可以在「设置 → 通用 → 反馈问题」里提交。
 
 ## 从源码构建
 
 需要 Rust 稳定版。`crates/llm-provider-kit` 是 git 子模块，克隆时带上 `--recurse-submodules`：
 
 ```sh
-git clone --recurse-submodules https://github.com/Libra1337/LynShen-CLI.git
-cd LynShen-CLI
+git clone --recurse-submodules https://github.com/Libra1337/Aogiri-CLI.git
+cd Aogiri-CLI
 cargo build --release
 ./target/release/lynshen --version
 ```
