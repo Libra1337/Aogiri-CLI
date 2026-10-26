@@ -1,6 +1,7 @@
 // lynshen-relay forwards opaque bytes between paired clients and a daemon
-// (docs/relay-protocol.md §3). It holds no keys, sees no content and stores
-// nothing: every client stream is a Noise session the relay cannot read.
+// (docs/relay-protocol.md §3, and §7 for v2, account-based, in v2.go). It
+// holds no keys, sees no content and stores nothing: every client stream is a
+// Noise session the relay cannot read.
 package main
 
 import (
@@ -18,9 +19,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/coder/websocket"
@@ -46,6 +49,8 @@ type stream struct {
 	conn     *websocket.Conn
 	lastSeen time.Time
 	cancel   context.CancelFunc
+	// v2 (v2.go): the caller the token named; empty for a v1 client.
+	user, authz string
 }
 
 type host struct {
@@ -56,7 +61,12 @@ type host struct {
 	streams map[uint32]*stream
 	nextID  uint32
 	done    chan struct{}
+	// v2 (v2.go): the account the host is registered under and the device
+	// authorization its token named; empty for a v1 host.
+	user, authz string
 }
+
+func (h *host) v2() bool { return h.user != "" }
 
 func (h *host) send(ctx context.Context, kind byte, sid uint32, payload []byte) error {
 	frame := make([]byte, 5+len(payload))
@@ -72,6 +82,14 @@ type relay struct {
 	mu    sync.Mutex
 	hosts map[string]*host
 	rate  *limiter
+	// accounts serves v2 (v2.go); nil: only v1 is served.
+	accounts *accounts
+	// v1 serves the v1 endpoints (default on, while old phones need them).
+	v1 bool
+	// offline lists v2 hosts gone since the last heartbeat.
+	offline []string
+	// draining: the server is going down; new connections are refused 4503.
+	draining bool
 }
 
 // limiter counts events per key in a sliding one-minute window.
@@ -124,32 +142,54 @@ func (rl *relay) serveHost(w http.ResponseWriter, r *http.Request) {
 	}
 	conn.SetReadLimit(maxMessage + 5)
 	ctx := r.Context()
+	auth, ok := hostChallenge(ctx, conn)
+	if !ok {
+		return
+	}
+	h := &host{id: hostID(auth.public), conn: conn, streams: map[uint32]*stream{}, done: make(chan struct{})}
+	ready, _ := json.Marshal(map[string]string{"t": "ready", "host": h.id})
+	if err := conn.Write(ctx, websocket.MessageText, ready); err != nil {
+		return
+	}
+	rl.runHost(h, auth.V)
+}
 
+// hostAuth is a host's answer to the challenge (§3.1; v2 adds static, name
+// and platform).
+type hostAuth struct {
+	T        string `json:"t"`
+	Pub      string `json:"pub"`
+	Sig      string `json:"sig"`
+	V        string `json:"v"`
+	Static   string `json:"static"`
+	Name     string `json:"name"`
+	Platform string `json:"platform"`
+	public   []byte
+}
+
+// hostChallenge sends the challenge and checks the signed answer; a bad one
+// closes the connection with 4401.
+func hostChallenge(ctx context.Context, conn *websocket.Conn) (*hostAuth, bool) {
 	nonce := make([]byte, 32)
 	if _, err := rand.Read(nonce); err != nil {
 		conn.Close(websocket.StatusInternalError, "rng")
-		return
+		return nil, false
 	}
 	challenge, _ := json.Marshal(map[string]string{"t": "challenge", "nonce": b64.EncodeToString(nonce)})
 	authCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
 	if err := conn.Write(authCtx, websocket.MessageText, challenge); err != nil {
-		return
+		return nil, false
 	}
 	kind, body, err := conn.Read(authCtx)
 	if err != nil || kind != websocket.MessageText {
 		conn.Close(4401, "auth failed")
-		return
+		return nil, false
 	}
-	var auth struct {
-		T   string `json:"t"`
-		Pub string `json:"pub"`
-		Sig string `json:"sig"`
-		V   string `json:"v"`
-	}
+	var auth hostAuth
 	if json.Unmarshal(body, &auth) != nil {
 		conn.Close(4401, "auth failed")
-		return
+		return nil, false
 	}
 	public, errPub := b64.DecodeString(auth.Pub)
 	signature, errSig := b64.DecodeString(auth.Sig)
@@ -157,14 +197,17 @@ func (rl *relay) serveHost(w http.ResponseWriter, r *http.Request) {
 	if auth.T != "auth" || errPub != nil || errSig != nil || len(public) != ed25519.PublicKeySize ||
 		!ed25519.Verify(public, message, signature) {
 		conn.Close(4401, "auth failed")
-		return
+		return nil, false
 	}
-	h := &host{id: hostID(public), conn: conn, streams: map[uint32]*stream{}, done: make(chan struct{})}
-	ready, _ := json.Marshal(map[string]string{"t": "ready", "host": h.id})
-	if err := conn.Write(ctx, websocket.MessageText, ready); err != nil {
-		return
-	}
+	auth.public = public
+	return &auth, true
+}
 
+// runHost serves an authenticated host (v1 or v2) until its socket drops: it
+// replaces an older connection of the same host, pings it, and routes its
+// frames to the client streams.
+func (rl *relay) runHost(h *host, version string) {
+	conn := h.conn
 	rl.mu.Lock()
 	previous := rl.hosts[h.id]
 	rl.hosts[h.id] = h
@@ -172,7 +215,7 @@ func (rl *relay) serveHost(w http.ResponseWriter, r *http.Request) {
 	if previous != nil {
 		previous.conn.Close(4409, "replaced")
 	}
-	log.Printf("host %s connected (daemon %s)", h.id, auth.V)
+	log.Printf("host %s connected (daemon %s)", h.id, version)
 
 	go func() {
 		ticker := time.NewTicker(pingEvery)
@@ -198,15 +241,28 @@ func (rl *relay) serveHost(w http.ResponseWriter, r *http.Request) {
 		rl.mu.Lock()
 		if rl.hosts[h.id] == h {
 			delete(rl.hosts, h.id)
+			if h.v2() {
+				rl.offline = append(rl.offline, h.id)
+			}
 		}
+		draining := rl.draining
 		rl.mu.Unlock()
-		h.mu.Lock()
-		for _, s := range h.streams {
-			s.conn.Close(4404, "host offline")
-			s.cancel()
+		code, reason := websocket.StatusCode(4404), "host offline"
+		if draining && h.v2() {
+			code, reason = 4503, "server restarting"
 		}
+		h.mu.Lock()
+		streams := h.streams
 		h.streams = map[uint32]*stream{}
 		h.mu.Unlock()
+		// Each close waits for its client's answer: one at a time, a slow
+		// client would hold up the others.
+		for _, s := range streams {
+			go func() {
+				s.conn.Close(code, reason)
+				s.cancel()
+			}()
+		}
 		log.Printf("host %s disconnected", h.id)
 	}()
 
@@ -261,6 +317,18 @@ func (rl *relay) serveConnect(w http.ResponseWriter, r *http.Request) {
 		conn.Close(4404, "host offline")
 		return
 	}
+	// A v1 client of a v2 host (an Aogiri release from before v2): the open
+	// frame says so, and the daemon admits only devices paired with it.
+	var payload []byte
+	if h.v2() {
+		payload = []byte(`{"v":1}`)
+	}
+	rl.serveStream(h, conn, &stream{}, payload)
+}
+
+// serveStream forwards one client's binary messages to its host and back
+// until either side closes (§3.2). `s` carries the caller (v2).
+func (rl *relay) serveStream(h *host, conn *websocket.Conn, s *stream, payload []byte) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	h.mu.Lock()
@@ -274,7 +342,7 @@ func (rl *relay) serveConnect(w http.ResponseWriter, r *http.Request) {
 		h.nextID = 1
 	}
 	sid := h.nextID
-	s := &stream{conn: conn, lastSeen: time.Now(), cancel: cancel}
+	s.conn, s.lastSeen, s.cancel = conn, time.Now(), cancel
 	h.streams[sid] = s
 	h.mu.Unlock()
 	defer func() {
@@ -289,7 +357,7 @@ func (rl *relay) serveConnect(w http.ResponseWriter, r *http.Request) {
 		}
 		conn.Close(websocket.StatusNormalClosure, "")
 	}()
-	if err := h.send(ctx, kindOpen, sid, nil); err != nil {
+	if err := h.send(ctx, kindOpen, sid, payload); err != nil {
 		return
 	}
 
@@ -327,18 +395,27 @@ func (rl *relay) serveConnect(w http.ResponseWriter, r *http.Request) {
 }
 
 func newRelay() *relay {
-	return &relay{hosts: map[string]*host{}, rate: &limiter{events: map[string][]time.Time{}}}
+	return &relay{hosts: map[string]*host{}, rate: &limiter{events: map[string][]time.Time{}}, v1: true}
 }
 
 // routes are the relay's endpoints; push ones only with a VAPID key or a
 // native provider.
 func routes(rl *relay, push *pusher) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/relay/v1/host", rl.serveHost)
-	mux.HandleFunc("/relay/v1/connect", rl.serveConnect)
+	if rl.v1 {
+		mux.HandleFunc("/relay/v1/host", rl.serveHost)
+		mux.HandleFunc("/relay/v1/connect", rl.serveConnect)
+	}
 	mux.HandleFunc("/relay/v1/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("ok"))
 	})
+	if rl.accounts != nil {
+		mux.HandleFunc("/relay/v2/host", rl.serveHostV2)
+		mux.HandleFunc("/relay/v2/connect", rl.serveConnectV2)
+		mux.HandleFunc("/relay/v2/healthz", func(w http.ResponseWriter, _ *http.Request) {
+			w.Write([]byte("ok"))
+		})
+	}
 	if push != nil {
 		mux.HandleFunc("/relay/v1/push/key", push.serveKey)
 		mux.HandleFunc("/relay/v1/push", push.servePush)
@@ -372,6 +449,10 @@ func main() {
 	apnsTeamID := flag.String("apns-team-id", os.Getenv("LYNSHEN_RELAY_APNS_TEAM_ID"), "the Apple Team ID (default $LYNSHEN_RELAY_APNS_TEAM_ID)")
 	apnsTopic := flag.String("apns-topic", "com.lynshen.aogiri", "the app's bundle id (apns-topic)")
 	fcmAccount := flag.String("fcm-account", "", "FCM service account key JSON (default: the systemd credential `fcm`); FCM is served only with one")
+	gateway := flag.String("gateway", os.Getenv("LYNSHEN_RELAY_GATEWAY"), "LynShen gateway origin for relay v2 (e.g. https://www.lynshen.org; default $LYNSHEN_RELAY_GATEWAY); v2 is served only with one")
+	serviceFile := flag.String("service-token-file", "", "the gateway's relay service token (default: the systemd credential `relay-service`, else $LYNSHEN_RELAY_SERVICE_TOKEN)")
+	relayKeys := flag.String("relay-keys", os.Getenv("LYNSHEN_RELAY_TOKEN_KEYS"), "comma-separated base64url Ed25519 keys that sign relay tokens, used until the gateway's relay-key answers (default $LYNSHEN_RELAY_TOKEN_KEYS)")
+	noV1 := flag.Bool("no-v1", false, "stop serving the v1 host and connect endpoints (keep them while phones from before v2 are in use)")
 	flag.Parse()
 	if *generate != "" {
 		if err := generateVAPID(*generate); err != nil {
@@ -385,6 +466,30 @@ func main() {
 		return
 	}
 	rl := newRelay()
+	rl.v1 = !*noV1
+	if *gateway != "" {
+		service, err := readSecret(*serviceFile, "relay-service", "LYNSHEN_RELAY_SERVICE_TOKEN")
+		if err != nil {
+			log.Fatal(err)
+		}
+		if len(service) < 32 {
+			log.Fatal("relay v2 needs the gateway's relay service token (32 bytes or more)")
+		}
+		keys, err := parseKeys(*relayKeys)
+		if err != nil {
+			log.Fatal(err)
+		}
+		rl.accounts = newAccounts(*gateway, service, keys)
+		ctx, cancel := context.WithTimeout(context.Background(), gatewayTimeout)
+		if err := rl.accounts.refreshKeys(ctx); err != nil && len(keys) == 0 {
+			log.Printf("relay v2: no token key yet (%v); retrying every %s", err, keysEvery)
+		}
+		cancel()
+		go rl.runAccounts(context.Background())
+		log.Printf("relay v2 on, gateway %s", *gateway)
+	} else {
+		log.Printf("relay v2 off: no gateway")
+	}
 	var v *vapid
 	if path := credentialPath(*vapidFlag, "vapid"); path != "" {
 		var err error
@@ -424,6 +529,18 @@ func main() {
 		}
 	}
 	server := &http.Server{Addr: *listen, Handler: routes(rl, push), ReadHeaderTimeout: 10 * time.Second}
+	// SIGTERM (systemd stop or restart): tell v2 hosts and clients 4503, so
+	// they come back in a second instead of backing off.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-stop
+		log.Printf("draining")
+		rl.drain()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		server.Shutdown(ctx)
+	}()
 	log.Printf("lynshen-relay listening on %s", *listen)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)

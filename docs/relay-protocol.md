@@ -1,7 +1,11 @@
-# Relay protocol (v1)
+# Relay protocol (v1 and v2)
 
 Lets a paired phone (the PWA at `https://app.lynshen.org`) reach a desktop's
-`lynshen daemon` from outside the LAN. Three parties:
+`lynshen daemon` from outside the LAN. §1–§6 describe v1 (pairing codes, no
+account). §7 describes v2, where remote access belongs to the LynShen account.
+The relay serves both at once: v1 stays until the Aogiri releases that speak
+v2 have replaced the old ones (App Store review delays phone updates). Three
+parties:
 
 - **host**: the daemon. Keeps one outbound WebSocket to the relay.
 - **relay**: `lynshen-relay` (Go, this repo's `relay/`). Forwards
@@ -268,3 +272,143 @@ messages as hex lines on stdin and writes replies as hex lines on stdout, with
 a fixed static key given on the command line. The JS side has a Node test that
 runs its initiator against it (handshake, one chunked frame each way). Keep
 both implementations in step with this document.
+
+## 7. Version 2: remote access through the account
+
+Upstream reference: the account-based relay of the upstream CLI (its
+`docs/relay-protocol.md` v2). Ours differs in four ways:
+- v1 keeps working next to v2;
+- the relay checks tokens offline;
+- push stays on this relay;
+- LAN and Tailscale direct connections stay as an advanced option.
+
+### 7.1 Tokens
+
+Every v2 socket presents a **relay token** that the LynShen gateway signed
+(gateway spec `account-computers.spec.md` AC-T3):
+
+```
+lrt1.<base64url(JSON claims)>.<base64url(Ed25519 signature over "lynshen-relay-token-v1:" || claims part)>
+claims: {"aud":"lynshen-relay","kid","sub":<user id>,"authz":<device authorization id>,
+         "client":"lynshen-desktop"|"lynshen-cli"|"aogiri-phone"|"lynshen-web","name","iat","exp"}
+```
+
+- A device gets a token with its device key: `POST /api/desktop/oauth/relay-token`.
+  The token is valid for 10 minutes. Clients get a new one for each connection.
+- The relay verifies tokens without a call to the gateway. It reads the public
+  keys from `GET /api/desktop/oauth/relay-key` (every 10 minutes; `-relay-keys`
+  is the fallback until the gateway answers). A token is valid when its
+  signature verifies with the key named by `kid`, `aud` is `lynshen-relay`,
+  and `iat − 60 s ≤ now < exp`.
+- Revocation: the relay sends a heartbeat to the gateway every 60 s (§7.5).
+  The gateway names hosts and device authorizations that are no longer valid,
+  and the relay closes them with 4403. A removed login therefore loses relay
+  access within 60 s, and a token is never valid for more than 10 minutes.
+- The relay holds no device keys. A token works only for the relay.
+
+**On the upgrade request:** native clients and the daemon send
+`Authorization: Bearer <token>`. Browsers cannot set headers on a WebSocket.
+They offer the subprotocols `lynshen-relay` and `lynshen-bearer.<token>`, and
+the relay answers `lynshen-relay`. A missing or invalid token fails the
+upgrade with HTTP **401**.
+
+### 7.2 Host connection: `GET /relay/v2/host?host=<host_id>`
+
+- The token must belong to a computer client (`lynshen-desktop` or
+  `lynshen-cli`). Another client gets HTTP 403.
+- The challenge is the same as in §3.1. The `auth` message adds the daemon's
+  Noise key, its name and its platform:
+  ```
+  {"t":"auth","pub","sig","v","static":"<x25519 static pub>","name":"<hostname>","platform":"macos|windows|linux"}
+  ```
+- The relay checks the signature (4401 when bad) and checks that
+  `HostID(pub) = host` (4400 when not).
+- The relay then registers the computer with the gateway (`POST
+  /api/relay/v1/computers`). The gateway records the computer under the
+  token's account and keeps a name the user changed. A host that moves to
+  another account leaves the old account's list.
+- Registration refused: 4401. Gateway error: 1011.
+- Success: `{"t":"ready","host","user"}`.
+- A newer connection for the same host replaces the older one (4409), as in v1.
+- The frames are the same as in §3.1, with one change: the `open` payload
+  names the caller (§7.3).
+
+### 7.3 Client connection: `GET /relay/v2/connect?host=<host_id>`
+
+Any client token is accepted (phone, web, desktop, CLI). After the upgrade:
+
+| Close | When |
+| --- | --- |
+| 4403 `not your computer` | the host is registered under another account, or it is a v1 host (no account) |
+| 4404 `host offline` | no host with this id is connected |
+| 4429 | 32 streams on the host, or 20 new connections per IP per minute |
+| 4503 `server restarting` | the relay is draining; reconnect after 1 s |
+| 4403 `revoked` | later: the caller's login was removed (§7.5) |
+
+When the connection is accepted, the host receives `open sid payload` with:
+
+```
+{"user":"<user id>","authz":"<device authorization id>","client":"<client id>","name":"<device name>"}
+```
+
+The rest is the same as §3.2. A v1 client (`/relay/v1/connect`) that reaches
+a v2 host sends `open` with the payload `{"v":1}`. The daemon admits it only
+as a device that was paired before.
+
+### 7.4 Noise and authorization in the daemon
+
+The Noise handshake is the same as §4, with the prologue `lynshen-relay-v1`.
+In msg 1 the client can also send `"request": true`. The daemon authorizes
+the client's static key in this order:
+
+1. The `open` user is not the account the computer is registered under:
+   refused, `wrong account`.
+2. The key belongs to a paired device that is not revoked: allowed.
+3. `pair` is a valid code: the device is paired, as in §4. The 6-digit check
+   code is shown on both sides, and the computer confirms the device.
+4. `request` is true: a **connect request**. The daemon sends
+   `connect_request {id, name, client, check, at}` to the local clients and
+   waits up to 120 s for `connect_decide {id, allow}`.
+   - No local client connected: `no_desktop`.
+   - Three requests already open: `busy`.
+   - Otherwise the result is allowed, `denied` or `expired`.
+   - The daemon sends `connect_request_closed {id, outcome}` when the request
+     ends.
+   - Allowed: the device is paired with the open's `user`, `authz` and
+     `client`.
+5. Otherwise: refused, `not paired`.
+
+A device paired in step 3 or 4 keeps our device scopes. The `check` code is
+the pairing check code of §4, and the desktop shows it in the request dialog.
+
+### 7.5 Heartbeat (relay → gateway, every 60 s)
+
+`POST /api/relay/v1/heartbeat` with the relay service token. The body lists:
+- the connected v2 hosts with `{host, user, authz}`;
+- the hosts that went offline since the last heartbeat;
+- the distinct `{user, authz}` of the open v2 streams.
+
+The gateway marks the listed hosts online and answers
+`{drop_hosts, drop_authz}`. The relay closes each of those hosts and streams
+with 4403.
+
+### 7.6 Push
+
+Push is unchanged: §3 "Web Push and native push", with a request signed by
+the host key for a host that is connected now (v1 or v2). With v2, the daemon
+reads its targets from the account (`GET /api/desktop/oauth/push/targets`)
+instead of keeping phone subscriptions itself. The gateway never sees the
+text of a notification: the daemon encrypts Web Push messages, and APNs and
+FCM receive generic text only.
+
+### 7.7 Relay configuration
+
+| Flag / environment | Meaning |
+| --- | --- |
+| `-gateway` / `LYNSHEN_RELAY_GATEWAY` | the gateway origin. v2 is served only when this is set. |
+| `-service-token-file`, systemd credential `relay-service`, or `LYNSHEN_RELAY_SERVICE_TOKEN` | the gateway's relay service token (≥ 32 bytes) |
+| `-relay-keys` / `LYNSHEN_RELAY_TOKEN_KEYS` | token keys to use until `relay-key` answers |
+| `-no-v1` | stop serving `/relay/v1/host` and `/relay/v1/connect`. Use it only when no phone from before v2 is in use. |
+
+On SIGTERM the relay drains: v2 hosts and streams get 4503 (reconnect in
+1 s), and v1 connections get 1001. `GET /relay/v2/healthz` → `200 ok`.
