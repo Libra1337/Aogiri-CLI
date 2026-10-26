@@ -323,7 +323,9 @@ mod tests {
 
     /// A gateway that answers each request with the next of `answers`
     /// (status, body) and records what it got.
-    fn gateway(answers: Vec<(u16, Value)>) -> (String, Arc<Mutex<Vec<Seen>>>) {
+    type Log = Arc<Mutex<Vec<Seen>>>;
+
+    fn gateway(answers: Vec<(u16, Value)>) -> (String, Log) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -390,7 +392,9 @@ mod tests {
 
     /// Runs the flow against `base`; returns the result, what the user was
     /// told and the waits.
-    fn run(base: &str) -> (Result<(String, Account), String>, Vec<String>, Vec<u64>) {
+    type Outcome = Result<(String, Account), String>;
+
+    fn run(base: &str) -> (Outcome, Vec<String>, Vec<u64>) {
         let mut said = Vec::new();
         let mut waits = Vec::new();
         let result = authorize(Flow {
