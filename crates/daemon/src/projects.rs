@@ -315,7 +315,12 @@ pub fn extra_dirs(hub: &Hub, cwd: &Path, project: &str) -> Vec<PathBuf> {
     let main = project["path"].as_str().map(PathBuf::from);
     let mut list: Vec<PathBuf> = Vec::new();
     for dir in main.into_iter().chain(dirs(&project)) {
-        if dir != cwd && dir.is_dir() && !list.contains(&dir) {
+        // A worktree works apart from the checkout it was made of.
+        if dir != cwd
+            && dir.is_dir()
+            && !list.contains(&dir)
+            && !crate::worktrees::in_worktree_of(cwd, &dir)
+        {
             list.push(dir);
         }
     }
@@ -390,6 +395,8 @@ mod tests {
             conversation: None,
             acp_agent: None,
             forked_from: None,
+            worktree: None,
+            parent: None,
             tool_provider: None,
         }
     }

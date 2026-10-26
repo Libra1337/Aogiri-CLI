@@ -588,9 +588,11 @@ fn start(hub: &Arc<Hub>, me: &str, args: &Value) -> Result<String, String> {
     }
     let title =
         text("title").unwrap_or_else(|| clip(&one_line(&text("message").unwrap_or_default()), 40));
+    // Its parent: what it costs counts toward the sender's (a scheduled
+    // run's budget).
     if let Err(error) = hub
         .store
-        .record_session_meta(&id, &json!({ "title": title }))
+        .record_session_meta(&id, &json!({ "title": title, "parent": me }))
     {
         lynshen_agent_core::log_warn!(
             "daemon",

@@ -84,6 +84,7 @@ impl Client {
             "tool_providers",
             "acp_presets",
             "term_attach",
+            "schedule_runs",
         ] {
             assert!(
                 features.as_array().unwrap().contains(&json!(feature)),
@@ -5717,4 +5718,266 @@ fn an_engine_probe_reports_models_and_commands_and_is_cached() {
         json!({ "op": "engine_probe", "engine": "lynshen" }),
     );
     assert_eq!(refused["type"], "error", "{refused}");
+}
+
+/// The task `id` as the daemon lists it, once `done` holds for it.
+fn schedule_when(client: &mut Client, id: &str, mut done: impl FnMut(&Value) -> bool) -> Value {
+    let frames = client.until(|frame| {
+        frame["type"] == "schedules"
+            && frame["schedules"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|s| s["id"] == id && done(s))
+    });
+    let list = &frames.last().unwrap()["schedules"];
+    list.as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == id)
+        .cloned()
+        .unwrap()
+}
+
+fn session_entry(client: &mut Client, session: &str) -> Value {
+    let list = request(client, json!({ "op": "session_list" }));
+    list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session"] == session)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+#[test]
+fn a_scheduled_run_is_recorded_fails_three_times_and_switches_its_task_off() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "nightly", "Runs the nightly checks");
+    let saved = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": {
+            "agent": "nightly", "name": "巡检", "prompt": "check the queue",
+            "repeat": "daily", "time": "09:00",
+        } }),
+    );
+    let id = saved["schedule"]["id"].as_str().unwrap().to_string();
+    assert_eq!(saved["schedule"]["failures"], 0);
+    assert_eq!(saved["schedule"]["history"], json!([]));
+    assert!(saved["schedule"]["last_run"].is_null());
+
+    // A run that ends well: done, with its session and times.
+    let started = request(&mut client, json!({ "op": "schedule_run", "schedule": id }));
+    assert_eq!(started["type"], "schedule_started", "{started}");
+    let done = schedule_when(&mut client, &id, |s| s["last_run"]["status"] == "done");
+    let session = done["last_run"]["session"].as_str().unwrap().to_string();
+    assert!(done["last_run"]["ended_at"].as_u64().is_some());
+    assert_eq!(
+        session_entry(&mut client, &session)["schedule"],
+        id.as_str()
+    );
+
+    // Three that fail (the model refuses): the task switches itself off and
+    // every client hears of it.
+    let failing = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": { "id": id, "prompt": "FAIL_TURN" } }),
+    );
+    assert_eq!(failing["type"], "schedule_saved", "{failing}");
+    for n in 1..=3u64 {
+        let reply = request(&mut client, json!({ "op": "schedule_run", "schedule": id }));
+        assert_eq!(reply["type"], "schedule_started", "run {n}: {reply}");
+        let failed = schedule_when(&mut client, &id, |s| {
+            s["last_run"]["status"] == "failed" && s["failures"] == n
+        });
+        assert_eq!(failed["enabled"], n < 3, "after {n}");
+    }
+    let off = request(&mut client, json!({ "op": "schedule_list" }));
+    let task = &off["schedules"][0];
+    assert_eq!(task["enabled"], false);
+    assert!(task["next_run_at"].is_null());
+    assert_eq!(task["history"].as_array().unwrap().len(), 3);
+    assert_eq!(task["history"][2]["status"], "done");
+    // Saved with the agent: a restarted daemon lists the same.
+    let saved: Value = serde_json::from_str(
+        &fs::read_to_string(daemon.agents.join("nightly/schedules.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved[0]["failures"], 3);
+    assert_eq!(saved[0]["last_run"]["status"], "failed");
+
+    // Switching it on forgives the failures.
+    let on = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": { "id": id, "enabled": true, "prompt": "check" } }),
+    );
+    assert_eq!(on["schedule"]["failures"], 0);
+    assert!(on["schedule"]["next_run_at"].as_u64().is_some());
+}
+
+#[test]
+fn a_stopped_task_is_told_once_as_a_schedule_event() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "flaky", "Fails");
+    let saved = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": {
+            "agent": "flaky", "name": "flaky", "prompt": "FAIL_TURN",
+            "repeat": "daily", "time": "09:00",
+        } }),
+    );
+    let id = saved["schedule"]["id"].as_str().unwrap().to_string();
+    let mut frames = Vec::new();
+    for n in 1..=3u64 {
+        client.send(json!({ "op": "schedule_run", "schedule": id }));
+        frames.extend(
+            client.until(|frame| {
+                frame["type"] == "schedules" && frame["schedules"][0]["failures"] == n
+            }),
+        );
+    }
+    frames.extend(
+        client.until(|frame| frame["type"] == "schedule_event" && frame["kind"] == "stopped"),
+    );
+    let events: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["type"] == "schedule_event")
+        .collect();
+    let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    // The first failure in a row is told, then the switch-off.
+    assert_eq!(kinds.first(), Some(&"failed"), "{events:?}");
+    assert_eq!(kinds.last(), Some(&"stopped"), "{events:?}");
+    assert_eq!(
+        kinds.iter().filter(|k| **k == "failed").count(),
+        1,
+        "{events:?}"
+    );
+    assert!(events.last().unwrap()["detail"]
+        .as_str()
+        .unwrap()
+        .contains("连续失败 3 次"));
+}
+
+#[test]
+fn a_worktree_task_runs_apart_and_an_unused_worktree_goes_with_its_run() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    let dir = create_agent(&mut client, "wt", "Works in a worktree");
+    git(&dir, &["init", "-q", "-b", "main"]);
+    git(
+        &dir,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "a",
+        ],
+    );
+    let saved = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": {
+            "agent": "wt", "name": "巡检", "prompt": "check", "repeat": "daily", "time": "09:00",
+            "worktree": true,
+        } }),
+    );
+    let id = saved["schedule"]["id"].as_str().unwrap().to_string();
+    assert_eq!(saved["schedule"]["worktree"], true);
+    let run = |client: &mut Client, previous: Option<&str>| {
+        let started = request(client, json!({ "op": "schedule_run", "schedule": id }));
+        assert_eq!(started["type"], "schedule_started", "{started}");
+        let done = schedule_when(client, &id, |s| {
+            s["last_run"]["status"] == "done"
+                && s["last_run"]["session"]
+                    .as_str()
+                    .is_some_and(|s| Some(s) != previous)
+        });
+        done["last_run"]["session"].as_str().unwrap().to_string()
+    };
+    let first = run(&mut client, None);
+    let entry = session_entry(&mut client, &first);
+    let tree = entry["worktree"].clone();
+    let path = PathBuf::from(tree["path"].as_str().unwrap());
+    let container = dir
+        .parent()
+        .unwrap()
+        .join(".lynshen-worktrees")
+        .join(dir.file_name().unwrap());
+    assert_eq!(path.parent(), Some(container.as_path()), "{entry}");
+    assert_eq!(entry["cwd"], tree["path"]);
+    assert_eq!(entry["agent"], "wt");
+    assert_eq!(tree["base"], "main");
+    assert!(tree["branch"].as_str().unwrap().starts_with("task/sch-"));
+    assert!(path.is_dir());
+
+    // The next run archives this one; nothing was left in its worktree,
+    // which goes once its engine closes.
+    let second = run(&mut client, Some(&first));
+    assert_eq!(session_entry(&mut client, &first)["archived"], true);
+    client.send(json!({ "op": "session_close", "session": first }));
+    let start = Instant::now();
+    while path.exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "worktree kept");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_ne!(
+        session_entry(&mut client, &second)["worktree"]["path"],
+        tree["path"]
+    );
+    let start = Instant::now();
+    while session_entry(&mut client, &first)["worktree"]["gone"] != true {
+        assert!(start.elapsed() < Duration::from_secs(10), "listed as gone");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn an_old_agent_store_loads_and_its_tasks_run() {
+    let _guard = setup();
+    let root = temp_dir("schedule-old-store");
+    let agents = lynshen_daemon::Agents::open(root.join("agents")).unwrap();
+    agents
+        .create(
+            "legacy",
+            "legacy",
+            &temp_dir("agent-legacy"),
+            "Old",
+            &Value::Null,
+        )
+        .unwrap();
+    // As the daemon saved tasks before runs were recorded.
+    let saved = json!([{
+        "id": "sch-old", "agent": "legacy", "name": "old", "prompt": "hello",
+        "enabled": true, "repeat": "daily", "time": "09:00", "days": [], "date": null,
+        "new_session": true, "by_agent": false, "origin": null, "created_at": 1,
+        "last_run_at": 5, "last_session": "s-gone", "next_run_at": 4102444800u64,
+    }]);
+    fs::write(root.join("agents/legacy/schedules.json"), saved.to_string()).unwrap();
+    let daemon = start_daemon_on(root.join("daemon"), root.join("agents"));
+    let mut client = Client::connect(&daemon);
+    let list = request(&mut client, json!({ "op": "schedule_list" }));
+    let task = &list["schedules"][0];
+    assert_eq!(task["id"], "sch-old");
+    assert_eq!(task["last_session"], "s-gone");
+    assert_eq!(task["failures"], 0);
+    assert_eq!(task["worktree"], false);
+    assert!(task["budget"].is_null() && task["last_run"].is_null());
+    assert_eq!(task["history"], json!([]));
+    request(
+        &mut client,
+        json!({ "op": "schedule_run", "schedule": "sch-old" }),
+    );
+    let done = schedule_when(&mut client, "sch-old", |s| {
+        s["last_run"]["status"] == "done"
+    });
+    assert_eq!(done["next_run_at"], 4102444800u64);
 }

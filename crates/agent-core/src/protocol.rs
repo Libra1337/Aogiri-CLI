@@ -168,6 +168,9 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
                 "decide_action requires action and decision: allow or deny".to_string(),
             )],
         },
+        // Stops what the last turn left going (subagents, background
+        // shells): a scheduled run stopped for its budget or its time.
+        "stop_background" => core.stop_background_work(),
         "agent_runs" => vec![core.agent_runs_event()],
         // The desktop's merge / discard buttons: {"op":"merge_agent",
         // "target":"/root/worker","action":"apply|discard"}.

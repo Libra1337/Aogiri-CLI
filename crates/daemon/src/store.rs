@@ -128,6 +128,11 @@ pub struct SessionRecord {
     /// The conversation it was forked from: `{session, turns, at}` (see
     /// `Hub::create_engine_session`).
     pub forked_from: Option<Value>,
+    /// The git worktree the daemon made for it (a scheduled run's):
+    /// `{repo, path, branch, base, slug}`, with `gone: true` once removed.
+    pub worktree: Option<Value>,
+    /// The session that started it (`start_session`).
+    pub parent: Option<String>,
     /// Claude / Codex: the custom provider it last ran on off the LynShen
     /// gateway ("": the tool's own configuration; None: not recorded).
     pub tool_provider: Option<String>,
@@ -310,6 +315,12 @@ impl Store {
             if let Some(source) = &record.forked_from {
                 meta["forked_from"] = source.clone();
             }
+            if let Some(tree) = &record.worktree {
+                meta["worktree"] = tree.clone();
+            }
+            if let Some(parent) = &record.parent {
+                meta["parent"] = json!(parent);
+            }
             if meta.as_object().is_some_and(|fields| fields.len() > 2) {
                 sessions.push(meta);
             }
@@ -479,7 +490,8 @@ impl Store {
     /// Renames, (un)archives, hides, regroups or moves a session from
     /// `changes` (`title`, `archived`, `hidden`, `group`, `project`; the
     /// daemon also keeps `gateway`, `tool_provider`, an ACP agent's
-    /// `conversation`, `acp_agent` and a fork's `forked_from`); fields left out are unchanged, an empty title goes back
+    /// `conversation`, `acp_agent`, a fork's `forked_from`, a scheduled run's
+    /// `worktree` and a helper's `parent`); fields left out are unchanged, an empty title goes back
     /// to the engine's label, an empty group to automatic routing and an
     /// empty project to none. False when `changes` names none.
     pub fn record_session_meta(&self, id: &str, changes: &Value) -> io::Result<bool> {
@@ -520,6 +532,14 @@ impl Store {
         }
         if changes["forked_from"].is_object() {
             entry["forked_from"] = changes["forked_from"].clone();
+            changed = true;
+        }
+        if changes["worktree"].is_object() {
+            entry["worktree"] = changes["worktree"].clone();
+            changed = true;
+        }
+        if let Some(parent) = changes["parent"].as_str() {
+            entry["parent"] = json!(parent);
             changed = true;
         }
         if let Some(provider) = changes["tool_provider"].as_str() {
@@ -594,6 +614,8 @@ impl Store {
                             conversation: None,
                             acp_agent: None,
                             forked_from: None,
+                            worktree: None,
+                            parent: None,
                             tool_provider: None,
                         }
                     });
@@ -639,6 +661,12 @@ impl Store {
                         }
                         if entry["forked_from"].is_object() {
                             record.forked_from = Some(entry["forked_from"].clone());
+                        }
+                        if entry["worktree"].is_object() {
+                            record.worktree = Some(entry["worktree"].clone());
+                        }
+                        if let Some(parent) = entry["parent"].as_str() {
+                            record.parent = Some(parent.to_string());
                         }
                         if let Some(provider) = entry["tool_provider"].as_str() {
                             record.tool_provider = Some(provider.to_string());
@@ -1715,6 +1743,10 @@ mod tests {
         assert!(store
             .record_session_meta("f", &json!({ "forked_from": source }))
             .unwrap());
+        let tree = json!({ "repo": "/r", "path": "/w/t", "branch": "task/t", "base": "main", "slug": "t" });
+        assert!(store
+            .record_session_meta("f", &json!({ "worktree": tree, "parent": "p-1" }))
+            .unwrap());
         store
             .record_session_meta(
                 "a",
@@ -1737,6 +1769,9 @@ mod tests {
         let reopened = reopen(dir).unwrap();
         let sessions = reopened.sessions();
         assert_eq!(sessions[0].forked_from, Some(source));
+        assert_eq!(sessions[0].worktree, Some(tree));
+        assert_eq!(sessions[0].parent.as_deref(), Some("p-1"));
+        assert_eq!(sessions[1].worktree, None);
         assert_eq!(sessions[1].conversation.as_deref(), Some("ses_1"));
         assert_eq!(
             sessions[1].acp_agent,

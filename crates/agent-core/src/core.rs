@@ -3499,6 +3499,30 @@ impl AgentCore {
         self.tool_state.has_running_shell() || self.subagent_manager.has_unfinished()
     }
 
+    /// Background work that comes back to the conversation: a subagent not
+    /// finished, or its result waiting to wake the engine. A background
+    /// shell (a dev server) does not: it never reports back by itself.
+    pub fn awaits_background_work(&self) -> bool {
+        self.subagent_manager.has_unfinished() || self.subagent_manager.pending_wake().is_some()
+    }
+
+    /// Stops the work a turn left going: its subagents, background ones
+    /// too, and its background shells (a scheduled run past its budget or
+    /// its time).
+    pub fn stop_background_work(&mut self) -> Vec<AgentEvent> {
+        self.subagent_manager
+            .close_everything("stopped: the scheduled run passed its limit");
+        let shells = self.tool_state.stop_shells();
+        let mut events = self.drain_subagent_events();
+        events.push(self.agent_runs_event());
+        if shells > 0 {
+            events.push(AgentEvent::Info(format!(
+                "stopped {shells} background command(s)"
+            )));
+        }
+        events
+    }
+
     /// What this engine holds of its session only in memory, for the
     /// session's next engine (`restore_kept_state`) when a host closes this
     /// one while the session stays in use.

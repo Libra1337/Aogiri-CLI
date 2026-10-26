@@ -186,7 +186,16 @@ fn run(
             _ => Err("timer action must be set, list or cancel".to_string()),
         },
         "schedule" => match text("action").as_deref() {
-            Some("list") => Ok(hub.schedules_json(Some(agent))["schedules"].clone()),
+            // Without their run records, which the desk shows.
+            Some("list") => {
+                let mut list = hub.schedules_json(Some(agent))["schedules"].clone();
+                for schedule in list.as_array_mut().into_iter().flatten() {
+                    if let Some(fields) = schedule.as_object_mut() {
+                        fields.remove("history");
+                    }
+                }
+                Ok(list)
+            }
             Some("create") if args["id"].is_null() => hub
                 .propose_schedule(agent, args)
                 .map(|schedule| json!({ "proposed": schedule.to_json(), "note": "switched off until the user turns it on" })),

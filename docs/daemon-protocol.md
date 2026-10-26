@@ -235,7 +235,7 @@ handshake with HTTP 401. Local clients read the daemon token from
 Each WebSocket text message is one JSON frame. The daemon first sends:
 
 ```json
-{"type":"hello","protocol":2,"version":"0.3.0","features":["queue","files","fork","engine_probe","tool_providers","acp_presets","term_attach"]}
+{"type":"hello","protocol":2,"version":"0.3.0","features":["queue","files","fork","engine_probe","tool_providers","acp_presets","term_attach","schedule_runs"]}
 {"type":"sessions","sessions":[{"session":"...","cwd":"...","created_at":0,"updated_at":0,"entries":4,"title":"...","archived":false,"open":true,"watchers":0}]}
 {"type":"workspaces","rev":1,"workspaces":[...]}
 ```
@@ -251,7 +251,8 @@ op, `tool_providers` for custom providers (see "Custom providers"),
 `acp_presets` for built-in ACP agents (`options.agent`, the ACP client of
 "The ACP client"), `term_attach` for session terminals any client views
 (see "Terminals"; an older daemon gives a session's TUI to the client that
-asked only).
+asked only), `schedule_runs` for scheduled tasks' run records, failures,
+`budget` and `worktree` (see "Scheduled tasks").
 
 ## Replies
 
@@ -264,7 +265,7 @@ every connected client.
 
 | Op | Fields | Reply |
 | --- | --- | --- |
-| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers`, `running` (a turn runs or messages wait; the list is sent again when it changes), `failed` (its latest turn ended on an error; cleared when the next turn starts, and the list is sent again when it changes), `project` (the id of the project it belongs to, else null), `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at`, `entries` (how many entries the engine saved for a LynShen session, null for other engines; 0 for one opened without a first message), `forked_from` (`{session, turns, at}` for a fork, see "Forks"; else null) |
+| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers`, `running` (a turn runs or messages wait; the list is sent again when it changes), `failed` (its latest turn ended on an error; cleared when the next turn starts, and the list is sent again when it changes), `project` (the id of the project it belongs to, else null), `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at`, `entries` (how many entries the engine saved for a LynShen session, null for other engines; 0 for one opened without a first message), `forked_from` (`{session, turns, at}` for a fork, see "Forks"; else null), `background` (background work its turn left going — background commands, subagents, workflows — runs: not a turn, so not `running`; the list is sent again when it changes), `schedule` (the scheduled task it is a run of, else null), `worktree` (`{repo, path, branch, base, slug}` for a scheduled run the daemon made a worktree for, with `gone: true` once removed; else null), `parent` (the session that started it with `start_session`, else null) |
 | `gateway_catalog` | — | `gateway_catalog`: `models` (the LynShen models the user chose to show, `lynshen_models` in config.json; one the gateway hides from pickers has `hidden: true`: it stays callable by name, and pickers list it only while a session runs it) and `groups` (the gateway's groups with their models and multipliers); empty when not signed in or offline. For clients that cannot read this machine's login (the remote page) |
 | `restart_when_idle` | — | none. Desktop only: this daemon exits once no session is running (after a `daemon_restarting` broadcast), so the desktop can start a newer one without cutting off a task |
 | `session_meta` | `session`, and any of `title`, `archived`, `hidden`, `group`, `project` | none; `project` moves the session into that project (an unknown id is an error) or, empty, out of any; every client receives the new `sessions` list. An empty title goes back to the engine's label; a hidden session leaves `session_list` and `session_history` (its conversation stays on disk). A session created here is titled after its first user message (first line, 40 characters) unless a client titled it first. After its 1st and 3rd turns, then every 5th, the title model (`title_model` in config.json, else the main `model`) renames it from the project name, the current title, the first and latest requests and the start of the latest reply. A title a client set with `session_meta` is never replaced |
@@ -320,12 +321,12 @@ every connected client.
 | `agent_memory_read` | `agent`, `file` (`deploy.md`, or `memory/deploy.md` as `agent_get` lists it) | `agent_memory` with `agent`, `file`, `content`; an error for anything but an existing `memory/<name>.md` (letters, digits, `-`, `_`) |
 | `schedule_list` | optional `agent` | `schedules`: all scheduled tasks, or `agent`'s. See "Scheduled tasks" |
 | `session_usage` | `session` (its id) | `session_usage` with `totals`, `sessions` and `turns`: persisted and live usage, with settled gateway charges |
-| `schedule_usage` | `schedule` (its id) | `schedule_usage` with `totals` and `sessions`: token counts and costs of the task's run sessions, including follow-ups; reused sessions count once |
-| `schedule_save` | `schedule`: without `id` creates one (`agent`, `name`, `prompt`, `repeat`, `time`, and `days` / `date` as `repeat` needs; optional `enabled`, `new_session`, both default `true`, and `origin`, the `id` of the `propose_schedule` card it is created from); with `id` changes the fields present among `name`, `prompt`, `enabled`, `repeat`, `time`, `days`, `date`, `new_session` | `schedule_saved` with `schedule`; `next_run_at` is computed again. A schedule carries `origin` (null when it came from no card), so a card finds the task created from it in `schedules` |
+| `schedule_usage` | `schedule` (its id) | `schedule_usage` with `totals` and `sessions`: token counts and costs of the task's run sessions and the sessions they started (rows with `parent`), including follow-ups; reused sessions count once |
+| `schedule_save` | `schedule`: without `id` creates one (`agent`, `name`, `prompt`, `repeat`, `time`, and `days` / `date` as `repeat` needs; optional `enabled`, `new_session`, both default `true`, `worktree` (default `false`), `budget` (default null) and `origin`, the `id` of the `propose_schedule` card it is created from); with `id` changes the fields present among `name`, `prompt`, `enabled`, `repeat`, `time`, `days`, `date`, `new_session`, `worktree`, `budget` | `schedule_saved` with `schedule`; `next_run_at` is computed again; switching a task on sets `failures` back to 0. A schedule carries `origin` (null when it came from no card), so a card finds the task created from it in `schedules` |
 | `app_tools` | – | `app_tools` with `present_files`, `propose_schedule` (booleans) and `sessions` (`off`, `ask`, `on`). See "App tools" |
 | `app_tools_set` | any of `present_files`, `propose_schedule` (booleans), `sessions` (`off`, `ask`, `on`; `true`/`false` for `on`/`off`). Local clients only | `app_tools` as it is now; sessions started from then on follow it |
 | `schedule_delete` | `schedule` (its id) | `schedule_deleted` with `schedule` |
-| `schedule_run` | `schedule` (its id) | `schedule_started` with `schedule`; runs it now, enabled or not (an error when its agent is disabled), without changing `next_run_at` |
+| `schedule_run` | `schedule` (its id) | `schedule_started` with `schedule`; runs it now, enabled or not (an error when its agent is disabled, or while its last run is not over), without changing `next_run_at` |
 | `question_list` | — | `questions`: unanswered questions, and in `closed` the ones closed in the last 7 days (each with `closed_by`, `closed_reason`, `closed_at`) |
 | `question_answer` | `question`, `answer` | `question_answered`; the answer is delivered to the session that asked |
 | `item_close` | `kind` (`question` or `action`), `item` (its id), optional `reason` | `item_closed` with `item`; closes an open question or deferred action without answering it, then broadcasts `questions` / `actions`. Nothing is sent to the agent |
@@ -989,7 +990,13 @@ agent's tasks are saved in `~/.lynshen/agents/<id>/schedules.json`.
   "created_at": 1790812800,
   "last_run_at": null,
   "last_session": null,
-  "next_run_at": 1790996400
+  "next_run_at": 1790996400,
+  "worktree": false,
+  "budget": null,
+  "failures": 0,
+  "skipped": 0,
+  "last_run": null,
+  "history": []
 }
 ```
 
@@ -1002,6 +1009,15 @@ agent's tasks are saved in `~/.lynshen/agents/<id>/schedules.json`.
 | `new_session` | `true`: each run starts a new session. `false`: a run continues `last_session`, or starts a new one when that session is gone or no longer the agent's. |
 | `created_at`, `last_run_at`, `next_run_at` | Unix **seconds** (other daemon times are milliseconds). `next_run_at` is null for a disabled task and for a `once` task whose time has passed. |
 | `last_session` | The session the last run was delivered to, filled in once it is delivered. |
+| `worktree` | A run that starts a new session starts it in a new git worktree of the agent's repository (below). Saving it on is refused when the agent's folder is not in a repository. |
+| `budget` | What one run may cost, with the sessions it started (`start_session`), or null: gateway points when the run's session goes through the LynShen gateway, else estimated US dollars. Above 0; `null` clears it. |
+| `failures` | Runs failed in a row while the task was on. A run that ends well, or switching the task on, sets it back to 0. |
+| `skipped` | Times skipped in a row because the last run was not over. |
+| `last_run` | The latest run, null before the first: `{at, ended_at, session, status, error, message, started, followed_up, worktree, cwd}`. `at` and `ended_at` are unix seconds; `status` is `preparing` (its worktree is being made), `running`, `waiting` (an approval waits), `background` (its turn ended; subagents or workflows it left going will come back to it), `done` or `failed` (with `error`); `message` is the message it sent; `followed_up` once someone else wrote in its session after it was done. |
+| `history` | The runs before `last_run`, newest first, up to 20, shaped as `last_run`. |
+
+A task saved before run records existed loads with `last_run` null, empty
+`history`, no failures, `worktree` false and no `budget`.
 
 Times follow this machine's time zone, daylight saving included: a local
 time skipped by a clock change runs an hour later, one that occurs twice
@@ -1024,11 +1040,58 @@ The agent receives the prompt after one line naming the task:
 Every client receives the full `schedules` list after any change, run or
 delivery.
 
+A run is `running` from when it fires until the turn its message starts
+ends. A time that comes while the last run is not over is skipped (the
+first in a row is told). The run fails when its turn ends on an error, it
+goes past 2 hours (working, waiting or on background work), it passes its
+`budget`, its worktree cannot be made, its message cannot be delivered, its
+session closes while it works, or the daemon stopped while it worked (a run
+waiting on a deferred action, or not delivered yet, goes on). A run past
+its time or budget has its turn interrupted and the work it left going
+stopped (`stop_background`: LynShen subagents and background shells,
+Claude Code's background tasks), with the sessions it started. After 3
+failures in a row the task switches itself off (`enabled` false, no
+`next_run_at`). A run done when its turn ended waits as `background` while
+subagents or workflows it left going come back to it (a turn they start is
+the run's again); a background command (a dev server) never does, so it
+holds no run. A message someone else sends in a run's session after it is
+done is theirs (`followed_up`): nothing that happens there since counts.
+
+Every client gets
+`{"type":"schedule_event","schedule":"sch-…","agent":"ops","name":"…","kind":"failed","detail":"…","session":"s…"}`
+when a run fails (the first in a row; `kind` `failed`), the task switches
+itself off (`stopped`), a run waits for an approval (`waiting`) or a time is
+skipped (`skipped`, the first in a row). The paired phones get a notice for
+`stopped`, `skipped` and the first failure in a row; a failed turn is the
+agent's report with its own notice, and an approval has its own.
+
+A `worktree` run's new session starts in
+`<repo parent>/.lynshen-worktrees/<repo name>/<task id>-MMDD-HHmm` (a free
+name) on a new branch `task/<that name>` from the branch the repository has
+checked out (its commit when detached), the layout of the desktop's
+parallel tasks, and works in the agent folder's place inside it; it keeps
+the agent's project, and the main checkout is not one of its extra
+directories. While the worktree is made the run is `preparing` and its
+message waits. When the run is archived (a newer run started), its
+worktree and branch are removed if nothing was left in them (no
+uncommitted or untracked files, no commit past `base`); while its engine is
+still open, when the engine closes; at the next start for one the last
+daemon left. A run that continues its last session works where that
+session does.
+
+While a run is `preparing`, `running` or `background` the daemon keeps the
+computer from idle sleep: macOS `caffeinate -i -w <daemon pid>`, Linux
+`systemd-inhibit --what=idle:sleep`, Windows `SetThreadExecutionState`. One
+hold covers every run; it ends when no run works, and with the daemon (the
+macOS and Linux holders end when the daemon dies). Closing the lid or
+choosing Sleep still sleeps.
+
 `schedule_delete` and `schedule_run` also take the task's id as `id` when
 `schedule` is absent; that `id` is then the request id too, echoed in the
 reply.
 
-`schedule_usage` joins the task's delivered sessions with persisted turns in
+`schedule_usage` joins the task's delivered sessions, and the sessions they
+started (rows with `parent`), with persisted turns in
 `usage.jsonl`, including any turn still running. Each unique session is counted
 once, including follow-up turns. `totals` and each row in `sessions` carry the
 five token counters, `turns`, `gateway_cost` (settled points, including group
