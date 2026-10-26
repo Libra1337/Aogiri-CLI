@@ -4,6 +4,8 @@
 
 #[path = "../../agent-core/tests/support/fake_model.rs"]
 mod fake_model;
+#[path = "support/signed_in.rs"]
+mod signed_in;
 
 use fake_model::{requests, setup, temp_dir};
 use lynshen_daemon::Store;
@@ -321,6 +323,7 @@ fn start_daemon_with(prepare: impl FnOnce(&Store)) -> (String, String, PathBuf) 
     prepare(&store);
     let token = store.token().unwrap();
     let agents = lynshen_daemon::Agents::open(root.join("agents")).unwrap();
+    signed_in::sign_in();
     thread::spawn(move || lynshen_daemon::serve(listener, store, agents, None, "test", None));
     (address, token, state)
 }

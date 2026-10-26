@@ -1,3 +1,4 @@
+pub mod account;
 pub mod actions;
 pub mod android;
 pub mod app_tools;
