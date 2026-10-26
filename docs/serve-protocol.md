@@ -693,6 +693,20 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `error` | `message` | Error line. Also used for malformed commands and unknown ops, and for a turn the loop guard stopped (message starts with `loop guard:`). |
 | `status` | `message` | Turn status string: `ready`, `streaming`, `queued: N`, `steering`, `interrupted`, `compacting`, `approval mode: ...`, `trusted ...`, etc. `ready` marks the end of a turn. |
 
+## Events of daemon engine sessions
+
+A session the daemon hosts on another engine (Claude Code, Codex, an ACP
+agent) sends the events above in the same shapes, and a few of its own
+(`docs/daemon-protocol.md` has the details):
+
+| `type` | Fields | Meaning |
+| --- | --- | --- |
+| `surface` / `term_*` | `surface` (`tui` with `term`, or `gui`) | The conversation moved to its engine's TUI on a terminal any client attaches to (`term_attach`), and back. See daemon-protocol.md → Terminals. |
+| `tool_provider` | `provider: {id, name, model, models} \| null` | Claude Code / Codex: the custom provider the session runs on (never its key or URL); null on the LynShen gateway or the tool's own configuration. Sent when the engine starts. See daemon-protocol.md → Custom providers. |
+| `engine_caps` | `agent: {id, name, version}`, `approvals`, `gateway`, `caps: {interrupt, approvalModes, modelPicker, contextUsage, slashCommands, transcriptReplay, fork}` | ACP: what the agent is and can do. |
+| `session_options` | `options: [{id, name, description, category, type, value, choices?}]` | ACP: the agent's settings besides model and effort; `set_session_option` (`id`, `value`) changes one. |
+| `model_status` | also `model_label`, `default_effort` | ACP: the model's name as the agent shows it, and the effort value that leaves the level to the agent. |
+
 ## App tools (daemon sessions)
 
 A session the daemon hosts (`docs/daemon-protocol.md` → "App tools") also

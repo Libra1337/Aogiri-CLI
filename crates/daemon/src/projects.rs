@@ -397,6 +397,7 @@ mod tests {
             forked_from: None,
             worktree: None,
             parent: None,
+            tool_provider: None,
         }
     }
 

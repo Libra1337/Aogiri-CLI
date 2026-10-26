@@ -139,7 +139,7 @@ fn contains_envelope(auth: &mut Value) -> bool {
     found
 }
 
-fn reveal_with_key(auth: &mut Value, key: &SecretKey) -> io::Result<()> {
+pub(crate) fn reveal_with_key(auth: &mut Value, key: &SecretKey) -> io::Result<()> {
     let mut result = Ok(());
     for_each_secret(auth, |slot| {
         if result.is_err() || !slot.starts_with(ENVELOPE_PREFIX) {
@@ -204,6 +204,17 @@ fn for_each_secret(auth: &mut Value, mut visit: impl FnMut(&mut String)) {
     if let Some(lynshen) = auth.get_mut("lynshen").and_then(Value::as_object_mut) {
         for field in ["access_token", "refresh_token"] {
             if let Some(Value::String(secret)) = lynshen.get_mut(field) {
+                visit(secret);
+            }
+        }
+    }
+    // The custom providers Claude Code and Codex sessions run on.
+    if let Some(keys) = auth
+        .get_mut(crate::config::TOOL_KEYS)
+        .and_then(Value::as_object_mut)
+    {
+        for value in keys.values_mut() {
+            if let Value::String(secret) = value {
                 visit(secret);
             }
         }

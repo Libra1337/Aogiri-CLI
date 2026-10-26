@@ -133,6 +133,9 @@ pub struct SessionRecord {
     pub worktree: Option<Value>,
     /// The session that started it (`start_session`).
     pub parent: Option<String>,
+    /// Claude / Codex: the custom provider it last ran on off the LynShen
+    /// gateway ("": the tool's own configuration; None: not recorded).
+    pub tool_provider: Option<String>,
 }
 
 /// A message for an agent: from the user, another agent or a timer.
@@ -296,6 +299,9 @@ impl Store {
             }
             if let Some(agent) = &record.acp_agent {
                 meta["acp_agent"] = agent.clone();
+            }
+            if let Some(provider) = &record.tool_provider {
+                meta["tool_provider"] = json!(provider);
             }
             if let Some(source) = &record.forked_from {
                 meta["forked_from"] = source.clone();
@@ -474,9 +480,9 @@ impl Store {
 
     /// Renames, (un)archives, hides, regroups or moves a session from
     /// `changes` (`title`, `archived`, `hidden`, `group`, `project`; the
-    /// daemon also keeps `gateway`, an ACP agent's `conversation`,
-    /// `acp_agent`, a fork's `forked_from`, a scheduled run's `worktree` and
-    /// a helper's `parent`); fields left out are unchanged, an empty title goes back
+    /// daemon also keeps `gateway`, `tool_provider`, an ACP agent's
+    /// `conversation`, `acp_agent`, a fork's `forked_from`, a scheduled run's
+    /// `worktree` and a helper's `parent`); fields left out are unchanged, an empty title goes back
     /// to the engine's label, an empty group to automatic routing and an
     /// empty project to none. False when `changes` names none.
     pub fn record_session_meta(&self, id: &str, changes: &Value) -> io::Result<bool> {
@@ -525,6 +531,10 @@ impl Store {
         }
         if let Some(parent) = changes["parent"].as_str() {
             entry["parent"] = json!(parent);
+            changed = true;
+        }
+        if let Some(provider) = changes["tool_provider"].as_str() {
+            entry["tool_provider"] = json!(provider);
             changed = true;
         }
         if changed {
@@ -597,6 +607,7 @@ impl Store {
                             forked_from: None,
                             worktree: None,
                             parent: None,
+                            tool_provider: None,
                         }
                     });
                     record.closed = false;
@@ -647,6 +658,9 @@ impl Store {
                         }
                         if let Some(parent) = entry["parent"].as_str() {
                             record.parent = Some(parent.to_string());
+                        }
+                        if let Some(provider) = entry["tool_provider"].as_str() {
+                            record.tool_provider = Some(provider.to_string());
                         }
                     }
                 }

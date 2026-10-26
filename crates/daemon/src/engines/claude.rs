@@ -83,12 +83,33 @@ static GATEWAY_FILES: std::sync::Mutex<Vec<(String, std::path::PathBuf)>> =
 /// by the session (`id`), not the key, since its path is in the engine's argv
 /// for anyone on the machine to read. An empty ANTHROPIC_API_KEY masks one
 /// the user's own settings set.
-pub fn use_gateway(command: &mut Command, id: &str, base: &str, key: &str) -> Result<(), String> {
-    let settings = json!({ "env": {
+///
+/// A custom provider (`tool_providers`) goes the same way; `model` is then
+/// its one model, which Claude Code's background and subagent requests
+/// (that name Claude models) use too.
+pub fn use_gateway(
+    command: &mut Command,
+    id: &str,
+    base: &str,
+    key: &str,
+    model: Option<&str>,
+) -> Result<(), String> {
+    let mut settings = json!({ "env": {
         "ANTHROPIC_BASE_URL": base,
         "ANTHROPIC_AUTH_TOKEN": key,
         "ANTHROPIC_API_KEY": "",
     } });
+    if let Some(model) = model {
+        for name in [
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+        ] {
+            settings["env"][name] = json!(model);
+        }
+    }
     let dir = home().join(".lynshen").join("daemon");
     // Older daemons wrote the LynShen token itself here.
     let _ = std::fs::remove_file(dir.join("claude-gateway.json"));
@@ -3970,6 +3991,7 @@ mod tests {
             "sess-1",
             "http://127.0.0.1:7788/gw",
             "jgw-secretkey",
+            None,
         )
         .unwrap();
         let args: Vec<String> = command
@@ -3984,6 +4006,33 @@ mod tests {
             .contains("jgw-secretkey"));
         forget_gateway("jgw-secretkey");
         assert!(!std::path::Path::new(&path).exists());
+        // A custom provider's one model serves the background requests too.
+        let mut command = Command::new("claude");
+        use_gateway(
+            &mut command,
+            "sess-2",
+            "http://x/gw",
+            "jgw-k2",
+            Some("deepseek-chat"),
+        )
+        .unwrap();
+        let path = command
+            .get_args()
+            .last()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for name in [
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+        ] {
+            assert_eq!(settings["env"][name], "deepseek-chat");
+        }
+        assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "jgw-k2");
+        forget_gateway("jgw-k2");
     }
 
     #[test]
@@ -5020,7 +5069,10 @@ mod tests {
             "env": { "CLAUDE_CONFIG_DIR": "/tmp/c" },
         }));
         assert!(options.runs_programs());
+        let dir = std::env::temp_dir().join(format!("lynshen-bin-test-{}", std::process::id()));
+        let store = crate::store::Store::open(dir.clone()).unwrap();
         let command = super::super::command(
+            &store,
             super::super::Kind::Claude,
             "x",
             &options,
@@ -5033,6 +5085,8 @@ mod tests {
             .get_envs()
             .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == Some("/tmp/c".as_ref())));
         assert!(!Options::from_json(&json!({ "model": "m" })).runs_programs());
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
