@@ -93,6 +93,9 @@ fn pair(hub: &Hub, body: &[u8]) -> Response {
     };
     let code = request["code"].as_str().unwrap_or_default();
     let name = request["name"].as_str().unwrap_or_default();
+    if let Err(error) = hub.relay.lan_pairing_allowed() {
+        return Response::json(403, json!({ "error": error }));
+    }
     match hub.pair(code, name) {
         // The token connects once the computer confirms the device; the
         // phone shows the check code (from the token) meanwhile.

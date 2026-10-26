@@ -209,6 +209,15 @@ pub struct Device {
     pub check: Option<String>,
 }
 
+/// The LynShen account a relay v2 device belongs to (`open` of
+/// `docs/relay-protocol.md` §7.3).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeviceAccount {
+    pub user: String,
+    pub authz: String,
+    pub client: String,
+}
+
 /// The chat account a binding stands for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatPeer {
@@ -1085,6 +1094,37 @@ impl Store {
 
     pub fn record_device_revoked(&self, id: &str) -> io::Result<()> {
         self.append(DEVICES, json!({ "kind": "revoked", "id": id, "at": now() }))
+    }
+
+    /// The LynShen account a device was paired under over relay v2
+    /// (`docs/relay-protocol.md` §7.4): the account, the device's
+    /// authorization there and its client.
+    pub fn record_device_account(&self, id: &str, account: &DeviceAccount) -> io::Result<()> {
+        self.append(
+            DEVICES,
+            json!({ "kind": "account", "id": id, "user": account.user, "authz": account.authz,
+                    "client": account.client, "at": now() }),
+        )
+    }
+
+    /// The account each device was paired under (devices paired without an
+    /// account, over v1 or the LAN, have none).
+    pub fn device_accounts(&self) -> HashMap<String, DeviceAccount> {
+        self.read(DEVICES)
+            .iter()
+            .filter(|entry| entry["kind"] == "account")
+            .filter_map(|entry| {
+                let text = |key: &str| entry[key].as_str().unwrap_or_default().to_string();
+                Some((
+                    entry["id"].as_str()?.to_string(),
+                    DeviceAccount {
+                        user: text("user"),
+                        authz: text("authz"),
+                        client: text("client"),
+                    },
+                ))
+            })
+            .collect()
     }
 
     pub fn devices(&self) -> Vec<Device> {
@@ -2050,5 +2090,14 @@ mod tests {
             .record_device_scopes("new", &grant(&["full_auto"]))
             .unwrap();
         assert_eq!(store.device("new").unwrap().scopes, grant(&["full_auto"]));
+        // The account of a relay v2 device, kept next to the device.
+        let account = DeviceAccount {
+            user: "u1".to_string(),
+            authz: "a1".to_string(),
+            client: "aogiri-phone".to_string(),
+        };
+        store.record_device_account("new", &account).unwrap();
+        assert_eq!(store.device_accounts().get("new"), Some(&account));
+        assert!(!store.device_accounts().contains_key("old"));
     }
 }

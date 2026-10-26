@@ -8,6 +8,8 @@
 
 #[path = "../../agent-core/tests/support/fake_model.rs"]
 mod fake_model;
+#[path = "support/signed_in.rs"]
+mod signed_in;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use fake_model::{setup, temp_dir};
@@ -138,6 +140,7 @@ fn a_built_in_agent_runs_from_any_client_with_its_options_forms_sign_in_mcp_and_
     let store = Store::open(state.join("daemon")).unwrap();
     let token = store.token().unwrap();
     let agents = lynshen_daemon::Agents::open(state.join("agents")).unwrap();
+    signed_in::sign_in();
     thread::spawn(move || lynshen_daemon::serve(listener, store, agents, None, "test", None));
     let mut desktop = Client::connect(&address, &token);
 

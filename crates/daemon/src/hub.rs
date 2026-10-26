@@ -185,6 +185,8 @@ struct Client {
     /// The paired device this connection authenticated as; None for a local
     /// client holding the daemon token.
     device: Option<String>,
+    /// The daemon's own listener (a transcript read), not a person.
+    internal: bool,
 }
 
 struct Hosted {
@@ -318,7 +320,24 @@ impl Hub {
         if let Some(device) = &device {
             self.touch_device(device);
         }
-        lock(&self.clients).insert(id, Client { outbox, device });
+        lock(&self.clients).insert(
+            id,
+            Client {
+                outbox,
+                device,
+                internal: false,
+            },
+        );
+        id
+    }
+
+    /// A client the daemon itself reads from (`transcript`): never counts as
+    /// someone at the computer.
+    fn add_internal_client(&self, outbox: Outbox) -> u64 {
+        let id = self.add_client(outbox, None);
+        if let Some(client) = lock(&self.clients).get_mut(&id) {
+            client.internal = true;
+        }
         id
     }
 
@@ -485,6 +504,65 @@ impl Hub {
         Ok(device)
     }
 
+    /// A device a connect request allowed (relay v2, §7.4): trusted at once
+    /// (the desktop saw the same check code and allowed it), under the
+    /// caller's account.
+    pub fn add_device(
+        &self,
+        name: &str,
+        token_hash: String,
+        account: &crate::store::DeviceAccount,
+    ) -> Result<Device, String> {
+        let name = name.trim();
+        let device = Device {
+            id: self.new_id("dev"),
+            name: if name.is_empty() { "device" } else { name }
+                .chars()
+                .take(60)
+                .collect(),
+            token_hash,
+            paired_at: now(),
+            revoked: false,
+            chat: None,
+            scopes: Vec::new(),
+            pending: false,
+            check: None,
+        };
+        self.store
+            .record_device(&device)
+            .and_then(|()| self.store.record_device_account(&device.id, account))
+            .map_err(|error| error.to_string())?;
+        self.broadcast_local(&self.devices_json());
+        Ok(device)
+    }
+
+    /// The computer moved to another LynShen account: every remote device
+    /// (not a chat binding) is revoked. Returns how many.
+    pub fn revoke_remote_devices(&self) -> Result<usize, String> {
+        let remote: Vec<String> = self
+            .store
+            .devices()
+            .into_iter()
+            .filter(|device| !device.revoked && device.chat.is_none())
+            .map(|device| device.id)
+            .collect();
+        for id in &remote {
+            self.revoke_device(id)?;
+        }
+        if !remote.is_empty() {
+            self.broadcast_local(&self.devices_json());
+        }
+        Ok(remote.len())
+    }
+
+    /// Whether a local client (the desktop, a CLI holding the daemon token)
+    /// is connected: a connect request has someone to ask.
+    pub fn has_local_client(&self) -> bool {
+        lock(&self.clients)
+            .values()
+            .any(|client| client.device.is_none() && !client.internal)
+    }
+
     /// Revokes a device and drops its open connections (a chat binding's
     /// client too: its connector stops serving it).
     pub fn revoke_device(&self, id: &str) -> Result<(), String> {
@@ -505,6 +583,7 @@ impl Hub {
 
     pub fn devices_json(&self) -> Value {
         let seen = lock(&self.seen).clone();
+        let accounts = self.store.device_accounts();
         let list: Vec<Value> = self
             .store
             .devices()
@@ -522,6 +601,10 @@ impl Hub {
                 });
                 if device.pending {
                     item["check"] = json!(device.check);
+                }
+                // Relay v2: the account client it connected as (§7.4).
+                if let Some(account) = accounts.get(&device.id) {
+                    item["client"] = json!(account.client);
                 }
                 if let Some(chat) = &device.chat {
                     item["platform"] = json!(chat.platform);
@@ -1065,7 +1148,7 @@ impl Hub {
     /// gets it: its `transcript` items.
     pub fn transcript(&self, session: &str) -> Result<Vec<Value>, String> {
         let (outbox, inbox) = std::sync::mpsc::channel();
-        let client = self.add_client(Outbox::local(outbox), None);
+        let client = self.add_internal_client(Outbox::local(outbox));
         let result = self
             .forward(session, json!({ "op": "snapshot", "client": client }))
             .and_then(|()| {

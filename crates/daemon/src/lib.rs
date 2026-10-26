@@ -390,6 +390,8 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             | "device_revoke"
             | "relay_status"
             | "relay_set"
+            | "connect_requests"
+            | "connect_decide"
             | "restart_when_idle"
             | "usage_import_legacy"
     ) && !hub.is_local(client)
@@ -760,6 +762,16 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         },
         ("pair_link", _) => hub.relay.pair_link(hub),
         ("relay_status", _) => Ok(hub.relay.status_json()),
+        // Relay v2 (relay-protocol.md §7.4): requests to connect from devices
+        // of this computer's account, and the desktop's answer.
+        ("connect_requests", _) => Ok(hub.relay.requests_json()),
+        ("connect_decide", _) => match (op["request"].as_str(), op["allow"].as_bool()) {
+            (Some(request), Some(allow)) => hub
+                .relay
+                .decide(request, allow)
+                .map(|()| json!({ "type": "connect_decided", "request": request, "allow": allow })),
+            _ => Err("connect_decide requires request and allow".to_string()),
+        },
         ("relay_set", _) => match op["enabled"].as_bool() {
             Some(enabled) => hub
                 .relay
@@ -768,7 +780,9 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             None => Err("relay_set requires enabled".to_string()),
         },
         ("pair_start", _) => hub
-            .start_pairing()
+            .relay
+            .lan_pairing_allowed()
+            .and_then(|()| hub.start_pairing())
             .map(|(code, expires_at)| json!({ "type": "pairing", "code": code, "expires_at": expires_at })),
         ("device_list", _) => Ok(hub.devices_json()),
         // The pairing dialog closed: its code no longer pairs anyone.

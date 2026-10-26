@@ -460,7 +460,34 @@ fn deliver(hub: &Arc<Hub>, outgoing: Outgoing) {
         },
         topic: topic(&outgoing.tag),
     };
-    let list = lock(&hub.push.subscriptions).clone();
+    let mut list = lock(&hub.push.subscriptions).clone();
+    // Relay v2: the account's phones and browsers registered with the
+    // account (relay-protocol.md §7.6), told apart from the daemon's own by
+    // `target`. A device that looks at the session is skipped by its
+    // account authorization.
+    let account = account_targets(hub);
+    let looking_authz: HashSet<String> = {
+        let accounts = hub.store.device_accounts();
+        looking
+            .iter()
+            .filter_map(|device| accounts.get(device).map(|a| a.authz.clone()))
+            .collect()
+    };
+    for target in account {
+        if target["authz"]
+            .as_str()
+            .is_some_and(|authz| looking_authz.contains(authz))
+        {
+            continue;
+        }
+        let mut subscription = target["subscription"].clone();
+        let duplicate = list.iter().any(|own| key(own) == key(&subscription));
+        if duplicate || subscription.is_null() {
+            continue;
+        }
+        subscription["target"] = target["id"].clone();
+        list.push(subscription);
+    }
     for subscription in list {
         if subscription["device"]
             .as_str()
@@ -475,9 +502,14 @@ fn deliver(hub: &Arc<Hub>, outgoing: Outgoing) {
         // 410: the relay says the push service dropped the subscription.
         thread::spawn(
             move || match hub.relay.push(&subscription, &payload, &native, &delivery) {
-                Ok(410) => {
-                    let _ = hub.push.unsubscribe(key(&subscription));
-                }
+                Ok(410) => match subscription["target"].as_str() {
+                    Some(target) => {
+                        let _ = lynshen_agent_core::account::forget_push_target(target);
+                    }
+                    None => {
+                        let _ = hub.push.unsubscribe(key(&subscription));
+                    }
+                },
                 Ok(status) if status >= 300 => {
                     lynshen_agent_core::log_warn!("daemon", "push refused", status = status);
                 }
@@ -487,6 +519,38 @@ fn deliver(hub: &Arc<Hub>, outgoing: Outgoing) {
                 }
             },
         );
+    }
+}
+
+/// The account's push targets while the computer is on relay v2, read at
+/// most once a minute (an error keeps the last list).
+fn account_targets(hub: &Hub) -> Vec<Value> {
+    static CACHE: Mutex<Option<(std::time::Instant, Vec<Value>)>> = Mutex::new(None);
+    if !hub.relay.on_v2() {
+        return Vec::new();
+    }
+    let mut cache = lock(&CACHE);
+    if let Some((at, list)) = cache.as_ref() {
+        if at.elapsed() < std::time::Duration::from_secs(60) {
+            return list.clone();
+        }
+    }
+    match lynshen_agent_core::account::push_targets() {
+        Ok(list) => {
+            *cache = Some((std::time::Instant::now(), list.clone()));
+            list
+        }
+        Err(error) => {
+            lynshen_agent_core::log_warn!(
+                "daemon",
+                "account push targets",
+                error = error.to_string()
+            );
+            cache
+                .as_ref()
+                .map(|(_, list)| list.clone())
+                .unwrap_or_default()
+        }
     }
 }
 

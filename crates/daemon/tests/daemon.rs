@@ -3,6 +3,8 @@
 
 #[path = "../../agent-core/tests/support/fake_model.rs"]
 mod fake_model;
+#[path = "support/signed_in.rs"]
+mod signed_in;
 
 use fake_model::{setup, temp_dir};
 use lynshen_daemon::Store;
@@ -37,6 +39,7 @@ fn start_daemon_on(state: PathBuf, agents: PathBuf) -> Daemon {
 }
 
 fn start_daemon_with(state: PathBuf, agents: PathBuf, relay: Option<String>) -> Daemon {
+    signed_in::sign_in();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let store = Store::open(state.clone()).unwrap();
@@ -1416,6 +1419,46 @@ fn pair_request(code: &str) -> String {
         "POST /api/pair HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     )
+}
+
+/// LAN and Tailscale direct connections are an advanced option of a signed-in
+/// computer (relay-protocol.md §7): signed out, no new pairing over the
+/// daemon's port, while a device paired before keeps connecting.
+#[test]
+fn lan_pairing_needs_a_sign_in_and_paired_devices_keep_working() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut desktop = Client::connect(&daemon);
+    let code = request(&mut desktop, json!({ "op": "pair_start" }))["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let token = paired_token(&daemon, &mut desktop, &code);
+    let leftover = request(&mut desktop, json!({ "op": "pair_start" }))["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    signed_in::sign_out();
+    let refused = request(&mut desktop, json!({ "op": "pair_start" }));
+    assert_eq!(refused["type"], "error", "{refused}");
+    assert!(refused["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("sign_in_required"));
+    // A code shown before the sign-out pairs nobody now.
+    let (status, response) = http(&daemon, &pair_request(&leftover));
+    assert_eq!(status, 403);
+    assert!(response.contains("sign_in_required"), "{response}");
+    // The phone paired before still connects.
+    let mut phone = Client::connect_with(&daemon, &token);
+    phone.send(json!({ "op": "agent_list", "id": 2 }));
+    assert_eq!(
+        phone.until(|frame| frame["id"] == 2).last().unwrap()["type"],
+        "agents"
+    );
+    let status = request(&mut desktop, json!({ "op": "relay_status" }));
+    assert_eq!(status["signed_in"], false, "{status}");
+    signed_in::sign_in();
 }
 
 #[test]

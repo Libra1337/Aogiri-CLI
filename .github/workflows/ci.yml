@@ -45,6 +45,27 @@ jobs:
       - name: Test the skills mirror builder
         run: python3 deploy/skills-mirror/test_build.py
 
+  # The relay (relay/, Go): vet and the race detector over its tests, v1 and
+  # v2 (docs/relay-protocol.md).
+  relay:
+    name: Relay (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: relay/go.mod
+          cache-dependency-path: relay/go.sum
+
+      - name: Vet
+        working-directory: relay
+        run: go vet ./...
+
+      - name: Test (race)
+        working-directory: relay
+        run: go test -race -count=1 ./...
+
   # The release workflow already builds Windows binaries, so keep Windows
   # compiling on every PR. Tests are only run on Linux for now, except the
   # shell tests, which run real commands in PowerShell 7, Windows
