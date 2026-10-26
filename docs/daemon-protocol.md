@@ -122,6 +122,11 @@ To reach the daemon from a phone, keep it on `127.0.0.1` and expose the
 port over HTTPS with `tailscale serve` or a reverse proxy; the daemon has no
 TLS of its own. Or use the relay (below).
 
+LAN and Tailscale pairing is an advanced option of a computer signed in to
+LynShen. Signed out, `pair_start` fails with `sign_in_required: …` and
+`POST /api/pair` answers `403 {"error":"sign_in_required: …"}`. Devices that
+were paired before keep connecting with their tokens.
+
 ## Relay
 
 With the relay on, the daemon keeps one outbound WebSocket to the LynShen
@@ -149,6 +154,68 @@ it from anywhere through end-to-end encrypted streams
    `device_revoke` closes their streams.
 
 A relay stream then behaves exactly like a device's local WebSocket.
+
+### Relay v2: remote access through the account
+
+A computer signed in to LynShen (a device key in auth.json: the desktop's
+`providers.monoize`, else the CLI's `providers.lynshen-cli`) uses relay v2
+(`docs/relay-protocol.md` §7) while the relay is on:
+
+- It gets a 10-minute relay token from the gateway, connects to
+  `…/relay/v2/host`, and registers as one of the account's computers. The
+  phone's list of computers comes from the account; the gateway then knows
+  the computer's Noise key.
+- Only clients signed in to the same account reach it. The daemon
+  authorizes them in this order:
+  1. another account → `wrong account`;
+  2. a paired device → allowed;
+  3. a pairing code → pending, then the check code is confirmed with
+     `device_confirm`, as above;
+  4. a connect request → asks the desktop;
+  5. anything else → `not paired`.
+
+  Devices keep their scopes. A device paired over v1 or the LAN joins the
+  account on its first v2 connection.
+- **Connect requests.** A client sends `"request": true` in msg 1. Every
+  local client gets
+  `{"type":"connect_request","request","name","client","check","at"}`.
+  - `check` is the same 6-digit check code the phone shows. Show it in the
+    dialog.
+  - The desktop answers with `{"op":"connect_decide","request","allow"}`
+    (reply `connect_decided`). `{"op":"connect_requests"}` lists the open
+    requests.
+  - A request waits up to 120 s. Every local client gets
+    `{"type":"connect_request_closed","request","outcome"}`, where `outcome`
+    is `allowed`, `denied`, `expired` or `cancelled`.
+  - Without a local client connected, the phone gets `no_desktop`. With 3
+    requests already open, it gets `busy`.
+  - An allowed device is trusted at once. It has no elevated scopes until
+    the desktop grants them.
+  - Both ops are local clients only.
+- **Account switch.** Signing the computer in to another account revokes
+  every remote device (not chat bindings) when the relay reports the new
+  account. `relay_status.user` names the account.
+- **Revoked login.** The gateway can refuse the device key, for example
+  after the computer was removed from the account. The daemon then removes
+  the key from auth.json (signed out), goes back to v1, and stops LAN
+  pairing. A LynShen OAuth refresh token that the server refuses (HTTP 400
+  or 401) signs the CLI out the same way. Network and server errors still
+  retry.
+- **Fallback.** When v2 cannot be reached (no relay token, or a relay
+  without v2), the daemon uses v1 for 10 minutes and then tries v2 again.
+  Signed out, it uses v1 as before.
+- **Push.** Notifications go to the daemon's own subscriptions and also to
+  the account's push registrations (`GET /api/desktop/oauth/push/targets`,
+  read at most once a minute) through the same relay push endpoint. A device
+  that looks at the session is skipped.
+
+`relay_status` adds these fields:
+- `signed_in`;
+- `refused` (the gateway refused the login);
+- `mode` (`v1`, `v2` or `off`);
+- `user` (the account of the last v2 registration).
+
+`device_list` adds `client` for devices of the account.
 
 ## Chat connectors
 
@@ -224,7 +291,9 @@ every connected client.
 | `device_me` | — | `device_me` with `device`, `name`, `scopes` (a local client: `local: true` and every scope) |
 | `device_forget_me` | — | `device_forgotten`, then the sending device is revoked (devices only) |
 | `device_revoke` | `device` | `device_revoked` (local clients only) |
-| `relay_status` | — | `relay_status` with `enabled`, `connected`, `host` (the host id), `url` (null with `--no-relay`) (local clients only) |
+| `relay_status` | — | `relay_status` with `enabled`, `connected`, `host` (the host id), `url` (null with `--no-relay`), `signed_in`, `refused`, `mode` (`v1`/`v2`/`off`), `user` (local clients only) |
+| `connect_requests` | — | `connect_requests` with `requests: [{request, name, client, check, at}]` (local clients only) |
+| `connect_decide` | `request`, `allow` | `connect_decided`; answers a waiting connect request (local clients only) |
 | `relay_set` | `enabled` | `relay_status`; turns the relay connection on or off and remembers it (local clients only) |
 | `mcp_set` / `mcp_remove` / `mcp_toggle` | as the session ops (`server`; `name`; `name`, `enabled`), with no `session` | `mcp_saved`; saves the change to `config.json` and sends the op to every open LynShen session, which answers with `mcp_servers`. Local clients only, with or without `session` |
 | `pair_link` | — | `pair_link` with `link`, `code` and `expires_at`; an error while the relay is off (local clients only) |
