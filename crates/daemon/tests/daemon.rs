@@ -3,6 +3,8 @@
 
 #[path = "../../agent-core/tests/support/fake_model.rs"]
 mod fake_model;
+#[path = "support/signed_in.rs"]
+mod signed_in;
 
 use fake_model::{setup, temp_dir};
 use lynshen_daemon::Store;
@@ -37,6 +39,7 @@ fn start_daemon_on(state: PathBuf, agents: PathBuf) -> Daemon {
 }
 
 fn start_daemon_with(state: PathBuf, agents: PathBuf, relay: Option<String>) -> Daemon {
+    signed_in::sign_in();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let store = Store::open(state.clone()).unwrap();
@@ -72,6 +75,22 @@ impl Client {
         let mut client = Self { socket };
         let hello = client.until(|frame| frame["type"] == "hello");
         assert_eq!(hello.last().unwrap()["protocol"], 2);
+        let features = &hello.last().unwrap()["features"];
+        for feature in [
+            "queue",
+            "files",
+            "fork",
+            "engine_probe",
+            "tool_providers",
+            "acp_presets",
+            "term_attach",
+            "schedule_runs",
+        ] {
+            assert!(
+                features.as_array().unwrap().contains(&json!(feature)),
+                "{features}"
+            );
+        }
         client
     }
 
@@ -1402,6 +1421,46 @@ fn pair_request(code: &str) -> String {
     )
 }
 
+/// LAN and Tailscale direct connections are an advanced option of a signed-in
+/// computer (relay-protocol.md §7): signed out, no new pairing over the
+/// daemon's port, while a device paired before keeps connecting.
+#[test]
+fn lan_pairing_needs_a_sign_in_and_paired_devices_keep_working() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut desktop = Client::connect(&daemon);
+    let code = request(&mut desktop, json!({ "op": "pair_start" }))["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let token = paired_token(&daemon, &mut desktop, &code);
+    let leftover = request(&mut desktop, json!({ "op": "pair_start" }))["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    signed_in::sign_out();
+    let refused = request(&mut desktop, json!({ "op": "pair_start" }));
+    assert_eq!(refused["type"], "error", "{refused}");
+    assert!(refused["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("sign_in_required"));
+    // A code shown before the sign-out pairs nobody now.
+    let (status, response) = http(&daemon, &pair_request(&leftover));
+    assert_eq!(status, 403);
+    assert!(response.contains("sign_in_required"), "{response}");
+    // The phone paired before still connects.
+    let mut phone = Client::connect_with(&daemon, &token);
+    phone.send(json!({ "op": "agent_list", "id": 2 }));
+    assert_eq!(
+        phone.until(|frame| frame["id"] == 2).last().unwrap()["type"],
+        "agents"
+    );
+    let status = request(&mut desktop, json!({ "op": "relay_status" }));
+    assert_eq!(status["signed_in"], false, "{status}");
+    signed_in::sign_in();
+}
+
 #[test]
 fn the_remote_page_is_served_over_plain_http() {
     let _guard = setup();
@@ -1893,6 +1952,97 @@ fn request(client: &mut Client, mut op: Value) -> Value {
 }
 
 #[test]
+fn a_session_belongs_to_the_project_it_names_wherever_it_runs() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let app = temp_dir("daemon-member-app");
+    let other = temp_dir("daemon-member-other");
+    fs::create_dir_all(&app).unwrap();
+    fs::create_dir_all(&other).unwrap();
+    let app = app.canonicalize().unwrap();
+    let mut client = Client::connect(&daemon);
+    let added = request(&mut client, json!({ "op": "project_add", "path": app }));
+    let ws = added["workspaces"][0].clone();
+    let project = ws["projects"][0]["id"].as_str().unwrap().to_string();
+    let project_of = |client: &mut Client, session: &str| {
+        let list = request(client, json!({ "op": "session_list" }));
+        list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["session"] == session)
+            .unwrap_or_else(|| panic!("{list}"))["project"]
+            .clone()
+    };
+
+    // Not named: the project whose folder it runs in, or none.
+    let inside = client.create_session(&app);
+    assert_eq!(project_of(&mut client, &inside), json!(project));
+    let outside = client.create_session(&other);
+    assert_eq!(project_of(&mut client, &outside), Value::Null);
+    // Named: that project, in another folder; "" or null: none.
+    let named = request(
+        &mut client,
+        json!({ "op": "session_create", "cwd": other, "project": project }),
+    );
+    let named = named["session"].as_str().unwrap().to_string();
+    assert_eq!(project_of(&mut client, &named), json!(project));
+    let loose = request(
+        &mut client,
+        json!({ "op": "session_create", "cwd": app, "project": null }),
+    );
+    let loose = loose["session"].as_str().unwrap().to_string();
+    assert_eq!(project_of(&mut client, &loose), Value::Null);
+    let unknown = request(
+        &mut client,
+        json!({ "op": "session_create", "cwd": other, "project": "nope" }),
+    );
+    assert_eq!(unknown["type"], "error", "{unknown}");
+
+    // Moved in and out.
+    client.send(json!({ "op": "session_meta", "session": outside, "project": project }));
+    client.until(|frame| frame["type"] == "sessions");
+    assert_eq!(project_of(&mut client, &outside), json!(project));
+    client.send(json!({ "op": "session_meta", "session": outside, "project": "" }));
+    client.until(|frame| frame["type"] == "sessions");
+    assert_eq!(project_of(&mut client, &outside), Value::Null);
+    let refused = request(
+        &mut client,
+        json!({ "op": "session_meta", "session": outside, "project": "nope" }),
+    );
+    assert_eq!(refused["type"], "error", "{refused}");
+
+    // Its project removed, a session belongs to none and is archived.
+    let removed = request(
+        &mut client,
+        json!({ "op": "project_remove", "workspace": ws["id"], "project": project }),
+    );
+    assert_eq!(removed["workspaces"][0]["projects"], json!([]));
+    let list = request(&mut client, json!({ "op": "session_list" }));
+    let entry = list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session"] == named.as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        (entry["project"].clone(), entry["archived"].clone()),
+        (Value::Null, json!(true))
+    );
+
+    // A project is in one workspace at a time.
+    let twice = request(
+        &mut client,
+        json!({ "op": "workspaces_set", "rev": removed["rev"], "workspaces": [
+            ws,
+            { "id": "w2", "name": "Two", "projects": ws["projects"] },
+        ] }),
+    );
+    assert_eq!(twice["type"], "error", "{twice}");
+}
+
+#[test]
 fn projects_are_shared_and_their_files_readable_but_nothing_else() {
     let _guard = setup();
     let daemon = start_daemon();
@@ -2096,6 +2246,19 @@ fn fake_claude() -> PathBuf {
     log
 }
 
+/// The fake engine's starts once there are at least `count` (an engine is
+/// named before its process has started).
+fn starts_after(log: &PathBuf, count: usize) -> Vec<Vec<String>> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let started = starts(log);
+        if started.len() >= count || Instant::now() > deadline {
+            return started;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn starts(log: &PathBuf) -> Vec<Vec<String>> {
     fs::read_to_string(log)
         .unwrap_or_default()
@@ -2191,21 +2354,29 @@ fn a_claude_conversation_moves_to_its_tui_and_back() {
     // The session stays listed and open; its GUI ops wait for the TUI.
     desktop.send(json!({ "op": "user_message", "session": session, "content": "too soon" }));
     desktop.until(|f| f["session"] == session.as_str() && f["type"] == "error");
-    // Opening it again is answered, not left waiting.
+    // The TUI is the session's: asking for it again (another window, a
+    // client that lost its view) attaches to the one that runs, with the
+    // latest output replayed.
+    let mut other = Client::connect(&daemon);
     let again = request(
-        &mut desktop,
+        &mut other,
         json!({ "op": "session_tui", "session": session, "cols": 100, "rows": 30 }),
     );
-    assert_eq!(again["type"], "error", "{again}");
-    assert_eq!(
-        again["message"],
-        "the conversation is already open in its terminal"
-    );
+    assert_eq!(again["type"], "term_attached", "{again}");
+    assert_eq!(again["term"], term.as_str());
+    other.until(|f| {
+        f["replay"] == true && term_text(std::slice::from_ref(f), &term).contains(&started)
+    });
 
-    type_in(&mut desktop, &term, "from the tui\n");
-    let frames =
-        desktop.until(|f| term_text(std::slice::from_ref(f), &term).contains("tui: from the tui"));
-    assert!(!frames.is_empty());
+    type_in(&mut other, &term, "from the tui\n");
+    for client in [&mut desktop, &mut other] {
+        client.until(|f| term_text(std::slice::from_ref(f), &term).contains("tui: from the tui"));
+    }
+    // A viewer that leaves only detaches: the TUI goes on for the others.
+    other.send(json!({ "op": "term_detach", "term": term }));
+    drop(other);
+    type_in(&mut desktop, &term, "still here\n");
+    desktop.until(|f| term_text(std::slice::from_ref(f), &term).contains("tui: still here"));
     type_in(&mut desktop, &term, "exit\n");
 
     // Back in the GUI: the engine resumed, with what the TUI added.
@@ -2350,16 +2521,13 @@ fn a_lynshen_conversation_moves_to_its_tui_and_back() {
         .to_string();
     let resume = format!("TUI --resume {session}");
     desktop.until(|f| term_text(std::slice::from_ref(f), &term).contains(&resume));
-    // Opening it again is answered, not left waiting.
+    // Opening it again attaches to the TUI that runs.
     let again = request(
         &mut desktop,
         json!({ "op": "session_tui", "session": session }),
     );
-    assert_eq!(again["type"], "error", "{again}");
-    assert_eq!(
-        again["message"],
-        "the conversation is already open in its terminal"
-    );
+    assert_eq!(again["type"], "term_attached", "{again}");
+    assert_eq!(again["term"], term.as_str());
     type_in(&mut desktop, &term, "exit\n");
     let frames = desktop.until(|f| f["session"] == session.as_str() && f["type"] == "transcript");
     assert!(frames
@@ -2368,6 +2536,290 @@ fn a_lynshen_conversation_moves_to_its_tui_and_back() {
     // The engine has the session again.
     desktop.send(json!({ "op": "user_message", "session": session, "content": "hi" }));
     desktop.until(ready(&session));
+}
+
+/// A stand-in for a user's own Anthropic-format API: answers each POST with
+/// a Messages reply and sends what it received (head and body) on.
+fn fake_provider() -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut received = String::new();
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = v.trim().parse().unwrap_or(0);
+                }
+                received.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            if !received.starts_with("POST ") {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                continue;
+            }
+            let mut body = vec![0u8; length];
+            let _ = reader.read_exact(&mut body);
+            received.push_str(&String::from_utf8_lossy(&body));
+            let reply = json!({ "id": "msg_1", "type": "message", "role": "assistant", "model": "own-model",
+                "content": [{ "type": "text", "text": "hi" }], "stop_reason": "end_turn",
+                "usage": { "input_tokens": 11, "output_tokens": 2 } })
+            .to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = tx.send(received);
+        }
+    });
+    (format!("http://{address}"), rx)
+}
+
+#[test]
+fn a_custom_provider_gets_its_key_alone_and_its_turns_stay_off_the_gateway_ledger() {
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-custom-provider");
+    fs::create_dir_all(&dir).unwrap();
+    let (api, received) = fake_provider();
+    let mut desktop = Client::connect(&daemon);
+    // A phone may neither list nor change them.
+    desktop.send(json!({ "op": "pair_start", "id": 1 }));
+    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let token = paired_token(&daemon, &mut desktop, &code);
+    let mut phone = Client::connect_with(&daemon, &token);
+    let refused = request(
+        &mut phone,
+        json!({ "op": "tool_providers", "tool": "claude" }),
+    );
+    assert_eq!(refused["type"], "error", "{refused}");
+
+    let saved = request(
+        &mut desktop,
+        json!({ "op": "tool_provider_save", "tool": "claude", "provider": {
+            "id": "own", "name": "Own API", "base_url": format!("{api}/v1"), "format": "anthropic",
+            "model": "own-model", "key": "sk-own-provider" } }),
+    );
+    assert_eq!(saved["type"], "tool_providers", "{saved}");
+    assert!(!saved.to_string().contains("sk-own-provider"));
+    let selected = request(
+        &mut desktop,
+        json!({ "op": "tool_provider_select", "tool": "claude", "provider_id": "own" }),
+    );
+    assert_eq!(selected["config"]["selected"], "own", "{selected}");
+    // The key is in auth.json's own block, not in the daemon's state.
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let auth: Value =
+        serde_json::from_str(&fs::read_to_string(home.join(".lynshen/auth.json")).unwrap())
+            .unwrap();
+    assert_eq!(auth["tool_providers"]["claude:own"], "sk-own-provider");
+    assert!(auth["providers"].get("claude:own").is_none());
+    assert!(!fs::read_to_string(daemon.state.join("settings.json"))
+        .unwrap()
+        .contains("sk-own-provider"));
+
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": { "approval_mode": "auto-edit" } }),
+    );
+    let session = created["session"].as_str().unwrap().to_string();
+    desktop.send(json!({ "op": "watch", "session": session }));
+    let frames = desktop.until(is_ready(&session));
+    let provider = frames
+        .iter()
+        .rev()
+        .find(|f| f["type"] == "tool_provider")
+        .unwrap_or_else(|| panic!("{frames:#?}"));
+    assert_eq!(provider["provider"]["id"], "own");
+    assert!(provider["provider"].get("base_url").is_none());
+    let args = starts_after(&log, 1)[0].clone();
+    assert!(
+        args.windows(2).any(|w| w == ["--model", "own-model"]),
+        "{args:?}"
+    );
+    assert!(
+        args.iter().all(|a| !a.contains("sk-own-provider")),
+        "{args:?}"
+    );
+
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "api call" }));
+    let frames = desktop.until(turn_done(&session));
+    assert!(
+        claude_reply(&frames, &session).contains("api call 200"),
+        "{frames:#?}"
+    );
+    let head = received
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(head.starts_with("post /v1/messages?beta=true "), "{head}");
+    assert!(head.contains("x-api-key: sk-own-provider"), "{head}");
+    assert!(!head.contains("authorization:"), "{head}");
+    assert!(!head.contains("jgw-"), "{head}");
+    assert!(!head.contains("x-lynshen-"), "{head}");
+    assert!(head.contains("\"model\": \"own-model\""), "{head}");
+
+    // The session keeps it; the list says so; its usage is this computer's.
+    let listed = request(&mut desktop, json!({ "op": "session_list" }));
+    let entry = listed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session"] == session.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(entry["tool_provider"], "own", "{entry}");
+    let mut records = Vec::new();
+    for _ in 0..100 {
+        records = fs::read_to_string(daemon.state.join("usage.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|r| r["session"] == session.as_str())
+            .collect();
+        if !records.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!records.is_empty());
+    for record in &records {
+        assert_eq!(record["channel_kind"], "local", "{record}");
+        assert_eq!(record["channel"], "claude:own", "{record}");
+        assert_eq!(record["upload"], false, "{record}");
+    }
+
+    // Selecting another default leaves this session on its own provider;
+    // removing the provider stops it from starting again, by name.
+    request(
+        &mut desktop,
+        json!({ "op": "tool_provider_select", "tool": "claude", "provider_id": "" }),
+    );
+    desktop.send(json!({ "op": "session_close", "session": session }));
+    desktop.until(|f| f["type"] == "session_closed" && f["session"] == session.as_str());
+    request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": session }),
+    );
+    let args = starts_after(&log, 2)[1].clone();
+    assert!(
+        args.windows(2).any(|w| w == ["--model", "own-model"]),
+        "{args:?}"
+    );
+    desktop.send(json!({ "op": "session_close", "session": session }));
+    desktop.until(|f| f["type"] == "session_closed" && f["session"] == session.as_str());
+    request(
+        &mut desktop,
+        json!({ "op": "tool_provider_remove", "tool": "claude", "provider_id": "own" }),
+    );
+    let auth: Value =
+        serde_json::from_str(&fs::read_to_string(home.join(".lynshen/auth.json")).unwrap())
+            .unwrap();
+    assert!(auth.get("tool_providers").is_none(), "{auth}");
+    let gone = request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": session }),
+    );
+    assert_eq!(gone["type"], "error", "{gone}");
+    assert!(gone["message"].as_str().unwrap().contains("own"), "{gone}");
+    // Reopened on the tool's own configuration, it runs.
+    let reopened = request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": session, "options": { "tool_provider": "" } }),
+    );
+    assert_ne!(reopened["type"], "error", "{reopened}");
+}
+
+#[test]
+fn a_phone_views_a_sessions_tui_and_types_only_with_the_terminal_scope() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-tui-phone");
+    fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("tui.sh");
+    fs::write(&script, "#!/bin/sh\necho \"TUI $*\"\nwhile read line; do echo \"got: $line\"; [ \"$line\" = exit ] && exit 0; done\n").unwrap();
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&script)
+        .status()
+        .unwrap();
+    let mut desktop = Client::connect(&daemon);
+    let session = desktop.create_session(&dir);
+    desktop.send(json!({ "op": "pair_start", "id": 1 }));
+    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let token = paired_token(&daemon, &mut desktop, &code);
+    let mut phone = Client::connect_with(&daemon, &token);
+    phone.send(json!({ "op": "watch", "session": session }));
+    std::env::set_var("LYNSHEN_BIN", &script);
+    let opened = request(
+        &mut desktop,
+        json!({ "op": "session_tui", "session": session, "cols": 100, "rows": 30 }),
+    );
+    std::env::remove_var("LYNSHEN_BIN");
+    let term = opened["term"].as_str().unwrap().to_string();
+    desktop.until(|f| term_text(std::slice::from_ref(f), &term).contains("TUI --resume"));
+    // The phone learns which terminal from the session's surface event.
+    let surface = phone.until(|f| f["session"] == session.as_str() && f["type"] == "surface");
+    assert_eq!(surface.last().unwrap()["term"], term.as_str());
+    let attached = request(
+        &mut phone,
+        json!({ "op": "term_attach", "term": term, "cols": 40, "rows": 10 }),
+    );
+    assert_eq!(attached["type"], "term_attached", "{attached}");
+    // Without the terminal scope it only looks: its window does not resize
+    // the TUI, and it may not type or close it.
+    assert_eq!(
+        (attached["cols"].clone(), attached["rows"].clone()),
+        (json!(100), json!(30))
+    );
+    let replay = phone.until(|f| f["replay"] == true);
+    assert!(term_text(&replay, &term).contains("TUI --resume"));
+    for op in [
+        json!({ "op": "term_input", "term": term, "data": "eA==" }),
+        json!({ "op": "term_close", "term": term }),
+    ] {
+        let refused = request(&mut phone, op);
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("scope_required:terminal"),
+            "{refused}"
+        );
+    }
+    type_in(&mut desktop, &term, "hello phone\n");
+    let seen =
+        phone.until(|f| term_text(std::slice::from_ref(f), &term).contains("got: hello phone"));
+    let bytes: usize = seen
+        .iter()
+        .filter(|f| f["type"] == "term_output" && f["term"] == term.as_str())
+        .map(|f| term_text(std::slice::from_ref(f), &term).len())
+        .sum();
+    phone.send(json!({ "op": "term_ack", "term": term, "bytes": bytes }));
+    // Leaving detaches the phone; the TUI is the session's and goes on.
+    phone.send(json!({ "op": "term_detach", "term": term }));
+    type_in(&mut desktop, &term, "exit\n");
+    desktop.until(|f| {
+        f["session"] == session.as_str() && f["type"] == "surface" && f["surface"] == "gui"
+    });
 }
 
 #[test]
@@ -2421,10 +2873,13 @@ fn a_claude_session_runs_turns_and_shares_approvals_with_every_client() {
     let snapshot =
         phone.until(|f| f["session"] == session.as_str() && f["type"] == "approval_request");
     let transcript = snapshot.iter().find(|f| f["type"] == "transcript").unwrap();
+    let reply = &transcript["items"][1];
     assert_eq!(
-        transcript["items"][1],
-        json!({ "role": "assistant", "content": "ok: hello" })
+        (&reply["role"], &reply["content"]),
+        (&json!("assistant"), &json!("ok: hello"))
     );
+    // When it was said.
+    assert!(reply["at"].as_u64().is_some_and(|at| at > 0), "{reply}");
     let call = snapshot.last().unwrap()["call_id"].clone();
     phone
         .send(json!({ "op": "approve", "session": session, "call_id": call, "decision": "allow" }));
@@ -2542,7 +2997,7 @@ fn full_access_restarts_claude_on_the_same_conversation_and_reopening_resumes_it
     client.send(json!({ "op": "watch", "session": session }));
     let frames = client.until(|f| f["session"] == session.as_str() && f["type"] == "transcript");
     assert_eq!(
-        frames.last().unwrap()["items"],
+        without_uuids(&frames.last().unwrap()["items"]),
         json!([
             { "role": "user", "content": "first" },
             { "role": "assistant", "content": "ok: first" },
@@ -2555,6 +3010,126 @@ fn full_access_restarts_claude_on_the_same_conversation_and_reopening_resumes_it
         .unwrap()
         .windows(2)
         .any(|w| w == ["--resume", session.as_str()]));
+}
+
+/// Creates a Claude Code session with `options`, runs one turn, closes it
+/// and opens it again: what the reopened session shows.
+fn reopened_claude(daemon: &Daemon, dir: &PathBuf, options: &Value) -> (String, Value) {
+    let mut client = Client::connect(daemon);
+    let created = request(
+        &mut client,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": options }),
+    );
+    let session = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    client.send(json!({ "op": "watch", "session": session }));
+    client.until(is_ready(&session));
+    client.send(json!({ "op": "user_message", "session": session, "content": "first" }));
+    client.until(turn_done(&session));
+    client.send(json!({ "op": "session_close", "session": session }));
+    client.until(|f| f["type"] == "session_closed" && f["session"] == session.as_str());
+    let opened = request(
+        &mut client,
+        json!({ "op": "session_open", "session": session, "options": options }),
+    );
+    assert_eq!(opened["type"], "session_opened", "{opened}");
+    client.send(json!({ "op": "watch", "session": session }));
+    let frames = client.until(|f| f["session"] == session.as_str() && f["type"] == "transcript");
+    (session, without_uuids(&frames.last().unwrap()["items"]))
+}
+
+/// Transcript items without the uuid each replayed Claude reply carries
+/// (where a rewind or a fork resumes); every reply has one.
+fn without_uuids(items: &Value) -> Value {
+    json!(items
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            let mut item = item.clone();
+            if item["role"] == "assistant" {
+                assert!(item["uuid"].is_string(), "{item}");
+                item.as_object_mut().unwrap().remove("uuid");
+            }
+            item
+        })
+        .collect::<Vec<_>>())
+}
+
+/// The desktop may set `CLAUDE_CONFIG_DIR` for the engine only: the daemon
+/// looks for the conversation there, resumes it (Claude Code refuses
+/// `--session-id` for a saved one: "Session ID … is already in use") and
+/// shows its history.
+#[test]
+fn a_conversation_saved_where_the_sessions_environment_says_reopens_by_resuming() {
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-claude-env-config");
+    fs::create_dir_all(&dir).unwrap();
+    let config = temp_dir("claude-env-config");
+    let options = json!({ "env": { "CLAUDE_CONFIG_DIR": config } });
+    let (session, items) = reopened_claude(&daemon, &dir, &options);
+    assert_eq!(
+        items,
+        json!([
+            { "role": "user", "content": "first" },
+            { "role": "assistant", "content": "ok: first" },
+        ])
+    );
+    let again = starts(&log).pop().unwrap();
+    assert!(
+        again
+            .windows(2)
+            .any(|w| w == ["--resume", session.as_str()]),
+        "{again:?}"
+    );
+    assert!(fs::read_dir(config.join("projects")).unwrap().count() > 0);
+}
+
+/// The desktop's Claude Code program may be the user's own (an account
+/// switcher) that sets `CLAUDE_CONFIG_DIR` itself before it runs Claude
+/// Code: neither the daemon's nor the session's environment names it.
+#[cfg(unix)]
+#[test]
+fn a_conversation_saved_where_the_users_program_says_reopens_by_resuming() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-claude-wrapper");
+    fs::create_dir_all(&dir).unwrap();
+    let config = temp_dir("claude-wrapper-config");
+    let wrapper = temp_dir("claude-wrapper").with_extension("sh");
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_claude.py");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nCLAUDE_CONFIG_DIR='{}' exec '{}' \"$@\"\n",
+            config.display(),
+            script.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let options = json!({ "bin": wrapper });
+    let (session, items) = reopened_claude(&daemon, &dir, &options);
+    assert_eq!(
+        items,
+        json!([
+            { "role": "user", "content": "first" },
+            { "role": "assistant", "content": "ok: first" },
+        ])
+    );
+    let again = starts(&log).pop().unwrap();
+    assert!(
+        again
+            .windows(2)
+            .any(|w| w == ["--resume", session.as_str()]),
+        "{again:?}"
+    );
 }
 
 fn fake_codex() -> PathBuf {
@@ -3171,7 +3746,10 @@ fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
         &mut desktop,
         json!({ "op": "skills_catalog", "backend": "claude" }),
     );
-    assert_eq!(catalog["installDir"], json!(home.join(".claude/skills")));
+    assert_eq!(
+        catalog["installDir"],
+        json!(home.join("claude-config/skills"))
+    );
     for op in [
         json!({ "op": "skill_install", "source": "elsewhere", "skill": "review" }),
         json!({ "op": "skill_install", "source": "lynshen", "skill": "review" }),
@@ -3554,7 +4132,7 @@ fn the_desktop_lists_switches_creates_and_deletes_skills() {
 
     // Claude Code's skills are listed, not switched.
     let claude = write(
-        home.join(".claude/skills/frontend"),
+        home.join("claude-config/skills/frontend"),
         "name: frontend\ndescription: UI",
     );
     let list = request(
@@ -3596,7 +4174,7 @@ fn the_desktop_lists_switches_creates_and_deletes_skills() {
     for dir in [review, notes] {
         let _ = fs::remove_dir_all(dir);
     }
-    let _ = fs::remove_dir_all(home.join(".claude/skills"));
+    let _ = fs::remove_dir_all(home.join("claude-config/skills"));
     let _ = fs::remove_dir_all(personal.join("blank"));
 }
 
@@ -4830,4 +5408,576 @@ fn a_closed_pairing_code_pairs_nobody() {
     );
     let (status, _) = http(&daemon, &pair_request(&code));
     assert_eq!(status, 403);
+}
+
+/// The user messages a `transcript` names, in order.
+fn user_texts(items: &[Value]) -> Vec<String> {
+    items
+        .iter()
+        .filter(|item| item["role"] == "user")
+        .map(|item| item["content"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// The conversation `session` shows to a client that starts watching it.
+fn watched_transcript(client: &mut Client, session: &str) -> Vec<Value> {
+    client.send(json!({ "op": "watch", "session": session }));
+    let frames = client.until(|f| f["session"] == session && f["type"] == "transcript");
+    frames.last().unwrap()["items"].as_array().unwrap().clone()
+}
+
+fn listed<'a>(list: &'a Value, session: &str) -> &'a Value {
+    list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session"] == session)
+        .unwrap_or_else(|| panic!("{list}"))
+}
+
+#[test]
+fn a_lynshen_fork_copies_the_first_turns_and_leaves_the_original() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-fork");
+    let mut client = Client::connect(&daemon);
+    let original = client.create_session(&dir);
+    for message in ["one", "two", "three"] {
+        client.send(json!({ "op": "user_message", "session": original, "content": message }));
+        client.until(ready(&original));
+    }
+    let created = request(
+        &mut client,
+        json!({ "op": "session_create", "cwd": dir, "options": { "fork_from": original, "fork_turns": 2 } }),
+    );
+    let fork = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    assert_ne!(fork, original);
+    assert_eq!(
+        user_texts(&watched_transcript(&mut client, &fork)),
+        ["one", "two"]
+    );
+    // It goes on from there; the original keeps its three turns.
+    client.send(json!({ "op": "user_message", "session": fork, "content": "four" }));
+    client.until(ready(&fork));
+    assert_eq!(
+        user_texts(&watched_transcript(&mut client, &original)),
+        ["one", "two", "three"]
+    );
+    let list = request(&mut client, json!({ "op": "session_list" }));
+    assert_eq!(
+        listed(&list, &fork)["forked_from"],
+        json!({ "session": original, "turns": 2, "at": null })
+    );
+    assert!(listed(&list, &original)["forked_from"].is_null());
+
+    // A fork that works in another directory (its own worktree) reads the
+    // original from where it was saved.
+    let tree = temp_dir("daemon-fork-tree");
+    let created = request(
+        &mut client,
+        json!({ "op": "session_create", "cwd": tree, "options": { "fork_from": original, "fork_turns": 1, "fork_cwd": dir } }),
+    );
+    let elsewhere = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    assert_eq!(
+        user_texts(&watched_transcript(&mut client, &elsewhere)),
+        ["one"]
+    );
+    // Not found there without fork_cwd; nothing kept is refused.
+    for options in [
+        json!({ "fork_from": original, "fork_turns": 1 }),
+        json!({ "fork_from": original, "fork_turns": 0, "fork_cwd": dir }),
+    ] {
+        let refused = request(
+            &mut client,
+            json!({ "op": "session_create", "cwd": tree, "options": options }),
+        );
+        assert_eq!(refused["type"], "error", "{refused}");
+    }
+}
+
+#[test]
+fn a_claude_fork_resumes_at_the_kept_turns_reply_as_a_new_conversation() {
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-claude-fork");
+    let mut desktop = Client::connect(&daemon);
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": { "approval_mode": "auto-edit" } }),
+    );
+    let original = created["session"].as_str().unwrap().to_string();
+    desktop.send(json!({ "op": "watch", "session": original }));
+    desktop.until(is_ready(&original));
+    for message in ["one", "two", "three"] {
+        desktop.send(json!({ "op": "user_message", "session": original, "content": message }));
+        desktop.until(turn_done(&original));
+    }
+    let before = starts(&log).len();
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": { "approval_mode": "auto-edit", "fork_from": original, "fork_turns": 2 } }),
+    );
+    let fork = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    assert_ne!(fork, original);
+    // Claude Code resumes the original at turn two's reply, as a new
+    // conversation under the fork's id.
+    let args = starts_after(&log, before + 1).last().unwrap().clone();
+    let at = args.iter().position(|a| a == "--resume").unwrap();
+    assert_eq!(
+        args[at..at + 5],
+        [
+            "--resume",
+            original.as_str(),
+            "--fork-session",
+            "--session-id",
+            fork.as_str()
+        ]
+    );
+    let point = args[args
+        .iter()
+        .position(|a| a == "--resume-session-at")
+        .unwrap()
+        + 1]
+    .clone();
+    // Until its first turn it shows the copied turns.
+    let items = watched_transcript(&mut desktop, &fork);
+    assert_eq!(user_texts(&items), ["one", "two"]);
+    assert_eq!(items.last().unwrap()["uuid"], point.as_str());
+    let list = request(&mut desktop, json!({ "op": "session_list" }));
+    assert_eq!(
+        listed(&list, &fork)["forked_from"],
+        json!({ "session": original, "turns": 2, "at": point })
+    );
+
+    // Closed before its first turn (nothing saved), it is forked again.
+    desktop.send(json!({ "op": "session_close", "session": fork }));
+    desktop.until(|f| f["type"] == "session_closed" && f["session"] == fork.as_str());
+    let before = starts(&log).len();
+    let reopened = request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": fork }),
+    );
+    assert_eq!(reopened["type"], "session_opened", "{reopened}");
+    let args = starts_after(&log, before + 1).last().unwrap().clone();
+    assert!(args.contains(&"--fork-session".to_string()), "{args:?}");
+    desktop.until(is_ready(&fork));
+    desktop.send(json!({ "op": "user_message", "session": fork, "content": "four" }));
+    desktop.until(turn_done(&fork));
+
+    // Saved now: a reopen resumes the fork itself.
+    desktop.send(json!({ "op": "session_close", "session": fork }));
+    desktop.until(|f| f["type"] == "session_closed" && f["session"] == fork.as_str());
+    let before = starts(&log).len();
+    request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": fork }),
+    );
+    let args = starts_after(&log, before + 1).last().unwrap().clone();
+    assert!(!args.contains(&"--fork-session".to_string()), "{args:?}");
+    assert!(args.windows(2).any(|w| w == ["--resume", fork.as_str()]));
+    assert_eq!(
+        user_texts(&watched_transcript(&mut desktop, &fork)),
+        ["one", "two", "four"]
+    );
+    // The original is as it was.
+    desktop.send(json!({ "op": "session_close", "session": original }));
+    desktop.until(|f| f["type"] == "session_closed" && f["session"] == original.as_str());
+    request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": original }),
+    );
+    assert_eq!(
+        user_texts(&watched_transcript(&mut desktop, &original)),
+        ["one", "two", "three"]
+    );
+
+    // A fork of a conversation that is not saved is refused.
+    let refused = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": { "fork_from": "00000000-0000-0000-0000-000000000000", "fork_turns": 1 } }),
+    );
+    assert_eq!(refused["type"], "error", "{refused}");
+}
+
+#[test]
+fn a_codex_fork_forks_the_thread_through_the_kept_turn() {
+    let _guard = setup();
+    let log = fake_codex();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-codex-fork");
+    let mut desktop = Client::connect(&daemon);
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "codex" }),
+    );
+    let original = created["session"].as_str().unwrap().to_string();
+    desktop.send(json!({ "op": "watch", "session": original }));
+    desktop.until(|f| f["session"] == original.as_str() && f["type"] == "attended");
+    for message in ["one", "two", "three"] {
+        desktop.send(json!({ "op": "user_message", "session": original, "content": message }));
+        desktop.until(turn_done(&original));
+    }
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "codex", "options": { "fork_from": original, "fork_turns": 2 } }),
+    );
+    let fork = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    assert!(fork.starts_with("th-") && fork != original, "{fork}");
+    assert_eq!(
+        user_texts(&watched_transcript(&mut desktop, &fork)),
+        ["one", "two"]
+    );
+    // The original's thread is as it was (a reopen replays it).
+    desktop.send(json!({ "op": "session_close", "session": original }));
+    desktop.until(|f| f["type"] == "session_closed" && f["session"] == original.as_str());
+    request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": original }),
+    );
+    assert_eq!(
+        user_texts(&watched_transcript(&mut desktop, &original)),
+        ["one", "two", "three"]
+    );
+    let list = request(&mut desktop, json!({ "op": "session_list" }));
+    assert_eq!(
+        listed(&list, &fork)["forked_from"]["session"],
+        original.as_str()
+    );
+    assert!(fs::read_to_string(&log).unwrap().lines().count() >= 2);
+}
+
+#[test]
+fn an_engine_probe_reports_models_and_commands_and_is_cached() {
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let mut desktop = Client::connect(&daemon);
+    let before = starts(&log).len();
+    let dir = temp_dir("daemon-probe");
+    let probed = request(
+        &mut desktop,
+        json!({ "op": "engine_probe", "engine": "claude", "cwd": dir }),
+    );
+    assert_eq!(probed["type"], "engine_probed", "{probed}");
+    assert_eq!(probed["cached"], false);
+    let kinds: Vec<&str> = probed["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["type"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"model_status"), "{probed}");
+    assert!(kinds.contains(&"model_view"), "{probed}");
+    assert!(kinds.contains(&"command_list"), "{probed}");
+    let args = starts(&log).last().unwrap().clone();
+    assert!(
+        args.contains(&"--no-session-persistence".to_string()),
+        "{args:?}"
+    );
+    // It is no session: none listed, nothing saved.
+    let list = request(&mut desktop, json!({ "op": "session_list" }));
+    assert!(
+        !list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["cwd"] == dir.display().to_string()),
+        "{list}"
+    );
+    // Asked again soon: the same answer, without running it.
+    let again = request(
+        &mut desktop,
+        json!({ "op": "engine_probe", "engine": "claude", "cwd": dir }),
+    );
+    assert_eq!(again["cached"], true);
+    assert_eq!(again["events"], probed["events"]);
+    assert_eq!(starts(&log).len(), before + 1);
+    // `force` runs it again.
+    let forced = request(
+        &mut desktop,
+        json!({ "op": "engine_probe", "engine": "claude", "cwd": dir, "force": true }),
+    );
+    assert_eq!(forced["cached"], false);
+    assert_eq!(starts(&log).len(), before + 2);
+    // The LynShen engine needs none.
+    let refused = request(
+        &mut desktop,
+        json!({ "op": "engine_probe", "engine": "lynshen" }),
+    );
+    assert_eq!(refused["type"], "error", "{refused}");
+}
+
+/// The task `id` as the daemon lists it, once `done` holds for it.
+fn schedule_when(client: &mut Client, id: &str, mut done: impl FnMut(&Value) -> bool) -> Value {
+    let frames = client.until(|frame| {
+        frame["type"] == "schedules"
+            && frame["schedules"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|s| s["id"] == id && done(s))
+    });
+    let list = &frames.last().unwrap()["schedules"];
+    list.as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == id)
+        .cloned()
+        .unwrap()
+}
+
+fn session_entry(client: &mut Client, session: &str) -> Value {
+    let list = request(client, json!({ "op": "session_list" }));
+    list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session"] == session)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+#[test]
+fn a_scheduled_run_is_recorded_fails_three_times_and_switches_its_task_off() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "nightly", "Runs the nightly checks");
+    let saved = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": {
+            "agent": "nightly", "name": "巡检", "prompt": "check the queue",
+            "repeat": "daily", "time": "09:00",
+        } }),
+    );
+    let id = saved["schedule"]["id"].as_str().unwrap().to_string();
+    assert_eq!(saved["schedule"]["failures"], 0);
+    assert_eq!(saved["schedule"]["history"], json!([]));
+    assert!(saved["schedule"]["last_run"].is_null());
+
+    // A run that ends well: done, with its session and times.
+    let started = request(&mut client, json!({ "op": "schedule_run", "schedule": id }));
+    assert_eq!(started["type"], "schedule_started", "{started}");
+    let done = schedule_when(&mut client, &id, |s| s["last_run"]["status"] == "done");
+    let session = done["last_run"]["session"].as_str().unwrap().to_string();
+    assert!(done["last_run"]["ended_at"].as_u64().is_some());
+    assert_eq!(
+        session_entry(&mut client, &session)["schedule"],
+        id.as_str()
+    );
+
+    // Three that fail (the model refuses): the task switches itself off and
+    // every client hears of it.
+    let failing = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": { "id": id, "prompt": "FAIL_TURN" } }),
+    );
+    assert_eq!(failing["type"], "schedule_saved", "{failing}");
+    for n in 1..=3u64 {
+        let reply = request(&mut client, json!({ "op": "schedule_run", "schedule": id }));
+        assert_eq!(reply["type"], "schedule_started", "run {n}: {reply}");
+        let failed = schedule_when(&mut client, &id, |s| {
+            s["last_run"]["status"] == "failed" && s["failures"] == n
+        });
+        assert_eq!(failed["enabled"], n < 3, "after {n}");
+    }
+    let off = request(&mut client, json!({ "op": "schedule_list" }));
+    let task = &off["schedules"][0];
+    assert_eq!(task["enabled"], false);
+    assert!(task["next_run_at"].is_null());
+    assert_eq!(task["history"].as_array().unwrap().len(), 3);
+    assert_eq!(task["history"][2]["status"], "done");
+    // Saved with the agent: a restarted daemon lists the same.
+    let saved: Value = serde_json::from_str(
+        &fs::read_to_string(daemon.agents.join("nightly/schedules.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved[0]["failures"], 3);
+    assert_eq!(saved[0]["last_run"]["status"], "failed");
+
+    // Switching it on forgives the failures.
+    let on = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": { "id": id, "enabled": true, "prompt": "check" } }),
+    );
+    assert_eq!(on["schedule"]["failures"], 0);
+    assert!(on["schedule"]["next_run_at"].as_u64().is_some());
+}
+
+#[test]
+fn a_stopped_task_is_told_once_as_a_schedule_event() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "flaky", "Fails");
+    let saved = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": {
+            "agent": "flaky", "name": "flaky", "prompt": "FAIL_TURN",
+            "repeat": "daily", "time": "09:00",
+        } }),
+    );
+    let id = saved["schedule"]["id"].as_str().unwrap().to_string();
+    let mut frames = Vec::new();
+    for n in 1..=3u64 {
+        client.send(json!({ "op": "schedule_run", "schedule": id }));
+        frames.extend(
+            client.until(|frame| {
+                frame["type"] == "schedules" && frame["schedules"][0]["failures"] == n
+            }),
+        );
+    }
+    frames.extend(
+        client.until(|frame| frame["type"] == "schedule_event" && frame["kind"] == "stopped"),
+    );
+    let events: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["type"] == "schedule_event")
+        .collect();
+    let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    // The first failure in a row is told, then the switch-off.
+    assert_eq!(kinds.first(), Some(&"failed"), "{events:?}");
+    assert_eq!(kinds.last(), Some(&"stopped"), "{events:?}");
+    assert_eq!(
+        kinds.iter().filter(|k| **k == "failed").count(),
+        1,
+        "{events:?}"
+    );
+    assert!(events.last().unwrap()["detail"]
+        .as_str()
+        .unwrap()
+        .contains("连续失败 3 次"));
+}
+
+#[test]
+fn a_worktree_task_runs_apart_and_an_unused_worktree_goes_with_its_run() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    let dir = create_agent(&mut client, "wt", "Works in a worktree");
+    git(&dir, &["init", "-q", "-b", "main"]);
+    git(
+        &dir,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "a",
+        ],
+    );
+    let saved = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": {
+            "agent": "wt", "name": "巡检", "prompt": "check", "repeat": "daily", "time": "09:00",
+            "worktree": true,
+        } }),
+    );
+    let id = saved["schedule"]["id"].as_str().unwrap().to_string();
+    assert_eq!(saved["schedule"]["worktree"], true);
+    let run = |client: &mut Client, previous: Option<&str>| {
+        let started = request(client, json!({ "op": "schedule_run", "schedule": id }));
+        assert_eq!(started["type"], "schedule_started", "{started}");
+        let done = schedule_when(client, &id, |s| {
+            s["last_run"]["status"] == "done"
+                && s["last_run"]["session"]
+                    .as_str()
+                    .is_some_and(|s| Some(s) != previous)
+        });
+        done["last_run"]["session"].as_str().unwrap().to_string()
+    };
+    let first = run(&mut client, None);
+    let entry = session_entry(&mut client, &first);
+    let tree = entry["worktree"].clone();
+    let path = PathBuf::from(tree["path"].as_str().unwrap());
+    let container = dir
+        .parent()
+        .unwrap()
+        .join(".lynshen-worktrees")
+        .join(dir.file_name().unwrap());
+    assert_eq!(path.parent(), Some(container.as_path()), "{entry}");
+    assert_eq!(entry["cwd"], tree["path"]);
+    assert_eq!(entry["agent"], "wt");
+    assert_eq!(tree["base"], "main");
+    assert!(tree["branch"].as_str().unwrap().starts_with("task/sch-"));
+    assert!(path.is_dir());
+
+    // The next run archives this one; nothing was left in its worktree,
+    // which goes once its engine closes.
+    let second = run(&mut client, Some(&first));
+    assert_eq!(session_entry(&mut client, &first)["archived"], true);
+    client.send(json!({ "op": "session_close", "session": first }));
+    let start = Instant::now();
+    while path.exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "worktree kept");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_ne!(
+        session_entry(&mut client, &second)["worktree"]["path"],
+        tree["path"]
+    );
+    let start = Instant::now();
+    while session_entry(&mut client, &first)["worktree"]["gone"] != true {
+        assert!(start.elapsed() < Duration::from_secs(10), "listed as gone");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn an_old_agent_store_loads_and_its_tasks_run() {
+    let _guard = setup();
+    let root = temp_dir("schedule-old-store");
+    let agents = lynshen_daemon::Agents::open(root.join("agents")).unwrap();
+    agents
+        .create(
+            "legacy",
+            "legacy",
+            &temp_dir("agent-legacy"),
+            "Old",
+            &Value::Null,
+        )
+        .unwrap();
+    // As the daemon saved tasks before runs were recorded.
+    let saved = json!([{
+        "id": "sch-old", "agent": "legacy", "name": "old", "prompt": "hello",
+        "enabled": true, "repeat": "daily", "time": "09:00", "days": [], "date": null,
+        "new_session": true, "by_agent": false, "origin": null, "created_at": 1,
+        "last_run_at": 5, "last_session": "s-gone", "next_run_at": 4102444800u64,
+    }]);
+    fs::write(root.join("agents/legacy/schedules.json"), saved.to_string()).unwrap();
+    let daemon = start_daemon_on(root.join("daemon"), root.join("agents"));
+    let mut client = Client::connect(&daemon);
+    let list = request(&mut client, json!({ "op": "schedule_list" }));
+    let task = &list["schedules"][0];
+    assert_eq!(task["id"], "sch-old");
+    assert_eq!(task["last_session"], "s-gone");
+    assert_eq!(task["failures"], 0);
+    assert_eq!(task["worktree"], false);
+    assert!(task["budget"].is_null() && task["last_run"].is_null());
+    assert_eq!(task["history"], json!([]));
+    request(
+        &mut client,
+        json!({ "op": "schedule_run", "schedule": "sch-old" }),
+    );
+    let done = schedule_when(&mut client, "sch-old", |s| {
+        s["last_run"]["status"] == "done"
+    });
+    assert_eq!(done["next_run_at"], 4102444800u64);
 }

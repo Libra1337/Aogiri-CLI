@@ -136,6 +136,7 @@ pub fn install_from_mirror(
     id: &str,
 ) -> io::Result<PathBuf> {
     validate_skill_id(id)?;
+    super::check_source_free(skills_dir, id, repository)?;
     let (url, sha256) = mirror.archive(repository, id).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -146,6 +147,7 @@ pub fn install_from_mirror(
     verify_sha256(&bytes, sha256)?;
     let dir = skills_dir.join(id);
     install_package_bytes(&dir, &bytes, "tar.gz")?;
+    super::record_source(&dir, repository)?;
     Ok(dir)
 }
 
@@ -276,6 +278,13 @@ mod tests {
         let dir = install_from_mirror(&mirror, &skills, REPOSITORY, "demo").unwrap();
         assert_eq!(dir, skills.join("demo"));
         assert!(super::super::skill_installed(&skills, "demo"));
+        // It came from that repository; another one's `demo` is not it.
+        assert!(super::super::installed_from(&skills, "demo", REPOSITORY));
+        assert!(!super::super::installed_from(
+            &skills,
+            "demo",
+            "https://github.com/someone/else"
+        ));
         assert_eq!(
             fs::read_to_string(dir.join("LICENSE")).unwrap(),
             "MIT License\n"

@@ -310,8 +310,13 @@ impl TuiState {
                     self.pending_messages = messages;
                     changed
                 }
-                // The TUI sends no unqueue; pending_messages already redrew.
-                AgentEvent::Unqueued(_) => false,
+                // A queued message taken back goes back to the input to edit.
+                AgentEvent::Unqueued { content, .. } => {
+                    input.clear();
+                    input.push_text(&content);
+                    self.completion_index = 0;
+                    true
+                }
                 // The TUI shows its own turn timer and usage.
                 AgentEvent::TurnStats(_) => false,
                 AgentEvent::UserMessage(message) => {
@@ -883,12 +888,12 @@ impl TuiState {
         self.mark_history_dirty();
     }
 
-    pub(super) fn replace_transcript(&mut self, items: Vec<TranscriptItem>) {
+    pub(super) fn replace_transcript(&mut self, items: Vec<(TranscriptItem, u64)>) {
         self.commit_live_assistant();
         self.reset_thinking();
         self.chat = items
             .into_iter()
-            .filter_map(|item| {
+            .filter_map(|(item, _)| {
                 Some(match item {
                     TranscriptItem::User(text) => ChatLine::User(text),
                     TranscriptItem::UserWithImages { content, images } => {

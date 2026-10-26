@@ -34,5 +34,18 @@ Without them those providers answer 501; Web Push is unaffected. Not
 implemented: Getui (501). Tests: `go test ./...` (the RFC 8291 example, VAPID
 and APNs/FCM tokens, every refusal, provider answers, host and client streams).
 
+Relay v2 (account-based, `docs/relay-protocol.md` §7) is served next to v1
+when the relay knows the gateway:
+
+```sh
+# systemd unit: LoadCredential=relay-service:/etc/lynshen-relay/relay-service
+#               Environment=LYNSHEN_RELAY_GATEWAY=https://www.lynshen.org
+```
+
+The relay checks relay tokens offline with the gateway's key
+(`/api/desktop/oauth/relay-key`). It registers computers and sends a heartbeat
+every 60 s with the service token. `-no-v1` turns v1 off; keep v1 on while
+phones from before v2 are in use. Tests: `go test -race ./...`.
+
 Interop check against a real daemon:
 `cargo run -p lynshen-daemon --example relay_phone -- ws://127.0.0.1:18095/relay/v1 '<pair link>'`

@@ -66,6 +66,9 @@ pub struct OAuthModel {
     /// The window range through each of the user's groups (group id →
     /// smallest, largest).
     pub group_windows: std::collections::BTreeMap<String, (u64, u64)>,
+    /// Left out of model pickers; still callable by name. A gateway that
+    /// does not mark models sends none hidden.
+    pub hidden: bool,
 }
 
 pub fn login(web_url: &str, api_url: &str) -> Result<OAuthLoginResult, String> {
@@ -174,12 +177,22 @@ fn exchange_code(
     parse_tokens(&json_response(response)?)
 }
 
+/// Why a refresh failed: the server refused the refresh token (revoked,
+/// expired, already used), or it could not be asked (network, server error).
+#[derive(Debug)]
+pub enum RefreshError {
+    Rejected(String),
+    Failed(String),
+}
+
 /// Exchange a refresh token for a fresh access+refresh pair (rotation).
 /// Used by the LLM client when the access token has expired or is rejected.
-pub fn refresh(api_url: &str, refresh_token: &str) -> Result<Tokens, String> {
+pub fn refresh(api_url: &str, refresh_token: &str) -> Result<Tokens, RefreshError> {
     let api_url = api_url.trim().trim_end_matches('/');
     if api_url.is_empty() {
-        return Err("LynShen API URL cannot be empty".to_string());
+        return Err(RefreshError::Failed(
+            "LynShen API URL cannot be empty".to_string(),
+        ));
     }
     let url = format!("{}/v1/oauth/token", api_url);
     // ureq::Error is large; it is ureq's own type, passed through as is.
@@ -194,7 +207,19 @@ pub fn refresh(api_url: &str, refresh_token: &str) -> Result<Tokens, String> {
                 "refresh_token": refresh_token,
             }))
     });
-    parse_tokens(&json_response(response)?)
+    // 400 and 401 are the gateway refusing this refresh token; anything else
+    // (a dropped connection, a 5xx while its database is slow) is worth
+    // retrying.
+    let refused = matches!(&response, Err(ureq::Error::Status(400 | 401, _)));
+    json_response(response)
+        .and_then(|value| parse_tokens(&value))
+        .map_err(|error| {
+            if refused {
+                RefreshError::Rejected(error)
+            } else {
+                RefreshError::Failed(error)
+            }
+        })
 }
 
 /// Serializes session checks within the process. Refresh tokens are single
@@ -273,11 +298,19 @@ pub fn ensure_session(api_url: &str, encrypt_secrets: bool) -> Result<AuthStore,
             auth.save().map_err(|error| error.to_string())?;
             Ok(auth)
         }
-        Err(error) => {
-            crate::log_error!("oauth", "token refresh failed", error = error.clone());
+        Err(RefreshError::Rejected(error)) => {
+            // Revoked or expired on the server: signed out here too, so every
+            // client shows sign-in instead of retrying a dead login.
+            crate::log_error!("oauth", "token refresh refused", error = error.clone());
+            auth.clear_lynshen();
+            let _ = auth.save();
             Err(format!(
-                "failed to refresh LynShen session: {error}. Run /login."
+                "the LynShen login is no longer valid ({error}). Run /login to sign in again."
             ))
+        }
+        Err(RefreshError::Failed(error)) => {
+            crate::log_error!("oauth", "token refresh failed", error = error.clone());
+            Err(format!("failed to refresh LynShen session: {error}"))
         }
     }
 }
@@ -390,7 +423,7 @@ fn device_name() -> String {
     name
 }
 
-fn hostname() -> Option<String> {
+pub fn hostname() -> Option<String> {
     if cfg!(windows) {
         return std::env::var("COMPUTERNAME")
             .ok()
@@ -453,6 +486,7 @@ fn parse_model(item: &Value) -> Option<OAuthModel> {
             .filter(|label| !label.is_empty())
             .map(str::to_string),
         group_windows: crate::config::read_group_windows(item.get("group_context_windows")),
+        hidden: item.get("hidden").and_then(Value::as_bool).unwrap_or(false),
     })
 }
 
@@ -500,6 +534,58 @@ fn json_response(response: Result<ureq::Response, ureq::Error>) -> Result<Value,
 mod tests {
     use super::*;
 
+    /// A server that answers every request with `status` and a JSON error.
+    /// It reads the whole request first, so the client never sees its
+    /// answer race its own write.
+    fn answering(status: u16) -> String {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let mut reader = std::io::BufReader::new(stream);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; length];
+                let _ = reader.read_exact(&mut body);
+                let answer = r#"{"error":"nope"}"#;
+                let _ = reader.get_mut().write_all(
+                    format!("HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}", answer.len()).as_bytes(),
+                );
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn a_refused_refresh_token_is_rejected_and_a_server_error_is_not() {
+        assert!(matches!(
+            refresh(&answering(401), "rt"),
+            Err(RefreshError::Rejected(_))
+        ));
+        assert!(matches!(
+            refresh(&answering(400), "rt"),
+            Err(RefreshError::Rejected(_))
+        ));
+        assert!(matches!(
+            refresh(&answering(500), "rt"),
+            Err(RefreshError::Failed(_))
+        ));
+        assert!(matches!(
+            refresh("http://127.0.0.1:1", "rt"),
+            Err(RefreshError::Failed(_))
+        ));
+    }
+
     #[test]
     fn parses_model_metadata_from_models_response() {
         let value = json!({
@@ -532,6 +618,7 @@ mod tests {
                     ("g-small".to_string(), (272_000, 272_000)),
                 ]
                 .into(),
+                hidden: false,
             }]
         );
     }
@@ -550,7 +637,17 @@ mod tests {
                 reasoning_efforts: None,
                 display_name: None,
                 group_windows: Default::default(),
+                hidden: false,
             }]
         );
+    }
+
+    #[test]
+    fn parses_the_hidden_flag_and_defaults_to_shown() {
+        let value =
+            json!({ "data": [{ "id": "codex-auto-review", "hidden": true }, { "id": "gpt-5.5" }] });
+        let models = parse_models_response(&value);
+        assert!(models[0].hidden);
+        assert!(!models[1].hidden);
     }
 }

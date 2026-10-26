@@ -106,6 +106,18 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(source['skills'][0]['license'], '')
         self.assertNotIn('archive', source['skills'][0])
 
+        # Terms of its own that are not open: listed with them, never packed.
+        closed = self.repo('closed')
+        write(closed, 'LICENSE', MIT)
+        write(closed, 'skills/docx/SKILL.md',
+              '---\nname: docx\nlicense: Proprietary. LICENSE.txt has complete terms\n---\n')
+        source = build.community_source('Closed', 'https://github.com/closed/skills',
+                                        build.Tree.from_dir(closed), SHA, 0, self.out)
+        docx = source['skills'][0]
+        self.assertEqual((docx['license'], docx['redistributable']),
+                         ('Proprietary. LICENSE.txt has complete terms', False))
+        self.assertNotIn('archive', docx)
+
     def test_anthropic_skills_keep_the_index_and_only_redistributable_ones_are_packed(self):
         repo = self.repo('anthropic')
         for skill in ('open', 'closed'):

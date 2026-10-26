@@ -1,18 +1,25 @@
-//! Messages between conversations. Every LynShen session the daemon hosts
-//! gets `list_sessions`, `read_session` and `send_to_session` (config.json
-//! `sessions.messages`: `off`, `ask` or `on`, the default). A message goes to
-//! the other session as its next user message through
-//! `Hub::send_to_session`, wrapped in `<session_message>`, so a session on
-//! any engine can receive it. The daemon follows each message until the
-//! receiver has handled it, for `wait_reply` and the `session_message`
-//! events.
+//! Messages between conversations: the session tools of the app's tools
+//! (`lynshen_agent_core::app_tools`): `list_sessions`, `read_session`,
+//! `start_session`, `send_to_session` and `wait_session`, for every session
+//! the daemon hosts (LynShen as host tools, Claude Code and Codex through
+//! `engines`), switched by config.json `sessions.messages`: `off`, `ask` or
+//! `on`, the default. A message goes to the other session as its next user
+//! message through `Hub::send_to_session`, wrapped in `<session_message>`,
+//! so a session on any engine can receive it. The daemon follows each
+//! message until the receiver has handled it, for `wait_reply`,
+//! `wait_session` and the `session_message` events.
 
 use crate::{
     engines,
     hub::{lock, Hub},
     store::now,
 };
-use lynshen_agent_core::host::{HostExtensions, HostGate};
+use lynshen_agent_core::{
+    app_tools::{
+        LIST_SESSIONS, READ_SESSION, SEND_TO_SESSION, SESSION_TOOLS, START_SESSION, WAIT_SESSION,
+    },
+    host::{HostExtensions, HostGate},
+};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
@@ -29,8 +36,10 @@ const MAX_HOPS: u32 = 4;
 /// Messages one session may send per hour.
 const SENDS_PER_HOUR: usize = 20;
 const HOUR_MS: u64 = 60 * 60 * 1000;
-/// How long `wait_reply` waits.
+/// How long `wait_reply` waits, and `wait_session` by default.
 const WAIT_LIMIT: Duration = Duration::from_secs(10 * 60);
+/// The longest `wait_session` (`timeout_seconds`).
+const MAX_WAIT_SECS: u64 = 30 * 60;
 /// How long a just-opened receiver has to report its approval mode.
 const MODE_WAIT: Duration = Duration::from_secs(5);
 const LIST_LIMIT: usize = 30;
@@ -64,7 +73,7 @@ pub enum Setting {
 }
 
 impl Setting {
-    fn parse(config: &Value) -> Self {
+    pub(crate) fn parse(config: &Value) -> Self {
         match config["sessions"]["messages"].as_str() {
             Some("off") => Self::Off,
             Some("ask") => Self::Ask,
@@ -74,12 +83,15 @@ impl Setting {
 
     /// As config.json says now.
     pub fn current() -> Self {
-        let config = crate::lynshen_dir()
-            .ok()
-            .and_then(|dir| std::fs::read_to_string(dir.join("config.json")).ok())
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .unwrap_or_default();
-        Self::parse(&config)
+        Self::parse(&crate::app_tools::config())
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Ask => "ask",
+            Self::On => "on",
+        }
     }
 }
 
@@ -102,6 +114,12 @@ struct State {
     pending: HashMap<String, Vec<Pending>>,
     /// Who waits for whose reply now: sender → receiver.
     waiting: HashMap<String, String>,
+    /// The last message each sender sent each receiver, (sender, receiver)
+    /// → message id, which `wait_session` waits on.
+    last_sent: HashMap<(String, String), String>,
+    /// How each sender's last message to each receiver ended, (sender,
+    /// receiver) → (message id, reply or why there is none).
+    replies: HashMap<(String, String), (String, Result<String, String>)>,
 }
 
 struct Pending {
@@ -116,6 +134,8 @@ struct Pending {
     active: bool,
     /// It arrived while the receiver was busy.
     queued: bool,
+    /// The receiver waits for the user to approve a step.
+    approval: bool,
     /// The receiver's latest reply text since it started.
     reply: String,
     waiter: Option<mpsc::Sender<Result<String, String>>>,
@@ -128,7 +148,7 @@ pub fn extensions(hub: Arc<Hub>, session: String) -> Option<HostExtensions> {
     }
     let summary_hub = Arc::clone(&hub);
     Some(HostExtensions {
-        tools: definitions(),
+        tools: lynshen_agent_core::app_tools::definitions(&SESSION_TOOLS),
         run_tool: Arc::new(move |name, arguments, stopped| {
             let result = serde_json::from_str::<Value>(arguments)
                 .map_err(|error| format!("invalid JSON arguments: {error}"))
@@ -143,30 +163,67 @@ pub fn extensions(hub: Arc<Hub>, session: String) -> Option<HostExtensions> {
         context: Arc::new(String::new),
         exclusive: false,
         gate: Arc::new(|name| match name {
-            "send_to_session" | "start_session" if Setting::current() == Setting::Ask => {
-                HostGate::Ask
-            }
-            "send_to_session" | "start_session" => HostGate::Outward,
+            SEND_TO_SESSION | START_SESSION if Setting::current() == Setting::Ask => HostGate::Ask,
+            SEND_TO_SESSION | START_SESSION => HostGate::Outward,
             _ => HostGate::ReadOnly,
         }),
         summary: Arc::new(move |name, arguments| {
             let args = serde_json::from_str::<Value>(arguments).unwrap_or_default();
-            if name == "start_session" {
-                return format!(
-                    "{} {}\n{}",
-                    args["engine"].as_str().unwrap_or("lynshen"),
-                    args["model"].as_str().unwrap_or_default(),
-                    clip(args["message"].as_str().unwrap_or_default(), 500)
-                );
-            }
-            let to = args["session"].as_str().unwrap_or_default();
-            format!(
-                "{} ({to})\n{}",
-                title(&summary_hub, to),
-                clip(args["message"].as_str().unwrap_or_default(), 500)
-            )
+            summary(&summary_hub, name, &args)
         }),
     })
+}
+
+/// The approval card's line for a `start_session` or `send_to_session`.
+pub(crate) fn summary(hub: &Hub, name: &str, args: &Value) -> String {
+    if name == START_SESSION {
+        return format!(
+            "{} {}\n{}",
+            args["engine"].as_str().unwrap_or("lynshen"),
+            args["model"].as_str().unwrap_or_default(),
+            clip(args["message"].as_str().unwrap_or_default(), 500)
+        );
+    }
+    let to = args["session"].as_str().unwrap_or_default();
+    format!(
+        "{} ({to})\n{}",
+        title(hub, to),
+        clip(args["message"].as_str().unwrap_or_default(), 500)
+    )
+}
+
+/// Whether a Claude Code or Codex session's call to `name` waits for the
+/// user, as a LynShen session's would (`extensions`' gate): Some(true) when
+/// it asks in every mode (`sessions.messages` is `ask`), Some(false) when
+/// its approval mode asks (`plan`, `manual` and the like), None when it
+/// runs at once.
+pub(crate) fn engine_gate(hub: &Hub, session: &str, name: &str) -> Option<bool> {
+    if !matches!(name, SEND_TO_SESSION | START_SESSION) {
+        return None;
+    }
+    match Setting::current() {
+        Setting::Ask => Some(true),
+        _ if rank(&hub.messages.mode(session).unwrap_or_default()) <= rank("manual") => Some(false),
+        _ => None,
+    }
+}
+
+/// A session tool's call from any engine: the JSON output, or what the model
+/// should fix. A Claude Code or Codex session's arguments come as given.
+pub(crate) fn call(
+    hub: &Arc<Hub>,
+    me: &str,
+    name: &str,
+    args: &Value,
+    stopped: &AtomicBool,
+) -> Result<Value, String> {
+    run(
+        hub,
+        me,
+        name,
+        &crate::agent_tools::without_empty(args.clone()),
+        stopped,
+    )
 }
 
 fn run(
@@ -189,12 +246,12 @@ fn run(
             .ok_or_else(|| format!("{name} requires {key}"))
     };
     match name {
-        "list_sessions" => Ok(list(hub, me, args["query"].as_str())),
-        "read_session" => {
+        LIST_SESSIONS => Ok(list(hub, me, args["query"].as_str())),
+        READ_SESSION => {
             let turns = args["turns"].as_u64().map_or(DEFAULT_TURNS, |n| n as usize);
             read(hub, me, &text("session")?, turns.clamp(1, MAX_TURNS))
         }
-        "send_to_session" => send(
+        SEND_TO_SESSION => send(
             hub,
             me,
             &text("session")?,
@@ -203,7 +260,20 @@ fn run(
             setting,
             stopped,
         ),
-        "start_session" => {
+        WAIT_SESSION => {
+            let secs = args["timeout_seconds"]
+                .as_u64()
+                .unwrap_or(WAIT_LIMIT.as_secs())
+                .clamp(10, MAX_WAIT_SECS);
+            wait_session(
+                hub,
+                me,
+                &text("session")?,
+                Duration::from_secs(secs),
+                stopped,
+            )
+        }
+        START_SESSION => {
             let target = start(hub, me, args)?;
             send(
                 hub,
@@ -386,6 +456,7 @@ fn send(
                 started: idle || engine.as_deref() == Some("acp"),
                 active: false,
                 queued: !idle,
+                approval: false,
                 reply: String::new(),
                 waiter: wait.then_some(reply_tx),
             });
@@ -405,6 +476,9 @@ fn send(
             .entry(me.to_string())
             .or_default()
             .push_back(now());
+        state
+            .last_sent
+            .insert((me.to_string(), target.to_string()), id.clone());
         broadcast(
             hub,
             &Event {
@@ -487,7 +561,8 @@ fn start(hub: &Arc<Hub>, me: &str, args: &Value) -> Result<String, String> {
         .find(|record| record.id == me)
         .map(|record| record.cwd)
         .ok_or("this conversation is not one of the daemon's")?;
-    let sender = hub.messages.mode(me).unwrap_or_else(|| "plan".to_string());
+    // A Claude Code or Codex sender reports its mode in its engine's names.
+    let sender = lynshen_mode(&hub.messages.mode(me).unwrap_or_else(|| "plan".to_string()));
     let mode = helper_mode(&sender, text("approval_mode").as_deref())?;
     let options = engines::Options {
         approval_mode: Some(mode.clone()),
@@ -496,7 +571,10 @@ fn start(hub: &Arc<Hub>, me: &str, args: &Value) -> Result<String, String> {
         ..engines::Options::default()
     };
     let handle = hub.handle().ok_or("the daemon is stopping")?;
-    let id = handle.create_engine_session(Some(cwd), None, false, engine, options)?;
+    // The new session belongs to this one's project, wherever this one runs.
+    let project = crate::projects::of_session(hub, me);
+    let id =
+        handle.create_engine_session(Some(cwd), None, false, engine, options, Some(&project))?;
     // The lynshen engine takes its mode, model and effort as ops.
     hub.forward(&id, json!({ "op": "set_approval_mode", "mode": mode }))?;
     if engine.is_none() {
@@ -510,9 +588,11 @@ fn start(hub: &Arc<Hub>, me: &str, args: &Value) -> Result<String, String> {
     }
     let title =
         text("title").unwrap_or_else(|| clip(&one_line(&text("message").unwrap_or_default()), 40));
+    // Its parent: what it costs counts toward the sender's (a scheduled
+    // run's budget).
     if let Err(error) = hub
         .store
-        .record_session_meta(&id, &json!({ "title": title }))
+        .record_session_meta(&id, &json!({ "title": title, "parent": me }))
     {
         lynshen_agent_core::log_warn!(
             "daemon",
@@ -534,6 +614,18 @@ fn helper_mode(sender: &str, asked: Option<&str>) -> Result<String, String> {
         None if rank(sender) > rank("auto") => Ok("auto".to_string()),
         None => Ok(sender.to_string()),
     }
+}
+
+/// An approval mode in LynShen's names, which every engine takes: Claude
+/// Code's and Codex's names mapped by what they allow.
+fn lynshen_mode(mode: &str) -> String {
+    match mode {
+        "read-only" | "default" => "manual",
+        "acceptEdits" => "auto-edit",
+        "full-auto" | "bypassPermissions" | "dontAsk" => "full-access",
+        other => other,
+    }
+    .to_string()
 }
 
 /// A session this one may read or message.
@@ -672,6 +764,14 @@ pub fn observe(hub: &Hub, session: &str, event: &Value) {
                     out.push((pending.snapshot(), "delivered"));
                 }
             }
+            // The receiver waits for the user, or goes on once answered.
+            kind @ ("approval_request" | "action_deferred" | "action_decided") => {
+                for pending in state.pending.get_mut(session).into_iter().flatten() {
+                    if pending.started {
+                        pending.approval = kind != "action_decided";
+                    }
+                }
+            }
             kind @ ("assistant_start" | "assistant_delta" | "tool_start" | "error") => {
                 let delta = event["delta"].as_str().unwrap_or_default();
                 for pending in state.pending.get_mut(session).into_iter().flatten() {
@@ -679,6 +779,7 @@ pub fn observe(hub: &Hub, session: &str, event: &Value) {
                         continue;
                     }
                     pending.active = true;
+                    pending.approval = false;
                     if kind == "assistant_start" {
                         pending.reply.clear();
                     }
@@ -703,6 +804,15 @@ pub fn observe(hub: &Hub, session: &str, event: &Value) {
     }
     for (pending, status) in out {
         let reply = (status == "replied").then(|| tail(pending.reply.trim(), WAIT_REPLY_LIMIT));
+        if let Some(reply) = &reply {
+            let key = (pending.from.clone(), session.to_string());
+            let mut state = lock(&messages.state);
+            if state.last_sent.get(&key) == Some(&pending.id) {
+                state
+                    .replies
+                    .insert(key, (pending.id.clone(), Ok(reply.clone())));
+            }
+        }
         if let (Some(waiter), Some(reply)) = (&pending.waiter, &reply) {
             let _ = waiter.send(Ok(if reply.is_empty() {
                 "(the conversation ended its turn without a reply)".to_string()
@@ -753,9 +863,84 @@ pub fn ended(hub: &Hub, session: &str) {
     state.modes.remove(session);
     state.hops.remove(session);
     for pending in state.pending.remove(session).unwrap_or_default() {
-        if let Some(waiter) = pending.waiter {
-            let _ = waiter.send(Err("the conversation closed before it replied".to_string()));
+        let closed = "the conversation closed before it replied".to_string();
+        let key = (pending.from.clone(), session.to_string());
+        if state.last_sent.get(&key) == Some(&pending.id) {
+            state
+                .replies
+                .insert(key, (pending.id.clone(), Err(closed.clone())));
         }
+        if let Some(waiter) = pending.waiter {
+            let _ = waiter.send(Err(closed));
+        }
+    }
+}
+
+/// `wait_session`: waits up to `timeout` for `target`'s reply to the last
+/// message this session sent it (`send_to_session` or `start_session`
+/// without `wait_reply`, or one whose wait ran out). Returns early with
+/// `waiting_approval` when the receiver waits for the user, `running` when
+/// the wait ends first; the reply again when it came earlier.
+fn wait_session(
+    hub: &Hub,
+    me: &str,
+    target: &str,
+    timeout: Duration,
+    stopped: &AtomicBool,
+) -> Result<Value, String> {
+    let key = (me.to_string(), target.to_string());
+    let id = lock(&hub.messages.state)
+        .last_sent
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| {
+            format!("this conversation sent {target} nothing since the app started; send_to_session first")
+        })?;
+    let deadline = Instant::now() + timeout;
+    let report = |status: &str| json!({ "id": id, "session": target, "title": title(hub, target), "status": status });
+    loop {
+        {
+            let state = lock(&hub.messages.state);
+            if let Some((replied, result)) = state.replies.get(&key) {
+                if *replied == id {
+                    return match result {
+                        Ok(reply) => {
+                            let mut out = report("replied");
+                            out["reply"] = json!(if reply.is_empty() {
+                                "(the conversation ended its turn without a reply)"
+                            } else {
+                                reply.as_str()
+                            });
+                            Ok(out)
+                        }
+                        Err(error) => Err(error.clone()),
+                    };
+                }
+            }
+            let pending = state
+                .pending
+                .get(target)
+                .and_then(|list| list.iter().find(|pending| pending.id == id));
+            if pending.is_some_and(|pending| pending.approval) {
+                let mut out = report("waiting_approval");
+                out["note"] = json!(
+                    "It waits for the user to approve a step; call wait_session again later."
+                );
+                return Ok(out);
+            }
+            if pending.is_none() {
+                return Err(format!("{target} closed before it replied"));
+            }
+        }
+        if stopped.load(Ordering::SeqCst) {
+            return Err("stopped while waiting; the message was still sent".to_string());
+        }
+        if Instant::now() >= deadline {
+            let mut out = report("running");
+            out["note"] = json!("Still working; call wait_session again.");
+            return Ok(out);
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -770,6 +955,7 @@ impl Pending {
             started: self.started,
             active: self.active,
             queued: self.queued,
+            approval: self.approval,
             reply: String::new(),
             waiter: None,
         }
@@ -883,71 +1069,6 @@ fn tail(text: &str, limit: usize) -> String {
     }
     let kept: String = text.chars().skip(count - limit).collect();
     format!("…{kept}")
-}
-
-fn definitions() -> Vec<Value> {
-    vec![
-        json!({
-            "type": "function",
-            "name": "list_sessions",
-            "description": "List the user's other conversations in this app: id, title, project directory, engine, state (idle, busy, closed), last activity.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "Filter by title or directory." }
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "type": "function",
-            "name": "read_session",
-            "description": "Read another conversation's latest requests and replies (no tool details).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "session": { "type": "string" },
-                    "turns": { "type": "integer", "minimum": 1, "maximum": 10, "description": "Default 3." }
-                },
-                "required": ["session"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "type": "function",
-            "name": "start_session",
-            "description": "Start a helper conversation in this project, on another engine or model, and send it a task (it arrives as its first message): e.g. a review on Codex, a check on Claude Code, a second opinion on another model. It runs in this conversation's approval mode or a stricter one, and shows in the user's list. With wait_reply, wait (up to 10 minutes) for its reply.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "engine": { "type": "string", "enum": ["lynshen", "claude", "codex"], "description": "Default: lynshen." },
-                    "model": { "type": "string", "description": "The engine's model name; default: the engine's own." },
-                    "effort": { "type": "string", "description": "Reasoning effort the engine offers (e.g. low, medium, high, xhigh, max)." },
-                    "approval_mode": { "type": "string", "enum": ["plan", "manual", "auto-edit", "auto"], "description": "Default: this conversation's." },
-                    "title": { "type": "string" },
-                    "message": { "type": "string", "description": "Self-contained: the helper does not see this conversation." },
-                    "wait_reply": { "type": "boolean" }
-                },
-                "required": ["message"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "type": "function",
-            "name": "send_to_session",
-            "description": "Send a message to another conversation's AI; it arrives there as its next message. With wait_reply, wait (up to 10 minutes) and get its reply.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "session": { "type": "string" },
-                    "message": { "type": "string", "description": "Self-contained: the receiver does not see this conversation." },
-                    "wait_reply": { "type": "boolean" }
-                },
-                "required": ["session", "message"],
-                "additionalProperties": false
-            }
-        }),
-    ]
 }
 
 #[cfg(test)]
@@ -1067,28 +1188,75 @@ mod tests {
         // Full access is never passed on.
         assert_eq!(helper_mode("full-access", None).unwrap(), "auto");
         assert!(helper_mode("full-access", Some("full-access")).is_err());
+        // A Claude Code or Codex sender's mode, in LynShen's names.
+        assert_eq!(
+            helper_mode(&lynshen_mode("read-only"), None).unwrap(),
+            "manual"
+        );
+        assert_eq!(
+            helper_mode(&lynshen_mode("full-auto"), None).unwrap(),
+            "auto"
+        );
+        assert_eq!(lynshen_mode("acceptEdits"), "auto-edit");
+        assert_eq!(lynshen_mode("plan"), "plan");
     }
 
     #[test]
-    fn start_session_is_offered_beside_the_message_tools() {
-        let names: Vec<String> = definitions()
-            .iter()
-            .map(|tool| tool["name"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(
-            names,
-            [
-                "list_sessions",
-                "read_session",
-                "start_session",
-                "send_to_session"
-            ]
+    fn wait_session_reports_the_reply_to_the_last_message() {
+        let dir = std::env::temp_dir().join(format!(
+            "lynshen-wait-session-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let hub = Hub::new(
+            crate::store::Store::open(dir.join("daemon")).unwrap(),
+            crate::agents::Agents::open(dir.join("agents")).unwrap(),
+            "test",
+            None,
         );
-        let start = &definitions()[2]["parameters"]["properties"];
-        assert_eq!(
-            start["engine"]["enum"],
-            json!(["lynshen", "claude", "codex"])
+        let stopped = AtomicBool::new(false);
+        let none = wait_session(&hub, "a", "b", Duration::ZERO, &stopped);
+        assert!(none.unwrap_err().contains("send_to_session first"));
+        {
+            let mut state = lock(&hub.messages.state);
+            state
+                .last_sent
+                .insert(("a".into(), "b".into()), "sm-1".into());
+            state.pending.entry("b".into()).or_default().push(Pending {
+                id: "sm-1".into(),
+                from: "a".into(),
+                content: "go".into(),
+                summary: "go".into(),
+                started: true,
+                active: false,
+                queued: false,
+                approval: false,
+                reply: String::new(),
+                waiter: None,
+            });
+        }
+        let running = wait_session(&hub, "a", "b", Duration::ZERO, &stopped).unwrap();
+        assert_eq!(running["status"], "running");
+        observe(
+            &hub,
+            "b",
+            &json!({ "type": "approval_request", "call_id": "c" }),
         );
+        let asked = wait_session(&hub, "a", "b", Duration::from_secs(5), &stopped).unwrap();
+        assert_eq!(asked["status"], "waiting_approval");
+        observe(&hub, "b", &json!({ "type": "assistant_start" }));
+        observe(
+            &hub,
+            "b",
+            &json!({ "type": "assistant_delta", "delta": "all good" }),
+        );
+        observe(&hub, "b", &json!({ "type": "status", "message": "ready" }));
+        let done = wait_session(&hub, "a", "b", Duration::from_secs(5), &stopped).unwrap();
+        assert_eq!(
+            (done["status"].as_str(), done["reply"].as_str()),
+            (Some("replied"), Some("all good"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

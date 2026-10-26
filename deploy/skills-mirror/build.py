@@ -207,6 +207,13 @@ def find_skills(tree: Tree) -> tuple[str, list[str]]:
     return best[1], sorted(by_dir[best[1]])
 
 
+def offered(terms: str) -> bool:
+    """`offered_license` of crates/agent-core/src/skills.rs: a skill whose
+    own terms say proprietary or source-available is not offered."""
+    terms = terms.lower()
+    return not any(word in terms for word in ('proprietary', 'source-available', 'source available'))
+
+
 def license_label(text: str) -> str:
     """A short name for a license file's text, for the catalog."""
     if 'Apache License' in text and 'Version 2.0' in text:
@@ -335,17 +342,21 @@ def community_source(name: str, repository: str, tree: Tree, sha: str, mtime: in
     for skill in ids:
         prefix = f'{folder}/{skill}' if folder else skill
         text = tree.read(f'{prefix}/SKILL.md').decode('utf-8', 'replace')
+        own_terms = frontmatter(text, 'license').strip()
         entry = {
             'id': skill,
             'name': frontmatter(text, 'name') or skill,
             'description': frontmatter(text, 'description'),
             'tags': [],
-            'license': '',
-            'redistributable': True,
+            'license': own_terms,
+            'redistributable': offered(own_terms),
         }
-        license_text = add_archive(entry, tree, prefix, f'{owner}/{repo}', mtime, out)
-        if license_text is not None:
-            entry['license'] = license_label(license_text)
+        # Proprietary or source-available terms: listed only, as the engine
+        # lists them (skills/agent-core `offered_license`).
+        if entry['redistributable']:
+            license_text = add_archive(entry, tree, prefix, f'{owner}/{repo}', mtime, out)
+            if license_text is not None:
+                entry['license'] = license_label(license_text)
         skills.append(entry)
     return {'name': name, 'repository': repository, 'revision': sha, 'dir': folder, 'skills': skills}
 

@@ -21,8 +21,8 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::Sender,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc::{Receiver, Sender, TryRecvError},
         Arc, Mutex, MutexGuard, Weak,
     },
     thread,
@@ -38,6 +38,27 @@ const PAIRING_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 /// would start another run wait for a free slot.
 pub const MAX_RUNNING: usize = 4;
 
+/// An engine session (Claude Code, Codex, an ACP agent) nobody watches,
+/// with nothing going on (see `Hub::close_idle_engines`), has its engine
+/// closed this long after its last activity; the next open resumes it as
+/// it ran. A LynShen session closes on its own thread (`retire_idle`).
+pub const ENGINE_IDLE_CLOSE: Duration = Duration::from_secs(30 * 60);
+/// Engine processes kept open at most: past this, unwatched idle engine
+/// sessions are closed, least recently active first, before their
+/// `ENGINE_IDLE_CLOSE` is up.
+pub const MAX_LIVE_ENGINES: usize = 16;
+/// An engine session idle this briefly is not closed for the cap: it was
+/// just opened or used, and closing it would only start it again.
+const CAP_MIN_IDLE: Duration = Duration::from_secs(2 * 60);
+/// Frames a client may have waiting: a client that falls this far behind
+/// (a stalled connection) is dropped rather than queued for without end;
+/// it reconnects and gets a fresh snapshot.
+pub const OUTBOX_LIMIT: usize = 10_000;
+/// How long a pending daemon update waits for held work (an engine
+/// session's TUI or background work) to end before it restarts anyway;
+/// running turns it always waits for.
+const RESTART_HOLD: Duration = Duration::from_secs(10 * 60);
+
 pub struct Hub {
     pub store: Store,
     pub agents: Agents,
@@ -45,7 +66,8 @@ pub struct Hub {
     pub requirements: crate::requirements::Requirements,
     pub uploads: crate::uploads::Uploads,
     pub push: crate::push::Push,
-    /// Remote terminals, each owned by the client that opened it.
+    /// Terminals (session TUIs, clients' shells) and the clients viewing
+    /// them.
     pub terminals: crate::terminal::Terminals,
     pub version: &'static str,
     pub relay: Relay,
@@ -53,8 +75,16 @@ pub struct Hub {
     /// What the engines of sessions closed as idle held only in memory,
     /// until each session opens again (see `retire_idle`).
     kept: Mutex<HashMap<String, KeptState>>,
+    /// Engine sessions closed as idle, with the options their engine ran
+    /// with, until each opens again (see `close_idle_engines`).
+    asleep: Mutex<HashMap<String, engines::Options>>,
+    /// Why the daemon closed a session, until its engine thread ends and
+    /// `session_ended` tells the clients (`session_closed`'s `reason`).
+    close_reasons: Mutex<HashMap<String, &'static str>>,
     /// Sessions whose engine is running a turn or has queued messages.
     busy: Mutex<HashSet<String>>,
+    /// Sessions whose latest turn ended on an error, until the next starts.
+    failed: Mutex<HashSet<String>>,
     /// A newer daemon waits to replace this one (`restart_when_idle`).
     restart_pending: AtomicBool,
     /// Delivered messages a session thread has not processed yet. They hold
@@ -93,15 +123,70 @@ pub struct Hub {
     pub(crate) messages: crate::session_messages::Messages,
     /// Chat bots and what they keep (see `connectors`).
     pub connectors: crate::connectors::Connectors,
+    /// Dev servers the sessions' commands started (see `devservers`).
+    pub dev_servers: crate::devservers::DevServers,
+    /// Keeps the computer from idle sleep while any feature needs it.
+    pub awake: crate::awake::Awake,
+    /// Sessions with background work their turn left going (background
+    /// commands, subagents, workflows): not a turn, so not `busy`. True
+    /// when some of it comes back to the conversation (subagents,
+    /// workflows; a dev server never does).
+    background: Mutex<HashMap<String, bool>>,
+    /// A scheduled runs' budget check is going (`check_budgets`).
+    pub(crate) budget_check: AtomicBool,
     /// When each device was last heard from (ms), since the daemon started.
     seen: Mutex<HashMap<String, u64>>,
 }
 
+/// Where a client's frames wait. A connection's (`Hub::outbox`) counts
+/// them: one that falls `OUTBOX_LIMIT` behind is dropped. An in-process
+/// client's (a chat binding, `Outbox::local`) is not limited: it reads its
+/// frames on its own thread, and dropping it would unbind its chat.
+pub struct Outbox {
+    sender: Sender<String>,
+    waiting: Option<Arc<AtomicUsize>>,
+}
+
+impl Outbox {
+    pub fn local(sender: Sender<String>) -> Self {
+        Self {
+            sender,
+            waiting: None,
+        }
+    }
+
+    /// Queues `text`; false when the client is gone or too far behind.
+    fn send(&self, text: String) -> bool {
+        if let Some(waiting) = &self.waiting {
+            if waiting.fetch_add(1, Ordering::SeqCst) >= OUTBOX_LIMIT {
+                return false;
+            }
+        }
+        self.sender.send(text).is_ok()
+    }
+}
+
+/// A connection's side of its `Outbox`.
+pub struct Inbox {
+    receiver: Receiver<String>,
+    waiting: Arc<AtomicUsize>,
+}
+
+impl Inbox {
+    pub fn try_recv(&self) -> Result<String, TryRecvError> {
+        let frame = self.receiver.try_recv()?;
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
+        Ok(frame)
+    }
+}
+
 struct Client {
-    outbox: Sender<String>,
+    outbox: Outbox,
     /// The paired device this connection authenticated as; None for a local
     /// client holding the daemon token.
     device: Option<String>,
+    /// The daemon's own listener (a transcript read), not a person.
+    internal: bool,
 }
 
 struct Hosted {
@@ -116,6 +201,12 @@ struct Hosted {
     /// When it was last opened (or found open): a client that opened it
     /// watches it next, so it is not closed as idle meanwhile.
     opened: Instant,
+    /// When something last happened in it: an op from a client, a turn
+    /// starting or ending, held work ending (engine sessions' idle close).
+    last_active: Instant,
+    /// Work outside a turn keeps an engine session open: background tasks
+    /// or subagents running, an approval waiting, its TUI open.
+    held: bool,
 }
 
 /// How long a tokenizer nobody counted with stays loaded (see `tick`).
@@ -124,6 +215,23 @@ const TOKENIZER_IDLE: Duration = Duration::from_secs(10 * 60);
 /// How long after an open an idle session is kept for the client that
 /// opened it to start watching (see `Hub::retire_idle`).
 const OPEN_GRACE: Duration = Duration::from_secs(30);
+
+/// How often idle engine sessions are looked for (`close_idle_engines`).
+const IDLE_SWEEP_EVERY: Duration = Duration::from_secs(30);
+
+/// `ENGINE_IDLE_CLOSE`, which a debug build's end-to-end checks shorten with
+/// `LYNSHEN_TEST_ENGINE_IDLE_SECS`. A release build always waits the full time.
+fn engine_idle_close() -> Duration {
+    if cfg!(debug_assertions) {
+        if let Some(secs) = std::env::var("LYNSHEN_TEST_ENGINE_IDLE_SECS")
+            .ok()
+            .and_then(|secs| secs.parse().ok())
+        {
+            return Duration::from_secs(secs);
+        }
+    }
+    ENGINE_IDLE_CLOSE
+}
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
@@ -162,6 +270,10 @@ impl Hub {
             uploads,
             push: crate::push::Push::load(store.dir(), &store),
             connectors: crate::connectors::Connectors::load(store.dir()),
+            dev_servers: Default::default(),
+            awake: Default::default(),
+            background: Mutex::new(HashMap::new()),
+            budget_check: AtomicBool::new(false),
             seen: Mutex::new(HashMap::new()),
             terminals: Default::default(),
             store,
@@ -169,7 +281,10 @@ impl Hub {
             version,
             sessions: Mutex::new(HashMap::new()),
             kept: Mutex::new(HashMap::new()),
+            asleep: Mutex::new(HashMap::new()),
+            close_reasons: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashSet::new()),
+            failed: Mutex::new(HashSet::new()),
             restart_pending: AtomicBool::new(false),
             claims: Mutex::new(HashMap::new()),
             delivering: Mutex::new(()),
@@ -183,12 +298,46 @@ impl Hub {
         })
     }
 
-    pub fn add_client(&self, outbox: Sender<String>, device: Option<String>) -> u64 {
+    /// The channel a connection's frames wait in (`OUTBOX_LIMIT`).
+    pub fn outbox() -> (Outbox, Inbox) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiting = Arc::new(AtomicUsize::new(0));
+        let outbox = Outbox {
+            sender,
+            waiting: Some(Arc::clone(&waiting)),
+        };
+        (outbox, Inbox { receiver, waiting })
+    }
+
+    /// Queues `text` for a client; false when the client is gone or so far
+    /// behind that it is dropped (it reconnects and gets a fresh snapshot).
+    fn queue(client: &Client, text: String) -> bool {
+        client.outbox.send(text)
+    }
+
+    pub fn add_client(&self, outbox: Outbox, device: Option<String>) -> u64 {
         let id = self.next_client.fetch_add(1, Ordering::SeqCst);
         if let Some(device) = &device {
             self.touch_device(device);
         }
-        lock(&self.clients).insert(id, Client { outbox, device });
+        lock(&self.clients).insert(
+            id,
+            Client {
+                outbox,
+                device,
+                internal: false,
+            },
+        );
+        id
+    }
+
+    /// A client the daemon itself reads from (`transcript`): never counts as
+    /// someone at the computer.
+    fn add_internal_client(&self, outbox: Outbox) -> u64 {
+        let id = self.add_client(outbox, None);
+        if let Some(client) = lock(&self.clients).get_mut(&id) {
+            client.internal = true;
+        }
         id
     }
 
@@ -355,6 +504,65 @@ impl Hub {
         Ok(device)
     }
 
+    /// A device a connect request allowed (relay v2, §7.4): trusted at once
+    /// (the desktop saw the same check code and allowed it), under the
+    /// caller's account.
+    pub fn add_device(
+        &self,
+        name: &str,
+        token_hash: String,
+        account: &crate::store::DeviceAccount,
+    ) -> Result<Device, String> {
+        let name = name.trim();
+        let device = Device {
+            id: self.new_id("dev"),
+            name: if name.is_empty() { "device" } else { name }
+                .chars()
+                .take(60)
+                .collect(),
+            token_hash,
+            paired_at: now(),
+            revoked: false,
+            chat: None,
+            scopes: Vec::new(),
+            pending: false,
+            check: None,
+        };
+        self.store
+            .record_device(&device)
+            .and_then(|()| self.store.record_device_account(&device.id, account))
+            .map_err(|error| error.to_string())?;
+        self.broadcast_local(&self.devices_json());
+        Ok(device)
+    }
+
+    /// The computer moved to another LynShen account: every remote device
+    /// (not a chat binding) is revoked. Returns how many.
+    pub fn revoke_remote_devices(&self) -> Result<usize, String> {
+        let remote: Vec<String> = self
+            .store
+            .devices()
+            .into_iter()
+            .filter(|device| !device.revoked && device.chat.is_none())
+            .map(|device| device.id)
+            .collect();
+        for id in &remote {
+            self.revoke_device(id)?;
+        }
+        if !remote.is_empty() {
+            self.broadcast_local(&self.devices_json());
+        }
+        Ok(remote.len())
+    }
+
+    /// Whether a local client (the desktop, a CLI holding the daemon token)
+    /// is connected: a connect request has someone to ask.
+    pub fn has_local_client(&self) -> bool {
+        lock(&self.clients)
+            .values()
+            .any(|client| client.device.is_none() && !client.internal)
+    }
+
     /// Revokes a device and drops its open connections (a chat binding's
     /// client too: its connector stops serving it).
     pub fn revoke_device(&self, id: &str) -> Result<(), String> {
@@ -375,6 +583,7 @@ impl Hub {
 
     pub fn devices_json(&self) -> Value {
         let seen = lock(&self.seen).clone();
+        let accounts = self.store.device_accounts();
         let list: Vec<Value> = self
             .store
             .devices()
@@ -393,6 +602,10 @@ impl Hub {
                 if device.pending {
                     item["check"] = json!(device.check);
                 }
+                // Relay v2: the account client it connected as (§7.4).
+                if let Some(account) = accounts.get(&device.id) {
+                    item["client"] = json!(account.client);
+                }
                 if let Some(chat) = &device.chat {
                     item["platform"] = json!(chat.platform);
                     item["connector"] = json!(chat.connector);
@@ -408,8 +621,8 @@ impl Hub {
         lock(&self.seen).get(device).copied()
     }
 
-    /// Drops the client, its watches and its terminals; sessions it was the
-    /// last watcher of become unattended.
+    /// Drops the client, its watches, the terminals it viewed and its
+    /// shells; sessions it was the last watcher of become unattended.
     pub fn remove_client(&self, client: u64) {
         let removed = lock(&self.clients).remove(&client);
         if let Some(device) = removed.and_then(|client| client.device) {
@@ -420,7 +633,7 @@ impl Hub {
                 crate::push::gone(self, &device);
             }
         }
-        self.terminals.close_client(client);
+        self.terminals.detach_client(client);
         let watched: Vec<String> = lock(&self.sessions)
             .iter()
             .filter(|(_, hosted)| hosted.watchers.contains(&client))
@@ -433,21 +646,23 @@ impl Hub {
 
     pub fn broadcast(&self, frame: &Value) {
         let text = frame.to_string();
-        lock(&self.clients).retain(|_, client| client.outbox.send(text.clone()).is_ok());
+        lock(&self.clients).retain(|_, client| Self::queue(client, text.clone()));
     }
 
     /// Sends `frame` to the local clients only (the desktop), never to a
     /// paired phone or a chat binding.
     pub fn broadcast_local(&self, frame: &Value) {
         let text = frame.to_string();
-        lock(&self.clients).retain(|_, client| {
-            client.device.is_some() || client.outbox.send(text.clone()).is_ok()
-        });
+        lock(&self.clients)
+            .retain(|_, client| client.device.is_some() || Self::queue(client, text.clone()));
     }
 
     pub fn send_to(&self, client: u64, frame: &Value) {
-        if let Some(client) = lock(&self.clients).get(&client) {
-            let _ = client.outbox.send(frame.to_string());
+        let mut clients = lock(&self.clients);
+        if let Some(queued) = clients.get(&client) {
+            if !Self::queue(queued, frame.to_string()) {
+                clients.remove(&client);
+            }
         }
     }
 
@@ -459,11 +674,12 @@ impl Hub {
         agent: Option<&str>,
         chat: bool,
     ) -> Result<String, String> {
-        self.create_engine_session(cwd, agent, chat, None, engines::Options::default())
+        self.create_engine_session(cwd, agent, chat, None, engines::Options::default(), None)
     }
 
-    /// `create_session` with the engine to run (None: lynshen) and its start
-    /// options.
+    /// `create_session` with the engine to run (None: lynshen), its start
+    /// options and the project it belongs to (`""`: none; None: the one
+    /// whose main directory is its folder).
     pub fn create_engine_session(
         self: &Arc<Self>,
         cwd: Option<PathBuf>,
@@ -471,10 +687,12 @@ impl Hub {
         chat: bool,
         engine: Option<engines::Kind>,
         options: engines::Options,
+        project: Option<&str>,
     ) -> Result<String, String> {
         if engine.is_some() && agent.is_some() {
             return Err("agents run on the lynshen engine".to_string());
         }
+        let mut agent_project: Option<String> = None;
         let cwd = match agent {
             None if chat => {
                 lynshen_agent_core::chat::ensure_chats_dir().map_err(|error| error.to_string())?
@@ -487,24 +705,73 @@ impl Hub {
                 if !agent.enabled {
                     return Err(format!("agent {id} is disabled"));
                 }
-                agent.cwd
+                // An agent works in its folder, or in a task worktree of it
+                // (a scheduled run's), still in the agent's project.
+                match cwd.filter(|cwd| crate::worktrees::in_worktree_of(cwd, &agent.cwd)) {
+                    Some(tree) => {
+                        agent_project = agent.project.clone();
+                        tree
+                    }
+                    None => agent.cwd,
+                }
             }
             None => cwd.ok_or_else(|| "session_create requires cwd or agent".to_string())?,
         };
         if !cwd.is_dir() {
             return Err(format!("not a directory: {}", cwd.display()));
         }
+        // A chat belongs to no project.
+        let project = match chat {
+            true => String::new(),
+            false => {
+                crate::projects::for_new_session(self, &cwd, project.or(agent_project.as_deref()))?
+            }
+        };
+        let dirs = crate::projects::extra_dirs(self, &cwd, &project);
+        let mut options = engines::Options {
+            dirs: dirs.clone(),
+            ..options
+        };
+        // A fork goes on from another conversation: where it cuts, and what
+        // it shows until its engine replays it (see `fork_start`).
+        let (forked, seed) = match options.fork_from.clone() {
+            Some(from) => self.fork_start(engine, &cwd, &from, &mut options)?,
+            None => (None, Vec::new()),
+        };
         let agent = agent.map(str::to_string);
         let gateway = options.gateway == Some(true);
-        let acp_agent = options
-            .acp_agent
-            .clone()
-            .filter(|_| engine == Some(engines::Kind::Acp));
+        // Claude Code / Codex off the gateway: the custom provider it starts
+        // on, kept with it (`pin_tool_provider`).
+        if let Some(kind) = engine {
+            engines::pin_tool_provider(&self.store, kind, &mut options);
+        }
+        let tool_provider = options.tool_provider.clone();
+        // Which ACP agent runs it (a built-in one by its id, or the
+        // desktop's registry entry): a client can start it again.
+        let acp_agent = match &options.agent {
+            Some(id) => engines::acp_presets::find(id)
+                .map(|preset| json!({ "id": preset.id, "name": preset.name, "builtin": true })),
+            None => options.acp_agent.clone(),
+        }
+        .filter(|_| engine == Some(engines::Kind::Acp));
         let mut hook_stopper = None;
         let (id, ops, generation) = match engine {
             None => {
+                // A fork: a copy of the conversation's first turns, resumed.
+                let resume = match &options.fork_from {
+                    Some(from) => Some(
+                        lynshen_agent_core::fork_session(
+                            options.fork_cwd.as_deref().unwrap_or(&cwd),
+                            &cwd,
+                            from,
+                            options.fork_turns.map(|turns| turns as usize),
+                        )
+                        .map_err(|error| format!("cannot fork {from}: {error}"))?,
+                    ),
+                    None => None,
+                };
                 let (id, ops, generation, stopper) =
-                    session::spawn(Arc::clone(self), cwd.clone(), None, agent.clone())?;
+                    session::spawn(Arc::clone(self), cwd.clone(), resume, agent.clone(), dirs)?;
                 hook_stopper = Some(stopper);
                 (id, ops, generation)
             }
@@ -514,7 +781,7 @@ impl Hub {
                     engines::Kind::Claude | engines::Kind::Acp => Some(engines::new_uuid()?),
                     engines::Kind::Codex => None,
                 };
-                engines::spawn(Arc::clone(self), kind, id, cwd.clone(), options, vec![])?
+                engines::spawn(Arc::clone(self), kind, id, cwd.clone(), options, seed)?
             }
         };
         self.store
@@ -524,19 +791,104 @@ impl Hub {
                 agent.as_deref(),
                 engine.map(engines::Kind::name),
                 gateway,
+                Some(&project),
             )
             .map_err(|error| error.to_string())?;
+        if let Some(provider) = tool_provider.filter(|_| !gateway) {
+            self.store
+                .record_session_meta(&id, &json!({ "tool_provider": provider }))
+                .map_err(|error| error.to_string())?;
+        }
         // Which of the desktop's ACP agents runs it: a client can start it again.
         if let Some(acp_agent) = acp_agent {
             self.store
                 .record_session_meta(&id, &json!({ "acp_agent": acp_agent }))
                 .map_err(|error| error.to_string())?;
         }
-        lock(&self.untitled).insert(id.clone());
+        // Where a fork comes from, kept with it: the list names it, and a
+        // Claude fork closed before its first turn is made again from it.
+        // A fork starts with its source's title (the daemon's own, which the
+        // title model may refine), not one from its next message.
+        let mut untitled = true;
+        if let Some(source) = forked {
+            self.store
+                .record_session_meta(&id, &json!({ "forked_from": source }))
+                .map_err(|error| error.to_string())?;
+            let title = self
+                .store
+                .sessions()
+                .into_iter()
+                .find(|record| Some(record.id.as_str()) == source["session"].as_str())
+                .and_then(|record| shown_title(&record, None));
+            if let Some(title) = title {
+                untitled = false;
+                self.store
+                    .record_session_meta(&id, &json!({ "title": title, "title_auto": true }))
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        if untitled {
+            lock(&self.untitled).insert(id.clone());
+        }
         self.host(id.clone(), ops, cwd, generation);
         self.set_hook_stopper(&id, hook_stopper);
         self.broadcast(&self.agents_json());
         Ok(id)
+    }
+
+    /// A fork of conversation `from` that `engine` starts in `cwd`: its
+    /// record (`{session, turns, at}`) and the transcript it shows until its
+    /// engine replays it. Claude Code forks at a reply (`resume_at`), found
+    /// here from `fork_turns` when the client named none; Codex and LynShen
+    /// cut at `fork_turns` themselves. An ACP agent's conversation is copied
+    /// whole with `fork` instead.
+    fn fork_start(
+        &self,
+        engine: Option<engines::Kind>,
+        cwd: &std::path::Path,
+        from: &str,
+        options: &mut engines::Options,
+    ) -> Result<(Option<Value>, Vec<Value>), String> {
+        if options.fork_turns == Some(0) {
+            return Err("a fork keeps at least one turn".to_string());
+        }
+        if let Some(dir) = options.fork_cwd.as_deref().filter(|dir| !dir.is_absolute()) {
+            return Err(format!("fork_cwd must be absolute: {}", dir.display()));
+        }
+        let mut seed = Vec::new();
+        match engine {
+            Some(engines::Kind::Acp) => {
+                return Err(
+                    "an ACP agent's conversation is copied whole with options.fork".to_string(),
+                )
+            }
+            Some(engines::Kind::Claude) => {
+                let source_cwd = options
+                    .fork_cwd
+                    .clone()
+                    .unwrap_or_else(|| cwd.to_path_buf());
+                let config = engines::claude::config_with(options, &source_cwd, from);
+                let path = engines::claude::find_conversation(&config, &source_cwd, from)
+                    .ok_or_else(|| {
+                        format!("cannot fork {from}: no saved Claude Code conversation")
+                    })?;
+                if options.resume_at.is_none() {
+                    if let Some(turns) = options.fork_turns {
+                        options.resume_at = engines::claude::fork_point(&path, turns)
+                            .map_err(|error| format!("cannot fork {from}: {error}"))?;
+                    }
+                }
+                seed = engines::claude::fork_transcript(
+                    &path,
+                    options.resume_at.as_deref(),
+                    self.uploads.dir(),
+                );
+            }
+            Some(engines::Kind::Codex) | None => {}
+        }
+        let source =
+            json!({ "session": from, "turns": options.fork_turns, "at": options.resume_at });
+        Ok((Some(source), seed))
     }
 
     /// Hosts a session recorded earlier (after a restart or a close). A
@@ -559,8 +911,17 @@ impl Hub {
     ) -> Result<(), String> {
         if let Some(hosted) = lock(&self.sessions).get_mut(id) {
             hosted.opened = Instant::now();
+            hosted.last_active = Instant::now();
             return Ok(());
         }
+        // An engine closed as idle: a client that does not say how (a phone,
+        // a watch, a delivery) opens it as it last ran. The entry goes once
+        // it is open (a failed open leaves it asleep).
+        let kept = lock(&self.asleep).get(id).cloned();
+        let options = match kept {
+            Some(kept) if options == engines::Options::default() => kept,
+            _ => options,
+        };
         let known = self
             .store
             .sessions()
@@ -574,9 +935,12 @@ impl Hub {
                         .map_err(|error| error.to_string())?
                         .iter()
                         .any(|summary| summary.id == id),
-                    Some(engines::Kind::Claude) => engines::claude::saved(&cwd)
-                        .iter()
-                        .any(|(saved, _, _)| saved == id),
+                    Some(engines::Kind::Claude) => engines::claude::saved(
+                        &engines::claude::config_with(&options, &cwd, id),
+                        &cwd,
+                    )
+                    .iter()
+                    .any(|(saved, _, _)| saved == id),
                     Some(engines::Kind::Codex) => engines::codex::saved(&cwd)
                         .iter()
                         .any(|(saved, _, _)| saved == id),
@@ -599,14 +963,25 @@ impl Hub {
                     engine: engine.map(|kind| kind.name().to_string()),
                     gateway: false,
                     group: None,
+                    project: None,
                     conversation: None,
                     acp_agent: None,
+                    forked_from: None,
+                    worktree: None,
+                    parent: None,
+                    tool_provider: None,
                 }
             }
             (None, None) => return Err(format!("unknown session {id}")),
         };
         let kind = engines::Kind::parse(record.engine.as_deref().unwrap_or_default())?;
+        let dirs = crate::projects::extra_dirs(
+            self,
+            &record.cwd,
+            &crate::projects::of_record(self, &record),
+        );
         let mut gateway = false;
+        let mut tool_provider = None;
         let mut hook_stopper = None;
         let (ops, generation) = match kind {
             None => {
@@ -615,6 +990,7 @@ impl Hub {
                     record.cwd.clone(),
                     Some(id.to_string()),
                     record.agent.clone(),
+                    dirs,
                 )?;
                 hook_stopper = Some(stopper);
                 (ops, generation)
@@ -625,27 +1001,105 @@ impl Hub {
                 // Codex resumes through its protocol, which also sends the
                 // history back. An ACP agent reopens the conversation it
                 // opened (its own session id, kept with the record).
+                // Where Claude Code saves its conversations (the session's
+                // environment or a program of the user's may set that).
+                let claude_config = (kind == engines::Kind::Claude)
+                    .then(|| engines::claude::config_with(&options, &record.cwd, id));
                 let saved = match kind {
-                    engines::Kind::Claude => engines::claude::is_saved(&record.cwd, id),
+                    engines::Kind::Claude => claude_config
+                        .as_deref()
+                        .is_some_and(|config| engines::claude::is_saved(config, &record.cwd, id)),
                     engines::Kind::Codex => true,
                     engines::Kind::Acp => record.conversation.is_some(),
                 };
-                let transcript = match kind {
-                    engines::Kind::Claude => engines::claude::transcript(&record.cwd, id),
-                    engines::Kind::Codex | engines::Kind::Acp => Vec::new(),
+                let mut transcript = claude_config
+                    .as_deref()
+                    .map(|config| {
+                        engines::claude::transcript(config, &record.cwd, id, self.uploads.dir())
+                    })
+                    .unwrap_or_default();
+                // A Claude fork closed before its first turn was never saved:
+                // it is forked again rather than started empty.
+                let refork = match (kind, saved, &record.forked_from) {
+                    (engines::Kind::Claude, false, Some(source)) => {
+                        let from = source["session"].as_str().map(str::to_string);
+                        let at = source["at"].as_str().map(str::to_string);
+                        if let (Some(config), Some(from)) = (claude_config.as_deref(), &from) {
+                            if let Some(path) =
+                                engines::claude::find_conversation(config, &record.cwd, from)
+                            {
+                                transcript = engines::claude::fork_transcript(
+                                    &path,
+                                    at.as_deref(),
+                                    self.uploads.dir(),
+                                );
+                            }
+                        }
+                        from.map(|from| (from, at))
+                    }
+                    _ => None,
                 };
-                // A client that does not say (a phone) keeps how it last ran.
-                let options = engines::Options {
+                // A built-in ACP agent opens again from its record, whatever
+                // the client names; a registered one only from the desktop,
+                // which knows its command.
+                let builtin = (kind == engines::Kind::Acp)
+                    .then_some(record.acp_agent.as_ref())
+                    .flatten()
+                    .filter(|agent| agent["builtin"] == true)
+                    .and_then(|agent| agent["id"].as_str())
+                    .map(str::to_string);
+                if kind == engines::Kind::Acp
+                    && builtin.is_none()
+                    && options.command.is_none()
+                    && options.agent.is_none()
+                {
+                    return Err(
+                        "this agent's session can only be reopened on the desktop".to_string()
+                    );
+                }
+                let options = match builtin {
+                    Some(agent) => engines::Options {
+                        agent: Some(agent),
+                        command: None,
+                        args: Vec::new(),
+                        ..options
+                    },
+                    None => options,
+                };
+                // A client that does not say (a phone) keeps how it last ran,
+                // on the provider it last ran on off the gateway (a session
+                // recorded before providers were: the tool's own).
+                let mut options = engines::Options {
                     resume: match kind {
                         engines::Kind::Acp => record.conversation.clone(),
                         _ => saved.then(|| id.to_string()),
                     },
                     gateway: Some(options.gateway.unwrap_or(record.gateway)),
+                    tool_provider: options.tool_provider.or_else(|| {
+                        record
+                            .tool_provider
+                            .clone()
+                            .or_else(|| (!record.gateway).then(String::new))
+                    }),
                     // A copy is made once, when the session is created.
                     fork: None,
+                    fork_from: refork.as_ref().map(|(from, _)| from.clone()),
+                    fork_turns: None,
+                    fork_cwd: None,
+                    resume_at: match &refork {
+                        Some((_, at)) => at.clone(),
+                        None => options.resume_at.clone(),
+                    },
+                    claude_config,
+                    dirs,
                     ..options
                 };
                 gateway = options.gateway == Some(true);
+                if gateway {
+                    options.tool_provider = None;
+                }
+                engines::pin_tool_provider(&self.store, kind, &mut options);
+                tool_provider = options.tool_provider.clone();
                 // A new start keeps the recorded id; a resume opens it. An
                 // ACP session keeps the daemon's id either way (`resume` is
                 // the agent's).
@@ -670,11 +1124,18 @@ impl Hub {
                     record.agent.as_deref(),
                     record.engine.as_deref(),
                     gateway,
+                    record.project.as_deref(),
                 )
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(provider) = tool_provider.filter(|p| record.tool_provider.as_ref() != Some(p)) {
+            self.store
+                .record_session_meta(id, &json!({ "tool_provider": provider }))
                 .map_err(|error| error.to_string())?;
         }
         self.host(id.to_string(), ops, record.cwd, generation);
         self.set_hook_stopper(id, hook_stopper);
+        lock(&self.asleep).remove(id);
         Ok(())
     }
 
@@ -687,7 +1148,7 @@ impl Hub {
     /// gets it: its `transcript` items.
     pub fn transcript(&self, session: &str) -> Result<Vec<Value>, String> {
         let (outbox, inbox) = std::sync::mpsc::channel();
-        let client = self.add_client(outbox, None);
+        let client = self.add_internal_client(Outbox::local(outbox));
         let result = self
             .forward(session, json!({ "op": "snapshot", "client": client }))
             .and_then(|()| {
@@ -719,6 +1180,8 @@ impl Hub {
                 watchers: HashSet::new(),
                 generation,
                 opened: Instant::now(),
+                last_active: Instant::now(),
+                held: false,
             },
         );
     }
@@ -788,10 +1251,138 @@ impl Hub {
         let hosted = lock(&self.sessions)
             .remove(id)
             .ok_or_else(|| format!("session {id} is not open"))?;
-        let _ = hosted.ops.send(json!({ "op": "shutdown" }));
+        self.shut(id, hosted)
+    }
+
+    fn shut(&self, id: &str, hosted: Hosted) -> Result<(), String> {
+        // An idle close keeps the engine's options for the next open.
+        let keep = lock(&self.close_reasons).get(id) == Some(&"idle");
+        let _ = hosted.ops.send(json!({ "op": "shutdown", "keep": keep }));
         self.store
             .record_session_closed(id)
             .map_err(|error| error.to_string())
+    }
+
+    /// Called by an engine session's thread every tick: whether work
+    /// outside a turn keeps its engine open (see `Hosted::held`). Work
+    /// ending counts as activity, so the idle time runs from then.
+    pub fn set_held(&self, id: &str, held: bool) {
+        if let Some(hosted) = lock(&self.sessions).get_mut(id) {
+            if hosted.held != held {
+                hosted.held = held;
+                hosted.last_active = Instant::now();
+            }
+        }
+    }
+
+    /// Something happened in a hosted session: its idle time starts again.
+    fn touch(&self, id: &str) {
+        if let Some(hosted) = lock(&self.sessions).get_mut(id) {
+            hosted.last_active = Instant::now();
+        }
+    }
+
+    /// Closes the engines of engine sessions nobody watches with nothing
+    /// going on: those idle for `ENGINE_IDLE_CLOSE`, then, while more than
+    /// `MAX_LIVE_ENGINES` engine processes run, the least recently active
+    /// ones idle for `CAP_MIN_IDLE`. Nothing is going on when no turn runs,
+    /// no message waits or is being delivered, no work is held
+    /// (`Hosted::held`), no title or handoff is being written and no other
+    /// session waits on its reply. Clients get `session_closed` with reason
+    /// `idle`. `engine_sessions`: the hosted sessions an engine process
+    /// runs (not LynShen's own, which close on their thread). Returns the
+    /// closed sessions.
+    pub(crate) fn close_idle_engines(
+        &self,
+        at: Instant,
+        engine_sessions: &HashSet<String>,
+    ) -> Vec<String> {
+        // Before the sessions lock (a send holds its state while it forwards).
+        let awaited: HashSet<String> = engine_sessions
+            .iter()
+            .filter(|id| crate::session_messages::awaited(self, id))
+            .cloned()
+            .collect();
+        let idle_close = engine_idle_close();
+        let mut closing = Vec::new();
+        {
+            // Checked and removed under one lock: an op that reaches the
+            // session first has made it active (`forward`), and one that
+            // comes after finds it asleep (`wake`).
+            let mut sessions = lock(&self.sessions);
+            let busy = lock(&self.busy).clone();
+            let claims = lock(&self.claims).clone();
+            let untitled = lock(&self.untitled).clone();
+            let titling = lock(&self.titling).clone();
+            let mut idle: Vec<(String, Duration)> = sessions
+                .iter()
+                .filter(|(id, hosted)| {
+                    engine_sessions.contains(*id)
+                        && hosted.watchers.is_empty()
+                        && !hosted.held
+                        && hosted.opened.elapsed() >= OPEN_GRACE
+                        && !busy.contains(*id)
+                        && !claims.contains_key(*id)
+                        && !untitled.contains(*id)
+                        && !titling.contains(*id)
+                        && !awaited.contains(*id)
+                })
+                .map(|(id, hosted)| {
+                    let idle = at.saturating_duration_since(hosted.last_active);
+                    (id.clone(), idle)
+                })
+                .collect();
+            // Longest idle first.
+            idle.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+            let mut live = sessions
+                .keys()
+                .filter(|id| engine_sessions.contains(*id))
+                .count();
+            for (id, idle_for) in idle {
+                let over = live > MAX_LIVE_ENGINES && idle_for >= CAP_MIN_IDLE;
+                if idle_for < idle_close && !over {
+                    continue;
+                }
+                if let Some(hosted) = sessions.remove(&id) {
+                    live -= 1;
+                    // Before the lock goes: an op right after finds it
+                    // asleep (`wake`), never just gone.
+                    lock(&self.asleep).insert(id.clone(), engines::Options::default());
+                    lock(&self.close_reasons).insert(id.clone(), "idle");
+                    closing.push((id, hosted));
+                }
+            }
+        }
+        let mut closed = Vec::new();
+        for (id, hosted) in closing {
+            if self.shut(&id, hosted).is_ok() {
+                closed.push(id);
+            }
+        }
+        closed
+    }
+
+    /// The options an engine closed as idle ran with (sent by its thread as
+    /// it stops), for its next open.
+    pub(crate) fn keep_options(&self, id: &str, options: engines::Options) {
+        if let Some(kept) = lock(&self.asleep).get_mut(id) {
+            *kept = options;
+        }
+    }
+
+    /// Before an op goes to `session`: an engine session closed as idle is
+    /// opened again, as it ran, and `client` (which watched it) watches it
+    /// again. Every client then gets `session_reopened`, so one that put it
+    /// to sleep can watch it again; clients that open it themselves first
+    /// (`session_open`, `watch`) never need this.
+    pub fn wake(self: &Arc<Self>, client: u64, session: &str) -> Result<(), String> {
+        if lock(&self.sessions).contains_key(session) || !lock(&self.asleep).contains_key(session) {
+            return Ok(());
+        }
+        self.open_session(session, None)?;
+        self.set_watch(client, session, true);
+        self.broadcast(&json!({ "type": "session_reopened", "session": session }));
+        Ok(())
     }
 
     /// Called by a session thread when its engine stops on its own (`/quit`
@@ -808,16 +1399,30 @@ impl Hub {
                     sessions.remove(id);
                     let _ = self.store.record_session_closed(id);
                 }
-                Some(_) => return,
+                // Reopened while this engine was stopping: the new one is
+                // live, and why the old one closed says nothing about it.
+                Some(_) => {
+                    lock(&self.close_reasons).remove(id);
+                    return;
+                }
                 None => {}
             }
         }
         crate::session_messages::ended(self, id);
         self.connectors.session_closed(id);
         lock(&self.busy).remove(id);
+        lock(&self.background).remove(id);
+        self.run_session_ended(id);
         lock(&self.claims).remove(id);
+        // Images waiting for an echo the closed engine will not send.
+        lock(&self.sent_images).remove(id);
         self.usage.close(id);
-        self.broadcast(&json!({ "type": "session_closed", "session": id }));
+        self.usage.forget(id);
+        let mut closed = json!({ "type": "session_closed", "session": id });
+        if let Some(reason) = lock(&self.close_reasons).remove(id) {
+            closed["reason"] = json!(reason);
+        }
+        self.broadcast(&closed);
     }
 
     /// Sends `op` to every open LynShen session (other engines have no MCP
@@ -841,10 +1446,11 @@ impl Hub {
         if op["op"] == "set_approval_mode" && crate::requirements::gated(self, session) {
             op["mode"] = json!(crate::requirements::read_only(self, session));
         }
-        let sessions = lock(&self.sessions);
+        let mut sessions = lock(&self.sessions);
         let hosted = sessions
-            .get(session)
+            .get_mut(session)
             .ok_or_else(|| format!("session {session} is not open"))?;
+        hosted.last_active = Instant::now();
         // The engine's thread may be held by a hook (a long stop hook) and
         // take the op only once it ends.
         if op["op"] == "interrupt" {
@@ -864,6 +1470,8 @@ impl Hub {
             return;
         };
         let before = !hosted.watchers.is_empty();
+        // Watched until now: its idle time starts when the last one leaves.
+        hosted.last_active = Instant::now();
         if watch {
             hosted.watchers.insert(client);
         } else {
@@ -893,8 +1501,13 @@ impl Hub {
         let Some(hub) = self.me.upgrade() else {
             return;
         };
+        let asked = Instant::now();
         thread::spawn(move || loop {
-            if lock(&hub.busy).is_empty() {
+            // Nothing running, and nothing held (an engine's TUI or
+            // background work) or held too long.
+            let held = lock(&hub.sessions).values().any(|hosted| hosted.held)
+                && asked.elapsed() < RESTART_HOLD;
+            if lock(&hub.busy).is_empty() && !held {
                 hub.broadcast(&json!({ "type": "daemon_restarting" }));
                 thread::sleep(std::time::Duration::from_millis(300));
                 // exit runs no destructors: the sessions' locks go first, or
@@ -902,6 +1515,9 @@ impl Hub {
                 // one is gone (Windows).
                 lynshen_agent_core::release_session_locks();
                 lynshen_agent_core::sandbox::release_os_sandbox();
+                // As on a signal: nothing this daemon started outlives it
+                // (engines and what they started, tool commands).
+                lynshen_agent_core::terminate_tool_processes();
                 std::process::exit(0);
             }
             thread::sleep(std::time::Duration::from_secs(1));
@@ -920,6 +1536,7 @@ impl Hub {
             lock(&self.busy).remove(session)
         };
         if changed {
+            self.touch(session);
             self.broadcast(&self.agents_json());
             self.broadcast(&self.sessions_json());
         }
@@ -935,6 +1552,34 @@ impl Hub {
     /// A session is running a turn or has messages waiting.
     pub fn is_busy(&self, session: &str) -> bool {
         lock(&self.busy).contains(session)
+    }
+
+    /// Called by a session thread every tick: whether background work the
+    /// turn left going runs (`any`), and whether some of it comes back to
+    /// the conversation (`awaited`). Clients follow `any` in the session
+    /// list; a scheduled run waits on `awaited`.
+    pub fn set_background(&self, session: &str, any: bool, awaited: bool) {
+        let before = if any {
+            lock(&self.background).insert(session.to_string(), awaited)
+        } else {
+            lock(&self.background).remove(session)
+        };
+        if before != any.then_some(awaited) {
+            if before.is_none() || !any {
+                self.broadcast(&self.sessions_json());
+            }
+            self.run_activity(session);
+        }
+    }
+
+    /// A session has background work going (`set_background`).
+    pub fn is_background(&self, session: &str) -> bool {
+        lock(&self.background).contains_key(session)
+    }
+
+    /// A session has background work going that comes back to it.
+    pub fn is_awaited(&self, session: &str) -> bool {
+        lock(&self.background).get(session) == Some(&true)
     }
 
     /// The end of a session's latest reply, as far as this daemon saw it.
@@ -1091,6 +1736,8 @@ impl Hub {
         let mut schedules = lock(&self.schedules);
         self.agents.delete(id)?;
         schedules.retain(|schedule| schedule.agent != id);
+        // Its runs no longer keep the computer awake.
+        self.sync_awake(&schedules);
         drop(schedules);
         for session in &own {
             let _ = self.close_session(session);
@@ -1162,12 +1809,63 @@ impl Hub {
     pub fn tick(self: &Arc<Self>) {
         self.fire_due_timers();
         self.fire_due_schedules();
+        self.sweep_schedule_runs();
         self.expire_questions();
         self.deliver_pending();
         crate::push::tick(self);
+        self.sweep_idle_engines();
+        self.scan_dev_servers();
         // The daemon runs for days: a tokenizer no session used for a while
         // is loaded again by the next count.
         lynshen_agent_core::release_idle_tokenizers(TOKENIZER_IDLE);
+    }
+
+    /// Looks for dev servers when a scan is due, off the scheduler thread
+    /// (listing sockets takes a moment), and tells the clients of changes.
+    fn scan_dev_servers(self: &Arc<Self>) {
+        let at = now();
+        if !self.dev_servers.due(at) {
+            return;
+        }
+        let sessions: Vec<crate::devservers::SessionDir> = lock(&self.sessions)
+            .iter()
+            .map(|(id, hosted)| crate::devservers::SessionDir {
+                id: id.clone(),
+                cwd: hosted.cwd.clone(),
+                last_active: at.saturating_sub(hosted.last_active.elapsed().as_millis() as u64),
+            })
+            .collect();
+        let hub = Arc::clone(self);
+        thread::spawn(move || {
+            if let Some(servers) = hub.dev_servers.scan(&sessions) {
+                hub.broadcast(&crate::devservers::servers_json(&servers));
+            }
+        });
+    }
+
+    /// Every `IDLE_SWEEP_EVERY`: idle engine sessions close
+    /// (`close_idle_engines`).
+    fn sweep_idle_engines(&self) {
+        static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+        {
+            let mut last = lock(&LAST);
+            if last.is_some_and(|at| at.elapsed() < IDLE_SWEEP_EVERY) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        let hosted: HashSet<String> = lock(&self.sessions).keys().cloned().collect();
+        if hosted.is_empty() {
+            return;
+        }
+        let engine_sessions: HashSet<String> = self
+            .store
+            .sessions()
+            .into_iter()
+            .filter(|record| record.engine.is_some() && hosted.contains(&record.id))
+            .map(|record| record.id)
+            .collect();
+        self.close_idle_engines(Instant::now(), &engine_sessions);
     }
 
     pub fn ask(&self, question: &Question) -> Result<(), String> {
@@ -1436,6 +2134,12 @@ impl Hub {
                     .store
                     .record_session_meta(&record.id, &json!({ "archived": true }))
                     .unwrap_or(false);
+                // Its worktree goes if nothing is in it; while its engine is
+                // still open, once it closes (`run_session_ended`).
+                let tree = record.worktree.filter(|tree| tree["gone"] != true);
+                if let Some(tree) = tree.filter(|_| !self.is_open(&record.id)) {
+                    self.drop_worktree(&record.id, tree);
+                }
             }
         }
         if archived {
@@ -1485,6 +2189,10 @@ impl Hub {
     pub fn deliver_pending(self: &Arc<Self>) {
         let _guard = lock(&self.delivering);
         for message in self.store.pending_messages() {
+            // A scheduled run's worktree is still being made.
+            if self.run_preparing(&message) {
+                continue;
+            }
             match self.route(&message) {
                 Ok(target) => {
                     let busy = target
@@ -1495,10 +2203,17 @@ impl Hub {
                     }
                     if let Err(error) = self.deliver(&message, target) {
                         lynshen_agent_core::log_warn!("daemon", "delivery failed", error = error);
+                        // A scheduled run that cannot start fails, rather
+                        // than wait for a session that never opens.
+                        if message.from.starts_with("schedule:") {
+                            let _ = self.store.record_undeliverable(&message.id, &error);
+                            self.run_undeliverable(&message, &error);
+                        }
                     }
                 }
                 Err(reason) => {
                     let _ = self.store.record_undeliverable(&message.id, &reason);
+                    self.run_undeliverable(&message, &reason);
                 }
             }
         }
@@ -1544,7 +2259,8 @@ impl Hub {
                 self.open_session(&session, None)?;
                 session
             }
-            None => self.create_session(None, Some(&message.to), false)?,
+            // A scheduled run may start in a worktree of its own.
+            None => self.create_session(self.run_cwd(message), Some(&message.to), false)?,
         };
         // A delivered message starts (or queues) a run: claim the slot before
         // forwarding, so the next message sees it taken.
@@ -1561,7 +2277,7 @@ impl Hub {
             .record_delivered(&message.id, &session)
             .map_err(|error| error.to_string())?;
         if let Some(schedule) = message.from.strip_prefix("schedule:") {
-            self.schedule_delivered(schedule, &session);
+            self.schedule_delivered(schedule, &session, &message.id);
         }
         self.broadcast(&json!({
             "type": "message_delivered",
@@ -1577,6 +2293,7 @@ impl Hub {
     /// Every event a session publishes: its title follows the conversation
     /// (see `titles`).
     pub fn observe(&self, session: &str, event: &Value) {
+        self.dev_servers.observe(event, now());
         crate::session_messages::observe(self, session, event);
         self.connectors.observe(session, event);
         self.usage.observe(session, event, || {
@@ -1588,6 +2305,7 @@ impl Hub {
             Some(SessionInfo {
                 engine: record.engine.unwrap_or_else(|| "lynshen".to_string()),
                 gateway: record.gateway,
+                tool_provider: record.tool_provider,
                 cwd: record.cwd.to_string_lossy().into_owned(),
             })
         });
@@ -1599,13 +2317,37 @@ impl Hub {
         if event["type"] == "session_title" {
             self.adopt_engine_title(session, event["title"].as_str().unwrap_or_default());
         }
-        let (due, ended, failed) = {
+        // `ended`: a turn with a reply ended; `started` / `over`: any turn.
+        let (due, ended, started, over, failed) = {
             let mut turns = lock(&self.turns);
             let turns = turns.entry(session.to_string()).or_default();
             let before = turns.done();
+            let running = turns.running();
             let due = turns.observe(event);
-            (due, turns.done() != before, turns.take_failed())
+            (
+                due,
+                turns.done() != before,
+                !running && turns.running(),
+                running && !turns.running(),
+                turns.take_failed(),
+            )
         };
+        // Every client follows which sessions failed, watched or not (a
+        // desktop marks them in the lists it is not showing).
+        if started || over {
+            let changed = {
+                let mut set = lock(&self.failed);
+                if over && failed.is_some() {
+                    set.insert(session.to_string())
+                } else {
+                    set.remove(session)
+                }
+            };
+            if changed {
+                self.broadcast(&self.sessions_json());
+            }
+        }
+        self.observe_run(session, event, over, failed.as_deref());
         if due {
             self.retitle(session);
         }
@@ -1860,8 +2602,13 @@ impl Hub {
     pub fn sessions_json(&self) -> Value {
         let records = self.store.sessions();
         let saved = saved_by_id(records.iter().map(|record| record.cwd.as_path()));
+        let projects = crate::projects::projects(self);
+        // Before the sessions lock: never held with the schedules'.
+        let runs = self.run_sessions();
         let sessions = lock(&self.sessions);
         let busy = lock(&self.busy).clone();
+        let failed = lock(&self.failed).clone();
+        let background = lock(&self.background).clone();
         let list: Vec<Value> = records
             .into_iter()
             // An agent's session stays on its agent's page even when a
@@ -1885,14 +2632,31 @@ impl Hub {
                     "title": shown_title(&record, summary.map(|s| s.label.as_str())),
                     "archived": record.archived,
                     "group": record.group,
+                    // The project it belongs to, wherever it works; null: none.
+                    "project": Some(crate::projects::member(&projects, &record)).filter(|p| !p.is_empty()),
                     "gateway": record.gateway,
+                    "tool_provider": record.tool_provider.as_deref().filter(|p| !p.is_empty() && !record.gateway),
                     "engine": record.engine.as_deref().unwrap_or("lynshen"),
                     "acp_agent": record.acp_agent,
+                    // The conversation it was forked from: {session, turns, at}.
+                    "forked_from": record.forked_from,
                     "agent": record.agent,
                     "open": hosted.is_some(),
                     "watchers": hosted.map(|h| h.watchers.len()).unwrap_or(0),
                     // A turn runs (or messages wait): 进行中 on the phone.
                     "running": busy.contains(&record.id),
+                    // Its latest turn ended on an error.
+                    "failed": failed.contains(&record.id),
+                    // Background work its turn left going runs (后台任务运行中):
+                    // not a turn, so not `running`.
+                    "background": background.contains_key(&record.id),
+                    // The scheduled task it is a run of, or null.
+                    "schedule": runs.get(&record.id),
+                    // The worktree the daemon made for it (a scheduled run's):
+                    // {repo, path, branch, base, slug}, gone: true once removed.
+                    "worktree": record.worktree,
+                    // The session that started it (start_session), or null.
+                    "parent": record.parent,
                 })
             })
             .collect();
@@ -1939,7 +2703,7 @@ impl Hub {
                 )
             })
             .chain(
-                engines::claude::saved(cwd)
+                engines::claude::saved(&engines::claude::config_dir(), cwd)
                     .into_iter()
                     .map(|(id, title, updated_at)| {
                         item(id, title, updated_at, Value::Null, "claude")
@@ -2179,8 +2943,13 @@ mod tests {
             engine: None,
             gateway: false,
             group: None,
+            project: None,
             conversation: None,
             acp_agent: None,
+            forked_from: None,
+            worktree: None,
+            parent: None,
+            tool_provider: None,
         };
         assert_eq!(
             shown_title(&record, Some(&scheduled)).as_deref(),
@@ -2263,10 +3032,10 @@ mod tests {
             None,
         );
         hub.store
-            .record_engine_session("a1", &dir, Some("ops"), None, false)
+            .record_engine_session("a1", &dir, Some("ops"), None, false, None)
             .unwrap();
         hub.store
-            .record_engine_session("u1", &dir, None, None, false)
+            .record_engine_session("u1", &dir, None, None, false, None)
             .unwrap();
         for session in ["a1", "u1"] {
             hub.observe(
@@ -2299,7 +3068,7 @@ mod tests {
         );
         for (message, session) in [("m1", "run1"), ("m2", "run2"), ("m3", "run3")] {
             hub.store
-                .record_engine_session(session, &dir, Some("ops"), None, false)
+                .record_engine_session(session, &dir, Some("ops"), None, false, None)
                 .unwrap();
             hub.store
                 .record_message(&Message {
@@ -2446,6 +3215,250 @@ mod tests {
         assert!(lock(&hub.sessions).contains_key("s1"));
         hub.session_ended("s1", new);
         assert!(!lock(&hub.sessions).contains_key("s1"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn every_client_learns_when_a_turn_fails_until_the_next_starts() {
+        let dir = std::env::temp_dir().join(format!(
+            "lynshen-hub-failed-list-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let hub = Hub::new(
+            Store::open(dir.join("daemon")).unwrap(),
+            Agents::open(dir.join("agents")).unwrap(),
+            "test",
+            None,
+        );
+        hub.store
+            .record_session("s", std::path::Path::new("/tmp"), None)
+            .unwrap();
+        let (outbox, frames) = mpsc::channel();
+        hub.add_client(Outbox::local(outbox), None);
+        let failed = |frames: &mpsc::Receiver<String>| {
+            let list: Value = frames
+                .try_iter()
+                .map(|f| serde_json::from_str::<Value>(&f).unwrap())
+                .filter(|f| f["type"] == "sessions")
+                .last()
+                .unwrap();
+            list["sessions"][0]["failed"].as_bool().unwrap()
+        };
+        let ready = json!({ "type": "status", "message": "ready" });
+
+        hub.observe("s", &json!({ "type": "user_message", "content": "go" }));
+        hub.observe("s", &json!({ "type": "error", "message": "rate limited" }));
+        hub.observe("s", &ready);
+        assert!(failed(&frames));
+        hub.observe("s", &json!({ "type": "user_message", "content": "again" }));
+        assert!(!failed(&frames));
+        hub.observe("s", &ready);
+        assert!(
+            frames
+                .try_iter()
+                .all(|f| !f.contains("\"type\":\"sessions\"")),
+            "a good turn changes nothing"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn engine_hub(label: &str) -> (Arc<Hub>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "lynshen-hub-engines-{label}-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let hub = Hub::new(
+            Store::open(dir.join("daemon")).unwrap(),
+            Agents::open(dir.join("agents")).unwrap(),
+            "test",
+            None,
+        );
+        (hub, dir)
+    }
+
+    /// Hosts `id`, opened long enough ago and last active at `active`; the
+    /// receiver sees its ops.
+    fn host_engine(hub: &Hub, id: &str, active: Instant) -> mpsc::Receiver<Value> {
+        let (ops, rx) = mpsc::channel();
+        hub.host(id.into(), ops, "/tmp".into(), hub.next_generation());
+        let mut sessions = lock(&hub.sessions);
+        let hosted = sessions.get_mut(id).unwrap();
+        hosted.opened = Instant::now() - OPEN_GRACE;
+        hosted.last_active = active;
+        rx
+    }
+
+    fn set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn idle_engine_sessions_close_after_the_idle_time_and_say_why() {
+        let (hub, dir) = engine_hub("time");
+        let start = Instant::now();
+        let at = start + ENGINE_IDLE_CLOSE;
+        let old = host_engine(&hub, "old", start);
+        let _recent = host_engine(&hub, "recent", start + Duration::from_secs(60));
+        let (outbox, frames) = mpsc::channel();
+        hub.add_client(Outbox::local(outbox), None);
+
+        assert_eq!(
+            hub.close_idle_engines(at, &set(&["old", "recent"])),
+            ["old"]
+        );
+        let shutdown = old.try_recv().unwrap();
+        assert_eq!(shutdown["op"], "shutdown");
+        assert_eq!(
+            shutdown["keep"], true,
+            "its options are kept for the next open"
+        );
+        assert!(lock(&hub.sessions).contains_key("recent"));
+
+        // The engine thread ends: clients learn it closed as idle.
+        hub.session_ended("old", 0);
+        let closed: Value = frames
+            .try_iter()
+            .map(|f| serde_json::from_str::<Value>(&f).unwrap())
+            .find(|f| f["type"] == "session_closed")
+            .unwrap();
+        assert_eq!(closed["reason"], "idle");
+        assert!(lock(&hub.close_reasons).is_empty());
+        assert!(
+            lock(&hub.asleep).contains_key("old"),
+            "a message opens it again"
+        );
+        // What its engine ran with waits for the next open.
+        let ran = engines::Options {
+            model: Some("claude-opus-5-5".into()),
+            ..engines::Options::default()
+        };
+        hub.keep_options("old", ran.clone());
+        assert_eq!(lock(&hub.asleep)["old"], ran);
+        // An open that fails (no record here) leaves it asleep.
+        assert!(hub.open_session("old", None).is_err());
+        assert!(lock(&hub.asleep).contains_key("old"));
+        // A user close says no reason.
+        hub.close_session("recent").unwrap();
+        hub.session_ended("recent", 1);
+        let closed: Value = frames
+            .try_iter()
+            .map(|f| serde_json::from_str::<Value>(&f).unwrap())
+            .find(|f| f["type"] == "session_closed")
+            .unwrap();
+        assert!(closed.get("reason").is_none(), "{closed}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn work_a_watcher_or_a_lynshen_engine_keeps_a_session_open() {
+        let (hub, dir) = engine_hub("work");
+        let start = Instant::now();
+        let at = start + ENGINE_IDLE_CLOSE * 4;
+        let ids = ["busy", "claimed", "held", "watched", "untitled", "lynshen"];
+        let _rx: Vec<_> = ids.iter().map(|id| host_engine(&hub, id, start)).collect();
+        lock(&hub.busy).insert("busy".into());
+        lock(&hub.claims).insert("claimed".into(), 1);
+        lock(&hub.sessions).get_mut("held").unwrap().held = true;
+        lock(&hub.sessions)
+            .get_mut("watched")
+            .unwrap()
+            .watchers
+            .insert(7);
+        lock(&hub.untitled).insert("untitled".into());
+        // Every session but `lynshen` runs on an engine process.
+        let engines = set(&ids[..5]);
+
+        assert!(hub.close_idle_engines(at, &engines).is_empty());
+        assert_eq!(lock(&hub.sessions).len(), ids.len());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn past_the_cap_the_least_recently_active_idle_engines_close() {
+        let (hub, dir) = engine_hub("cap");
+        let start = Instant::now();
+        let at = start + CAP_MIN_IDLE * 3;
+        let mut ids = Vec::new();
+        let mut rx = Vec::new();
+        // Over the cap by three: two idle long enough, the rest just used.
+        for i in 0..MAX_LIVE_ENGINES + 3 {
+            let active = match i {
+                0 => start,
+                1 => start + CAP_MIN_IDLE,
+                _ => at - CAP_MIN_IDLE + Duration::from_secs(1),
+            };
+            let id = format!("s{i}");
+            rx.push(host_engine(&hub, &id, active));
+            ids.push(id);
+        }
+        let engines: HashSet<String> = ids.into_iter().collect();
+        let mut closed = hub.close_idle_engines(at, &engines);
+        closed.sort();
+        assert_eq!(closed, ["s0", "s1"], "only sessions idle past CAP_MIN_IDLE");
+        assert_eq!(lock(&hub.sessions).len(), MAX_LIVE_ENGINES + 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_op_a_turn_or_work_ending_restarts_the_idle_time() {
+        let (hub, dir) = engine_hub("touch");
+        let start = Instant::now();
+        let _sent = host_engine(&hub, "sent", start);
+        let _turned = host_engine(&hub, "turned", start);
+        let _released = host_engine(&hub, "released", start);
+        hub.forward("sent", json!({ "op": "user_message", "content": "hi" }))
+            .unwrap();
+        hub.set_busy("turned", true);
+        hub.set_busy("turned", false);
+        lock(&hub.sessions).get_mut("released").unwrap().held = true;
+        hub.set_held("released", false);
+
+        let at = Instant::now() + ENGINE_IDLE_CLOSE - Duration::from_secs(5);
+        let engines = set(&["sent", "turned", "released"]);
+        assert!(hub.close_idle_engines(at, &engines).is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_reopened_session_does_not_inherit_the_idle_reason() {
+        let (hub, dir) = engine_hub("reopen");
+        let start = Instant::now();
+        let _old = host_engine(&hub, "s", start);
+        let old_generation = lock(&hub.sessions)["s"].generation;
+        hub.close_idle_engines(start + ENGINE_IDLE_CLOSE, &set(&["s"]));
+        // Opened again before the old engine thread finished.
+        let _new = host_engine(&hub, "s", Instant::now());
+        hub.session_ended("s", old_generation);
+        assert!(lock(&hub.sessions).contains_key("s"));
+        assert!(lock(&hub.close_reasons).is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_connection_that_falls_too_far_behind_is_dropped() {
+        let (hub, dir) = engine_hub("outbox");
+        let (outbox, inbox) = Hub::outbox();
+        let client = hub.add_client(outbox, None);
+        for _ in 0..OUTBOX_LIMIT {
+            hub.broadcast(&json!({ "type": "x" }));
+        }
+        assert!(lock(&hub.clients).contains_key(&client));
+        // What it reads makes room again.
+        inbox.try_recv().unwrap();
+        hub.broadcast(&json!({ "type": "x" }));
+        assert!(lock(&hub.clients).contains_key(&client));
+        hub.broadcast(&json!({ "type": "x" }));
+        assert!(!lock(&hub.clients).contains_key(&client));
+        // An in-process client (a chat binding) reads on its own thread and
+        // is never dropped for it.
+        let (local, _frames) = mpsc::channel();
+        let chat = hub.add_client(Outbox::local(local), None);
+        for _ in 0..OUTBOX_LIMIT + 5 {
+            hub.broadcast(&json!({ "type": "x" }));
+        }
+        assert!(lock(&hub.clients).contains_key(&chat));
         let _ = fs::remove_dir_all(dir);
     }
 }

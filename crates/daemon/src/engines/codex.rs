@@ -21,7 +21,11 @@
 //!   the conversation. `thread/turns/list` reads one back.
 //! - A rewind is `thread/revert` to before a user message's turn.
 
-use super::{home, resolve, Adapter, Line, Options, Output};
+use super::{home, op_files, resolve, set_files, Adapter, HostCall, Line, Options, Output};
+use lynshen_agent_core::{
+    app_tools, attachments,
+    queue::{queue_move_target, QueuePick},
+};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -72,17 +76,33 @@ pub fn tui(id: Option<&str>, options: &Options) -> Command {
 /// The provider a gateway session configures (see `use_gateway`).
 const GATEWAY_PROVIDER: &str = "lynshen_gateway";
 
+/// The provider a session on a custom provider (`tool_providers`)
+/// configures: also through the local gateway, but never the LynShen
+/// gateway (usage and the UI tell them apart by it).
+pub(crate) const CUSTOM_PROVIDER: &str = "lynshen_custom";
+
 /// The env var a gateway session reads its key from.
 const GATEWAY_KEY_ENV: &str = "LYNSHEN_GATEWAY_TOKEN";
 
-/// This session talks to the LynShen gateway through the daemon's local
-/// gateway (`base`, see crate::gateway): config overrides for this process
-/// alone, with the local `key` (never the LynShen token) in its environment.
-pub fn use_gateway(command: &mut Command, base: &str, key: &str) -> Result<(), String> {
+/// This session talks to the LynShen gateway, or to the custom provider
+/// named `custom`, through the daemon's local gateway (`base`, see
+/// crate::gateway): config overrides for this process alone, with the local
+/// `key` (never the real credential) in its environment.
+pub fn use_gateway(
+    command: &mut Command,
+    base: &str,
+    key: &str,
+    custom: Option<&str>,
+) -> Result<(), String> {
+    let (provider, name) = match custom {
+        // A JSON string is a TOML basic string.
+        Some(name) => (CUSTOM_PROVIDER, json!(name).to_string()),
+        None => (GATEWAY_PROVIDER, json!("LynShen").to_string()),
+    };
     command
-        .args(["-c", &format!("model_provider=\"{GATEWAY_PROVIDER}\""), "-c"])
+        .args(["-c", &format!("model_provider=\"{provider}\""), "-c"])
         .arg(format!(
-            "model_providers.{GATEWAY_PROVIDER}={{name=\"LynShen\",base_url=\"{base}/v1\",env_key=\"{GATEWAY_KEY_ENV}\",wire_api=\"responses\"}}"
+            "model_providers.{provider}={{name={name},base_url=\"{base}/v1\",env_key=\"{GATEWAY_KEY_ENV}\",wire_api=\"responses\"}}"
         ))
         .env(GATEWAY_KEY_ENV, key);
     Ok(())
@@ -175,6 +195,10 @@ fn sandbox_mode(sandbox: &Value) -> &'static str {
 }
 
 fn error_event(message: &str, info: &Value) -> Value {
+    // Out of plan usage: the usage-limit notice, not an error.
+    if info == "usageLimitExceeded" || info.get("usageLimitExceeded").is_some() {
+        return json!({ "type": "rate_limit", "level": "limited", "message": message, "resets_at": null, "window": null, "used": null });
+    }
     let lower = message.to_lowercase();
     let unauthorized = info == "unauthorized"
         || info
@@ -212,6 +236,53 @@ fn plan_usage(snapshot: &Value) -> Option<Value> {
     (!windows.is_empty()).then(|| json!({ "type": "plan_usage", "plan": plan, "windows": windows }))
 }
 
+/// Codex sends no warning before a limit: from this much of a window on, its
+/// usage is one (the fullest window); at 100% the limit is hit.
+const LIMIT_WARNING: f64 = 90.0;
+
+/// The usage-limit notice of a rate-limit snapshot (`plan_usage`'s windows).
+fn limit_notice(usage: &Value) -> Option<Value> {
+    let fullest = usage["windows"].as_array()?.iter().max_by(|a, b| {
+        a["used"]
+            .as_f64()
+            .unwrap_or(0.0)
+            .total_cmp(&b["used"].as_f64().unwrap_or(0.0))
+    })?;
+    let used = fullest["used"].as_f64().unwrap_or(0.0);
+    let level = if used >= 100.0 {
+        "limited"
+    } else if used >= LIMIT_WARNING {
+        "warning"
+    } else {
+        return Some(
+            json!({ "type": "rate_limit", "level": "ok", "message": "", "resets_at": null }),
+        );
+    };
+    // Codex names windows primary/secondary: by their length instead.
+    let window = match fullest["minutes"].as_u64() {
+        Some(300) => json!("five_hour"),
+        Some(10_080) => json!("seven_day"),
+        _ => fullest["key"].clone(),
+    };
+    Some(json!({
+        "type": "rate_limit",
+        "level": level,
+        "message": "",
+        "resets_at": fullest["resets_at"],
+        "window": window,
+        "used": used,
+    }))
+}
+
+/// `plan_usage` and the usage-limit notice of a rate-limit snapshot.
+fn usage_events(snapshot: &Value) -> Vec<Value> {
+    let Some(usage) = plan_usage(snapshot) else {
+        return vec![];
+    };
+    let notice = limit_notice(&usage);
+    std::iter::once(usage).chain(notice).collect()
+}
+
 fn file_change_output(changes: &[Value], error: Option<&str>) -> String {
     let paths: Vec<&str> = changes
         .iter()
@@ -229,6 +300,18 @@ fn file_change_output(changes: &[Value], error: Option<&str>) -> String {
         out["error"] = json!(error);
     }
     out.to_string()
+}
+
+/// A dynamic tool call's result: the text it returned.
+fn dynamic_body(item: &Value) -> String {
+    item["contentItems"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["type"] == "inputText")
+        .map(|c| text(&c["text"]))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn mcp_body(item: &Value) -> String {
@@ -258,6 +341,23 @@ fn command_output(item: &Value, command: &str, streamed: &str) -> Value {
     out
 }
 
+/// The last turn a fork keeping `keep` user turns of `turns` goes through:
+/// the one before the next user turn (None: the fork keeps them all).
+fn fork_point(turns: &Value, keep: Option<u64>) -> Option<String> {
+    let turns = turns.as_array()?;
+    let next = turns
+        .iter()
+        .enumerate()
+        .filter(|(_, turn)| {
+            turn["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["type"] == "userMessage"))
+        })
+        .nth(usize::try_from(keep?).ok()?)?
+        .0;
+    Some(text(&turns[next.checked_sub(1)?]["id"]).to_string())
+}
+
 /// A resumed thread's history (`thread.turns[].items`) as transcript items.
 fn transcript(turns: &Value) -> Vec<Value> {
     let mut rows = Vec::new();
@@ -269,12 +369,13 @@ fn transcript(turns: &Value) -> Vec<Value> {
     {
         match text(&item["type"]) {
             "userMessage" => {
-                let (content, images) = user_input(&item["content"]);
-                if !content.is_empty() || !images.is_empty() {
+                let (content, images, files) = user_input(&item["content"]);
+                if !content.is_empty() || !images.is_empty() || !files.is_empty() {
                     let mut row = json!({ "role": "user", "content": content });
                     if !images.is_empty() {
                         row["images"] = json!(images);
                     }
+                    set_files(&mut row, &files);
                     rows.push(row);
                 }
             }
@@ -282,34 +383,96 @@ fn transcript(turns: &Value) -> Vec<Value> {
                 rows.push(json!({ "role": "assistant", "content": item["text"] }));
             }
             "reasoning" => {
-                let summary = item["summary"].as_array().into_iter().flatten().map(text).collect::<Vec<_>>().join("\n\n");
+                let summary = item["summary"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(text)
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
                 if !summary.is_empty() {
                     rows.push(json!({ "role": "reasoning", "content": summary }));
                 }
             }
-            "commandExecution" => rows.push(json!({ "role": "tool", "name": "bash", "output": command_output(item, "", "").to_string() })),
-            "fileChange" => rows.push(json!({
-                "role": "tool", "name": "apply_patch",
-                "output": file_change_output(item["changes"].as_array().map(Vec::as_slice).unwrap_or_default(), None),
-            })),
-            "mcpToolCall" => rows.push(json!({
-                "role": "tool", "name": format!("{}.{}", text(&item["server"]), text(&item["tool"])), "output": mcp_body(item),
-            })),
-            "webSearch" => rows.push(json!({ "role": "tool", "name": "web_search", "output": json!({ "query": item["query"] }).to_string() })),
+            "commandExecution" | "fileChange" | "mcpToolCall" | "webSearch" => {
+                rows.push(tool_row(item));
+            }
+            // The app's tools keep their cards on a resumed thread.
+            "dynamicToolCall" if app_tools::NAMES.contains(&text(&item["tool"])) => {
+                let mut row = json!({ "role": "tool", "name": item["tool"], "output": dynamic_body(item), "call_id": item["id"] });
+                if item["success"] == false {
+                    row["is_error"] = json!(true);
+                }
+                rows.push(row);
+            }
             _ => {}
         }
     }
     rows
 }
 
+/// A finished tool item of a resumed thread as the card its live
+/// `tool_output` showed, failed (`is_error`) the same way.
+fn tool_row(item: &Value) -> Value {
+    // An item saved before it finished has no status: not a failure.
+    let status = text(&item["status"]);
+    let unfinished = !matches!(status, "" | "completed");
+    let (name, output, failed) = match text(&item["type"]) {
+        "commandExecution" => {
+            let mut output = command_output(item, "", "");
+            if status == "declined" {
+                output["error"] = json!("declined");
+            }
+            (json!("bash"), output.to_string(), unfinished)
+        }
+        "fileChange" => {
+            let changes = item["changes"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            (
+                json!("apply_patch"),
+                file_change_output(changes, unfinished.then_some(status)),
+                unfinished,
+            )
+        }
+        "mcpToolCall" => (
+            json!(format!("{}.{}", text(&item["server"]), text(&item["tool"]))),
+            mcp_body(item),
+            !item["error"].is_null() || status == "failed",
+        ),
+        _ => (
+            json!("web_search"),
+            json!({ "query": item["query"] }).to_string(),
+            false,
+        ),
+    };
+    let mut row = json!({ "role": "tool", "name": name, "output": output, "call_id": item["id"] });
+    if failed {
+        row["is_error"] = json!(true);
+    }
+    row
+}
+
 /// A user message's text and its images (local paths).
-fn user_input(content: &Value) -> (String, Vec<String>) {
+/// A user message's text, its images (local paths) and the files its
+/// attached-file items name (one text item each, as sent; inputs merged from
+/// several messages keep every message's files).
+fn user_input(content: &Value) -> (String, Vec<String>, Vec<String>) {
     let blocks = content.as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut files = Vec::new();
     let text_part = blocks
         .iter()
         .filter(|c| c["type"] == "text")
         .map(|c| text(&c["text"]))
         .filter(|t| !t.is_empty())
+        .filter(|t| match attachments::line_path(t) {
+            Some(path) => {
+                files.push(path);
+                false
+            }
+            None => true,
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let images = blocks
@@ -318,7 +481,7 @@ fn user_input(content: &Value) -> (String, Vec<String>) {
         .map(|c| text(&c["path"]).to_string())
         .filter(|p| !p.is_empty())
         .collect();
-    (text_part, images)
+    (text_part, images, files)
 }
 
 /// A subagent's short name from its path (`/root/pong` → `pong`).
@@ -385,9 +548,16 @@ pub struct Codex {
     pending: HashMap<u64, (String, String)>,
     thread: Option<String>,
     resume: Option<String>,
-    /// Talks to the LynShen gateway: a resumed thread must too, whichever
-    /// provider it was written with (`thread/resume` would use that one).
-    gateway: bool,
+    /// A new thread forked from this one, keeping its first so many user
+    /// turns (None: all of them).
+    fork: Option<(String, Option<u64>)>,
+    /// A probe's run (`engine_probe`): its thread is not saved.
+    ephemeral: bool,
+    /// The provider `use_gateway` configured (the LynShen gateway or a
+    /// custom one): a resumed thread must use it too, whichever provider it
+    /// was written with (`thread/resume` would use that one). None: Codex's
+    /// own configuration, the only one with a ChatGPT plan's limits.
+    gateway: Option<&'static str>,
     active_turn: Option<String>,
     /// A turn is starting or running.
     busy: bool,
@@ -398,6 +568,11 @@ pub struct Codex {
     rolling_back: bool,
     after_rollback: Vec<Value>,
     open_params: Value,
+    /// The app's tools offered as dynamic tools on a new thread (a resumed
+    /// thread keeps the ones it started with).
+    app_tools: Vec<&'static str>,
+    /// App-tool calls waiting for the daemon.
+    calls: Vec<HostCall>,
     /// Synthetic call id → the server request awaiting our answer: its id,
     /// method and params.
     approvals: HashMap<String, (Value, String, Value)>,
@@ -452,13 +627,31 @@ impl Codex {
             pending: HashMap::new(),
             thread: None,
             resume: options.resume.clone(),
-            gateway: options.gateway == Some(true),
+            fork: options
+                .fork_from
+                .clone()
+                .filter(|_| options.resume.is_none())
+                .map(|from| (from, options.fork_turns)),
+            ephemeral: options.probe,
+            gateway: if options.gateway == Some(true) {
+                Some(GATEWAY_PROVIDER)
+            } else if options
+                .tool_provider
+                .as_deref()
+                .is_some_and(|p| !p.is_empty())
+            {
+                Some(CUSTOM_PROVIDER)
+            } else {
+                None
+            },
             active_turn: None,
             busy: false,
             queued: Vec::new(),
             rolling_back: false,
             after_rollback: Vec::new(),
             open_params: Value::Null,
+            app_tools: options.app_tools.clone(),
+            calls: Vec::new(),
             approvals: HashMap::new(),
             approval_seq: 0,
             items: HashMap::new(),
@@ -549,8 +742,12 @@ impl Codex {
             .is_some_and(|tiers| tiers.iter().any(|t| t["id"] == "priority"))
     }
 
+    fn waiting_texts(&self) -> Vec<&str> {
+        self.waiting.iter().map(|(text, _)| text.as_str()).collect()
+    }
+
     fn pending_event(&self) -> Value {
-        let texts: Vec<&str> = self.waiting.iter().map(|(text, _)| text.as_str()).collect();
+        let texts: Vec<&str> = self.waiting_texts();
         json!({ "type": "pending_messages", "messages": texts })
     }
 
@@ -821,6 +1018,14 @@ impl Codex {
                     json!({ "type": "compaction_failed", "error": message }),
                 ]);
             }
+            // A fork that cannot be made is an error, not an empty thread.
+            if matches!(method.as_str(), "thread/read" | "thread/fork") && self.fork.is_some() {
+                return Output::events(vec![json!({
+                    "type": "error",
+                    "message": format!("cannot fork the thread: {message}"),
+                    "fatal": true,
+                })]);
+            }
             if method == "thread/resume" && self.open_params.is_object() {
                 let params = self.open_params.clone();
                 let frame = self.request("thread/start", params, "");
@@ -852,26 +1057,48 @@ impl Codex {
         match method.as_str() {
             "initialize" => {
                 let (approval, sandbox) = policy(self.mode, &self.dirs);
-                let open = json!({ "cwd": self.cwd, "approvalPolicy": approval, "sandbox": sandbox_mode(&sandbox) });
+                let mut open = json!({ "cwd": self.cwd, "approvalPolicy": approval, "sandbox": sandbox_mode(&sandbox) });
+                if self.ephemeral {
+                    open["ephemeral"] = json!(true);
+                }
+                // The app's tools, as dynamic tools: a thread keeps them, so
+                // a resumed one is not told again.
                 self.open_params = open.clone();
+                if !self.app_tools.is_empty() {
+                    let tools: Vec<Value> = app_tools::definitions(&self.app_tools)
+                        .into_iter()
+                        .map(|tool| json!({ "name": tool["name"], "description": tool["description"], "inputSchema": tool["parameters"] }))
+                        .collect();
+                    self.open_params["dynamicTools"] = json!(tools);
+                }
                 let mut frames =
                     vec![json!({ "jsonrpc": "2.0", "method": "initialized" }).to_string()];
-                frames.push(match self.resume.clone() {
-                    Some(thread) => {
+                frames.push(match (self.resume.clone(), self.fork.clone()) {
+                    (Some(thread), _) => {
                         let mut params = open;
                         params["threadId"] = json!(thread);
-                        if self.gateway {
-                            params["modelProvider"] = json!(GATEWAY_PROVIDER);
+                        if let Some(provider) = self.gateway {
+                            params["modelProvider"] = json!(provider);
                         }
                         self.request("thread/resume", params, "")
                     }
-                    None => self.request("thread/start", open, ""),
+                    // A fork reads the thread's turns first, to know where to cut.
+                    (None, Some((from, _))) => self.request(
+                        "thread/read",
+                        json!({ "threadId": from, "includeTurns": true }),
+                        "fork",
+                    ),
+                    (None, None) => {
+                        let params = self.open_params.clone();
+                        self.request("thread/start", params, "")
+                    }
                 });
                 frames.push(self.request("model/list", json!({}), ""));
                 let cwd = self.cwd.clone();
                 frames.push(self.request("skills/list", json!({ "cwds": [cwd] }), ""));
-                // The ChatGPT plan's limits (a gateway session has none).
-                if !self.gateway {
+                // The ChatGPT plan's limits (a gateway or custom provider
+                // session has none).
+                if self.gateway.is_none() {
                     frames.push(self.request("account/rateLimits/read", json!({}), ""));
                 }
                 Output {
@@ -880,10 +1107,29 @@ impl Codex {
                 }
             }
             "thread/start" => self.thread_opened(result, false),
-            "thread/resume" => self.thread_opened(result, true),
-            "account/rateLimits/read" => {
-                Output::events(plan_usage(&result["rateLimits"]).into_iter().collect())
+            "thread/resume" | "thread/fork" => self.thread_opened(result, true),
+            "thread/read" if tag == "fork" => {
+                let Some((from, keep)) = self.fork.clone() else {
+                    return Output::default();
+                };
+                // The forked thread keeps the tools it was started with.
+                let mut params = self.open_params.clone();
+                if let Some(fields) = params.as_object_mut() {
+                    fields.remove("dynamicTools");
+                }
+                params["threadId"] = json!(from);
+                if let Some(last) = fork_point(&result["thread"]["turns"], keep) {
+                    params["lastTurnId"] = json!(last);
+                }
+                if let Some(provider) = self.gateway {
+                    params["modelProvider"] = json!(provider);
+                }
+                Output {
+                    events: vec![],
+                    frames: vec![self.request("thread/fork", params, "")],
+                }
             }
+            "account/rateLimits/read" => Output::events(usage_events(&result["rateLimits"])),
             "model/list" => {
                 self.catalog = result["data"]
                     .as_array()
@@ -975,6 +1221,23 @@ impl Codex {
         let answer =
             |result: Value| json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
         let full = self.mode == "full-auto";
+        // An app tool: the daemon runs it and answers (`answer`).
+        if method == "item/tool/call" {
+            let tool = text(&params["tool"]);
+            if app_tools::NAMES.contains(&tool) {
+                self.calls.push(HostCall {
+                    token: id.clone(),
+                    name: tool.to_string(),
+                    args: params["arguments"].clone(),
+                });
+                return Output::default();
+            }
+            let unknown = json!({ "contentItems": [{ "type": "inputText", "text": format!("unknown tool: {tool}") }], "success": false });
+            return Output {
+                events: vec![],
+                frames: vec![answer(unknown)],
+            };
+        }
         // Full access never prompts; a turn started before the switch still may.
         match method {
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" if full => {
@@ -1134,10 +1397,11 @@ impl Codex {
             "turn/started" => agent["status"] = json!("running"),
             "turn/completed" => {
                 let turn = &params["turn"];
-                agent["status"] = json!(if turn["status"] == "failed" {
-                    "failed"
-                } else {
-                    "completed"
+                // Stopped by the user: not done.
+                agent["status"] = json!(match text(&turn["status"]) {
+                    "failed" => "failed",
+                    "interrupted" => "stopped",
+                    _ => "completed",
                 });
                 if let Some(ms) = turn["durationMs"].as_u64() {
                     agent["duration_ms"] = json!(agent["duration_ms"].as_u64().unwrap_or(0) + ms);
@@ -1190,14 +1454,15 @@ impl Codex {
                 if !turn.is_empty() {
                     self.user_turns.push(turn.to_string());
                 }
-                let (content, images) = user_input(&item["content"]);
-                if content.is_empty() && images.is_empty() {
+                let (content, images, files) = user_input(&item["content"]);
+                if content.is_empty() && images.is_empty() && files.is_empty() {
                     vec![]
                 } else {
                     let mut event = json!({ "type": "user_message", "content": content });
                     if !images.is_empty() {
                         event["images"] = json!(images);
                     }
+                    set_files(&mut event, &files);
                     vec![event]
                 }
             }
@@ -1392,7 +1657,7 @@ impl Codex {
                         t => t.into(),
                     });
                 vec![
-                    json!({ "type": "tool_output", "call_id": id, "name": name, "output": item["contentItems"].to_string(), "is_error": failed }),
+                    json!({ "type": "tool_output", "call_id": id, "name": name, "output": dynamic_body(item), "is_error": failed }),
                 ]
             }
             "webSearch" => vec![
@@ -1449,7 +1714,7 @@ impl Codex {
             }
         }
         match method {
-            "account/rateLimits/updated" => plan_usage(&params["rateLimits"]).into_iter().collect(),
+            "account/rateLimits/updated" => usage_events(&params["rateLimits"]),
             "turn/started" => {
                 self.busy = true;
                 if let Some(turn) = params["turn"]["id"].as_str() {
@@ -1678,6 +1943,21 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    fn take_calls(&mut self) -> Vec<HostCall> {
+        std::mem::take(&mut self.calls)
+    }
+
+    fn answer(&mut self, token: &Value, result: Result<Value, String>) -> Vec<String> {
+        let (body, success) = match result {
+            Ok(output) => (output.to_string(), true),
+            Err(error) => (json!({ "error": error }).to_string(), false),
+        };
+        vec![json!({ "jsonrpc": "2.0", "id": token, "result": {
+            "contentItems": [{ "type": "inputText", "text": body }], "success": success,
+        } })
+        .to_string()]
+    }
+
     fn start(&mut self) -> Vec<String> {
         vec![self.request(
             "initialize",
@@ -1727,6 +2007,10 @@ impl Adapter for Codex {
                 for image in op["images"].as_array().into_iter().flatten() {
                     input.push(json!({ "type": "localImage", "path": image }));
                 }
+                // Each other file: a text item saying where it is saved.
+                for file in op_files(op) {
+                    input.push(json!({ "type": "text", "text": attachments::file_line(&file), "text_elements": [] }));
+                }
                 if self.thread.is_none() {
                     self.queued.extend(input);
                     return Ok(Output::default());
@@ -1743,39 +2027,55 @@ impl Adapter for Codex {
                 vec![self.turn_start(input)]
             }
             // A waiting message taken back before it runs (serve-protocol
-            // `unqueue`): the one at `index` when its text is `text`, else
-            // the first with that text.
+            // `unqueue`, picked as `QueuePick` says), or dropped (`discard`).
             "unqueue" => {
-                let wanted = op["text"].as_str();
-                let index = op["index"].as_u64().map_or(usize::MAX, |i| i as usize);
-                let at = match wanted {
-                    None => (index < self.waiting.len()).then_some(index),
-                    Some(wanted) => self
-                        .waiting
-                        .get(index)
-                        .filter(|(text, _)| text == wanted)
-                        .map(|_| index)
-                        .or_else(|| self.waiting.iter().position(|(text, _)| text == wanted)),
-                };
+                let at = QueuePick::from_op(op).find(&self.waiting_texts());
                 let mut events = Vec::new();
                 if let Some(at) = at {
-                    let (text, _) = self.waiting.remove(at);
+                    let (content, input) = self.waiting.remove(at);
                     events.push(self.pending_event());
-                    events.push(json!({ "type": "unqueued", "text": text }));
+                    if op["discard"] != true {
+                        let (_, images, files) = user_input(&json!(input));
+                        let mut unqueued = json!({ "type": "unqueued", "content": content, "text": content, "images": images });
+                        set_files(&mut unqueued, &files);
+                        events.push(unqueued);
+                    }
                 } else {
                     events.push(self.pending_event());
                 }
                 return Ok(Output::events(events));
             }
+            // A waiting message to another place: `index` to `to`.
+            "queue_move" => {
+                let Some((from, to)) = queue_move_target(
+                    &QueuePick::from_op(op),
+                    op["to"].as_i64(),
+                    &self.waiting_texts(),
+                ) else {
+                    return Ok(Output::default());
+                };
+                let item = self.waiting.remove(from);
+                self.waiting.insert(to, item);
+                return Ok(Output::events(vec![self.pending_event()]));
+            }
+            // One waiting message (`index`, `text`) into the running turn, or
+            // every one that waits when the op names none.
             "steer" => {
                 let (Some(thread), Some(turn)) = (self.thread.clone(), self.active_turn.clone())
                 else {
                     return Ok(Output::default());
                 };
-                if self.waiting.is_empty() {
+                let pick = QueuePick::from_op(op);
+                self.steering = if pick == QueuePick::default() {
+                    std::mem::take(&mut self.waiting)
+                } else {
+                    pick.find(&self.waiting_texts())
+                        .map(|at| vec![self.waiting.remove(at)])
+                        .unwrap_or_default()
+                };
+                if self.steering.is_empty() {
                     return Ok(Output::default());
                 }
-                self.steering = std::mem::take(&mut self.waiting);
                 let input: Vec<Value> = self
                     .steering
                     .iter()
@@ -1897,7 +2197,24 @@ impl Adapter for Codex {
                     json!({ "type": "status", "message": "ready" }),
                 ]));
             }
+            // With `index`: that waiting message starts the next turn once
+            // this one has stopped ("interrupt and send").
             "interrupt" => match (self.thread.clone(), self.active_turn.clone()) {
+                (Some(thread), Some(turn)) if op["index"].is_i64() => {
+                    if let Some(at) = QueuePick::from_op(op).find(&self.waiting_texts()) {
+                        let chosen = self.waiting.remove(at);
+                        self.waiting.insert(0, chosen);
+                    }
+                    let frame = self.request(
+                        "turn/interrupt",
+                        json!({ "threadId": thread, "turnId": turn }),
+                        "",
+                    );
+                    return Ok(Output {
+                        events: vec![self.pending_event()],
+                        frames: vec![frame],
+                    });
+                }
                 (Some(thread), Some(turn)) => vec![self.request(
                     "turn/interrupt",
                     json!({ "threadId": thread, "turnId": turn }),
@@ -2073,6 +2390,10 @@ impl Adapter for Codex {
     fn approval_mode(&self) -> Option<String> {
         Some(self.mode.to_string())
     }
+
+    fn model(&self) -> Option<String> {
+        (!self.model.is_empty()).then(|| self.model.clone())
+    }
 }
 
 // --- saved threads ---
@@ -2189,6 +2510,66 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn app_tools_are_dynamic_tools_on_a_new_thread() {
+        let options = Options {
+            app_tools: vec!["present_files", "wait_session"],
+            ..Options::default()
+        };
+        let mut c = Codex::new(Path::new("/p"), &options);
+        c.start();
+        let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        let names: Vec<&str> = next[1]["params"]["dynamicTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, ["present_files", "wait_session"]);
+        assert!(next[1]["params"]["dynamicTools"][0]["inputSchema"].is_object());
+        let call = frame(
+            &mut c,
+            json!({ "id": 40, "method": "item/tool/call", "params": { "threadId": "th", "turnId": "tu", "callId": "c", "tool": "present_files", "arguments": { "files": ["a"] } } }),
+        );
+        assert!(call.frames.is_empty());
+        let calls = c.take_calls();
+        assert_eq!((calls.len(), calls[0].name.as_str()), (1, "present_files"));
+        let answer = sent(&c.answer(&calls[0].token, Ok(json!({ "files": [] }))));
+        assert_eq!(answer[0]["id"], 40);
+        assert_eq!(answer[0]["result"]["success"], true);
+        assert_eq!(
+            answer[0]["result"]["contentItems"][0]["text"],
+            "{\"files\":[]}"
+        );
+        let refused = sent(&c.answer(&json!(41), Err("off".into())));
+        assert_eq!(refused[0]["result"]["success"], false);
+        let unknown = sent(&frame(&mut c, json!({ "id": 42, "method": "item/tool/call", "params": { "tool": "other", "arguments": {} } })).frames);
+        assert_eq!(unknown[0]["result"]["success"], false);
+        let done = json!({ "type": "dynamicToolCall", "id": "d", "tool": "present_files", "contentItems": [{ "type": "inputText", "text": "{}" }] });
+        assert_eq!(dynamic_body(&done), "{}");
+        let rows = transcript(&json!([{ "items": [done] }]));
+        assert_eq!(
+            (rows[0]["name"].as_str(), rows[0]["output"].as_str()),
+            (Some("present_files"), Some("{}"))
+        );
+        // None offered: no dynamic tools; a resumed thread keeps its own.
+        let mut bare = Codex::new(Path::new("/p"), &Options::default());
+        bare.start();
+        let next = sent(&frame(&mut bare, json!({ "id": 1, "result": {} })).frames);
+        assert!(next[1]["params"]["dynamicTools"].is_null());
+        let mut resumed = Codex::new(
+            Path::new("/p"),
+            &Options {
+                resume: Some("th-9".into()),
+                ..options
+            },
+        );
+        resumed.start();
+        let next = sent(&frame(&mut resumed, json!({ "id": 1, "result": {} })).frames);
+        assert_eq!(next[1]["method"], "thread/resume");
+        assert!(next[1]["params"]["dynamicTools"].is_null());
+    }
+
     fn opened() -> Codex {
         let mut c = Codex::new(
             Path::new("/p"),
@@ -2291,7 +2672,7 @@ mod tests {
         );
         assert_eq!(
             taken.events[1],
-            json!({ "type": "unqueued", "text": "also this" })
+            json!({ "type": "unqueued", "content": "also this", "text": "also this", "images": [] })
         );
         // Taking back what is no longer queued answers with the queue alone.
         let gone = c
@@ -2391,6 +2772,127 @@ mod tests {
         assert_eq!(frames[0]["params"]["turnId"], "turn-1");
     }
 
+    /// A busy Codex with `texts` waiting.
+    fn waiting(texts: &[&str]) -> Codex {
+        let mut c = opened();
+        busy(&mut c);
+        for text in texts {
+            c.encode(&json!({ "op": "user_message", "content": text }))
+                .unwrap();
+        }
+        c
+    }
+
+    #[test]
+    fn attached_files_go_as_text_items_and_come_back_as_files() {
+        let mut c = opened();
+        let line = attachments::file_line("/tmp/my report.pdf");
+        let turn = sent(
+            &c.encode(&json!({ "op": "user_message", "content": "read", "images": ["/tmp/a.png"], "files": ["/tmp/my report.pdf"] }))
+                .unwrap()
+                .frames,
+        );
+        assert_eq!(
+            turn[0]["params"]["input"],
+            json!([
+                { "type": "text", "text": "read", "text_elements": [] },
+                { "type": "localImage", "path": "/tmp/a.png" },
+                { "type": "text", "text": line, "text_elements": [] },
+            ])
+        );
+        // The echo, a saved thread and a message taken back: `files`.
+        let content = turn[0]["params"]["input"].clone();
+        let echo = frame(
+            &mut c,
+            json!({ "method": "item/started", "params": { "item": { "id": "u1", "type": "userMessage", "content": content } } }),
+        );
+        assert_eq!(
+            echo.events,
+            vec![
+                json!({ "type": "user_message", "content": "read", "images": ["/tmp/a.png"], "files": ["/tmp/my report.pdf"] })
+            ]
+        );
+        let item = json!({ "type": "userMessage", "content": content });
+        assert_eq!(
+            transcript(&json!([{ "items": [item] }])),
+            vec![
+                json!({ "role": "user", "content": "read", "images": ["/tmp/a.png"], "files": ["/tmp/my report.pdf"] })
+            ]
+        );
+        let mut c = waiting(&[]);
+        c.encode(
+            &json!({ "op": "user_message", "content": "oops", "files": ["/tmp/my report.pdf"] }),
+        )
+        .unwrap();
+        let back = c.encode(&json!({ "op": "unqueue", "index": 0 })).unwrap();
+        assert_eq!(
+            back.events[1],
+            json!({ "type": "unqueued", "content": "oops", "text": "oops", "images": [], "files": ["/tmp/my report.pdf"] })
+        );
+    }
+
+    #[test]
+    fn one_waiting_message_steers_in_by_its_place() {
+        let mut c = waiting(&["one", "two"]);
+        let steer = c.encode(&json!({ "op": "steer", "index": 1 })).unwrap();
+        let frames = sent(&steer.frames);
+        assert_eq!(frames[0]["method"], "turn/steer");
+        assert_eq!(frames[0]["params"]["input"][0]["text"], "two");
+        assert_eq!(frames[0]["params"]["input"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            steer.events,
+            vec![json!({ "type": "pending_messages", "messages": ["one"] })]
+        );
+        assert!(c
+            .encode(&json!({ "op": "steer", "index": -3 }))
+            .unwrap()
+            .frames
+            .is_empty());
+        // By its text, after the queue moved on.
+        let mut c = waiting(&["one", "two"]);
+        let steer = c
+            .encode(&json!({ "op": "steer", "index": 0, "text": "two" }))
+            .unwrap();
+        assert_eq!(sent(&steer.frames)[0]["params"]["input"][0]["text"], "two");
+    }
+
+    #[test]
+    fn waiting_messages_move_and_drop() {
+        let mut c = waiting(&["one", "two", "three"]);
+        let moved = c
+            .encode(&json!({ "op": "queue_move", "index": -1, "to": 0 }))
+            .unwrap();
+        assert_eq!(
+            moved.events,
+            vec![json!({ "type": "pending_messages", "messages": ["three", "one", "two"] })]
+        );
+        let dropped = c
+            .encode(&json!({ "op": "unqueue", "index": 1, "discard": true }))
+            .unwrap();
+        assert_eq!(
+            dropped.events,
+            vec![json!({ "type": "pending_messages", "messages": ["three", "two"] })]
+        );
+    }
+
+    #[test]
+    fn interrupting_for_a_waiting_message_starts_it_next() {
+        let mut c = waiting(&["one", "two"]);
+        let stop = c.encode(&json!({ "op": "interrupt", "index": 1 })).unwrap();
+        assert_eq!(sent(&stop.frames)[0]["method"], "turn/interrupt");
+        assert_eq!(
+            stop.events,
+            vec![json!({ "type": "pending_messages", "messages": ["two", "one"] })]
+        );
+        let next = frame(
+            &mut c,
+            json!({ "method": "turn/completed", "params": { "threadId": "th-1", "turn": { "id": "turn-1", "status": "interrupted" } } }),
+        );
+        let started = sent(&next.frames);
+        assert_eq!(started[0]["method"], "turn/start");
+        assert_eq!(started[0]["params"]["input"][0]["text"], "two");
+    }
+
     #[test]
     fn a_subagents_thread_stays_out_of_the_conversation() {
         let mut c = opened();
@@ -2418,6 +2920,10 @@ mod tests {
         assert_eq!(runs["agents"][0]["tokens"], 900);
         assert_eq!(runs["agents"][0]["status"], "completed");
         assert_eq!(runs["agents"][0]["duration_ms"], 3814);
+        // A turn of it the user stopped: stopped, not done.
+        let stopped = frame(&mut c, json!({ "method": "turn/completed", "params": { "threadId": "child", "turn": { "id": "c2", "status": "interrupted" } } })).events;
+        let runs = stopped.iter().find(|e| e["type"] == "agent_runs").unwrap();
+        assert_eq!(runs["agents"][0]["status"], "stopped");
         // Its conversation is read back from its thread.
         let ask = sent(
             &c.encode(&json!({ "op": "subagent_transcript", "agent_id": "child" }))
@@ -2634,7 +3140,7 @@ mod tests {
     #[test]
     fn the_gateway_goes_to_this_process_only() {
         let mut command = std::process::Command::new("codex");
-        use_gateway(&mut command, "http://127.0.0.1:7788/gw", "tok").unwrap();
+        use_gateway(&mut command, "http://127.0.0.1:7788/gw", "tok", None).unwrap();
         let args: Vec<String> = command
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
@@ -2843,7 +3349,9 @@ mod tests {
             &mut c,
             json!({ "id": read["id"], "result": { "rateLimits": snapshot } }),
         );
-        assert_eq!(types(&out.events), ["plan_usage"]);
+        // Under 90%: the limit notice says all is well.
+        assert_eq!(types(&out.events), ["plan_usage", "rate_limit"]);
+        assert_eq!(out.events[1]["level"], "ok");
         assert_eq!(out.events[0]["plan"], "plus");
         assert_eq!(
             out.events[0]["windows"][0],
@@ -2855,6 +3363,21 @@ mod tests {
         );
         assert_eq!(out.events[0]["windows"][0]["used"], 40.0);
         assert_eq!(out.events[0]["windows"][0]["resets_at"], Value::Null);
+        // The fullest window, named by its length.
+        let out = frame(
+            &mut c,
+            json!({ "method": "account/rateLimits/updated", "params": { "rateLimits": {
+                "primary": { "usedPercent": 20, "windowDurationMins": 300 },
+                "secondary": { "usedPercent": 93, "windowDurationMins": 10080, "resetsAt": 1791300000 } } } }),
+        );
+        assert_eq!(out.events[1]["level"], "warning");
+        assert_eq!(out.events[1]["window"], "seven_day");
+        assert_eq!(out.events[1]["used"], 93.0);
+        assert_eq!(out.events[1]["resets_at"], 1_791_300_000_000u64);
+        // Out of usage: the turn's error is the limit notice.
+        let limited = error_event("You've hit your usage limit.", &json!("usageLimitExceeded"));
+        assert_eq!(limited["type"], "rate_limit");
+        assert_eq!(limited["level"], "limited");
     }
 
     #[test]
@@ -2903,6 +3426,138 @@ mod tests {
     }
 
     #[test]
+    fn a_custom_provider_session_is_not_the_lynshen_gateway_and_has_no_plan() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                resume: Some("th-9".into()),
+                gateway: Some(false),
+                tool_provider: Some("mine".into()),
+                ..Options::default()
+            },
+        );
+        c.start();
+        let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        assert_eq!(next[1]["params"]["modelProvider"], CUSTOM_PROVIDER);
+        assert!(next
+            .iter()
+            .all(|f| f["method"] != "account/rateLimits/read"));
+        let mut command = std::process::Command::new("codex");
+        use_gateway(
+            &mut command,
+            "http://127.0.0.1:7788/gw",
+            "tok",
+            Some("My \"API\""),
+        )
+        .unwrap();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args[1], "model_provider=\"lynshen_custom\"");
+        assert!(
+            args[3].starts_with("model_providers.lynshen_custom={name=\"My \\\"API\\\"\","),
+            "{}",
+            args[3]
+        );
+    }
+
+    #[test]
+    fn a_fork_reads_the_thread_then_forks_it_through_the_kept_turn() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                fork_from: Some("th-1".into()),
+                fork_turns: Some(1),
+                app_tools: vec!["present_files"],
+                ..Options::default()
+            },
+        );
+        c.start();
+        let opened = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        let read = opened
+            .iter()
+            .find(|f| f["method"] == "thread/read")
+            .unwrap();
+        assert_eq!(
+            read["params"],
+            json!({ "threadId": "th-1", "includeTurns": true })
+        );
+        assert!(opened.iter().all(|f| f["method"] != "thread/start"));
+        let user =
+            |id: &str| json!({ "id": id, "items": [{ "type": "userMessage", "content": [] }] });
+        let turns = json!([user("t1"), { "id": "t1b", "items": [] }, user("t2")]);
+        let forked = sent(
+            &frame(
+                &mut c,
+                json!({ "id": read["id"], "result": { "thread": { "turns": turns } } }),
+            )
+            .frames,
+        );
+        assert_eq!(forked[0]["method"], "thread/fork");
+        assert_eq!(forked[0]["params"]["threadId"], "th-1");
+        assert_eq!(forked[0]["params"]["lastTurnId"], "t1b");
+        // The thread keeps the tools it started with.
+        assert!(forked[0]["params"].get("dynamicTools").is_none());
+        let events = frame(&mut c, json!({ "id": forked[0]["id"], "result": { "thread": { "id": "th-2", "turns": [user("t1")] }, "model": "m" } })).events;
+        let startup = events.iter().find(|e| e["type"] == "startup").unwrap();
+        assert_eq!(startup["session_id"], "th-2");
+        assert_eq!(c.conversation().as_deref(), Some("th-2"));
+    }
+
+    #[test]
+    fn a_fork_that_fails_says_so_instead_of_starting_empty() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                fork_from: Some("gone".into()),
+                fork_turns: Some(1),
+                ..Options::default()
+            },
+        );
+        c.start();
+        let opened = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        let read = opened
+            .iter()
+            .find(|f| f["method"] == "thread/read")
+            .unwrap();
+        let failed = frame(
+            &mut c,
+            json!({ "id": read["id"], "error": { "code": -32600, "message": "no rollout" } }),
+        );
+        assert!(failed.frames.is_empty());
+        assert_eq!(failed.events[0]["type"], "error");
+        assert!(text(&failed.events[0]["message"]).contains("cannot fork"));
+    }
+
+    #[test]
+    fn a_fork_point_is_the_turn_before_the_next_user_turn() {
+        let user = |id: &str| json!({ "id": id, "items": [{ "type": "userMessage" }] });
+        let turns = json!([user("a"), user("b"), { "id": "b2", "items": [] }]);
+        assert_eq!(fork_point(&turns, Some(1)).as_deref(), Some("a"));
+        assert_eq!(fork_point(&turns, Some(2)), None);
+        assert_eq!(fork_point(&turns, None), None);
+    }
+
+    #[test]
+    fn a_probe_opens_an_ephemeral_thread() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                probe: true,
+                ..Options::default()
+            },
+        );
+        c.start();
+        let opened = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        let start = opened
+            .iter()
+            .find(|f| f["method"] == "thread/start")
+            .unwrap();
+        assert_eq!(start["params"]["ephemeral"], true);
+    }
+
+    #[test]
     fn a_resume_replays_history_and_falls_back_to_a_new_thread() {
         let mut c = Codex::new(
             Path::new("/p"),
@@ -2930,6 +3585,23 @@ mod tests {
             resumed.events[0]["items"],
             json!([{ "role": "user", "content": "q" }, { "role": "assistant", "content": "a" }])
         );
+        // Tool calls replay as the cards their live output showed, failed
+        // ones marked; one saved before it finished is no failure.
+        let rows = transcript(&json!([{ "items": [
+            { "type": "commandExecution", "id": "c1", "command": "ls", "aggregatedOutput": "a", "exitCode": 0, "status": "completed" },
+            { "type": "commandExecution", "id": "c2", "command": "rm x", "status": "declined" },
+            { "type": "fileChange", "id": "f1", "changes": [{ "path": "/a", "diff": "+x" }], "status": "failed" },
+            { "type": "mcpToolCall", "id": "m1", "server": "s", "tool": "t", "error": { "message": "boom" } },
+            { "type": "commandExecution", "id": "c3", "command": "sleep 9" },
+        ] }]));
+        assert!(rows[0].get("is_error").is_none());
+        assert_eq!(rows[0]["call_id"], "c1");
+        assert_eq!(rows[1]["is_error"], true);
+        assert!(rows[1]["output"].as_str().unwrap().contains("declined"));
+        assert_eq!(rows[2]["is_error"], true);
+        assert_eq!(rows[3]["is_error"], true);
+        assert_eq!(rows[3]["name"], "s.t");
+        assert!(rows[4].get("is_error").is_none());
 
         let mut c = Codex::new(
             Path::new("/p"),

@@ -6,7 +6,10 @@
 
 mod agent_tools;
 mod agents;
+mod app_tools;
+mod awake;
 mod connectors;
+mod devservers;
 mod dispatch;
 mod engines;
 mod feedback;
@@ -33,9 +36,11 @@ mod store;
 mod styles;
 mod terminal;
 mod titles;
+mod tool_providers;
 mod uploads;
 mod usage;
 mod webpush;
+mod worktrees;
 
 pub use agents::Agents;
 pub use hub::check_code;
@@ -89,6 +94,10 @@ pub fn serve(
         gateway::set_group(&record.id, record.group.as_deref());
     }
     let hub = Hub::new(store, agents, version, relay);
+    // Runs left going by the last daemon ended with it; the worktrees of
+    // archived runs it left behind go when nothing is in them.
+    hub.interrupt_schedule_runs();
+    hub.clean_run_worktrees();
     // A bot answers one computer: the copy leaves it to the original.
     if copied {
         connectors::turn_all_off(&hub);
@@ -233,7 +242,7 @@ impl Link for WebSocket<TcpStream> {
 /// `device` is the paired device it authenticated as; None for a local
 /// client.
 fn attach(hub: &Arc<Hub>, link: &mut impl Link, device: Option<String>) -> Result<(), String> {
-    let (outbox, inbox) = mpsc::channel();
+    let (outbox, inbox) = Hub::outbox();
     let client = hub.add_client(outbox, device);
     let result = pump(hub, client, link, &inbox);
     hub.remove_client(client);
@@ -244,10 +253,25 @@ fn pump(
     hub: &Arc<Hub>,
     client: u64,
     link: &mut impl Link,
-    inbox: &mpsc::Receiver<String>,
+    inbox: &hub::Inbox,
 ) -> Result<(), String> {
+    // The daemon also forks conversations and probes engines (B08), runs
+    // custom providers, built-in ACP agents and session terminals any client
+    // attaches to (B10), and keeps scheduled runs with failures, budgets and
+    // worktrees (B12); a client checks for them before it offers any.
+    let mut hello = protocol::hello_json(hub.version);
+    if let Some(features) = hello["features"].as_array_mut() {
+        features.extend([
+            json!("fork"),
+            json!("engine_probe"),
+            json!("tool_providers"),
+            json!("acp_presets"),
+            json!("term_attach"),
+            json!("schedule_runs"),
+        ]);
+    }
     for frame in [
-        protocol::hello_json(hub.version),
+        hello,
         hub.sessions_json(),
         projects::workspaces_json(hub),
         hub.agents_json(),
@@ -256,6 +280,7 @@ fn pump(
         hub.actions_json(),
         hub.dispatch.json(),
         hub.requirements.json(hub),
+        hub.dev_servers.json(),
     ] {
         link.send(&frame.to_string())?;
     }
@@ -366,11 +391,46 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             | "device_revoke"
             | "relay_status"
             | "relay_set"
+            | "connect_requests"
+            | "connect_decide"
             | "restart_when_idle"
             | "usage_import_legacy"
     ) && !hub.is_local(client)
     {
         reply(json!({ "type": "error", "message": "only the desktop can manage devices" }));
+        return;
+    }
+    // What every session is given is the desktop's setting.
+    if name == "app_tools_set" && !hub.is_local(client) {
+        reply(json!({ "type": "error", "message": "only the desktop can change the app tools" }));
+        return;
+    }
+    // Custom providers for Claude Code and Codex: where their sessions'
+    // requests go and with which key. Only the desktop manages them; the
+    // model list waits on the provider's API.
+    if matches!(
+        name,
+        "tool_providers"
+            | "tool_provider_save"
+            | "tool_provider_remove"
+            | "tool_provider_select"
+            | "tool_provider_models"
+    ) {
+        if !hub.is_local(client) {
+            reply(
+                json!({ "type": "error", "message": "only the desktop can manage custom providers" }),
+            );
+            return;
+        }
+        let hub = Arc::clone(hub);
+        let name = name.to_string();
+        thread::spawn(move || {
+            let result = match name.as_str() {
+                "tool_provider_models" => tool_providers::models(&hub.store, &op),
+                _ => tool_providers::handle(&hub.store, &op),
+            };
+            respond(&hub, client, &request, result);
+        });
         return;
     }
     // An MCP server is a command to run or a place to send credentials.
@@ -497,9 +557,27 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                     let sessions = if key == "session" {
                         vec![id.to_string()]
                     } else {
-                        hub.store.sessions_reached_from(&format!("schedule:{id}"))
+                        // The runs and the sessions they started.
+                        hub.with_children(
+                            hub.store.sessions_reached_from(&format!("schedule:{id}")),
+                        )
                     };
                     let mut usage = hub.usage.sessions_json(&sessions);
+                    if key == "schedule" {
+                        let parents: std::collections::HashMap<String, String> = hub
+                            .store
+                            .sessions()
+                            .into_iter()
+                            .filter_map(|r| Some((r.id, r.parent?)))
+                            .collect();
+                        for row in usage["sessions"].as_array_mut().into_iter().flatten() {
+                            if let Some(parent) =
+                                row["session"].as_str().and_then(|s| parents.get(s))
+                            {
+                                row["parent"] = json!(parent);
+                            }
+                        }
+                    }
                     usage["type"] = json!(name);
                     usage[key] = json!(id);
                     Ok(usage)
@@ -527,33 +605,113 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     // Input is written in the order it arrives, so these stay on this thread.
     if matches!(
         name,
-        "term_open" | "term_input" | "term_resize" | "term_close"
+        "term_open"
+            | "term_attach"
+            | "term_detach"
+            | "term_input"
+            | "term_resize"
+            | "term_ack"
+            | "term_close"
     ) {
+        // A device without the terminal scope only looks: its window does
+        // not resize the session's TUI.
+        let mut op = op.clone();
+        if name == "term_attach" {
+            if let Some(device) = hub.device_of(client) {
+                if scopes::check(hub, &device, "term_resize", &op).is_err() {
+                    if let Some(fields) = op.as_object_mut() {
+                        fields.remove("cols");
+                        fields.remove("rows");
+                    }
+                }
+            }
+        }
         let result = terminal::handle(hub, client, name, &op);
         respond(hub, client, &request, result);
         return;
     }
-    // A program to run (an ACP agent, an engine binary, its environment):
-    // only the desktop names one.
-    if matches!(name, "session_create" | "session_open") {
+    // A program to run (an ACP agent's command line, an engine binary, its
+    // environment): only the desktop names one. A built-in ACP agent
+    // (`options.agent`) is the daemon's own, so a phone may start it too.
+    if matches!(name, "session_create" | "session_open" | "engine_probe") {
         let options = engines::Options::from_json(&op["options"]);
         let acp = op["engine"] == "acp";
-        if (acp || options.runs_programs()) && !hub.is_local(client) {
+        if options.runs_programs() && !hub.is_local(client) {
             reply(
                 json!({ "type": "error", "message": "only the desktop can choose what an engine runs" }),
             );
             return;
         }
-        let checked = options
-            .check_env()
-            .and_then(|()| match acp && options.command.is_none() {
-                true => Err("an ACP session needs options.command".to_string()),
-                false => Ok(()),
-            });
+        let checked = options.check_env().and_then(|()| match acp {
+            true if name == "session_create"
+                && options.command.is_none()
+                && options.agent.is_none() =>
+            {
+                Err("an ACP session needs options.agent or options.command".to_string())
+            }
+            true => engines::acp::preset(&options).map(|_| ()),
+            false => Ok(()),
+        });
         if let Err(message) = checked {
             reply(json!({ "type": "error", "message": message }));
             return;
         }
+        // Pi asks nothing before running tools: a phone starts it only with
+        // the scope 全自动 needs.
+        let never_asks = acp
+            && options
+                .agent
+                .as_deref()
+                .and_then(engines::acp_presets::find)
+                .is_some_and(|preset| !preset.approvals);
+        if never_asks {
+            if let Some(device) = hub.device_of(client) {
+                let full = json!({ "mode": "full-access" });
+                if let Err(message) = scopes::check(hub, &device, "set_approval_mode", &full) {
+                    reply(json!({ "type": "error", "message": message }));
+                    return;
+                }
+            }
+        }
+    }
+    // Each built-in ACP agent's version is asked of the agent (seconds).
+    if name == "acp_presets" {
+        let hub = Arc::clone(hub);
+        thread::spawn(move || {
+            respond(
+                &hub,
+                client,
+                &request,
+                Ok(engines::acp_presets::presets_json()),
+            )
+        });
+        return;
+    }
+    // What an engine says of itself before any conversation (its models,
+    // commands, options), from a run of it that no list shows. It takes
+    // seconds, so it answers from a thread of its own.
+    if name == "engine_probe" {
+        let options = engines::Options::from_json(&op["options"]);
+        let cwd = op["cwd"]
+            .as_str()
+            .filter(|cwd| !cwd.is_empty())
+            .map_or_else(engines::home, PathBuf::from);
+        let engine = op["engine"].as_str().unwrap_or_default().to_string();
+        let force = op["force"] == true;
+        let hub = Arc::clone(hub);
+        thread::spawn(move || {
+            let result = engines::Kind::parse(&engine).and_then(|kind| match kind {
+                _ if !cwd.is_dir() => Err(format!("not a directory: {}", cwd.display())),
+                Some(kind) => engines::probe_cached(&hub.store, kind, &cwd, &options, force).map(
+                    |(events, at, cached)| {
+                        json!({ "type": "engine_probed", "engine": kind.name(), "events": events, "at": at, "cached": cached })
+                    },
+                ),
+                None => Err("the lynshen engine needs no probe: its sessions report all of this".to_string()),
+            });
+            respond(&hub, client, &request, result);
+        });
+        return;
     }
     let result = match (name, session) {
         ("ping", _) => Ok(json!({ "type": "pong" })),
@@ -570,9 +728,15 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             None => Err("session_history requires cwd".to_string()),
         },
         // A client's title is its own: never one the daemon may rewrite.
-        ("session_meta", Some(session)) => match hub.store.record_session_meta(
+        ("session_meta", Some(session)) => match op["project"]
+            .as_str()
+            .map(str::trim)
+            .filter(|p| !p.is_empty() && projects::project(hub, p).is_none())
+        {
+            Some(unknown) => Err(format!("unknown project {unknown}")),
+            None => match hub.store.record_session_meta(
             &session,
-            &json!({ "title": op["title"], "archived": op["archived"], "hidden": op["hidden"], "group": op["group"] }),
+            &json!({ "title": op["title"], "archived": op["archived"], "hidden": op["hidden"], "group": op["group"], "project": op["project"] }),
         ) {
             Ok(true) => {
                 // The local gateway routes this session's next request there.
@@ -593,11 +757,22 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 hub.broadcast(&hub.sessions_json());
                 Ok(Value::Null)
             }
-            Ok(false) => Err("session_meta requires title, archived, hidden or group".to_string()),
+            Ok(false) => Err("session_meta requires title, archived, hidden, group or project".to_string()),
             Err(error) => Err(error.to_string()),
+        },
         },
         ("pair_link", _) => hub.relay.pair_link(hub),
         ("relay_status", _) => Ok(hub.relay.status_json()),
+        // Relay v2 (relay-protocol.md §7.4): requests to connect from devices
+        // of this computer's account, and the desktop's answer.
+        ("connect_requests", _) => Ok(hub.relay.requests_json()),
+        ("connect_decide", _) => match (op["request"].as_str(), op["allow"].as_bool()) {
+            (Some(request), Some(allow)) => hub
+                .relay
+                .decide(request, allow)
+                .map(|()| json!({ "type": "connect_decided", "request": request, "allow": allow })),
+            _ => Err("connect_decide requires request and allow".to_string()),
+        },
         ("relay_set", _) => match op["enabled"].as_bool() {
             Some(enabled) => hub
                 .relay
@@ -606,7 +781,9 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             None => Err("relay_set requires enabled".to_string()),
         },
         ("pair_start", _) => hub
-            .start_pairing()
+            .relay
+            .lan_pairing_allowed()
+            .and_then(|()| hub.start_pairing())
             .map(|(code, expires_at)| json!({ "type": "pairing", "code": code, "expires_at": expires_at })),
         ("device_list", _) => Ok(hub.devices_json()),
         // The pairing dialog closed: its code no longer pairs anyone.
@@ -663,6 +840,8 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                     op["chat"].as_bool().unwrap_or(false),
                     engine,
                     engines::Options::from_json(&op["options"]),
+                    // Left out: the project of its folder; null or "": none.
+                    op.get("project").map(|p| p.as_str().unwrap_or_default()),
                 )
             })
             .map(|session| json!({ "type": "session_created", "session": session })),
@@ -881,6 +1060,8 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             }),
             _ => Err("agent_memory_read requires agent and file".to_string()),
         },
+        ("app_tools", _) => Ok(app_tools::json(&app_tools::config())),
+        ("app_tools_set", _) => app_tools::set(&op),
         ("schedule_list", _) => Ok(hub.schedules_json(op["agent"].as_str())),
         ("schedule_save", _) => hub
             .save_schedule(&op["schedule"])
@@ -958,8 +1139,9 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 json!({ "type": "mcp_saved" })
             })
         }
-        // The session's engine stops and its own TUI runs on a terminal for
-        // this client; the engine resumes when the TUI exits.
+        // The session's engine stops and its own TUI runs on a terminal
+        // that belongs to the session: this client views it first, others
+        // attach (`term_attach`); the engine resumes when the TUI exits.
         ("session_tui", Some(session)) => hub
             .forward(
                 &session,
@@ -968,6 +1150,12 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             .map(|()| Value::Null),
         // Ops the daemon sends a session itself.
         ("tui" | "tui_exit", Some(_)) => Err(format!("{name} is not a client op")),
+        // A message to an engine session closed as idle opens it again first
+        // (clients that do not reopen it themselves keep working).
+        ("user_message" | "command" | "continue" | "approve_plan", Some(session)) => hub
+            .wake(client, &session)
+            .and_then(|()| hub.forward(&session, op.clone()))
+            .map(|()| Value::Null),
         (_, Some(session)) => hub.forward(&session, op.clone()).map(|()| Value::Null),
         (name, None) => Err(format!("{name} requires session")),
     };

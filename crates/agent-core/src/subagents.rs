@@ -1121,6 +1121,12 @@ impl SubagentManager {
     /// A subagent works or worked in this engine (a background one outlives
     /// its turn): its run, transcript and conversation live only here. A
     /// saved team brings back only its worktree agents' rows (`restore`).
+    /// A subagent has not finished (waiting to start or running).
+    pub(crate) fn has_unfinished(&self) -> bool {
+        let state = self.inner.state.lock().unwrap();
+        state.agents.values().any(|agent| agent.status.is_live())
+    }
+
     pub(crate) fn has_unsaved_runs(&self) -> bool {
         let state = self.inner.state.lock().unwrap();
         state.agents.values().any(|agent| !agent.restored)

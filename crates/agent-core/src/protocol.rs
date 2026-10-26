@@ -2,7 +2,9 @@
 //! events serialize to `{"type": ...}` objects and client ops arrive as
 //! `{"op": ...}` objects. See `docs/serve-protocol.md`.
 
-use crate::{event::AgentEvent, AgentCore, ApprovalMode, ApproveOptions};
+use crate::{
+    attachments, event::AgentEvent, queue::QueuePick, AgentCore, ApprovalMode, ApproveOptions,
+};
 use serde_json::{json, Value};
 
 /// Wire protocol version, announced in the `hello` event. Clients refuse to
@@ -11,8 +13,17 @@ pub const PROTOCOL_VERSION: u64 = 2;
 
 /// First frame on every connection: the protocol version and the engine
 /// build, so a client can refuse a mismatch before reading anything else.
+/// What this side takes beyond the protocol version, for a client to check
+/// before relying on it (an older engine or daemon sends none):
+/// - `queue`: queued messages are picked by `index` (and `text`) on every
+///   engine: `steer` one, `unqueue` with `discard`, `queue_move`,
+///   `interrupt` with `index`; Claude Code's queue is held by the daemon.
+/// - `files`: a `user_message` takes `files`, attachments other than
+///   images, which each engine gets its own way, not as prompt text.
+pub const FEATURES: &[&str] = &["queue", "files"];
+
 pub fn hello_json(version: &str) -> Value {
-    json!({ "type": "hello", "protocol": PROTOCOL_VERSION, "version": version })
+    json!({ "type": "hello", "protocol": PROTOCOL_VERSION, "version": version, "features": FEATURES })
 }
 
 /// An engine event on the wire, tagged with the session it belongs to so
@@ -33,17 +44,22 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
                 .get("content")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let images = value
-                .get("images")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item.as_str().map(str::to_string))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            core.submit_user_message_with_images(content.to_string(), images)
+            let strings = |key: &str| {
+                value
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+            // Other files go to the model as lines after the text; events
+            // and the transcript split them back off (`with_files_json`).
+            let content = attachments::with_files(content, &strings("files"));
+            core.submit_user_message_with_images(content, strings("images"))
         }
         "command" => {
             let input = value
@@ -54,14 +70,20 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
         }
         // A failed turn again, without a new user message (see continue_turn).
         "continue" => core.continue_turn(),
-        "steer" => core.steer(),
-        "unqueue" => core.unqueue(
-            value
-                .get("index")
-                .and_then(Value::as_u64)
-                .map_or(usize::MAX, |index| index as usize),
-            value.get("text").and_then(Value::as_str),
+        // A queued message (`index`, negative from the last; `text` to find
+        // it if the queue moved on, see `queue`) into the running turn.
+        "steer" => core.steer(&QueuePick::from_op(value)),
+        // Taken back to the client's box, or dropped with `discard`.
+        "unqueue" => core.unqueue(&QueuePick::from_op(value), value["discard"] == true),
+        // To another place: `index` to `to`.
+        "queue_move" => core.queue_move(
+            &QueuePick::from_op(value),
+            value.get("to").and_then(Value::as_i64),
         ),
+        // With `index`: stop the turn and send that queued message now.
+        "interrupt" if value.get("index").is_some_and(Value::is_i64) => {
+            core.interrupt_send(&QueuePick::from_op(value))
+        }
         "interrupt" => core.interrupt(),
         // Structured twin of the `/approve` text command (GUI convenience):
         // {"op":"approve","call_id":"...","decision":"allow|deny",
@@ -146,6 +168,9 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
                 "decide_action requires action and decision: allow or deny".to_string(),
             )],
         },
+        // Stops what the last turn left going (subagents, background
+        // shells): a scheduled run stopped for its budget or its time.
+        "stop_background" => core.stop_background_work(),
         "agent_runs" => vec![core.agent_runs_event()],
         // The desktop's merge / discard buttons: {"op":"merge_agent",
         // "target":"/root/worker","action":"apply|discard"}.
@@ -353,11 +378,26 @@ pub fn event_json(event: AgentEvent) -> Value {
             event
         }
         AgentEvent::PendingMessages(messages) => {
+            let messages: Vec<String> = messages
+                .iter()
+                .map(|message| attachments::split_files(message).0)
+                .collect();
             json!({ "type": "pending_messages", "messages": messages })
         }
-        AgentEvent::Unqueued(text) => json!({ "type": "unqueued", "text": text }),
-        AgentEvent::UserMessage(content) => json!({ "type": "user_message", "content": content }),
-        AgentEvent::FillInput(content) => json!({ "type": "fill_input", "content": content }),
+        // `text` for clients that read only it (desktop 0.10 and older).
+        AgentEvent::Unqueued { content, images } => {
+            let mut event =
+                with_files_json(json!({ "type": "unqueued", "images": images }), &content);
+            event["text"] = event["content"].clone();
+            event
+        }
+        AgentEvent::UserMessage(content) => {
+            with_files_json(json!({ "type": "user_message" }), &content)
+        }
+        // A message put back in the input: its files apart from its text.
+        AgentEvent::FillInput(content) => {
+            with_files_json(json!({ "type": "fill_input" }), &content)
+        }
         AgentEvent::Connecting => json!({ "type": "connecting" }),
         AgentEvent::CompactionStart => json!({ "type": "compaction_start" }),
         AgentEvent::CompactionProgress { output_tokens } => {
@@ -673,10 +713,11 @@ pub fn event_json(event: AgentEvent) -> Value {
         }),
         AgentEvent::Transcript(items) => json!({
             "type": "transcript",
-            "items": items.into_iter().map(|item| match item {
-                crate::TranscriptItem::User(content) => json!({ "role": "user", "content": content }),
+            "items": items.into_iter().map(|(item, at)| {
+                let mut row = match item {
+                crate::TranscriptItem::User(content) => with_files_json(json!({ "role": "user" }), &content),
                 crate::TranscriptItem::UserWithImages { content, images } => {
-                    json!({ "role": "user", "content": content, "images": images })
+                    with_files_json(json!({ "role": "user", "images": images }), &content)
                 }
                 crate::TranscriptItem::Assistant(content) => json!({ "role": "assistant", "content": content }),
                 crate::TranscriptItem::Tool { name, output } => json!({ "role": "tool", "name": name, "output": output }),
@@ -690,6 +731,12 @@ pub fn event_json(event: AgentEvent) -> Value {
                     item["role"] = json!("turn_stats");
                     item
                 }
+                };
+                // When it was written, ms.
+                if at > 0 {
+                    row["at"] = json!(at * 1000);
+                }
+                row
             }).collect::<Vec<_>>()
         }),
         AgentEvent::Info(message) => json!({ "type": "info", "message": message }),
@@ -744,6 +791,17 @@ pub fn event_json(event: AgentEvent) -> Value {
             "by": by,
         }),
     }
+}
+
+/// `value` with a user message's `content`, and the files attached to it
+/// as `files` (when there are any).
+fn with_files_json(mut value: Value, message: &str) -> Value {
+    let (content, files) = attachments::split_files(message);
+    value["content"] = json!(content);
+    if !files.is_empty() {
+        value["files"] = json!(files);
+    }
+    value
 }
 
 #[cfg(test)]

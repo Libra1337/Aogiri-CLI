@@ -1,6 +1,9 @@
+pub mod account;
 pub mod actions;
 pub mod android;
+pub mod app_tools;
 pub mod approval;
+pub mod attachments;
 mod board;
 pub mod chat;
 pub mod command_text;
@@ -25,12 +28,14 @@ mod oauth;
 mod plan_mode;
 mod plan_progress;
 mod plan_reminder;
+pub mod process_group;
 mod prompt;
 #[cfg(test)]
 mod prompt_budget;
 pub mod protocol;
 pub mod provider_login;
 mod providers;
+pub mod queue;
 mod roles;
 pub mod sandbox;
 mod search;
@@ -147,6 +152,32 @@ pub fn lynshen_logout() -> Result<(), String> {
     oauth::logout(&config.lynshen_api_url, config.encrypt_secrets)
 }
 
+/// The API key of `tool`'s custom provider `id` (the daemon's
+/// `tool_providers`), from auth.json's `tool_providers` block, decrypted.
+pub fn tool_provider_key(tool: &str, id: &str) -> Option<String> {
+    let encrypt = config::Config::load_existing()
+        .map(|config| config.encrypt_secrets)
+        .unwrap_or(false);
+    let auth = config::AuthStore::load_or_create(encrypt).ok()?;
+    auth.tool_key(tool, id)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+}
+
+/// Saves (`Some`) or removes (`None`) that key, encrypted as the rest of
+/// auth.json is (`docs/secrets.md`). Holds the lock logins hold, so a token
+/// refresh in another process does not write over it.
+pub fn set_tool_provider_key(tool: &str, id: &str, key: Option<&str>) -> Result<(), String> {
+    let encrypt = config::Config::load_existing()
+        .map(|config| config.encrypt_secrets)
+        .unwrap_or(false);
+    let _lock = oauth::lock_auth_refresh()?;
+    let mut auth = config::AuthStore::load_or_create(encrypt).map_err(|e| e.to_string())?;
+    auth.set_tool_key(tool, id, key.map(str::to_string));
+    auth.save().map_err(|error| error.to_string())
+}
+
 /// A daemon secret (a chat bot's token) as it is saved: a `jcenc1:` envelope
 /// when config.json's `encrypt_secrets` is on and a secret key exists, else
 /// the plaintext (`docs/secrets.md`).
@@ -184,6 +215,34 @@ fn gateway_credentials(config: config::Config) -> Result<(String, String, u64), 
         tokens.access_token.clone(),
         tokens.access_expires_at,
     ))
+}
+
+/// The user's enabled MCP servers as an ACP agent takes them with each
+/// session (`mcpServers`): stdio ones with their command, http ones with
+/// their URL. Servers that sign in with OAuth stay out (their tokens are
+/// this engine's, refreshed here).
+pub fn acp_mcp_servers() -> Vec<serde_json::Value> {
+    let Ok(config) = config::Config::load_existing() else {
+        return Vec::new();
+    };
+    let pairs = |map: &std::collections::BTreeMap<String, String>| {
+        map.iter()
+            .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+            .collect::<Vec<_>>()
+    };
+    config
+        .mcp_servers
+        .iter()
+        .filter(|server| server.enabled && server.oauth.is_none())
+        .map(|server| match server.transport {
+            config::McpTransportKind::Stdio => serde_json::json!({
+                "name": server.name, "command": server.command, "args": server.args, "env": pairs(&server.env),
+            }),
+            config::McpTransportKind::Http => serde_json::json!({
+                "type": "http", "name": server.name, "url": server.url, "headers": pairs(&server.headers),
+            }),
+        })
+        .collect()
 }
 
 /// Saves an MCP server change to config.json: `mcp_set` (`server`, a config
@@ -230,6 +289,18 @@ pub fn change_mcp_config(op: &serde_json::Value) -> Result<(), String> {
         .map_err(|error| format!("failed to save config: {error}"))
 }
 
+/// Changes `~/.lynshen/config.json` in place under its lock: `edit` gets the
+/// parsed file (an empty object when there is none); every other key stays.
+/// For daemon settings kept there (`app_tools`, `sessions.messages`).
+pub fn edit_config(
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> Result<(), String>,
+) -> Result<(), String> {
+    let path = config::lynshen_dir()
+        .map_err(|error| error.to_string())?
+        .join("config.json");
+    config::edit_config_json(&path, edit)
+}
+
 /// The desktop's Android phone ops (see `android`): `android_use_status`
 /// (`doctor: true` runs au's own check), `android_use_install`,
 /// `android_use_setup`, `android_use_enable` (`enabled`). Each answers with
@@ -267,4 +338,20 @@ pub fn android_use_op(name: &str, op: &serde_json::Value) -> Result<serde_json::
 /// seconds).
 pub fn saved_sessions(cwd: &std::path::Path) -> std::io::Result<Vec<SessionSummary>> {
     session::SessionStore::list_for_cwd(&config::profile_dir()?, cwd)
+}
+
+/// Forks session `from`, saved for `from_cwd`, into a new session saved for
+/// `cwd` (another directory when the fork works in its own worktree) that
+/// holds its first `keep` user turns (all when None). Returns the new
+/// session's id; the original is not touched.
+pub fn fork_session(
+    from_cwd: &std::path::Path,
+    cwd: &std::path::Path,
+    from: &str,
+    keep: Option<usize>,
+) -> std::io::Result<String> {
+    let profile = config::profile_dir()?;
+    let mut fork = session::SessionStore::load_for_cwd(&profile, from_cwd, from)?.forked(keep);
+    fork.save_for_cwd(&profile, cwd)?;
+    Ok(fork.session_id().to_string())
 }

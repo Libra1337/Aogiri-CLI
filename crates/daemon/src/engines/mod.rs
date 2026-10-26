@@ -6,23 +6,27 @@
 //! clients that start watching mid-session.
 
 pub mod acp;
+pub mod acp_presets;
 pub mod claude;
 pub mod codex;
 pub mod opencode;
 
 use crate::hub::Hub;
+use crate::store::Store;
+use lynshen_agent_core::process_group::{self, ProcessGroup};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// How long a retired engine gets to exit on its own after its stdin closes.
@@ -65,8 +69,26 @@ pub struct Options {
     pub approval_mode: Option<String>,
     pub model: Option<String>,
     pub resume: Option<String>,
-    /// Claude: resume the conversation as it was at this message.
+    /// Claude: resume the conversation as it was at this message (a rewind,
+    /// or with `fork_from` the reply a fork goes on after).
     pub resume_at: Option<String>,
+    /// A new session that forks this conversation (the engine's id: a
+    /// LynShen session, a Claude Code conversation, a Codex thread) instead
+    /// of starting empty; it goes on apart from it, which stays as it is.
+    /// Only `session_create` reads it.
+    pub fork_from: Option<String>,
+    /// Codex / LynShen: how many of `fork_from`'s user turns the fork keeps
+    /// (None: all). Claude Code forks at `resume_at` instead.
+    pub fork_turns: Option<u64>,
+    /// LynShen: the directory `fork_from` was saved for, when the fork works
+    /// elsewhere (its own worktree). None: the fork's own `cwd`.
+    pub fork_cwd: Option<PathBuf>,
+    /// A run of `engine_probe`: nothing is saved and nothing waits on the
+    /// user (set by the daemon, never by a client).
+    pub probe: bool,
+    /// ACP: a built-in agent (`acp_presets`), by id; the daemon finds and
+    /// starts it. Excludes `command` and `args`.
+    pub agent: Option<String>,
     /// ACP: the agent's command line.
     pub command: Option<String>,
     pub args: Vec<String>,
@@ -78,6 +100,11 @@ pub struct Options {
     /// instead of the provider in their own config (which stays untouched).
     /// None: as the session last ran.
     pub gateway: Option<bool>,
+    /// Claude / Codex off the LynShen gateway: the custom provider
+    /// (`tool_providers`) the session runs on, by id; "" the tool's own
+    /// configuration; None the tool's selected one (a new session). A
+    /// session keeps the one it started on (see `pin_tool_provider`).
+    pub tool_provider: Option<String>,
     /// Claude: start with ultracode on (standing Workflow orchestration).
     pub ultracode: bool,
     /// Claude: the thinking effort to start with.
@@ -87,7 +114,7 @@ pub struct Options {
     /// Claude: show thinking summaries (Some(false) hides them).
     pub thinking: Option<bool>,
     /// Claude / Codex: directories besides `cwd` the engine may work in (the
-    /// project's extra directories; set by `spawn`, never by a client).
+    /// session's project's; set by the hub, never by a client).
     pub dirs: Vec<PathBuf>,
     /// ACP: a conversation of the agent's to copy into this new session
     /// (`session/fork`); the original stays as it is.
@@ -98,6 +125,13 @@ pub struct Options {
     /// ACP: the desktop's registry entry for the agent (`{id, name}`), kept
     /// with the session so a client can start it again.
     pub acp_agent: Option<Value>,
+    /// Claude: the config directory the session's Claude Code keeps its
+    /// state in, once found (`claude::config_with`, or its `initialize`
+    /// reply; set by the daemon, never by a client).
+    pub claude_config: Option<PathBuf>,
+    /// Claude / Codex: the app's tools the engine is offered (the ones the
+    /// user left on when it started; set by the daemon, never by a client).
+    pub app_tools: Vec<&'static str>,
 }
 
 impl Options {
@@ -114,6 +148,11 @@ impl Options {
             model: text("model"),
             resume: None,
             resume_at: text("resume_at"),
+            fork_from: text("fork_from"),
+            fork_turns: value["fork_turns"].as_u64(),
+            fork_cwd: text("fork_cwd").map(PathBuf::from),
+            probe: false,
+            agent: text("agent"),
             command: text("command"),
             bin: text("bin"),
             args: value["args"]
@@ -129,6 +168,9 @@ impl Options {
                 .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
                 .collect(),
             gateway: value["lynshen_gateway"].as_bool(),
+            tool_provider: value["tool_provider"]
+                .as_str()
+                .map(|id| id.trim().to_string()),
             ultracode: value["ultracode"] == true,
             effort: text("effort"),
             fast: value["fast"] == true,
@@ -138,13 +180,18 @@ impl Options {
             quiet: false,
             acp_agent: Some(value["acp_agent"].clone())
                 .filter(|agent| agent["id"].is_string() && agent["name"].is_string()),
+            claude_config: None,
+            app_tools: Vec::new(),
         }
     }
 
     /// Whether these options name a program or environment to run, which
     /// only the desktop may do.
     pub fn runs_programs(&self) -> bool {
-        self.command.is_some() || self.bin.is_some() || !self.env.is_empty()
+        self.command.is_some()
+            || self.bin.is_some()
+            || !self.args.is_empty()
+            || !self.env.is_empty()
     }
 
     /// Environment names an agent may be given: plain names, never ones that
@@ -185,6 +232,28 @@ impl Output {
     }
 }
 
+/// The engine called one of the app's tools (`app_tools`); `token` is how
+/// the adapter finds the request to answer.
+#[derive(Debug)]
+pub struct HostCall {
+    pub token: Value,
+    pub name: String,
+    pub args: Value,
+}
+
+/// The app tools an engine of `kind` starting now is offered: none for an
+/// ACP agent.
+fn app_tools_for(kind: Kind) -> Vec<&'static str> {
+    match kind {
+        Kind::Acp => Vec::new(),
+        Kind::Claude | Kind::Codex => crate::app_tools::enabled(&crate::app_tools::config()),
+    }
+}
+
+/// A session tool's result on its way back from its thread: (which engine
+/// process asked, token, result).
+type Answer = (u64, Value, Result<Value, String>);
+
 pub trait Adapter: Send {
     /// Frames to send once the engine started.
     fn start(&mut self) -> Vec<String>;
@@ -207,8 +276,24 @@ pub trait Adapter: Send {
     fn approval_mode(&self) -> Option<String> {
         None
     }
+    /// The model it runs now (a switch mid-session included).
+    fn model(&self) -> Option<String> {
+        None
+    }
     /// A mode switch reaches the running turn (else it applies to the next).
     fn mode_applies_live(&self) -> bool {
+        true
+    }
+    /// The app-tool calls the engine made since last asked.
+    fn take_calls(&mut self) -> Vec<HostCall> {
+        Vec::new()
+    }
+    /// Frames answering a `HostCall` with the tool's result.
+    fn answer(&mut self, _token: &Value, _result: Result<Value, String>) -> Vec<String> {
+        Vec::new()
+    }
+    /// It can move to the LynShen gateway (`set_gateway`).
+    fn has_gateway(&self) -> bool {
         true
     }
 }
@@ -217,7 +302,9 @@ fn adapter(kind: Kind, cwd: &Path, options: &Options) -> Box<dyn Adapter> {
     match kind {
         Kind::Claude => Box::new(claude::Claude::new(options).at(cwd)),
         Kind::Codex => Box::new(codex::Codex::new(cwd, options)),
-        Kind::Acp => Box::new(acp::Acp::new(cwd, options)),
+        Kind::Acp => {
+            Box::new(acp::Acp::new(cwd, options).with_mcp(lynshen_agent_core::acp_mcp_servers()))
+        }
     }
 }
 
@@ -231,20 +318,30 @@ struct Start {
 }
 
 /// How the engine starts in `cwd`.
-fn command(kind: Kind, id: &str, options: &Options, cwd: &Path) -> Result<Start, String> {
+fn command(
+    store: &Store,
+    kind: Kind,
+    id: &str,
+    options: &Options,
+    cwd: &Path,
+) -> Result<Start, String> {
     let command = match kind {
         Kind::Claude => claude::command(id, options),
         Kind::Codex => codex::command(options),
-        Kind::Acp => acp::command(options),
+        Kind::Acp => acp::command(options)?,
     };
-    with_gateway(kind, id, options, cwd, command)
+    with_gateway(store, kind, id, options, cwd, command)
 }
 
-/// The engine's own TUI resuming conversation `id` (Claude Code, Codex),
-/// configured as its GUI process is: environment and gateway.
+/// The engine's own TUI resuming conversation `id` (Claude Code, Codex, a
+/// built-in ACP agent, OpenCode), configured as its GUI process is:
+/// environment and gateway, with a gateway key for `session`.
+#[allow(clippy::too_many_arguments)]
 fn tui_command(
+    store: &Store,
     kind: Kind,
     id: &str,
+    session: &str,
     options: &Options,
     cwd: &Path,
     saved: bool,
@@ -252,15 +349,17 @@ fn tui_command(
     let command = match kind {
         Kind::Claude => claude::tui(id, options, saved),
         Kind::Codex => codex::tui(saved.then_some(id), options),
-        Kind::Acp => return Err("an ACP agent has no TUI here".to_string()),
+        Kind::Acp => acp::tui(options, id)?,
     };
-    with_gateway(kind, id, options, cwd, command)
+    with_gateway(store, kind, session, options, cwd, command)
 }
 
-/// `command` with the session's environment, and on the LynShen gateway when
-/// it runs there: with the local gateway key it holds. OpenCode also gets
-/// the agent its approval modes run on (see `opencode`).
+/// `command` with the session's environment, and on the LynShen gateway or
+/// a custom provider when it runs there: with the local gateway key it
+/// holds. OpenCode also gets the agent its approval modes run on (see
+/// `opencode`).
 fn with_gateway(
+    store: &Store,
     kind: Kind,
     id: &str,
     options: &Options,
@@ -268,7 +367,47 @@ fn with_gateway(
     mut command: Command,
 ) -> Result<Start, String> {
     command.envs(options.env.iter().map(|(name, value)| (name, value)));
-    let opencode = kind == Kind::Acp && opencode::is_opencode(options);
+    let preset = match kind {
+        Kind::Acp => acp::preset(options)?,
+        _ => None,
+    };
+    let opencode = kind == Kind::Acp
+        && (opencode::is_opencode(options) || preset.is_some_and(|p| p.id == "opencode"));
+    // A custom provider: through the local gateway, which sends its requests
+    // to the provider with its key and nothing of LynShen's (no login needed).
+    if let Some(provider) = custom_provider(store, kind, options)? {
+        let tool = kind.name();
+        let provider_id = provider["id"].as_str().unwrap_or_default().to_string();
+        let secret = crate::tool_providers::key(tool, &provider_id).ok_or_else(|| {
+            format!(
+                "自定义服务商「{}」没有保存 API key，请在设置里重新填写。",
+                provider["name"].as_str().unwrap_or(&provider_id)
+            )
+        })?;
+        let base = crate::gateway::base_url()?;
+        let key = crate::gateway::issue(id)?;
+        let mut route = provider.clone();
+        route["tool"] = json!(tool);
+        route["key"] = json!(secret);
+        crate::gateway::set_custom(&key, route);
+        let configured = match kind {
+            Kind::Claude => {
+                claude::use_gateway(&mut command, id, &base, &key, provider["model"].as_str())
+            }
+            _ => codex::use_gateway(&mut command, &base, &key, provider["name"].as_str()),
+        };
+        return match configured {
+            Ok(()) => Ok(Start {
+                command,
+                key: Some(key),
+                notices: Vec::new(),
+            }),
+            Err(error) => {
+                release_key(kind, &key);
+                Err(error)
+            }
+        };
+    }
     if options.gateway != Some(true) {
         let notices = if opencode {
             opencode::configure(&mut command, options, cwd, None)?
@@ -281,17 +420,33 @@ fn with_gateway(
             notices,
         });
     }
-    if kind == Kind::Acp && !opencode {
-        return Err("of the ACP agents only OpenCode has a LynShen gateway mode".to_string());
+    if kind == Kind::Acp && !opencode && !preset.is_some_and(|p| p.gateway) {
+        return Err("this ACP agent has no LynShen gateway mode".to_string());
     }
     // Not signed in fails the start, not the first request.
     lynshen_agent_core::lynshen_gateway_credentials()?;
     let base = crate::gateway::base_url()?;
     let key = crate::gateway::issue(id)?;
     let configured = match kind {
-        Kind::Claude => claude::use_gateway(&mut command, id, &base, &key).map(|()| Vec::new()),
-        Kind::Codex => codex::use_gateway(&mut command, &base, &key).map(|()| Vec::new()),
-        Kind::Acp => opencode::configure(&mut command, options, cwd, Some((&base, &key))),
+        Kind::Claude => {
+            claude::use_gateway(&mut command, id, &base, &key, None).map(|()| Vec::new())
+        }
+        Kind::Codex => codex::use_gateway(&mut command, &base, &key, None).map(|()| Vec::new()),
+        Kind::Acp if opencode => {
+            opencode::configure(&mut command, options, cwd, Some((&base, &key)))
+        }
+        Kind::Acp => match preset {
+            Some(preset) => acp_presets::use_gateway(
+                &mut command,
+                preset,
+                cwd,
+                &base,
+                &key,
+                options.model.as_deref(),
+            )
+            .map(|()| Vec::new()),
+            None => Err("this ACP agent has no LynShen gateway mode".to_string()),
+        },
     };
     match configured {
         Ok(notices) => Ok(Start {
@@ -304,6 +459,62 @@ fn with_gateway(
             Err(error)
         }
     }
+}
+
+/// Settles which custom provider a Claude Code / Codex session off the
+/// gateway runs on, so it keeps that one when it reopens or restarts: one
+/// upstream rejects another's conversation state (Claude's thinking
+/// signatures). None (a new session, or one leaving the gateway) takes the
+/// tool's selected provider ("" when none is).
+pub fn pin_tool_provider(store: &Store, kind: Kind, options: &mut Options) {
+    if matches!(kind, Kind::Claude | Kind::Codex)
+        && options.gateway != Some(true)
+        && options.tool_provider.is_none()
+    {
+        let selected = crate::tool_providers::selected(store, kind.name());
+        options.tool_provider = Some(
+            selected
+                .and_then(|p| p["id"].as_str().map(str::to_string))
+                .unwrap_or_default(),
+        );
+    }
+}
+
+/// The custom provider a session runs on (None: the LynShen gateway or the
+/// tool's own configuration), without its key. One that was removed fails
+/// the start rather than moving the conversation somewhere else.
+pub fn custom_provider(
+    store: &Store,
+    kind: Kind,
+    options: &Options,
+) -> Result<Option<Value>, String> {
+    if !matches!(kind, Kind::Claude | Kind::Codex) || options.gateway == Some(true) {
+        return Ok(None);
+    }
+    match options.tool_provider.as_deref() {
+        None | Some("") => Ok(None),
+        Some(id) => crate::tool_providers::find(store, kind.name(), id)
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "这个会话使用的自定义服务商「{id}」已被删除，无法继续。请把会话切换到 LynShen 网关或 {} 自己的配置后再打开。",
+                    match kind {
+                        Kind::Claude => "Claude Code",
+                        _ => "Codex",
+                    }
+                )
+            }),
+    }
+}
+
+/// The `tool_provider` state event: the custom provider the session runs
+/// on (id, name, model, models; never its key or URL), or null.
+fn tool_provider_event(store: &Store, kind: Kind, options: &Options) -> Value {
+    let provider = custom_provider(store, kind, options)
+        .ok()
+        .flatten()
+        .map(|p| crate::tool_providers::view(&p));
+    json!({ "type": "tool_provider", "provider": provider })
 }
 
 /// Notices as `info` events.
@@ -330,6 +541,182 @@ pub(crate) fn plan_window(
     })
 }
 
+/// The events a probe keeps (the last of each kind): what a client shows of
+/// an engine before any conversation of it.
+const PROBE_KEEPS: &[&str] = &[
+    "model_status",
+    "model_view",
+    "engine_caps",
+    "command_list",
+    "session_options",
+];
+/// A probe gives up after this long, and waits this long for the rest once
+/// the engine has said something (and again once its models were asked for).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(25);
+const PROBE_SETTLE: Duration = Duration::from_secs(4);
+/// A probe's answer is reused for this long (`force` asks again): models
+/// and commands change with a release or a setting, not from one minute to
+/// the next, and each probe starts a process.
+const PROBE_FRESH: Duration = Duration::from_secs(10 * 60);
+
+/// One probe answer per engine setup (`probe_key`): when it was made and
+/// the events. Its own lock also makes a second probe of the same setup
+/// wait for the first and take its answer.
+type ProbeSlot = Arc<std::sync::Mutex<Option<(Instant, u64, Vec<Value>)>>>;
+static PROBES: std::sync::Mutex<Option<HashMap<String, ProbeSlot>>> = std::sync::Mutex::new(None);
+
+/// What makes two probes the same: the engine, where it runs and what runs.
+fn probe_key(kind: Kind, cwd: &Path, options: &Options) -> String {
+    json!([
+        kind.name(),
+        cwd,
+        options.bin,
+        options.env,
+        options.gateway,
+        options.tool_provider,
+        options.agent,
+        options.command,
+        options.args,
+        options.model,
+    ])
+    .to_string()
+}
+
+/// `probe`, answered from the cache while it is fresh (`force`: run it
+/// anyway): the events, when they were found (ms) and whether they came
+/// from the cache.
+pub fn probe_cached(
+    store: &Store,
+    kind: Kind,
+    cwd: &Path,
+    options: &Options,
+    force: bool,
+) -> Result<(Vec<Value>, u64, bool), String> {
+    // On the provider a new session would start on.
+    let mut options = options.clone();
+    pin_tool_provider(store, kind, &mut options);
+    let options = &options;
+    let slot = {
+        let mut probes = PROBES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(
+            probes
+                .get_or_insert_with(HashMap::new)
+                .entry(probe_key(kind, cwd, options))
+                .or_default(),
+        )
+    };
+    let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((at, ms, events)) = slot.as_ref() {
+        if !force && at.elapsed() < PROBE_FRESH {
+            return Ok((events.clone(), *ms, true));
+        }
+    }
+    let events = probe(store, kind, cwd, options)?;
+    let ms = now_ms();
+    *slot = Some((Instant::now(), ms, events.clone()));
+    Ok((events, ms, false))
+}
+
+/// What an engine says of itself before any conversation: started in `cwd`
+/// as a session of it would be, but out of every list and saving nothing
+/// (Claude Code `--no-session-persistence`, a Codex `ephemeral` thread),
+/// asked for its models, then stopped. Returns the last event of each
+/// PROBE_KEEPS kind it sent.
+pub fn probe(
+    store: &Store,
+    kind: Kind,
+    cwd: &Path,
+    options: &Options,
+) -> Result<Vec<Value>, String> {
+    let options = Options {
+        probe: true,
+        resume: None,
+        resume_at: None,
+        fork: None,
+        fork_from: None,
+        fork_turns: None,
+        fork_cwd: None,
+        app_tools: Vec::new(),
+        ..options.clone()
+    };
+    let id = new_uuid()?;
+    let Start { command, key, .. } = command(store, kind, &id, &options, cwd)?;
+    let release = |key: &Option<String>| {
+        if let Some(key) = key {
+            release_key(kind, key);
+        }
+    };
+    let process = match Process::spawn(command, cwd) {
+        Ok(process) => process,
+        Err(error) => {
+            release(&key);
+            return Err(error);
+        }
+    };
+    let mut engine = adapter(kind, cwd, &options);
+    process.write(engine.start());
+    let mut kept: HashMap<String, Value> = HashMap::new();
+    let keep = |events: Vec<Value>, kept: &mut HashMap<String, Value>| {
+        for event in events {
+            if let Some(kind) = event["type"].as_str().filter(|t| PROBE_KEEPS.contains(t)) {
+                kept.insert(kind.to_string(), event);
+            }
+        }
+    };
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let mut settle: Option<Instant> = None;
+    let mut asked = false;
+    let mut said = None;
+    loop {
+        let until = settle.map_or(deadline, |at| at.min(deadline));
+        let Some(wait) = until.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match process.lines.recv_timeout(wait) {
+            Ok(Ok(line)) => {
+                if let Line::Stderr(text) = &line {
+                    said = Some(text.clone()).filter(|text| !text.trim().is_empty());
+                }
+                let out = engine.translate(line);
+                process.write(out.frames);
+                keep(out.events, &mut kept);
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+        // Talking: it has a little longer to say the rest. Its conversation
+        // open (it said which model it is on): its models, asked for.
+        if settle.is_none() && !kept.is_empty() {
+            settle = Some(Instant::now() + PROBE_SETTLE);
+        }
+        if !asked && kept.contains_key("model_status") {
+            asked = true;
+            settle = Some(Instant::now() + PROBE_SETTLE);
+            if let Ok(out) = engine.encode(&json!({ "op": "command", "input": "/model" })) {
+                process.write(out.frames);
+                keep(out.events, &mut kept);
+            }
+        }
+        if kept.contains_key("model_view") && kept.contains_key("command_list") {
+            break;
+        }
+    }
+    process.kill();
+    release(&key);
+    if kept.is_empty() {
+        return Err(match said {
+            Some(line) => format!("{} said nothing about itself: {line}", kind.name()),
+            None => format!("{} said nothing about itself", kind.name()),
+        });
+    }
+    // In a steady order, as a session sends them.
+    Ok(PROBE_KEEPS
+        .iter()
+        .filter_map(|name| kept.remove(*name))
+        .collect())
+}
+
 /// A local gateway key is done with: no request may use it again.
 fn release_key(kind: Kind, key: &str) {
     crate::gateway::revoke(key);
@@ -341,6 +728,9 @@ fn release_key(kind: Kind, key: &str) {
 /// A running engine process: its stdin writer and merged output.
 struct Process {
     child: Child,
+    /// The engine and what it starts (MCP servers, shells): they end with
+    /// it, and with the daemon. None where the system refused one.
+    group: Option<ProcessGroup>,
     stdin: Option<Sender<String>>,
     lines: Receiver<Result<Line, String>>,
 }
@@ -353,9 +743,11 @@ impl Process {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        process_group::prepare(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| format!("cannot start {program}: {error}"))?;
+        let group = ProcessGroup::adopt(&child);
         let (lines_tx, lines) = mpsc::channel();
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let stderr = child.stderr.take().ok_or("no stderr")?;
@@ -392,6 +784,7 @@ impl Process {
         });
         Ok(Self {
             child,
+            group,
             stdin: Some(stdin),
             lines,
         })
@@ -406,17 +799,19 @@ impl Process {
     }
 
     /// Closes stdin and kills the process if it has not exited after a grace
-    /// period. Returns how it ended.
+    /// period; what it started goes with it (`end_group`).
     fn stop(mut self) {
         self.stdin = None;
         thread::spawn(move || {
             let deadline = std::time::Instant::now() + EXIT_GRACE;
             while std::time::Instant::now() < deadline {
                 if matches!(self.child.try_wait(), Ok(Some(_))) {
+                    self.end_group(false);
                     return;
                 }
                 thread::sleep(Duration::from_millis(50));
             }
+            self.end_group(true);
             let _ = self.child.kill();
             let _ = self.child.wait();
         });
@@ -424,8 +819,17 @@ impl Process {
 
     /// Ends the engine now, without the grace `stop` gives it.
     fn kill(mut self) {
+        self.end_group(true);
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    /// Ends what the engine started and left running (MCP servers,
+    /// shells). `now`: at once, else asking them to stop.
+    fn end_group(&self, now: bool) {
+        if let Some(group) = &self.group {
+            group.end(now);
+        }
     }
 
     fn exit_reason(&mut self) -> String {
@@ -437,6 +841,35 @@ impl Process {
             Err(error) => error.to_string(),
         }
     }
+}
+
+/// How an engine closed as idle opens again: as it runs now (model and
+/// approval mode switched mid-session, the settings `keep` carries), on its
+/// conversation as a whole. The per-open fields stay behind: a rewind point
+/// carried over would silently cut the conversation back, and the project's
+/// folders and the conversation to resume are found again at the open.
+fn asleep_options(adapter: &dyn Adapter, current: &Options) -> Options {
+    Options {
+        model: adapter.model().or(current.model.clone()),
+        approval_mode: adapter.approval_mode().or(current.approval_mode.clone()),
+        resume: None,
+        resume_at: None,
+        dirs: Vec::new(),
+        fork: None,
+        fork_from: None,
+        fork_turns: None,
+        fork_cwd: None,
+        quiet: false,
+        ..adapter.keep(current.clone())
+    }
+}
+
+/// Whether a subagent or workflow in this state is working or about to.
+fn running(state: &str) -> bool {
+    matches!(
+        state,
+        "running" | "pending" | "queued" | "start" | "started" | "async_launched" | "in_progress"
+    )
 }
 
 /// The state a client needs when it starts watching.
@@ -463,7 +896,40 @@ const STATE_EVENTS: &[&str] = &[
     "plan",
     "rate_limit",
     "plan_usage",
+    // Messages waiting for the turn: a client that attaches (another device,
+    // a desktop back from elsewhere) shows them too.
+    "pending_messages",
+    "tool_provider",
+    "engine_caps",
+    "session_options",
 ];
+
+/// The non-image files a `user_message` op attaches (`files`, absolute
+/// paths). The model is told where each is (`attachments`) and opens it
+/// with its own tools.
+pub(crate) fn op_files(op: &Value) -> Vec<String> {
+    op["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+/// `files` on a user message event or item, when there are any.
+pub(crate) fn set_files(value: &mut Value, files: &[String]) {
+    if !files.is_empty() {
+        value["files"] = json!(files);
+    }
+}
+
+/// Now, ms since the epoch: when a snapshot item happened.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
 
 impl Snapshot {
     pub fn seed(&mut self, transcript: Vec<Value>) {
@@ -483,22 +949,26 @@ impl Snapshot {
             }
             "user_message" => {
                 self.in_reply = false;
-                let mut item = json!({ "role": "user", "content": event["content"] });
+                let mut item =
+                    json!({ "role": "user", "content": event["content"], "at": now_ms() });
                 if event["images"].is_array() {
                     item["images"] = event["images"].clone();
+                }
+                if event["files"].is_array() {
+                    item["files"] = event["files"].clone();
                 }
                 self.transcript.push(item);
             }
             "assistant_start" => {
                 self.in_reply = true;
                 self.transcript
-                    .push(json!({ "role": "assistant", "content": "" }));
+                    .push(json!({ "role": "assistant", "content": "", "at": now_ms() }));
             }
             "assistant_delta" => {
                 if !self.in_reply {
                     self.in_reply = true;
                     self.transcript
-                        .push(json!({ "role": "assistant", "content": "" }));
+                        .push(json!({ "role": "assistant", "content": "", "at": now_ms() }));
                 }
                 // Appended in place: rebuilding the reply on every delta
                 // copies it once per token.
@@ -513,7 +983,7 @@ impl Snapshot {
             "tool_start" => {
                 self.in_reply = false;
                 self.transcript.push(json!({
-                    "role": "tool", "name": event["name"], "output": "", "call_id": event["call_id"],
+                    "role": "tool", "name": event["name"], "output": "", "call_id": event["call_id"], "at": now_ms(),
                 }));
             }
             "tool_output" => {
@@ -524,6 +994,9 @@ impl Snapshot {
                     .find(|item| item["call_id"] == event["call_id"])
                 {
                     item["output"] = event["output"].clone();
+                    if event["is_error"] == true {
+                        item["is_error"] = json!(true);
+                    }
                 }
             }
             // A finished turn's figures, as a reopened transcript has them.
@@ -548,6 +1021,49 @@ impl Snapshot {
             }
             _ => {}
         }
+    }
+
+    /// Work outside a turn keeps the engine open (`Hub::set_held`):
+    /// background work, approvals waiting.
+    fn holds(&self, kind: Kind) -> bool {
+        self.background(kind).0 || !self.approvals.is_empty()
+    }
+
+    /// Background work the turn left going (`Hub::set_background`): any
+    /// (background commands, agents, workflows), and whether some of it will
+    /// come back to the conversation (agents, workflows; a dev server never
+    /// does). Claude Code's run list is rebuilt from its transcript (a run
+    /// that never ended stays "running" there); its live background work is
+    /// in `background_tasks`, so only other engines' runs count.
+    fn background(&self, kind: Kind) -> (bool, bool) {
+        let list = self
+            .state
+            .get("background_tasks")
+            .and_then(|event| event["tasks"].as_array());
+        let tasks = list.is_some_and(|tasks| !tasks.is_empty());
+        let agents = list.into_iter().flatten().any(|task| {
+            let kind = task["kind"].as_str().unwrap_or_default();
+            kind.starts_with("local_agent") || kind.starts_with("local_workflow")
+        });
+        let runs = kind != Kind::Claude
+            && self.state.get("agent_runs").is_some_and(|event| {
+                let workflows = event["workflows"].as_array().into_iter().flatten();
+                let nested = workflows
+                    .clone()
+                    .flat_map(|workflow| workflow["agents"].as_array().into_iter().flatten());
+                event["agents"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(workflows)
+                    .chain(nested)
+                    .any(|run| {
+                        // Runs say `status`; a workflow's agents say `state`.
+                        let state = run["status"].as_str().or(run["state"].as_str());
+                        running(state.unwrap_or_default())
+                    })
+            });
+        (tasks || runs, agents || runs)
     }
 
     fn answered(&mut self, call: &str) {
@@ -610,20 +1126,34 @@ pub fn spawn(
         .as_deref()
         .or(options.resume.as_deref())
         .is_some_and(|session| crate::requirements::gated(&hub, session));
+    // On a custom provider with no model named: its default one.
+    let model = options.model.clone().or_else(|| {
+        custom_provider(&hub.store, kind, &options)
+            .ok()
+            .flatten()
+            .and_then(|provider| provider["model"].as_str().map(str::to_string))
+    });
     let options = Options {
-        dirs: crate::projects::extra_dirs(&hub, &cwd),
         approval_mode: if gated {
             Some("read-only".to_string())
         } else {
             options.approval_mode
         },
+        app_tools: app_tools_for(kind),
+        model,
         ..options
     };
     let Start {
         command,
         key: gateway_key,
         notices: started,
-    } = command(kind, id.as_deref().unwrap_or_default(), &options, &cwd)?;
+    } = command(
+        &hub.store,
+        kind,
+        id.as_deref().unwrap_or_default(),
+        &options,
+        &cwd,
+    )?;
     let process = match Process::spawn(command, &cwd) {
         Ok(process) => process,
         Err(error) => {
@@ -638,7 +1168,6 @@ pub fn spawn(
     let generation = hub.next_generation();
     // An ACP agent reopening its conversation keeps it under the same id.
     let conversation = options.resume.clone().filter(|_| kind == Kind::Acp);
-    let opencode = kind == Kind::Acp && opencode::is_opencode(&options);
     thread::spawn(move || {
         let mut session = Session {
             hub: &hub,
@@ -655,7 +1184,11 @@ pub fn spawn(
             gateway_key,
             tui_request: None,
             conversation,
-            opencode,
+            app_approvals: HashMap::new(),
+            app_approval_seq: 0,
+            app_stops: Vec::new(),
+            process_seq: 0,
+            app_answers: None,
         };
         session.snapshot.seed(transcript);
         // A resumed conversation is ready once the engine has opened it.
@@ -711,8 +1244,17 @@ struct Session<'a> {
     tui_request: Option<Value>,
     /// ACP: the agent's own session id, as recorded for the session.
     conversation: Option<String>,
-    /// The ACP agent is OpenCode (approval modes, LynShen gateway).
-    opencode: bool,
+    /// Session-tool calls waiting for the user's approval, by the call id
+    /// of the `approval_request` shown for them.
+    app_approvals: HashMap<String, HostCall>,
+    app_approval_seq: u64,
+    /// Turns true for the session-tool calls running now when the turn is
+    /// interrupted or the engine stops (`send_to_session` may wait).
+    app_stops: Vec<Arc<AtomicBool>>,
+    /// Counts engine processes: an answer for an earlier one is dropped.
+    process_seq: u64,
+    /// Where session tools' threads send their answers (set by `run`).
+    app_answers: Option<Sender<Answer>>,
 }
 
 impl Drop for Session<'_> {
@@ -720,6 +1262,7 @@ impl Drop for Session<'_> {
         if let Some(key) = self.gateway_key.take() {
             release_key(self.kind, &key);
         }
+        self.stop_app_calls();
     }
 }
 
@@ -751,13 +1294,40 @@ impl Session<'_> {
     fn run(&mut self, mut process: Process, options: Options, ops: Receiver<Value>) {
         let mut adapter = adapter(self.kind, &self.cwd, &options);
         process.write(adapter.start());
-        // What the process runs as now (a restart changes it).
+        // A new process runs no background task yet (the last one's went with
+        // it); Claude Code reports none at startup. Nothing waits for it.
+        self.publish(vec![
+            json!({ "type": "background_tasks", "tasks": [] }),
+            json!({ "type": "pending_messages", "messages": [] }),
+            tool_provider_event(&self.hub.store, self.kind, &options),
+        ]);
+        // What the process runs as now (a restart changes it). A fork's
+        // fields stay until it is saved: the engine only forks while it has
+        // no conversation of its own (`claude::command`, `Codex::new`).
         let mut current = options.clone();
+        // Session tools answer from their own threads (they may wait).
+        let (answers_tx, answers) = mpsc::channel::<Answer>();
+        self.app_answers = Some(answers_tx);
         loop {
+            while let Ok((seq, token, result)) = answers.try_recv() {
+                if seq == self.process_seq {
+                    process.write(adapter.answer(&token, result));
+                }
+            }
             loop {
                 match ops.try_recv() {
                     Ok(op) => {
                         if self.apply(&mut process, adapter.as_mut(), &op) {
+                            // Closed as idle: the next open starts it as it
+                            // runs now (model, effort, mode).
+                            if op["keep"] == true {
+                                if let Some(id) = &self.id {
+                                    self.hub.keep_options(
+                                        id,
+                                        asleep_options(adapter.as_ref(), &current),
+                                    );
+                                }
+                            }
                             process.stop();
                             return;
                         }
@@ -793,6 +1363,7 @@ impl Session<'_> {
                         }
                         let output = adapter.translate(line);
                         process.write(output.frames);
+                        self.host_calls(&process, adapter.as_mut(), &current);
                         if self.id.is_none() {
                             if let Some(id) = adapter.conversation() {
                                 self.named(id);
@@ -803,10 +1374,19 @@ impl Session<'_> {
                         }
                         let events =
                             self.allow_while_opening(&mut process, adapter.as_mut(), output.events);
+                        // The conversation cannot open (a fork that cannot
+                        // be made): the start fails now, with that error.
+                        let failed = self.id.is_none() && events.iter().any(|e| e["fatal"] == true);
                         self.publish(events);
+                        if failed {
+                            process.stop();
+                            return;
+                        }
                     }
                     Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {
                         let reason = process.exit_reason();
+                        // What it started does not outlive it.
+                        process.end_group(false);
                         let message = self
                             .stopped_message(&format!("{} stopped ({reason})", self.kind.name()));
                         self.publish(vec![json!({ "type": "error", "message": message })]);
@@ -818,6 +1398,13 @@ impl Session<'_> {
             let busy = adapter.busy();
             if let Some(id) = &self.id {
                 self.hub.set_busy(id, busy);
+                // A switch or a TUI waiting for the turn to end is work too.
+                let held = self.snapshot.holds(self.kind)
+                    || self.restart.is_some()
+                    || self.tui_request.is_some();
+                self.hub.set_held(id, held);
+                let (any, awaited) = self.snapshot.background(self.kind);
+                self.hub.set_background(id, any, awaited);
             }
             if !busy && self.pending_mode.take().is_some() {
                 self.publish(vec![
@@ -827,17 +1414,48 @@ impl Session<'_> {
             if !busy {
                 if let Some(mut next) = self.restart.take() {
                     next.resume = adapter.conversation().or(next.resume);
+                    // A fork restarted before its first turn saved it (a
+                    // mode switch): it is forked again, not started empty.
+                    if next.resume.is_none() && options.fork_from.is_some() {
+                        next.fork_from = options.fork_from.clone();
+                        next.fork_turns = options.fork_turns;
+                        next.resume_at = options.resume_at.clone();
+                    }
                     // What the process runs as stays: its binary, environment
                     // and gateway.
                     next.bin = options.bin.clone();
                     next.env = options.env.clone();
-                    next.gateway = next.gateway.or(options.gateway);
+                    next.claude_config = next.claude_config.or(options.claude_config.clone());
+                    next.gateway = next.gateway.or(current.gateway);
+                    // On the provider it ran on; off the gateway for the
+                    // first time: the tool's selected one, kept from now on.
+                    next.tool_provider = next.tool_provider.or(current.tool_provider.clone());
+                    if next.gateway == Some(true) {
+                        next.tool_provider = None;
+                    }
+                    pin_tool_provider(&self.hub.store, self.kind, &mut next);
+                    if let (Some(id), Some(provider)) = (&self.id, &next.tool_provider) {
+                        let _ = self
+                            .hub
+                            .store
+                            .record_session_meta(id, &json!({ "tool_provider": provider }));
+                    }
                     next.approval_mode = next.approval_mode.or(options.approval_mode.clone());
-                    next.dirs = crate::projects::extra_dirs(self.hub, &self.cwd);
-                    // An ACP agent: the same command, reopened without a replay.
+                    next.dirs = crate::projects::extra_dirs(
+                        self.hub,
+                        &self.cwd,
+                        &crate::projects::of_session(
+                            self.hub,
+                            self.id.as_deref().unwrap_or_default(),
+                        ),
+                    );
+                    // An ACP agent: the same one, reopened without a replay.
+                    next.agent = options.agent.clone();
                     next.command = options.command.clone();
                     next.args = options.args.clone();
                     next.quiet = true;
+                    next.app_tools = app_tools_for(self.kind);
+                    self.new_process();
                     current = next.clone();
                     process.stop();
                     let id = self.id.clone().unwrap_or_default();
@@ -845,16 +1463,24 @@ impl Session<'_> {
                         release_key(self.kind, &key);
                     }
                     let mut said = Vec::new();
-                    match command(self.kind, &id, &next, &self.cwd).and_then(|start| {
-                        self.gateway_key = start.key;
-                        said = start.notices;
-                        Process::spawn(start.command, &self.cwd)
-                    }) {
+                    match command(&self.hub.store, self.kind, &id, &next, &self.cwd).and_then(
+                        |start| {
+                            self.gateway_key = start.key;
+                            said = start.notices;
+                            Process::spawn(start.command, &self.cwd)
+                        },
+                    ) {
                         Ok(started) => {
                             process = started;
                             adapter = self::adapter(self.kind, &self.cwd, &next);
                             process.write(adapter.start());
-                            self.publish(notices(said));
+                            // The new process runs nothing yet and nothing
+                            // waits for it.
+                            let mut events = notices(said);
+                            events.push(json!({ "type": "background_tasks", "tasks": [] }));
+                            events.push(json!({ "type": "pending_messages", "messages": [] }));
+                            events.push(tool_provider_event(&self.hub.store, self.kind, &next));
+                            self.publish(events);
                         }
                         Err(error) => {
                             self.publish(vec![json!({ "type": "error", "message": error })]);
@@ -873,12 +1499,17 @@ impl Session<'_> {
                         // The TUI resumes the conversation file at once: no
                         // grace period in which a cut-off turn still writes it.
                         process.kill();
-                        // Its background tasks went with the process.
-                        let mut ended = vec![json!({ "type": "background_tasks", "tasks": [] })];
+                        // Its background tasks and the messages waiting
+                        // for it went with the process.
+                        let mut ended = vec![
+                            json!({ "type": "background_tasks", "tasks": [] }),
+                            json!({ "type": "pending_messages", "messages": [] }),
+                        ];
                         if busy {
                             ended.push(json!({ "type": "status", "message": "interrupted" }));
                         }
                         self.publish(ended);
+                        self.new_process();
                         match self.terminal(tui, keep, &request, &ops) {
                             Some((started, next, options)) => {
                                 process = started;
@@ -893,15 +1524,30 @@ impl Session<'_> {
         }
     }
 
-    /// Whether the engine has saved conversation `id` (only then can its
-    /// TUI resume it).
-    fn saved(&self, id: &str) -> bool {
+    /// Whether the engine run with `options` has saved conversation `id`
+    /// (only then can its TUI resume it).
+    fn saved(&self, id: &str, options: &Options) -> bool {
         match self.kind {
-            Kind::Claude => !claude::transcript(&self.cwd, id).is_empty(),
+            Kind::Claude => !claude::transcript(
+                &claude::config_with(options, &self.cwd, id),
+                &self.cwd,
+                id,
+                self.hub.uploads.dir(),
+            )
+            .is_empty(),
             Kind::Codex => codex::saved(&self.cwd)
                 .iter()
                 .any(|(saved, ..)| saved == id),
             Kind::Acp => true,
+        }
+    }
+
+    /// The id a gateway key is issued for: the conversation's, except that
+    /// an ACP agent's is not the session's.
+    fn key_owner(&self, conversation: &str) -> String {
+        match (self.kind, &self.id) {
+            (Kind::Acp, Some(session)) => session.clone(),
+            _ => conversation.to_string(),
         }
     }
 
@@ -924,11 +1570,34 @@ impl Session<'_> {
         options: &Options,
         request: &Value,
     ) -> Option<(String, Command, Option<String>)> {
-        let Some(id) = adapter.conversation().or(self.id.clone()) else {
+        // An ACP agent's conversation is its own, never the session id.
+        let conversation = match self.kind {
+            Kind::Acp => adapter.conversation(),
+            _ => adapter.conversation().or(self.id.clone()),
+        };
+        let Some(id) = conversation else {
             self.refuse(request, "the conversation has not started yet".to_string());
             return None;
         };
-        match tui_command(self.kind, &id, options, &self.cwd, self.saved(&id)) {
+        // Claude Code writes a fork with its first turn; its TUI would start
+        // the conversation empty.
+        if self.kind == Kind::Claude && options.fork_from.is_some() && !self.saved(&id, options) {
+            self.refuse(
+                request,
+                "send the fork its first message before opening it in its terminal".to_string(),
+            );
+            return None;
+        }
+        let session = self.key_owner(&id);
+        match tui_command(
+            &self.hub.store,
+            self.kind,
+            &id,
+            &session,
+            options,
+            &self.cwd,
+            self.saved(&id, options),
+        ) {
             Ok(start) => Some((id, start.command, start.key)),
             Err(error) => {
                 self.refuse(request, error);
@@ -978,6 +1647,8 @@ impl Session<'_> {
         match opened {
             Ok(term) => {
                 self.hub.set_busy(&session, false);
+                // The conversation is in the TUI until it exits: never idle.
+                self.hub.set_held(&session, true);
                 self.publish(vec![
                     json!({ "type": "surface", "surface": "tui", "term": term, "client": client }),
                 ]);
@@ -1005,8 +1676,16 @@ impl Session<'_> {
                             }
                         }
                         "set_attended" => {}
-                        // Another open: answered, so it does not wait forever.
-                        "tui" => self.refuse(&op, crate::session::ALREADY_IN_TERMINAL.to_string()),
+                        // Another client asks for it: it attaches to the
+                        // TUI that runs.
+                        "tui" => {
+                            let viewer = op["client"].as_u64().unwrap_or(0);
+                            if let Err(error) =
+                                crate::terminal::attach_to(&hub, viewer, &term, &op)
+                            {
+                                self.refuse(&op, error);
+                            }
+                        }
                         _ => self.publish(vec![json!({ "type": "error", "message": "the conversation is open in its terminal: exit the TUI to continue here" })]),
                     }
                 }
@@ -1019,7 +1698,7 @@ impl Session<'_> {
         // Back to the engine, on the conversation as the TUI left it (none
         // when the TUI saved nothing: the engine starts it afresh).
         let id = match self.kind {
-            Kind::Codex if !self.saved(&id) => codex::saved(&self.cwd)
+            Kind::Codex if !self.saved(&id, &options) => codex::saved(&self.cwd)
                 .into_iter()
                 .map(|(id, ..)| id)
                 .find(|saved| !earlier.contains(saved))
@@ -1027,14 +1706,16 @@ impl Session<'_> {
             _ => id,
         };
         let next = Options {
-            resume: self.saved(&id).then(|| id.clone()),
+            resume: self.saved(&id, &options).then(|| id.clone()),
             resume_at: None,
             ..options
         };
-        let started = self::command(self.kind, &id, &next, &self.cwd).and_then(|start| {
-            self.gateway_key = start.key;
-            Process::spawn(start.command, &self.cwd)
-        });
+        let owner = self.key_owner(&id);
+        let started =
+            self::command(&self.hub.store, self.kind, &owner, &next, &self.cwd).and_then(|start| {
+                self.gateway_key = start.key;
+                Process::spawn(start.command, &self.cwd)
+            });
         match started {
             Ok(started) => {
                 let mut engine = self::adapter(self.kind, &self.cwd, &next);
@@ -1043,7 +1724,8 @@ impl Session<'_> {
                 // Codex replays its thread when it resumes; Claude Code's
                 // conversation is read from its file.
                 if self.kind == Kind::Claude {
-                    events.push(json!({ "type": "transcript", "items": claude::transcript(&self.cwd, &id) }));
+                    let config = claude::config_with(&next, &self.cwd, &id);
+                    events.push(json!({ "type": "transcript", "items": claude::transcript(&config, &self.cwd, &id, self.hub.uploads.dir()) }));
                 }
                 self.publish(events);
                 Some((started, engine, next))
@@ -1090,13 +1772,19 @@ impl Session<'_> {
                     ]);
                     return false;
                 };
-                if self.kind == Kind::Acp && !self.opencode {
-                    self.publish(vec![json!({ "type": "error", "message": "of the ACP agents only OpenCode has a LynShen gateway mode" })]);
+                if !adapter.has_gateway() {
+                    self.publish(vec![json!({ "type": "error", "message": "this ACP agent has no LynShen gateway mode" })]);
                     return false;
                 }
                 self.restart = Some(
                     adapter.keep(Options {
                         gateway: Some(gateway),
+                        // Off the gateway: the custom provider the client
+                        // names ("" the tool's own), else the selected one.
+                        tool_provider: op["tool_provider"]
+                            .as_str()
+                            .filter(|_| !gateway)
+                            .map(|id| id.trim().to_string()),
                         model: op["model"]
                             .as_str()
                             .filter(|m| !m.is_empty())
@@ -1134,7 +1822,15 @@ impl Session<'_> {
                 if name == "approve" {
                     if let Some(call) = op["call_id"].as_str() {
                         self.snapshot.answered(call);
+                        if self.app_approvals.contains_key(call) {
+                            let allow = op["decision"] != "deny";
+                            self.decide_app_call(process, adapter, call, allow);
+                            return false;
+                        }
                     }
+                }
+                if name == "interrupt" {
+                    self.stop_app_calls();
                 }
                 if let Some(id) = &self.id {
                     self.hub.note_sent_images(id, op);
@@ -1151,6 +1847,107 @@ impl Session<'_> {
                 false
             }
         }
+    }
+
+    /// Runs the app-tool calls the engine made: a turned-off one is refused,
+    /// `present_files` and `propose_schedule` run here, a session tool runs
+    /// on its own thread (answered through `app_answers`), after the user's
+    /// approval where a LynShen session's would ask (`engine_gate`).
+    fn host_calls(&mut self, process: &Process, adapter: &mut dyn Adapter, current: &Options) {
+        for call in adapter.take_calls() {
+            let name = call.name.as_str();
+            // A resumed Codex thread keeps the tools it started with.
+            if !current.app_tools.contains(&name) || !crate::app_tools::is_on(name) {
+                let refused = Err(crate::app_tools::turned_off(name));
+                process.write(adapter.answer(&call.token, refused));
+                continue;
+            }
+            if !lynshen_agent_core::app_tools::SESSION_TOOLS.contains(&name) {
+                let result = crate::app_tools::run(name, &call.args, &self.cwd);
+                process.write(adapter.answer(&call.token, result));
+                continue;
+            }
+            let Some(session) = self.id.clone() else {
+                let early = Err("the session is not open yet".to_string());
+                process.write(adapter.answer(&call.token, early));
+                continue;
+            };
+            match crate::session_messages::engine_gate(self.hub, &session, name) {
+                None => self.run_session_tool(call),
+                Some(must_ask) => {
+                    self.app_approval_seq += 1;
+                    let id = format!("app-approval-{}", self.app_approval_seq);
+                    let summary = crate::session_messages::summary(self.hub, name, &call.args);
+                    let event = json!({
+                        "type": "approval_request",
+                        "call_id": id,
+                        "name": name,
+                        "summary": summary,
+                        "subagent_id": null,
+                        "hunks": null,
+                        "kind": "tool",
+                        "must_ask": must_ask,
+                        "scopes": ["once"],
+                    });
+                    self.app_approvals.insert(id, call);
+                    self.publish(vec![event]);
+                }
+            }
+        }
+    }
+
+    /// Runs a session tool on its own thread; its answer comes back to
+    /// `run`'s loop (`app_answers`).
+    fn run_session_tool(&mut self, call: HostCall) {
+        let (Some(hub), Some(session), Some(answers)) =
+            (self.hub.handle(), self.id.clone(), self.app_answers.clone())
+        else {
+            return;
+        };
+        let stopped = Arc::new(AtomicBool::new(false));
+        self.app_stops.retain(|stop| !stop.load(Ordering::SeqCst));
+        self.app_stops.push(Arc::clone(&stopped));
+        let seq = self.process_seq;
+        thread::spawn(move || {
+            let result =
+                crate::session_messages::call(&hub, &session, &call.name, &call.args, &stopped);
+            stopped.store(true, Ordering::SeqCst);
+            let _ = answers.send((seq, call.token, result));
+        });
+    }
+
+    /// The user decided a session-tool call that waited for approval.
+    fn decide_app_call(
+        &mut self,
+        process: &mut Process,
+        adapter: &mut dyn Adapter,
+        call: &str,
+        allow: bool,
+    ) {
+        let Some(host) = self.app_approvals.remove(call) else {
+            return;
+        };
+        if allow {
+            self.run_session_tool(host);
+            return;
+        }
+        let denied = Err("The user denied this tool use.".to_string());
+        process.write(adapter.answer(&host.token, denied));
+    }
+
+    /// Session-tool calls waiting for a reply give up (the turn was
+    /// interrupted, or the engine stopped).
+    fn stop_app_calls(&mut self) {
+        for stop in self.app_stops.drain(..) {
+            stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A new engine process: calls of the last one are answered no more.
+    fn new_process(&mut self) {
+        self.process_seq += 1;
+        self.stop_app_calls();
+        self.app_approvals.clear();
     }
 
     fn tagged(&self, mut event: Value) -> Value {
@@ -1206,6 +2003,7 @@ impl Session<'_> {
                 .snapshot
                 .approvals
                 .iter()
+                .filter(|(_, request)| request["must_ask"] != true)
                 .map(|(call, _)| call.clone())
                 .collect();
             for call in open {
@@ -1228,7 +2026,8 @@ impl Session<'_> {
         let mut kept = Vec::with_capacity(events.len());
         for event in events {
             match event["call_id"].as_str() {
-                Some(call) if event["type"] == "approval_request" => {
+                // One that asks in every mode (`sessions.messages` ask) still asks.
+                Some(call) if event["type"] == "approval_request" && event["must_ask"] != true => {
                     let call = call.to_string();
                     self.allow(process, adapter, &call);
                 }
@@ -1239,6 +2038,11 @@ impl Session<'_> {
     }
 
     fn allow(&mut self, process: &mut Process, adapter: &mut dyn Adapter, call: &str) {
+        if self.app_approvals.contains_key(call) {
+            self.snapshot.answered(call);
+            self.decide_app_call(process, adapter, call, true);
+            return;
+        }
         let op = json!({ "op": "approve", "call_id": call, "decision": "allow" });
         match adapter.encode(&op) {
             Ok(output) => {
@@ -1420,6 +2224,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_idle_closed_engine_reopens_on_its_whole_conversation() {
+        let current = Options {
+            model: Some("started-with".into()),
+            resume: Some("conv".into()),
+            resume_at: Some("rewind-point".into()),
+            bin: Some("/opt/claude".into()),
+            dirs: vec![PathBuf::from("/p/other")],
+            ..Options::default()
+        };
+        let engine = adapter(Kind::Claude, Path::new("/tmp"), &current);
+        let kept = asleep_options(engine.as_ref(), &current);
+        assert_eq!(
+            kept.resume_at, None,
+            "a rewind applies to the open that asked"
+        );
+        assert_eq!(kept.resume, None);
+        assert!(
+            kept.dirs.is_empty(),
+            "the project's folders are found again"
+        );
+        assert_eq!(kept.bin.as_deref(), Some("/opt/claude"));
+        assert_eq!(kept.model.as_deref(), Some("started-with"));
+        assert!(kept.approval_mode.is_some());
+    }
+
+    #[test]
+    fn background_work_and_waiting_approvals_hold_the_engine() {
+        let mut snapshot = Snapshot::default();
+        assert!(!snapshot.holds(Kind::Codex));
+        snapshot.apply(&json!({ "type": "background_tasks", "tasks": [{ "id": "t1" }] }));
+        assert!(snapshot.holds(Kind::Claude));
+        // A background command is background work that never comes back.
+        assert_eq!(snapshot.background(Kind::Claude), (true, false));
+        snapshot.apply(&json!({ "type": "background_tasks", "tasks": [{ "id": "a1", "kind": "local_agent" }] }));
+        assert_eq!(snapshot.background(Kind::Claude), (true, true));
+        snapshot.apply(&json!({ "type": "background_tasks", "tasks": [] }));
+        assert_eq!(snapshot.background(Kind::Claude), (false, false));
+        assert!(!snapshot.holds(Kind::Claude));
+        // As Codex reports a subagent still working after its turn.
+        snapshot.apply(&json!({ "type": "agent_runs", "workflows": [], "agents": [{ "id": "a", "status": "running" }, { "id": "b", "status": "completed" }] }));
+        assert!(snapshot.holds(Kind::Codex));
+        // Claude's run list comes from its transcript: not trusted to hold.
+        assert!(!snapshot.holds(Kind::Claude));
+        snapshot.apply(&json!({ "type": "agent_runs", "workflows": [{ "status": "completed", "agents": [{ "state": "async_launched" }] }], "agents": [] }));
+        assert!(
+            snapshot.holds(Kind::Codex),
+            "a workflow's agent still running"
+        );
+        snapshot.apply(&json!({ "type": "agent_runs", "workflows": [{ "status": "completed", "agents": [{ "state": "done" }] }], "agents": [{ "status": "failed" }, { "status": "" }] }));
+        assert!(!snapshot.holds(Kind::Codex));
+        snapshot.apply(&json!({ "type": "approval_request", "call_id": "c1" }));
+        assert!(snapshot.holds(Kind::Codex));
+        snapshot.apply(&json!({ "type": "status", "message": "ready" }));
+        assert!(!snapshot.holds(Kind::Codex));
+    }
+
+    #[test]
     fn the_snapshot_rebuilds_the_conversation_and_open_approvals() {
         let mut snapshot = Snapshot::default();
         for event in [
@@ -1431,6 +2292,8 @@ mod tests {
             json!({ "type": "assistant_delta", "delta": "lo" }),
             json!({ "type": "tool_start", "call_id": "t1", "name": "bash" }),
             json!({ "type": "tool_output", "call_id": "t1", "name": "bash", "output": "ok", "is_error": false }),
+            json!({ "type": "tool_start", "call_id": "t2", "name": "read" }),
+            json!({ "type": "tool_output", "call_id": "t2", "name": "read", "output": "no", "is_error": true }),
             json!({ "type": "approval_request", "call_id": "a1", "name": "bash" }),
             json!({ "type": "approval_request", "call_id": "a2", "name": "write" }),
         ] {
@@ -1440,12 +2303,25 @@ mod tests {
         let events = snapshot.events(true);
         assert_eq!(events[0], json!({ "type": "startup", "model": "b" }));
         let transcript = events.iter().find(|e| e["type"] == "transcript").unwrap();
+        // Each item says when it happened.
+        let items: Vec<Value> = transcript["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                assert!(item["at"].as_u64().is_some_and(|at| at > 0), "{item}");
+                let mut item = item.clone();
+                item.as_object_mut().unwrap().remove("at");
+                item
+            })
+            .collect();
         assert_eq!(
-            transcript["items"],
+            json!(items),
             json!([
                 { "role": "user", "content": "hi" },
                 { "role": "assistant", "content": "hello" },
                 { "role": "tool", "name": "bash", "output": "ok" },
+                { "role": "tool", "name": "read", "output": "no", "is_error": true },
             ])
         );
         let open: Vec<&Value> = events
@@ -1501,6 +2377,22 @@ mod tests {
         let mut plain = Snapshot::default();
         plain.apply(&json!({ "type": "model_status", "model": "m" }));
         assert!(plain.events(false)[0].get("state").is_none());
+    }
+
+    #[test]
+    fn a_client_that_attaches_sees_the_messages_waiting_for_the_turn() {
+        let mut snapshot = Snapshot::default();
+        snapshot.apply(&json!({ "type": "pending_messages", "messages": ["one"] }));
+        snapshot.apply(&json!({ "type": "pending_messages", "messages": ["one", "two"] }));
+        let events = snapshot.events(true);
+        let queued: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["type"] == "pending_messages")
+            .collect();
+        assert_eq!(
+            queued,
+            [&json!({ "type": "pending_messages", "messages": ["one", "two"] })]
+        );
     }
 
     #[test]

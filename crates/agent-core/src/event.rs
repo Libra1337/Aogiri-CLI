@@ -260,7 +260,12 @@ pub enum AgentEvent {
     TurnStats(TurnStats),
     /// A queued message was taken back (`unqueue`): its text, for the client
     /// to return to the message box.
-    Unqueued(String),
+    /// A queued message taken back (`unqueue`): its text and images, for
+    /// the client to edit again.
+    Unqueued {
+        content: String,
+        images: Vec<String>,
+    },
     UserMessage(String),
     /// Pre-fill the input box (e.g. with a checked-out user message).
     FillInput(String),
@@ -470,7 +475,9 @@ pub enum AgentEvent {
     McpServers {
         servers: Vec<McpServerView>,
     },
-    Transcript(Vec<TranscriptItem>),
+    /// The conversation, each item with when it was written (seconds; 0:
+    /// unknown).
+    Transcript(Vec<(TranscriptItem, u64)>),
     Info(String),
     Error(String),
     Status(String),

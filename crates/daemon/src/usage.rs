@@ -45,6 +45,9 @@ pub struct SessionInfo {
     pub engine: String,
     /// Claude / Codex through the LynShen gateway.
     pub gateway: bool,
+    /// Claude / Codex on a custom provider (`tool_providers`), by id: its
+    /// turns are this computer's own record, never the account's.
+    pub tool_provider: Option<String>,
     pub cwd: String,
 }
 
@@ -154,7 +157,16 @@ impl Usage {
             },
         };
         let (provider, model) = state.routes.get(session).cloned().unwrap_or_default();
-        let (kind, channel) = channel(&info.engine, info.gateway, &provider);
+        let custom = info
+            .tool_provider
+            .as_deref()
+            .filter(|id| !id.is_empty() && !info.gateway);
+        // A custom provider: its own channel (`claude:<id>`), never priced
+        // as Anthropic's or OpenAI's and never the gateway's.
+        let (kind, channel) = match custom {
+            Some(id) => ("local", format!("{}:{id}", info.engine)),
+            None => channel(&info.engine, info.gateway, &provider),
+        };
         let record = state.open.entry(turn.clone()).or_insert_with(|| {
             json!({
                 "turn_id": turn,
@@ -172,21 +184,30 @@ impl Usage {
         });
         record["channel_kind"] = json!(kind);
         record["channel"] = json!(channel);
-        record["model"] = json!(event["model"]
+        if custom.is_some() {
+            record["local_only"] = json!(true);
+        }
+        let model = event["model"]
             .as_str()
             .filter(|m| !m.is_empty())
-            .unwrap_or(&model));
-        record["requests"] = json!(record["requests"].as_u64().unwrap_or(0) + 1);
+            .unwrap_or(&model)
+            .to_string();
+        // An aggregate (Claude Code's subagents and the like, summed over
+        // several requests, maybe on another model) leaves the turn's model
+        // and request count as they are.
+        let aggregate = event["aggregate"] == true;
+        if !aggregate || record["model"].is_null() {
+            record["model"] = json!(model);
+        }
+        if !aggregate {
+            record["requests"] = json!(record["requests"].as_u64().unwrap_or(0) + 1);
+        }
         for field in TOKEN_FIELDS {
             let sum = record[field].as_u64().unwrap_or(0) + event[field].as_u64().unwrap_or(0);
             record[field] = json!(sum);
         }
         if kind != "lynshen" {
-            match estimate(
-                &channel,
-                record["model"].as_str().unwrap_or_default(),
-                event,
-            ) {
+            match estimate(&channel, &model, event) {
                 Some(cost) => {
                     record["estimated_cost_usd"] =
                         json!(record["estimated_cost_usd"].as_f64().unwrap_or(0.0) + cost);
@@ -199,13 +220,21 @@ impl Usage {
         }
     }
 
+    /// The session's engine stopped: its route and gateway turn are
+    /// forgotten (a reopened engine announces its route again).
+    pub fn forget(&self, session: &str) {
+        self.lock().routes.remove(session);
+        crate::gateway::set_turn(session, None);
+    }
+
     /// The session is ready again: its turns are written.
     pub fn close(&self, session: &str) {
         // Keep the move from open turns to the file atomic for ledger snapshots.
         let mut state = self.lock();
-        if state.current.remove(session).is_some() {
-            crate::gateway::set_turn(session, None);
-        }
+        // The gateway keeps tagging requests with this turn until the next
+        // one opens: Claude Code's background agents and Workflows run on
+        // after the turn ends, and are this turn's cost.
+        state.current.remove(session);
         let turns: Vec<String> = state
             .open
             .iter()
@@ -231,7 +260,7 @@ impl Usage {
             })
             .map(|mut record| {
                 record["ended_at"] = json!(ended);
-                record["upload"] = json!(upload);
+                mark_upload(&mut record, upload);
                 format!("{record}\n")
             })
             .collect();
@@ -407,6 +436,16 @@ impl Usage {
     }
 }
 
+/// Whether a written turn goes to the LynShen account (`signed_in`): never a
+/// custom provider's (`local_only`, dropped here).
+fn mark_upload(record: &mut Value, signed_in: bool) {
+    let local_only = record
+        .as_object_mut()
+        .and_then(|fields| fields.remove("local_only"))
+        == Some(json!(true));
+    record["upload"] = json!(signed_in && !local_only);
+}
+
 /// The next batch to upload from `text` (FILE from `offset`): the upload
 /// bodies and the offset after the last line it covers. Records kept local
 /// are passed over.
@@ -468,16 +507,25 @@ fn channel(engine: &str, gateway: bool, provider: &str) -> (&'static str, String
     }
 }
 
-// A reference estimate is captured when the tokens arrive. Unknown models
-// and cache-write prices stay unknown, rather than borrowing another model's price.
+// A reference estimate, for turns that do not run through the gateway (its
+// charges are the bill there), captured when the tokens arrive. Unknown
+// models stay unknown rather than borrowing another model's price.
 fn estimate(provider: &str, model: &str, usage: &Value) -> Option<f64> {
-    if usage["cache_write_tokens"].as_u64().unwrap_or(0) > 0
+    let writes = usage["cache_write_tokens"].as_u64().unwrap_or(0);
+    let writes_1h = usage["cache_write_1h_tokens"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(writes);
+    // Only Anthropic's cache-write prices are known (below).
+    if (writes > 0 && provider != "anthropic")
         || !lynshen_agent_core::builtin_providers()
             .iter()
             .any(|(id, _, _)| id == provider)
     {
         return None;
     }
+    // Claude Code names a long-context model "claude-opus-4-8[1m]".
+    let model = model.split('[').next().unwrap_or(model);
     let prices = lynshen_agent_core::models_for_provider(provider)
         .into_iter()
         .find(|m| m.name == model)?;
@@ -490,7 +538,11 @@ fn estimate(provider: &str, model: &str, usage: &Value) -> Option<f64> {
     {
         return None;
     }
-    Some(prices.cost_for(input, cached, output))
+    // Cache writes are input, priced once above; Anthropic bills them at
+    // 1.25x the input price for the 5-minute cache and 2x for the 1-hour one.
+    let write_surcharge =
+        ((writes - writes_1h) as f64 * 0.25 + writes_1h as f64) * prices.input_cost / 1_000_000.0;
+    Some(prices.cost_for(input, cached, output) + write_surcharge)
 }
 
 fn fetch_charges(turns: &[String]) -> Result<HashMap<String, Value>, String> {
@@ -747,8 +799,55 @@ mod tests {
         Some(SessionInfo {
             engine: engine.to_string(),
             gateway,
+            tool_provider: None,
             cwd: "/p".to_string(),
         })
+    }
+
+    #[test]
+    fn a_custom_providers_turns_are_local_and_never_uploaded() {
+        let (usage, dir) = usage_in("custom-provider");
+        let custom = || {
+            Some(SessionInfo {
+                engine: "claude".to_string(),
+                gateway: false,
+                tool_provider: Some("relay".to_string()),
+                cwd: "/p".to_string(),
+            })
+        };
+        usage.observe(
+            "s-custom",
+            &json!({ "type": "model_status", "model": "claude-opus-4-1" }),
+            || None,
+        );
+        usage.observe("s-custom", &json!({ "type": "user_message" }), custom);
+        usage.observe("s-custom", &spend(100, 10), custom);
+        let mut event = spend(5, 5);
+        event["type"] = json!("usage");
+        usage.tag_event("s-custom", &mut event);
+        assert_eq!(event["billing_gateway"], false);
+        usage.close("s-custom");
+        let records = usage.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["channel_kind"], "local");
+        assert_eq!(records[0]["channel"], "claude:relay");
+        assert_eq!(records[0]["upload"], false);
+        assert!(records[0].get("local_only").is_none());
+        // Never priced as Anthropic's own API.
+        assert!(records[0]["estimated_cost_usd"].is_null());
+        // Signed in or not, it stays here; a gateway turn would go.
+        let mut record = json!({ "local_only": true });
+        mark_upload(&mut record, true);
+        assert_eq!(record, json!({ "upload": false }));
+        let mut record = json!({ "turn_id": "t" });
+        mark_upload(&mut record, true);
+        assert_eq!(record["upload"], true);
+        // The upload batch passes over it.
+        let text = std::fs::read_to_string(dir.join(FILE)).unwrap();
+        let (turns, end) = pending(&text, 0);
+        assert!(turns.is_empty());
+        assert_eq!(end, text.len() as u64);
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn usage_in(name: &str) -> (Usage, PathBuf) {
@@ -905,6 +1004,25 @@ mod tests {
     }
 
     #[test]
+    fn an_aggregate_adds_tokens_but_not_the_model_or_a_request() {
+        let (usage, dir) = usage_in("aggregate");
+        usage.observe(
+            "s1",
+            &json!({ "type": "model_status", "model": "claude-opus-5-5" }),
+            || None,
+        );
+        usage.observe("s1", &spend(100, 10), || info("claude", true));
+        let aggregate = json!({ "type": "usage", "aggregate": true, "model": "claude-haiku-5-5", "input_tokens": 50, "cached_input_tokens": 0, "output_tokens": 5 });
+        usage.observe("s1", &aggregate, || info("claude", true));
+        let record = usage.lock().open.values().next().unwrap().clone();
+        assert_eq!(record["model"], "claude-opus-5-5");
+        assert_eq!(record["requests"], 1);
+        assert_eq!(record["input_tokens"], 150);
+        assert_eq!(record["output_tokens"], 15);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn direct_cost_estimates_are_saved_and_unknown_prices_stay_unknown() {
         let (usage, dir) = usage_in("estimates");
         let model = lynshen_agent_core::models_for_provider("anthropic")
@@ -933,9 +1051,15 @@ mod tests {
         assert_eq!(saved["totals"]["running"], false);
         assert!(estimate("my-provider", "unknown-model", &event).is_none());
         assert!(estimate("anthropic", "unknown-model", &event).is_none());
+        // Writes (part of input): 5-minute ones at 1.25x the input price,
+        // 1-hour ones at 2x; a long-context name finds its model's price.
         let mut writes = event.clone();
-        writes["cache_write_tokens"] = json!(5);
-        assert!(estimate("anthropic", &model.name, &writes).is_none());
+        writes["cache_write_tokens"] = json!(300);
+        writes["cache_write_1h_tokens"] = json!(100);
+        let priced = estimate("anthropic", &format!("{}[1m]", model.name), &writes).unwrap();
+        let surcharge = (200.0 * 0.25 + 100.0) * model.input_cost / 1_000_000.0;
+        assert!((priced - (expected + surcharge)).abs() < 1e-12);
+        assert!(estimate("openai", &model.name, &writes).is_none());
         drop(store);
         let _ = fs::remove_dir_all(dir);
     }

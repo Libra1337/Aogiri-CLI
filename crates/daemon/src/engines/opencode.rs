@@ -939,6 +939,7 @@ mod tests {
             group_windows: Default::default(),
             reasoning: None,
             input_modalities: None,
+            hidden: false,
         }
     }
 

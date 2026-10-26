@@ -567,6 +567,9 @@ pub struct ModelConfig {
     /// What the model takes as input (`input_modalities`: "text", "image").
     /// None: not stated, which accepts images as before.
     pub input_modalities: Option<Vec<String>>,
+    /// LynShen: the gateway leaves it out of model pickers; still callable
+    /// by name (a helper, subagent or image model names it).
+    pub hidden: bool,
 }
 
 /// Input kinds a model entry may list in `input_modalities`.
@@ -613,6 +616,13 @@ pub struct AuthStore {
     keys: BTreeMap<String, String>,
     lynshen: Option<LynShenTokens>,
     oauth: BTreeMap<String, llm_provider_kit::auth::StoredCredential>,
+    /// API keys of the custom providers Claude Code and Codex sessions run
+    /// on (`tool_providers`: `"<tool>:<id>"` → key), apart from `providers`
+    /// so no client lists them as engine providers.
+    tool_keys: BTreeMap<String, String>,
+    /// `tool_keys` changed here: `save` writes them; otherwise it keeps
+    /// the block as it is on disk (another process may have changed it).
+    tool_keys_changed: bool,
     encryption_key: Option<crate::secrets::SecretKey>,
     path: PathBuf,
 }
@@ -1069,6 +1079,8 @@ impl AuthStore {
                 keys: BTreeMap::new(),
                 lynshen: None,
                 oauth: BTreeMap::new(),
+                tool_keys: BTreeMap::new(),
+                tool_keys_changed: false,
                 encryption_key: if encrypt_secrets {
                     crate::secrets::find_key()?
                 } else {
@@ -1125,10 +1137,18 @@ impl AuthStore {
             })
             .unwrap_or_default();
 
+        let tool_keys = value
+            .get(TOOL_KEYS)
+            .and_then(Value::as_object)
+            .map(read_provider_keys)
+            .unwrap_or_default();
+
         Ok(Self {
             keys,
             lynshen,
             oauth,
+            tool_keys,
+            tool_keys_changed: false,
             encryption_key,
             path,
         })
@@ -1140,6 +1160,10 @@ impl AuthStore {
 
     pub fn set_key(&mut self, provider: &str, key: String) {
         self.keys.insert(provider.to_string(), key);
+    }
+
+    pub fn remove_key(&mut self, provider: &str) {
+        self.keys.remove(provider);
     }
 
     /// The current LynShen OAuth token bundle, if logged in on this computer.
@@ -1179,6 +1203,23 @@ impl AuthStore {
 
     pub fn clear_lynshen(&mut self) {
         self.lynshen = None;
+    }
+
+    /// The API key of `tool`'s custom provider `id` (`tool_providers`).
+    pub fn tool_key(&self, tool: &str, id: &str) -> Option<&str> {
+        self.tool_keys
+            .get(&format!("{tool}:{id}"))
+            .map(String::as_str)
+    }
+
+    /// Saves (`Some`) or forgets (`None`) the key of `tool`'s provider `id`.
+    pub fn set_tool_key(&mut self, tool: &str, id: &str, key: Option<String>) {
+        let name = format!("{tool}:{id}");
+        match key {
+            Some(key) => self.tool_keys.insert(name, key),
+            None => self.tool_keys.remove(&name),
+        };
+        self.tool_keys_changed = true;
     }
 
     /// Stored OAuth credential for an omp provider (`oauth.<id>` block).
@@ -1227,13 +1268,22 @@ impl AuthStore {
         }
         // MCP transports refresh their own credentials while the agent is
         // running. Preserve that independently-managed block when account
-        // login or provider-key changes rewrite auth.json.
+        // login or provider-key changes rewrite auth.json. The custom
+        // providers' keys too, unless they were changed here.
         if let Ok(content) = fs::read_to_string(&self.path) {
             if let Ok(current) = serde_json::from_str::<Value>(&content) {
                 if let Some(tokens) = current.get("mcp_servers") {
                     value["mcp_servers"] = tokens.clone();
                 }
+                if !self.tool_keys_changed {
+                    if let Some(keys) = current.get(TOOL_KEYS) {
+                        value[TOOL_KEYS] = keys.clone();
+                    }
+                }
             }
+        }
+        if self.tool_keys_changed && !self.tool_keys.is_empty() {
+            value[TOOL_KEYS] = json!(self.tool_keys);
         }
         if let Some(key) = &self.encryption_key {
             crate::secrets::protect_auth(&mut value, key)?;
@@ -1245,6 +1295,9 @@ impl AuthStore {
         )
     }
 }
+
+/// auth.json's block of custom provider keys (see `AuthStore::tool_key`).
+pub(crate) const TOOL_KEYS: &str = "tool_providers";
 
 /// config.json keys of the sandbox (see `Config::save`).
 const SANDBOX_KEYS: [&str; 4] = [
@@ -1844,6 +1897,10 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
             group_windows: read_group_windows(model.get("group_context_windows")),
             reasoning,
             input_modalities: read_input_modalities(model.get("input_modalities")),
+            hidden: model
+                .get("hidden")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         });
     }
 
@@ -2038,6 +2095,9 @@ fn model_config_value(model: &ModelConfig) -> Value {
     }
     if let Some(kinds) = &model.input_modalities {
         value["input_modalities"] = json!(kinds);
+    }
+    if model.hidden {
+        value["hidden"] = json!(true);
     }
     value
 }
@@ -2263,6 +2323,7 @@ fn model_config_from_catalog(
         // settings at all ("none" is a 400 on some).
         reasoning: (!model.reasoning).then_some(false),
         input_modalities: None,
+        hidden: false,
     }
 }
 
@@ -2288,6 +2349,7 @@ pub fn provider_model_value(model: &ModelConfig) -> Value {
             .reasoning
             .unwrap_or_else(|| !is_thinking_disabled(&model.reasoning_efforts)),
         "reasoning_efforts": model.reasoning_efforts,
+        "hidden": model.hidden,
     })
 }
 
@@ -2309,6 +2371,7 @@ fn model_config_from_template(model: &llm_provider_kit::ModelTemplate) -> ModelC
         group_windows: BTreeMap::new(),
         reasoning: None,
         input_modalities: None,
+        hidden: false,
     }
 }
 
@@ -2484,6 +2547,7 @@ fn default_model_config(name: &str) -> ModelConfig {
             group_windows: BTreeMap::new(),
             reasoning: None,
             input_modalities: None,
+            hidden: false,
         })
 }
 
@@ -2836,6 +2900,8 @@ mod tests {
                 "access_token": "a", "refresh_token": "r", "machine": "another-computer"
             })),
             oauth: BTreeMap::new(),
+            tool_keys: BTreeMap::new(),
+            tool_keys_changed: false,
             encryption_key: None,
             path: PathBuf::from("auth.json"),
         };
@@ -2868,6 +2934,7 @@ mod tests {
             group_windows: BTreeMap::new(),
             reasoning: None,
             input_modalities: None,
+            hidden: false,
         };
         let overrides = BTreeMap::from([("gpt-6-sol".to_string(), 2_000_000)]);
         // Raised toward, but never past, the largest account window.
@@ -2896,6 +2963,7 @@ mod tests {
             group_windows: BTreeMap::from([("g-big".to_string(), (1_050_000, 1_050_000))]),
             reasoning: None,
             input_modalities: None,
+            hidden: false,
         };
         // Saved and read back with its label and group windows.
         let read = read_model_configs(
@@ -2904,6 +2972,17 @@ mod tests {
         );
         assert_eq!(read[0].display_name.as_deref(), Some("GPT-6 Sol"));
         assert_eq!(read[0].group_windows, model.group_windows);
+        assert!(!read[0].hidden);
+        // The hidden flag survives config.json; entries saved without it
+        // (every older config) load as shown.
+        let hidden = ModelConfig {
+            hidden: true,
+            ..model.clone()
+        };
+        let saved = model_config_value(&hidden);
+        assert_eq!(saved["hidden"], json!(true));
+        assert!(model_config_value(&model).get("hidden").is_none());
+        assert!(read_model_configs(&json!({ "models": [saved] }), "lynshen")[0].hidden);
         // Pinned to the big group: its window. Unpinned or another group:
         // the range over all groups.
         let pinned = BTreeMap::from([("gpt-6-sol".to_string(), "g-big".to_string())]);
@@ -2948,6 +3027,7 @@ mod tests {
             group_windows: BTreeMap::new(),
             reasoning: None,
             input_modalities: None,
+            hidden: false,
         };
         // 1M non-cached input @2 + 1M cached @0.5 + 1M output @8 = 10.5
         let cost = model.cost_for(2_000_000, 1_000_000, 1_000_000);
@@ -3391,6 +3471,7 @@ mod tests {
                     group_windows: BTreeMap::new(),
                     reasoning: None,
                     input_modalities: None,
+                    hidden: false,
                 },
                 ModelConfig {
                     name: "compact-model".to_string(),
@@ -3405,6 +3486,7 @@ mod tests {
                     group_windows: BTreeMap::new(),
                     reasoning: None,
                     input_modalities: None,
+                    hidden: false,
                 },
             ],
             base_url: "https://api.openai.com/v1".to_string(),
@@ -4247,6 +4329,8 @@ mod tests {
             keys: BTreeMap::from([("openai".to_string(), "sk-test".to_string())]),
             lynshen: None,
             oauth: BTreeMap::new(),
+            tool_keys: BTreeMap::new(),
+            tool_keys_changed: false,
             encryption_key: None,
             path: path.clone(),
         };
@@ -4255,6 +4339,62 @@ mod tests {
         let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["providers"]["openai"], "sk-test");
         assert_eq!(saved["mcp_servers"]["fs"]["access_token"], "tok");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_provider_keys_stay_apart_encrypted_and_survive_other_saves() {
+        let dir = std::env::temp_dir().join(format!(
+            "lynshen-auth-tool-keys-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        let key = [7u8; 32];
+        let mut store = AuthStore {
+            keys: BTreeMap::new(),
+            lynshen: None,
+            oauth: BTreeMap::new(),
+            tool_keys: BTreeMap::new(),
+            tool_keys_changed: false,
+            encryption_key: Some(key),
+            path: path.clone(),
+        };
+        store.set_tool_key("claude", "relay", Some("sk-relay".to_string()));
+        store.save().unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("sk-relay"), "{text}");
+        let saved: Value = serde_json::from_str(&text).unwrap();
+        // Not an engine provider: clients that list `providers` never see it.
+        assert!(saved["providers"].as_object().unwrap().is_empty());
+        assert!(saved["tool_providers"]["claude:relay"]
+            .as_str()
+            .unwrap()
+            .starts_with("jcenc1:"));
+
+        // Another process (a login) saves without knowing the block: it stays.
+        let other = AuthStore {
+            keys: BTreeMap::from([("openai".to_string(), "sk-o".to_string())]),
+            lynshen: None,
+            oauth: BTreeMap::new(),
+            tool_keys: BTreeMap::new(),
+            tool_keys_changed: false,
+            encryption_key: Some(key),
+            path: path.clone(),
+        };
+        other.save().unwrap();
+        let mut revealed: Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        crate::secrets::reveal_with_key(&mut revealed, &key).unwrap();
+        assert_eq!(revealed["tool_providers"]["claude:relay"], "sk-relay");
+        // A removal is saved.
+        store.set_tool_key("claude", "relay", None);
+        store.save().unwrap();
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("tool_providers").is_none(), "{saved}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

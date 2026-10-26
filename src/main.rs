@@ -54,6 +54,14 @@ impl TuiRuntime for Runtime {
         self.0.interrupt()
     }
 
+    fn unqueue_last(&mut self) -> Vec<AgentEvent> {
+        let last = lynshen_agent_core::queue::QueuePick {
+            index: Some(-1),
+            text: None,
+        };
+        self.0.unqueue(&last, false)
+    }
+
     fn handle_command(&mut self, input: &str) -> (bool, Vec<AgentEvent>) {
         self.0.handle_command(input)
     }
@@ -809,7 +817,7 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
         AgentEvent::Startup { .. } => "startup",
         AgentEvent::ModelStatus { .. } => "model_status",
         AgentEvent::PendingMessages(_) => "pending_messages",
-        AgentEvent::Unqueued(_) => "unqueued",
+        AgentEvent::Unqueued { .. } => "unqueued",
         AgentEvent::UserMessage(_) => "user_message",
         AgentEvent::FillInput(_) => "fill_input",
         AgentEvent::Connecting => "connecting",

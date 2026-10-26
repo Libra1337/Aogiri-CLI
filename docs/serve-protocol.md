@@ -29,10 +29,14 @@ standardized subset for ACP clients; see `docs/serve-vs-acp.md` for the split.
 This document describes protocol version 2. The first line on stdout is
 
 ```json
-{"type":"hello","protocol":2,"version":"0.3.0"}
+{"type":"hello","protocol":2,"version":"0.3.0","features":["queue","files"]}
 ```
 
 A client that does not support `protocol` must stop instead of guessing.
+`features` names what this engine takes beyond the protocol version (an
+older one sends none, so a client checks before relying on it): `queue`,
+queued messages picked by place (see "Picking a queued message"); `files`,
+a `user_message`'s attachments other than images (see `user_message`).
 Every later event carries a `session` field with the engine's current
 session id, the same shape the daemon uses to multiplex several sessions on
 one connection (`docs/agent-daemon-plan.md`). Ops may carry a `session`
@@ -83,7 +87,15 @@ Every command is a JSON object with an `op` field.
 ```
 
 Submits a user turn. `images` is an optional array of local image paths;
-unattachable paths produce `info` events and are skipped.
+unattachable paths produce `info` events and are skipped. `files` is an
+optional array of other local files (absolute paths, any type): they are not
+inlined; the model is told where each is saved, one line
+`[Attached file "<name>" is saved at: <path>]` per file after the text, and
+opens it with its own tools. Events (`user_message`, `unqueued`,
+`fill_input`) and the transcript carry them back as `files` next to
+`content`, without those lines; `pending_messages` lists the text only. The daemon's Claude Code and
+Codex sessions get the same lines (one text block or item each), ACP agents a
+`resource_link` per file.
 
 If a turn is already running, the message is queued instead: the engine emits
 `pending_messages` (the full queue) and `status:"queued: N"`. Queued messages
@@ -99,6 +111,20 @@ Runs any slash command exactly as the TUI would (`/model`, `/resume`,
 `/compact`, `/approve`, `/mcp`, custom commands, MCP prompt commands, ...).
 Structured views come back as events (`model_view`, `resume_view`,
 `tree_view`, ...). `/quit` and `/exit` terminate the process.
+
+### Forking into a new session
+
+`/fork <label>` branches the conversation inside this session (see
+`tree_view`). A fork as a session of its own, which goes on apart from the
+original while both stay listed, is the daemon's: `session_create` with
+`options.fork_from` and `fork_turns` (see "Forks" in
+`docs/daemon-protocol.md`). It copies the session's first `fork_turns` user
+turns on its active branch, with the plan, reply style and system prompt
+they had, into a new session file (`~/.lynshen/sessions/<cwd>/<new id>`, or
+under `fork_cwd`'s when the fork works in another directory); `lynshen serve`
+then opens it like any saved session (`/resume <new id>`). Entries keep their
+ids. The notes sent with the first left-out message, the goal, the agent
+team and the resume summary stay with the original.
 
 ### Rewind
 
@@ -156,15 +182,27 @@ In `manual` approval mode a `restore` asks first, like an edit; a `restore`
 with `force` asks in every mode but `full-access`, and "always allow" does
 not cover it; `list` and `create` never ask.
 
+### Picking a queued message
+
+`steer`, `unqueue`, `queue_move` and `interrupt` with `index` name a queued
+message by its place in the `pending_messages` the client saw: `index`
+counts from the first (0, the default), or from the last when negative (`-1`
+is the message just sent, so a client can send a message and steer it in at
+once without knowing the queue's length). With `text` too, the message at
+`index` counts only when its text is `text`, else the first queued message
+with that text (the queue may have moved on since the client saw it).
+Nothing there, nothing happens.
+
 ### `steer`
 
 ```json
 {"op":"steer"}
+{"op":"steer","index":-1}
 ```
 
-Sends the next queued message into the in-flight turn; running tools and
-subagents keep going. Emits `status:"steering"` and the updated
-`pending_messages`.
+Sends a queued message (the next one by default) into the in-flight turn;
+running tools and subagents keep going, and the other queued messages keep
+waiting. Emits `status:"steering"` and the updated `pending_messages`.
 
 - While the model's response streams (reasoning, text, or tool-call
   arguments with no tool running yet), the response is cut off as soon as
@@ -187,14 +225,26 @@ No-op when idle or when the queue is empty.
 
 ```json
 {"op":"unqueue","index":0,"text":"also check the tests"}
+{"op":"unqueue","index":-1,"discard":true}
 ```
 
-Takes a queued message back before it runs. Removes the message at `index`
-when its text equals `text`, else the first queued message with that text
-(the queue may have moved on since the client saw it); without `text`, the
-one at `index`. Emits the updated `pending_messages` either way, and
-`{"type":"unqueued","text":…}` when a message was taken back (a client
-returns its text to the message box; one that already started is not taken).
+Takes a queued message back before it runs. Emits the updated
+`pending_messages` either way, and
+`{"type":"unqueued","content":…,"text":…,"images":[…],"files":[…]}`
+(`files` only when it had some) when a message was
+taken back (a client returns it to the message box; one that already started
+is not taken; `text` repeats `content` for older clients). With
+`discard: true` the message is dropped and no `unqueued` follows. The TUI
+takes the last queued message back with ↑ on an empty input.
+
+### `queue_move`
+
+```json
+{"op":"queue_move","index":-1,"to":0}
+```
+
+Moves a queued message to place `to` (negative from the last). Emits the
+updated `pending_messages`.
 
 ### `interrupt`
 
@@ -207,6 +257,14 @@ closes subagents, clears pending approvals. Emits
 `info:"request interrupted"` and `status:"interrupted"`. Queued messages still
 auto-start as the next turn; send `interrupt` again (or avoid queueing) to
 stop those too. No-op when idle.
+
+```json
+{"op":"interrupt","index":-1}
+```
+
+With `index`: "interrupt and send". The turn stops and that queued message
+starts the next one at once, ahead of the others. The daemon's Claude Code,
+Codex and ACP sessions take the same field.
 
 ### `approve`
 
@@ -597,10 +655,10 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `mcp_servers` | `servers: [{name, transport, state, tools, error?}]` | MCP server states; `state` ∈ `connecting`/`connected`/`failed`/`disabled`. |
 | `trust_prompt` | `cwd`, `repo_root` | Project has local resources (skills, commands, hooks) and no stored trust decision; answer via `command` `/trust yes\|no\|repo`. |
 | `user_message` | `content` | A user turn was accepted and started (echoes the submitted text). |
-| `pending_messages` | `messages` | The queued-message list after it changed. |
+| `pending_messages` | `messages`, `fixed`? | The queued-message list after it changed (texts, without the attached-file lines). `fixed` (Claude Code sessions): the first `fixed` messages are already with the CLI (steered, or sent as the next turn started); they can no longer be taken back, moved or picked. |
 | `fill_input` | `content` | Front-end should pre-fill its input box (e.g. after `/checkout`). |
 | `connecting` | — | A model request is starting. |
-| `thinking_start` | — | Reasoning output begins. |
+| `thinking_start` | — | The model answered the request; its first token is on the way. |
 | `reasoning_delta` | `delta` | Reasoning text chunk. |
 | `assistant_start` | — | Assistant reply begins. |
 | `assistant_delta` | `delta` | Reply text chunk. |
@@ -630,10 +688,43 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `checkpoint_view` | `items: [{id, label, detail}]` | Checkpoint picker data. |
 | `goal` | `goal: {objective, status, token_budget, tokens_used, time_used_seconds, created_at, updated_at} \| null` | Goal state; `null` clears it. |
 | `plan` | `plan: [{step, status, agent, files}]` | Goal/plan step list. `agent` (string or `null`) is the subagent doing the step, as the model named it (path or task name); `files` the files it is expected to write. Saved with the session: part of the startup batch and of a resumed session's events when the session has a plan; `/new` or `/resume` sends an empty `plan` to clear the previous session's plan when it had one and the next session has none. `/rewind`, `/checkout` and `/fork` set the plan the last successful `update_plan` call before that point set (none without one), and send `plan` when it changed. |
-| `transcript` | `items: [{role, ...}]` | Rendered conversation (`/transcript`); roles: `user`, `assistant`, `tool` (`name`, `output`), `branch` (`label`), `compaction` (`summary`: where the older conversation was folded). |
+| `transcript` | `items: [{role, ...}]` | Rendered conversation (`/transcript`); roles: `user`, `assistant`, `tool` (`name`, `output`), `branch` (`label`), `compaction` (`summary`: where the older conversation was folded). Items carry `at` (ms) when it is known when they were written. |
 | `info` | `message` | Informational line (hook output, notices, update available, loop guard warnings; see "Loop guard"). |
 | `error` | `message` | Error line. Also used for malformed commands and unknown ops, and for a turn the loop guard stopped (message starts with `loop guard:`). |
 | `status` | `message` | Turn status string: `ready`, `streaming`, `queued: N`, `steering`, `interrupted`, `compacting`, `approval mode: ...`, `trusted ...`, etc. `ready` marks the end of a turn. |
+
+## Events of daemon engine sessions
+
+A session the daemon hosts on another engine (Claude Code, Codex, an ACP
+agent) sends the events above in the same shapes, and a few of its own
+(`docs/daemon-protocol.md` has the details):
+
+| `type` | Fields | Meaning |
+| --- | --- | --- |
+| `surface` / `term_*` | `surface` (`tui` with `term`, or `gui`) | The conversation moved to its engine's TUI on a terminal any client attaches to (`term_attach`), and back. See daemon-protocol.md → Terminals. |
+| `tool_provider` | `provider: {id, name, model, models} \| null` | Claude Code / Codex: the custom provider the session runs on (never its key or URL); null on the LynShen gateway or the tool's own configuration. Sent when the engine starts. See daemon-protocol.md → Custom providers. |
+| `engine_caps` | `agent: {id, name, version}`, `approvals`, `gateway`, `caps: {interrupt, approvalModes, modelPicker, contextUsage, slashCommands, transcriptReplay, fork}` | ACP: what the agent is and can do. |
+| `session_options` | `options: [{id, name, description, category, type, value, choices?}]` | ACP: the agent's settings besides model and effort; `set_session_option` (`id`, `value`) changes one. |
+| `model_status` | also `model_label`, `default_effort` | ACP: the model's name as the agent shows it, and the effort value that leaves the level to the agent. |
+
+## App tools (daemon sessions)
+
+A session the daemon hosts (`docs/daemon-protocol.md` → "App tools") also
+has the app's own tools, whatever its engine; `lynshen serve` on its own
+offers none of them. They arrive as ordinary `tool_start` / `tool_output`
+events under their own names (on Claude Code too: not
+`mcp__lynshen__…`), and a replayed `transcript` keeps them as `tool` items,
+so a client draws the same cards live and after a reopen:
+
+| Tool | `output` (JSON text) | Card |
+| --- | --- | --- |
+| `present_files` | `{files: [{path, description, size, kind}], missing?}`; `kind` is `image`, `video` or `file` | The turn's deliverables: images and videos inline (`fs_image`), other files as cards that open them. |
+| `propose_schedule` | `{id, name, prompt, repeat, time, days?, date?, note}` | A proposed scheduled task with a create button: `schedule_save` with `origin: <id>`; a schedule whose `origin` is `id` shows the card as created. |
+| `start_session` | `{id, session, title, status, reply?}` | A helper conversation the turn started, with a link to it. |
+| `send_to_session` / `wait_session` | `{id, session, title, status, reply?, note?}`; `status` `delivered`, `queued`, `replied`, `waiting_approval` or `running` | A message to another conversation, and its reply. |
+| `list_sessions` / `read_session` | as in the daemon protocol | Plain tool rows. |
+
+A failed call has `is_error: true` and `{"error": "..."}` as its output.
 
 ## Reply styles
 
@@ -1054,7 +1145,7 @@ A normal turn looks like:
 {"op":"user_message","content":"fix the test"}
 < {"type":"user_message","content":"fix the test"}
 < {"type":"connecting"}
-< {"type":"thinking_start"}            // reasoning models only
+< {"type":"thinking_start"}            // the model answered
 < {"type":"reasoning_delta","delta":"..."}
 < {"type":"assistant_start"}
 < {"type":"assistant_delta","delta":"..."}
@@ -1103,7 +1194,7 @@ Suggested rendering (as used by LynShen Desktop):
 | --- | --- |
 | `assistant_start` / `assistant_delta` | streaming message bubble |
 | `response_interrupted` | mark the streaming bubble and thinking section interrupted; later deltas start new ones |
-| `thinking_start` / `reasoning_delta` | collapsible thinking section |
+| `reasoning_delta` | collapsible thinking section |
 | `tool_start` / `tool_update` / `tool_output` | tool cards keyed by `call_id` |
 | `approval_request` | approval dialog → `approve` op |
 | `model_view` / `tree_view` / `resume_view` / `checkpoint_view` | pickers/sidebars |

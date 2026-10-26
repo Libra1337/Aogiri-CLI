@@ -37,7 +37,7 @@ State lives in `~/.lynshen/daemon/`:
 | File | Contents |
 | --- | --- |
 | `token` | Client token, created on first start, mode 0600. |
-| `sessions.jsonl` | Append log of sessions opened and closed. |
+| `sessions.jsonl` | Append log of sessions opened and closed, and their metadata (title, archive state, project...). A session recorded before sessions carried a project (a daemon up to 0.7.9) belongs to the project whose `path` is its `cwd`, if any, until it is moved. |
 | `actions.jsonl` | Append log of deferred actions and their decisions. |
 | `messages.jsonl` | Append log of messages to agents and their delivery. |
 | `timers.jsonl` | Append log of agent timers set, fired and cancelled. |
@@ -96,10 +96,10 @@ whole list each time). The device's connections then get
 
 | Scope | What it allows |
 | --- | --- |
-| `full_auto` | 全自动: `set_approval_mode` / `approve_plan` / `requirement_begin` / `requirement_confirm` with `full-access` (or another engine's full mode), `dispatch_send` with `approval_mode: "full-access"`, `/permissions full-access`, `agent_update` / `agent_create` of the approval mode, sandbox, directories or command rules |
+| `full_auto` | 全自动: `session_create` of a built-in ACP agent that never asks (Pi), `set_approval_mode` / `approve_plan` / `requirement_begin` / `requirement_confirm` with `full-access` (or another engine's full mode), `dispatch_send` with `approval_mode: "full-access"`, `/permissions full-access`, `agent_update` / `agent_create` of the approval mode, sandbox, directories or command rules |
 | `full_access` | Running outside the sandbox: `set_sandbox` and `/sandbox` with `full-access`, approving (`approve` / `decide_action` with `allow`) an `escalation` or an `elevation` |
 | `add_folder` | `project_add`, `project_create`, `workspaces_set`, `add_directory`, an approval's `add_dir`, approving an `outside_write`, `/trust` |
-| `terminal` | `term_open`, `term_input`, `term_resize`, `term_close`, `session_tui` |
+| `terminal` | `term_open`, `term_input`, `term_resize`, `term_close`, `session_tui`. Without it a device still views a session's TUI (`term_attach`, `term_ack`, `term_detach`), read-only: its window does not resize the TUI |
 
 An op that needs a scope the device lacks fails with
 `{"type":"error","code":"scope_required","message":"scope_required:<scope>: …"}`.
@@ -121,6 +121,11 @@ open connections at once.
 To reach the daemon from a phone, keep it on `127.0.0.1` and expose the
 port over HTTPS with `tailscale serve` or a reverse proxy; the daemon has no
 TLS of its own. Or use the relay (below).
+
+LAN and Tailscale pairing is an advanced option of a computer signed in to
+LynShen. Signed out, `pair_start` fails with `sign_in_required: …` and
+`POST /api/pair` answers `403 {"error":"sign_in_required: …"}`. Devices that
+were paired before keep connecting with their tokens.
 
 ## Relay
 
@@ -150,6 +155,68 @@ it from anywhere through end-to-end encrypted streams
 
 A relay stream then behaves exactly like a device's local WebSocket.
 
+### Relay v2: remote access through the account
+
+A computer signed in to LynShen (a device key in auth.json: the desktop's
+`providers.monoize`, else the CLI's `providers.lynshen-cli`) uses relay v2
+(`docs/relay-protocol.md` §7) while the relay is on:
+
+- It gets a 10-minute relay token from the gateway, connects to
+  `…/relay/v2/host`, and registers as one of the account's computers. The
+  phone's list of computers comes from the account; the gateway then knows
+  the computer's Noise key.
+- Only clients signed in to the same account reach it. The daemon
+  authorizes them in this order:
+  1. another account → `wrong account`;
+  2. a paired device → allowed;
+  3. a pairing code → pending, then the check code is confirmed with
+     `device_confirm`, as above;
+  4. a connect request → asks the desktop;
+  5. anything else → `not paired`.
+
+  Devices keep their scopes. A device paired over v1 or the LAN joins the
+  account on its first v2 connection.
+- **Connect requests.** A client sends `"request": true` in msg 1. Every
+  local client gets
+  `{"type":"connect_request","request","name","client","check","at"}`.
+  - `check` is the same 6-digit check code the phone shows. Show it in the
+    dialog.
+  - The desktop answers with `{"op":"connect_decide","request","allow"}`
+    (reply `connect_decided`). `{"op":"connect_requests"}` lists the open
+    requests.
+  - A request waits up to 120 s. Every local client gets
+    `{"type":"connect_request_closed","request","outcome"}`, where `outcome`
+    is `allowed`, `denied`, `expired` or `cancelled`.
+  - Without a local client connected, the phone gets `no_desktop`. With 3
+    requests already open, it gets `busy`.
+  - An allowed device is trusted at once. It has no elevated scopes until
+    the desktop grants them.
+  - Both ops are local clients only.
+- **Account switch.** Signing the computer in to another account revokes
+  every remote device (not chat bindings) when the relay reports the new
+  account. `relay_status.user` names the account.
+- **Revoked login.** The gateway can refuse the device key, for example
+  after the computer was removed from the account. The daemon then removes
+  the key from auth.json (signed out), goes back to v1, and stops LAN
+  pairing. A LynShen OAuth refresh token that the server refuses (HTTP 400
+  or 401) signs the CLI out the same way. Network and server errors still
+  retry.
+- **Fallback.** When v2 cannot be reached (no relay token, or a relay
+  without v2), the daemon uses v1 for 10 minutes and then tries v2 again.
+  Signed out, it uses v1 as before.
+- **Push.** Notifications go to the daemon's own subscriptions and also to
+  the account's push registrations (`GET /api/desktop/oauth/push/targets`,
+  read at most once a minute) through the same relay push endpoint. A device
+  that looks at the session is skipped.
+
+`relay_status` adds these fields:
+- `signed_in`;
+- `refused` (the gateway refused the login);
+- `mode` (`v1`, `v2` or `off`);
+- `user` (the account of the last v2 registration).
+
+`device_list` adds `client` for devices of the account.
+
 ## Chat connectors
 
 A chat connector (Telegram; Discord and QQ planned) connects a bot that the
@@ -168,15 +235,24 @@ handshake with HTTP 401. Local clients read the daemon token from
 Each WebSocket text message is one JSON frame. The daemon first sends:
 
 ```json
-{"type":"hello","protocol":2,"version":"0.3.0"}
+{"type":"hello","protocol":2,"version":"0.3.0","features":["queue","files","fork","engine_probe","tool_providers","acp_presets","term_attach","schedule_runs"]}
 {"type":"sessions","sessions":[{"session":"...","cwd":"...","created_at":0,"updated_at":0,"entries":4,"title":"...","archived":false,"open":true,"watchers":0}]}
 {"type":"workspaces","rev":1,"workspaces":[...]}
 ```
 
-followed by the current `agents`, `schedules`, `questions` and `actions`
-lists.
+followed by the current `agents`, `schedules`, `questions`, `actions`,
+`dispatches`, `requirements` and `dev_servers` lists.
 
-A client that does not speak `protocol` 2 must disconnect.
+A client that does not speak `protocol` 2 must disconnect. `features` names
+what the daemon takes beyond the protocol version (an older daemon sends
+fewer, or none): `queue` and `files` as in `docs/serve-protocol.md`, `fork`
+for `session_create` with `fork_from` (see "Forks"), `engine_probe` for that
+op, `tool_providers` for custom providers (see "Custom providers"),
+`acp_presets` for built-in ACP agents (`options.agent`, the ACP client of
+"The ACP client"), `term_attach` for session terminals any client views
+(see "Terminals"; an older daemon gives a session's TUI to the client that
+asked only), `schedule_runs` for scheduled tasks' run records, failures,
+`budget` and `worktree` (see "Scheduled tasks").
 
 ## Replies
 
@@ -189,15 +265,22 @@ every connected client.
 
 | Op | Fields | Reply |
 | --- | --- | --- |
-| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers`, `running` (a turn runs or messages wait; the list is sent again when it changes), `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at`, `entries` (how many entries the engine saved for a LynShen session, null for other engines; 0 for one opened without a first message) |
-| `gateway_catalog` | — | `gateway_catalog`: `models` (the LynShen models the user chose to show, `lynshen_models` in config.json) and `groups` (the gateway's groups with their models and multipliers); empty when not signed in or offline. For clients that cannot read this machine's login (the remote page) |
+| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers`, `running` (a turn runs or messages wait; the list is sent again when it changes), `failed` (its latest turn ended on an error; cleared when the next turn starts, and the list is sent again when it changes), `project` (the id of the project it belongs to, else null), `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at`, `entries` (how many entries the engine saved for a LynShen session, null for other engines; 0 for one opened without a first message), `forked_from` (`{session, turns, at}` for a fork, see "Forks"; else null), `background` (background work its turn left going — background commands, subagents, workflows — runs: not a turn, so not `running`; the list is sent again when it changes), `schedule` (the scheduled task it is a run of, else null), `worktree` (`{repo, path, branch, base, slug}` for a scheduled run the daemon made a worktree for, with `gone: true` once removed; else null), `parent` (the session that started it with `start_session`, else null) |
+| `gateway_catalog` | — | `gateway_catalog`: `models` (the LynShen models the user chose to show, `lynshen_models` in config.json; one the gateway hides from pickers has `hidden: true`: it stays callable by name, and pickers list it only while a session runs it) and `groups` (the gateway's groups with their models and multipliers); empty when not signed in or offline. For clients that cannot read this machine's login (the remote page) |
 | `restart_when_idle` | — | none. Desktop only: this daemon exits once no session is running (after a `daemon_restarting` broadcast), so the desktop can start a newer one without cutting off a task |
-| `session_meta` | `session`, and any of `title`, `archived`, `hidden`, `group` | none; every client receives the new `sessions` list. An empty title goes back to the engine's label; a hidden session leaves `session_list` and `session_history` (its conversation stays on disk). A session created here is titled after its first user message (first line, 40 characters) unless a client titled it first. After its 1st and 3rd turns, then every 5th, the title model (`title_model` in config.json, else the main `model`) renames it from the project name, the current title, the first and latest requests and the start of the latest reply. A title a client set with `session_meta` is never replaced |
+| `session_meta` | `session`, and any of `title`, `archived`, `hidden`, `group`, `project` | none; `project` moves the session into that project (an unknown id is an error) or, empty, out of any; every client receives the new `sessions` list. An empty title goes back to the engine's label; a hidden session leaves `session_list` and `session_history` (its conversation stays on disk). A session created here is titled after its first user message (first line, 40 characters) unless a client titled it first. After its 1st and 3rd turns, then every 5th, the title model (`title_model` in config.json, else the main `model`) renames it from the project name, the current title, the first and latest requests and the start of the latest reply. A title a client set with `session_meta` is never replaced |
 | `session_history` | `cwd` | `session_history`: every session saved in `cwd`, newest first, whoever ran it (daemon, TUI, `lynshen serve`), with `title`, `updated_at`, `entries`, `archived`, `agent`, `open` |
-| `session_create` | `cwd`, optional `engine` (`lynshen`, default, `claude`, `codex` or `acp`) and `options` | `session_created` with `session`; the session's startup events follow. See "Other engines" |
+| `tool_providers` | `tool` (`claude` or `codex`) | `tool_providers` with `tool` and `config: {selected, providers: [{id, name, base_url, format, model, models, has_key}]}`. Never a key. Local clients only. See "Custom providers" |
+| `tool_provider_save` | `tool`, `provider: {id, name, base_url, format, model, models, key}` | the new `tool_providers`. `id`: 1–100 letters, digits, `-`, `_`; `base_url`: http(s), no credentials, query or fragment; `format` must be the tool's (`anthropic` for Claude Code, `responses` for Codex); `models` (≤ 500) and `model` (the default, else the first); an empty `key` keeps the saved one. Local clients only |
+| `tool_provider_select` | `tool`, `provider_id` (`""`: the tool's own configuration) | the new `tool_providers`. New sessions start on it; a session keeps the one it started on. Local clients only |
+| `tool_provider_remove` | `tool`, `provider_id` | the new `tool_providers`; its key is deleted, and a selected one is unselected. Sessions on it no longer start until moved. Local clients only |
+| `tool_provider_models` | `tool`, `base_url`, `key` (or `provider_id` for its saved key) | `tool_provider_models` with `models: [{id, name, context_window}]` and `hidden` (how many the list says take another protocol). From the API's `GET …/v1/models` (Anthropic and OpenAI shapes, paged); the request carries that key and nothing else. Local clients only |
+| `acp_presets` | — | `acp_presets` with `presets: [{id, name, status, path, version, min_version, below_version, approvals, gateway, install, tui}]`: the built-in ACP agents and whether each can start here (`ready`, `missing`, or `unsupported` with its version outside `min_version`..`below_version`). Each program is asked its `--version` (10 s at most). See "Built-in ACP agents" |
+| `session_create` | `cwd`, optional `engine` (`lynshen`, default, `claude`, `codex` or `acp`), `options` and `project` | `session_created` with `session`; the session's startup events follow. See "Other engines"; with `options.fork_from` the session is a fork (see "Forks"). `project`: the project it belongs to, whatever its `cwd` (an unknown id is an error); `""` or null: none; left out: the project whose `path` is `cwd`, if any. A chat belongs to none; a session started with `start_session` belongs to its parent's project |
+| `engine_probe` | `engine` (`claude`, `codex` or `acp`), optional `options` (as `session_create`'s: `bin`, `env`, `lynshen_gateway`, `model`, `command`, `args`), `cwd` (default: the home directory), `force` | `engine_probed` with `engine`, `events`, `at` (ms, when the engine was run) and `cached`. See "Engine probe". `bin`, `env` and `acp` are local clients only, as for `session_create` |
 | `session_open` | `session`, optional `cwd`, `engine`, `options` | `session_opened`; with `cwd`, also opens a session saved there that the daemon never hosted. Reopens a closed session (or one from before a restart), resuming its transcript and its undecided deferred actions |
-| `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped |
-| `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` opens a closed session first, as `session_open` does (an error when it cannot), and also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `approval_mode_pending`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
+| `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped (with `reason: "idle"` when the daemon closed an idle engine session; see "Differences from `lynshen serve`") |
+| `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` opens a closed session first, as `session_open` does (an error when it cannot), and also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `approval_mode_pending`, `mcp_servers`, `tool_provider`, `engine_caps`, `session_options`, and `surface` while the conversation is in its TUI), a `transcript` of the conversation so far and `attended` |
 | `actions_list` | — | `actions`: undecided deferred actions across all sessions, and in `closed` the ones closed lately (as in `questions`) |
 | `pair_start` | — | `pairing` with `code` and `expires_at` (local clients only) |
 | `device_list` | — | `devices`: paired, unrevoked devices with `id`, `name`, `paired_at`, `kind` (`device`, or `chat` for a chat binding, which also has `platform`, `connector` and `last_seen`), `scopes`, `pending` (and `check` while pending) (local clients only) |
@@ -209,20 +292,22 @@ every connected client.
 | `device_me` | — | `device_me` with `device`, `name`, `scopes` (a local client: `local: true` and every scope) |
 | `device_forget_me` | — | `device_forgotten`, then the sending device is revoked (devices only) |
 | `device_revoke` | `device` | `device_revoked` (local clients only) |
-| `relay_status` | — | `relay_status` with `enabled`, `connected`, `host` (the host id), `url` (null with `--no-relay`) (local clients only) |
+| `relay_status` | — | `relay_status` with `enabled`, `connected`, `host` (the host id), `url` (null with `--no-relay`), `signed_in`, `refused`, `mode` (`v1`/`v2`/`off`), `user` (local clients only) |
+| `connect_requests` | — | `connect_requests` with `requests: [{request, name, client, check, at}]` (local clients only) |
+| `connect_decide` | `request`, `allow` | `connect_decided`; answers a waiting connect request (local clients only) |
 | `relay_set` | `enabled` | `relay_status`; turns the relay connection on or off and remembers it (local clients only) |
 | `mcp_set` / `mcp_remove` / `mcp_toggle` | as the session ops (`server`; `name`; `name`, `enabled`), with no `session` | `mcp_saved`; saves the change to `config.json` and sends the op to every open LynShen session, which answers with `mcp_servers`. Local clients only, with or without `session` |
 | `pair_link` | — | `pair_link` with `link`, `code` and `expires_at`; an error while the relay is off (local clients only) |
 | `connector_list`, `connector_add`, `connector_set`, `connector_remove`, `connector_bind_start` | see `docs/chat-connectors.md` | `connectors`, `connector_added`, `connector_removed`, `connector_bind_code` (local clients only) |
 | `ping` | — | `pong`. Clients behind the relay send it every minute so an idle stream is not closed |
-| `workspaces` | — | `workspaces` with `rev` and `workspaces: [{id, name, is_default?, color?, icon?, projects: [{id, name, path, dirs?, chats?, worktree?, color?, icon?}]}]`. A project's `color` and `icon` are kept as the client sent them (shaped as an agent's, see "Agents"). `dirs`: the project's extra directories (absolute paths, not including `path`); remote clients may read them, and an engine started in `path` may work in those that exist: Claude Code gets one `--add-dir` each, Codex has them as writable roots of its workspace-write sandbox (and `--add-dir` in its TUI), and a LynShen session's file tools and sandbox treat them as writable workspace (ACP agents get nothing) |
-| `workspaces_set` | `rev`, `workspaces` | `workspaces`; replaces the list when `rev` is the current one, else an error (another client changed it). A project's `dirs`, when present, must be a list of absolute paths. Desktop imports its list with `rev: 0` into an empty daemon |
+| `workspaces` | — | `workspaces` with `rev` and `workspaces: [{id, name, is_default?, color?, icon?, projects: [{id, name, path, dirs?, chats?, worktree?, color?, icon?}]}]`. A project's `color` and `icon` are kept as the client sent them (shaped as an agent's, see "Agents"). `dirs`: the project's extra directories (absolute paths, not including `path`); remote clients may read them, and an engine started for a session of the project may work in the project's `path` and `dirs` that exist, besides its own `cwd`: Claude Code gets one `--add-dir` each, Codex has them as writable roots of its workspace-write sandbox (and `--add-dir` in its TUI), and a LynShen session's file tools and sandbox treat them as writable workspace (ACP agents get nothing) |
+| `workspaces_set` | `rev`, `workspaces` | `workspaces`; replaces the list when `rev` is the current one, else an error (another client changed it). A project id may appear in one workspace only (sessions name their project by id). The sessions of a project a save removes (here or with `project_remove`) belong to none and are archived; every client receives the new `sessions` list. A project's `dirs`, when present, must be a list of absolute paths. Desktop imports its list with `rev: 0` into an empty daemon |
 | `project_add` | `path`, optional `workspace`, `project_name`, `workspace_name` | `workspaces`; adds an existing directory. With no workspaces yet, one named `workspace_name` is created |
 | `project_create` | `parent`, `name`, optional `git_init`, `workspace`, `workspace_name` | `workspaces`; makes the folder `parent/name` (optionally `git init`) and adds it |
 | `project_remove` | `workspace`, `project` | `workspaces`; the files stay |
 | `fs_list` | `path` (`~` is the home directory), optional `dirs_only` | `fs_list` with `path`, `git`, `entries: [{name, dir, size}]`, `truncated`. Git-ignored entries and `.git` are left out |
 | `fs_read` | `path` | `fs_read` with `size`, `binary`, `text` (first 1 MiB), `truncated` |
-| `fs_image` | `path` (a png/jpeg/gif/webp in a known directory or an upload, up to 16 MiB) | `fs_image` with `data`, a data URL: how the remote page shows a message's images |
+| `fs_image` | `path` (a png/jpeg/gif/webp image or an mp4/m4v/webm/mov video in a known directory or an upload, up to 16 MiB) | `fs_image` with `data`, a data URL (`image/…` or `video/mp4`, `video/webm`, `video/quicktime`): how the remote page shows a message's images and the images and videos an agent presented (`present_files`) |
 | `git_status` | `path` | `git_status` with `repo`, `branch`, `files: [{path, status, from}]` (porcelain codes) |
 | `git_diff` | `path`, optional `file` | `git_diff` with `diff` (unified, untracked files included, first 1 MiB), `truncated` |
 | `agent_list` | — | `agents` |
@@ -236,10 +321,12 @@ every connected client.
 | `agent_memory_read` | `agent`, `file` (`deploy.md`, or `memory/deploy.md` as `agent_get` lists it) | `agent_memory` with `agent`, `file`, `content`; an error for anything but an existing `memory/<name>.md` (letters, digits, `-`, `_`) |
 | `schedule_list` | optional `agent` | `schedules`: all scheduled tasks, or `agent`'s. See "Scheduled tasks" |
 | `session_usage` | `session` (its id) | `session_usage` with `totals`, `sessions` and `turns`: persisted and live usage, with settled gateway charges |
-| `schedule_usage` | `schedule` (its id) | `schedule_usage` with `totals` and `sessions`: token counts and costs of the task's run sessions, including follow-ups; reused sessions count once |
-| `schedule_save` | `schedule`: without `id` creates one (`agent`, `name`, `prompt`, `repeat`, `time`, and `days` / `date` as `repeat` needs; optional `enabled`, `new_session`, both default `true`); with `id` changes the fields present among `name`, `prompt`, `enabled`, `repeat`, `time`, `days`, `date`, `new_session` | `schedule_saved` with `schedule`; `next_run_at` is computed again |
+| `schedule_usage` | `schedule` (its id) | `schedule_usage` with `totals` and `sessions`: token counts and costs of the task's run sessions and the sessions they started (rows with `parent`), including follow-ups; reused sessions count once |
+| `schedule_save` | `schedule`: without `id` creates one (`agent`, `name`, `prompt`, `repeat`, `time`, and `days` / `date` as `repeat` needs; optional `enabled`, `new_session`, both default `true`, `worktree` (default `false`), `budget` (default null) and `origin`, the `id` of the `propose_schedule` card it is created from); with `id` changes the fields present among `name`, `prompt`, `enabled`, `repeat`, `time`, `days`, `date`, `new_session`, `worktree`, `budget` | `schedule_saved` with `schedule`; `next_run_at` is computed again; switching a task on sets `failures` back to 0. A schedule carries `origin` (null when it came from no card), so a card finds the task created from it in `schedules` |
+| `app_tools` | – | `app_tools` with `present_files`, `propose_schedule` (booleans) and `sessions` (`off`, `ask`, `on`). See "App tools" |
+| `app_tools_set` | any of `present_files`, `propose_schedule` (booleans), `sessions` (`off`, `ask`, `on`; `true`/`false` for `on`/`off`). Local clients only | `app_tools` as it is now; sessions started from then on follow it |
 | `schedule_delete` | `schedule` (its id) | `schedule_deleted` with `schedule` |
-| `schedule_run` | `schedule` (its id) | `schedule_started` with `schedule`; runs it now, enabled or not (an error when its agent is disabled), without changing `next_run_at` |
+| `schedule_run` | `schedule` (its id) | `schedule_started` with `schedule`; runs it now, enabled or not (an error when its agent is disabled, or while its last run is not over), without changing `next_run_at` |
 | `question_list` | — | `questions`: unanswered questions, and in `closed` the ones closed in the last 7 days (each with `closed_by`, `closed_reason`, `closed_at`) |
 | `question_answer` | `question`, `answer` | `question_answered`; the answer is delivered to the session that asked |
 | `item_close` | `kind` (`question` or `action`), `item` (its id), optional `reason` | `item_closed` with `item`; closes an open question or deferred action without answering it, then broadcasts `questions` / `actions`. Nothing is sent to the agent |
@@ -260,6 +347,76 @@ every connected client.
 `decide_action` (a session op) also works for a session that is closed or
 was hosted before a restart: the daemon reopens it first.
 
+### Forks
+
+A fork is a `session_create` whose `options` carry `fork_from`: the engine's
+id of a conversation (a session id, which for Claude Code and Codex is the
+conversation's), on the same `engine`. The new session holds that
+conversation's first turns and goes on from there; the original stays as it
+is, and both can run at once.
+
+| Option | Meaning |
+| --- | --- |
+| `fork_from` | The conversation to fork |
+| `fork_turns` | How many of its user turns the fork keeps, counted on its active branch (at least 1; left out: all of them) |
+| `resume_at` | Claude Code: the uuid of the reply the fork goes on after, instead of `fork_turns`. Replayed replies carry it as `uuid` in `transcript`; live ones as `assistant_uuid` |
+| `fork_cwd` | LynShen: the directory `fork_from` is saved for, when the fork's `cwd` is another one (its own worktree). Claude Code and Codex find the conversation by id from any directory |
+
+How each engine forks:
+
+- LynShen copies the source session's first `fork_turns` user turns (and the
+  plan, reply style and system prompt they had) into a new session saved for
+  `cwd`, and opens it. The notes a left-out message was sent with stay out.
+- Claude Code: the daemon finds the reply that ends turn `fork_turns` on the
+  conversation's active branch (following each row's parent, so turns a
+  rewind cut stay out) and starts `claude --resume <fork_from>
+  --fork-session --session-id <new> --resume-session-at <reply>`. Claude Code
+  writes the fork's file with its first turn; until then a watcher's
+  `transcript` holds the copied turns. A fork closed, or restarted (a mode
+  switch), before its first turn is forked again from its record. Its own
+  TUI opens only after that first turn.
+- Codex reads the thread (`thread/read`) and forks it (`thread/fork` with
+  `lastTurnId`, the turn before the next user turn); the new thread's id is
+  the session id, and its history comes back as `transcript`.
+- ACP agents copy a whole conversation with `fork` (see "Other engines");
+  `fork_from` is an error for them.
+
+A fork that cannot be made (no such conversation, `fork_turns` 0, a
+relative `fork_cwd`, a Claude conversation with no reply in the kept turns)
+fails `session_create` with an `error`. The session list names the source as
+`forked_from: {session, turns, at}` (`turns` and `at` as asked or found;
+null when not used), kept through restarts. A fork starts with its source's
+title (`title_auto`, so the title model may still rename it).
+
+A fork in its own worktree: the client makes the worktree first (on the
+desktop, the parallel-task worktree under `.lynshen-worktrees`, branch
+`task/<slug>`), then creates the fork with `cwd` the worktree, `project` the
+original's project (so it is listed with it), and for LynShen `fork_cwd` the
+original's directory. The daemon itself makes no worktree.
+
+### Engine probe
+
+`engine_probe` tells a client what an engine offers before any session of it
+runs: its models, slash commands, capabilities and session options. The
+daemon starts the engine in `cwd` as a session of it would start (the same
+binary, environment and gateway from `options`), asks for its model list
+(`/model`), keeps the last event of each of these kinds and stops it:
+`model_status`, `model_view`, `engine_caps`, `command_list`,
+`session_options` (each as a session sends it; an engine sends only some).
+It waits 25 s at most, and 4 s for the rest once the engine said something.
+
+The run is no session: no list shows it, and it saves nothing (Claude Code
+runs with `--no-session-persistence`, Codex opens an `ephemeral` thread). An
+ACP agent opens a session of its own, as it always does. Nothing that waits
+for the user (approvals, a sign-in) is answered.
+
+Answers are cached per engine setup (engine, `cwd`, `bin`, `env`,
+`lynshen_gateway`, `model`, `command`, `args`) for 10 minutes; `cached` says
+whether this one came from the cache, `at` when the engine was run, and
+`force: true` runs it again. Two probes of one setup at once run it once.
+An engine that says nothing is an error (with its last stderr line). The
+LynShen engine needs no probe: an error.
+
 `session_create` also accepts `agent` instead of `cwd`: the session runs in
 the agent's directory as that agent. With `chat: true` instead, the session is
 a chat: it runs in `~/.lynshen/chats` with the chat prompt (conversation and
@@ -276,13 +433,66 @@ Credentials (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.lynshen/auth.json`,
 `~/.lynshen/daemon`) are never readable. Paths are resolved (symlinks
 followed) before the check.
 
+## Custom providers
+
+A Claude Code or Codex session can run on an API the user brings (a relay,
+a vendor's Anthropic-compatible endpoint, their own Responses server) with
+its own key, instead of the LynShen gateway or the tool's own configuration
+(`tool_providers.rs`).
+
+- **Where things are kept.** The list is a daemon setting
+  (`tool_providers_<tool>` in the daemon's `settings.json`, owner-only):
+  `selected` and `providers: [{id, name, base_url, format, model, models}]`.
+  Each key is in `~/.lynshen/auth.json`'s own block `tool_providers` as
+  `"<tool>:<id>": "<key>"`, encrypted (`jcenc1:`) when `encrypt_secrets` is on
+  (`docs/secrets.md`), and kept when the CLI or the desktop rewrites the
+  file. It is not in `providers`, so no client lists it as an engine
+  provider. No reply, event, log or engine argument carries a key or the
+  URL; a provider row says `has_key`.
+- **How requests go.** The session runs through the local gateway like a
+  gateway session: the engine holds a local key of its own (Claude Code: a
+  `--settings` file; Codex: `-c` overrides with provider `lynshen_custom`
+  and an env var), never the real key. The local gateway sends each request
+  to the provider's `base_url` (with its `/v1`, or `/v1` added) with the
+  provider's key alone: `x-api-key` for the Anthropic format, a bearer token
+  for Responses. It never sends the LynShen token, the session's group or
+  turn, or any `X-LynShen-*` header (one the engine sent is dropped), and
+  follows no redirect. It goes through the user's proxy as the tool would.
+  A provider that refuses Claude Code's mid-conversation system messages is
+  told to Claude Code as `capability_rejected: mid_conv_system`.
+- **Usage.** The engine's usage events record the turn locally with
+  `channel_kind: "local"` and `channel: "<tool>:<id>"`, with no price
+  estimate. Such turns are never uploaded to the LynShen account's ledger
+  (`upload: false`) and never count as gateway use (`billing_gateway`
+  false on their `usage` events).
+- **A session keeps its provider.** A new session takes the tool's selected
+  provider (`options.tool_provider` names another, `""` the tool's own
+  configuration); the session records it (`session_list`'s `tool_provider`)
+  and reopens and restarts on it (one upstream refuses another's
+  conversation state, Claude's thinking signatures). Changing the selection
+  affects new sessions only. `set_gateway` with `gateway: false` may name
+  `tool_provider`. A session whose provider was removed does not start: the
+  error names it, and the client may reopen it with `lynshen_gateway: true`
+  or `tool_provider: ""`. Claude Code's background and subagent requests go
+  to the provider's model too (`ANTHROPIC_DEFAULT_*_MODEL`). A Codex session
+  on one reports `lynshen_custom` as its `model_status.provider` and has no
+  ChatGPT plan usage.
+- **State event.** Every Claude Code, Codex and ACP session sends, when its
+  engine starts (and again after a restart),
+  `{"type":"tool_provider","session":"…","provider":{"id","name","model","models"}}`
+  or `"provider": null` (the gateway or the tool's own configuration). It is
+  part of a watcher's snapshot.
+
 ## Skills
 
 `skills_catalog` answers at once with the bundled index of
 github.com/anthropics/skills and the community repositories as last read.
 `source` is `anthropic` or a community repository's `owner/repo`;
-`redistributable` is false for Anthropic's source-available document skills,
-which `skill_install` refuses.
+`redistributable` is false for Anthropic's source-available document skills
+and for a community skill whose terms say proprietary or source-available
+(its frontmatter `license`, else its repository's), which `skill_install`
+refuses. A community repository is read at its default branch's current
+commit (`revision`), and its skills install from that commit.
 
 The community sources are cached in `~/.lynshen/cache/skills-catalog.json`.
 `sources` has one entry per source, Anthropic first: `origin` is `bundled`,
@@ -304,9 +514,15 @@ mirror does not have. Requests go through the proxy that `HTTPS_PROXY`,
 `latest.json` URL (empty: no mirror) and `LYNSHEN_SKILL_SOURCES`
 (`Name=https://github.com/o/r;…`) the community list.
 
-`backend` picks the directory: `claude` installs into `~/.claude/skills`,
+`backend` picks the directory: `claude` installs into the `skills` of
+Claude Code's config directory (`~/.claude/skills`, or under
+`CLAUDE_CONFIG_DIR` when the daemon's environment sets it),
 anything else into `~/.lynshen/skills`. `installed` means
-`<installDir>/<id>/SKILL.md` exists. `skill_install` looks the skill up again
+`<installDir>/<id>/SKILL.md` exists and, for a community skill, that it came
+from this entry's repository (`<installDir>/<id>/.lynshen-source`; one
+installed before sources were recorded counts for every source). Installing a
+skill whose name another repository's installed skill already has is an
+error until that one is removed. `skill_install` looks the skill up again
 in its source (the bundled index or the cache), then installs the mirror's
 archive of it, checked against the sha256 in the mirror's signed manifest.
 Without one (or without the mirror) it downloads the skill's whole directory
@@ -320,8 +536,8 @@ run.
 `~/.agents/skills` (`"shared"`) and, with `cwd`, the project's
 `.lynshen/skills` and `.agents/skills` (`"project"`, only once the project is
 trusted; `projectTrusted` says whether it is). For `claude` they come from
-`~/.claude/skills` and the project's `.claude/skills`, all `enabled`, and
-`toggleable` is false: LynShen does not switch Claude Code's skills.
+the `installDir` above and the project's `.claude/skills`, all `enabled`,
+and `toggleable` is false: LynShen does not switch Claude Code's skills.
 `removable` is true for a folder directly in the personal directory; a shared
 skill is other tools' too and a project's belongs to the project. `problems`
 are what keeps a skill from loading: `unreadable` (an `error` when the skill
@@ -359,18 +575,24 @@ clients need nothing engine-specific. `options`:
 | `model` | Model to start with |
 | `resume_at` | Claude Code: resume the conversation as it was at this assistant message uuid |
 | `effort`, `ultracode`, `fast`, `thinking` | Claude Code: start with this thinking effort, ultracode on, fast mode on, thinking summaries shown (`false` hides them). A restart (full access, gateway switch) keeps the session's own |
-| `lynshen_gateway` | Claude Code / Codex / OpenCode: `true` runs this session through the LynShen gateway on the user's LynShen login; `false` on the provider in the user's own Claude Code / Codex / OpenCode config. The endpoint and key go to this process only (Claude: `--settings` file; Codex: `-c` overrides and an env var; OpenCode: `OPENCODE_CONFIG_CONTENT` and an env var), never to the user's config files. Omitted on `session_open`: as the session last ran |
-| `command`, `args` | ACP: the agent's command line |
+| `tool_provider` | Claude Code / Codex off the gateway: the custom provider (`tool_providers`) to run on, by id; `""` the tool's own configuration. Left out: a new session takes the tool's selected provider, a reopened one the provider it last ran on. See "Custom providers" |
+| `agent` | ACP: a built-in agent by id (`opencode`, `omp`, `pi`; see `acp_presets`). The daemon finds and starts it, so any client (a phone too) may name it. Excludes `command` and `args` |
+| `lynshen_gateway` | Claude Code / Codex / OpenCode / oh-my-pi / Pi: `true` runs this session through the LynShen gateway on the user's LynShen login; `false` on the session's custom provider (Claude Code / Codex, see `tool_provider`) or the provider in the user's own config. The endpoint and key go to this process only (Claude: `--settings` file; Codex: `-c` overrides and an env var; OpenCode: `OPENCODE_CONFIG_CONTENT` and an env var), never to the user's config files. Omitted on `session_open`: as the session last ran |
+| `command`, `args` | ACP: the agent's command line (an agent the desktop registered; local clients only) |
 | `fork` | ACP, `session_create` only: a conversation of the agent's (its own session id) to copy into the new session with `session/fork`; the original stays as it is |
+| `fork_from`, `fork_turns`, `fork_cwd` | `session_create` only: a fork of a LynShen, Claude Code or Codex conversation (see "Forks") |
 | `acp_agent` | ACP: `{id, name}`, the desktop's registry entry for the agent, kept with the session (`session_list` returns it) |
 | `bin` | Claude Code / Codex: the engine binary to run instead of the one found on `PATH` |
 | `env` | Extra environment variables for the engine process (plain names; no `DYLD_*`/`LD_*`) |
 
-`engine: "acp"` runs an Agent Client Protocol agent (`lynshen acp`,
-`gemini --experimental-acp`, ...) from `options.command`. Only local
-clients may start or reopen one, or pass `bin` or `env` for any engine,
-since that names a program to run; paired devices watch and drive such
-sessions like any other. The daemon names an ACP session itself and keeps
+`engine: "acp"` runs an Agent Client Protocol agent: a built-in one by id
+(`options.agent`, see "Built-in ACP agents"), or one the desktop registered
+by its command line (`options.command`, `args`: `lynshen acp`,
+`gemini --experimental-acp`, ...). Only local clients may name a command, or
+pass `bin`, `args` or `env` for any engine, since that names a program to
+run; any client may start a built-in agent, and paired devices watch and
+drive every session like any other. A session of a built-in agent reopens
+from its record, whatever the client names. The daemon names an ACP session itself and keeps
 the agent's own session id with it; reopening the session (with the same
 `command`) asks the agent for that conversation: `session/load` when the
 agent offers it (its replay becomes the session's `transcript`), else
@@ -378,18 +600,41 @@ agent offers it (its replay becomes the session's `transcript`), else
 conversation, starts a new one under the same session id, and clients get
 an `info` event saying so.
 
+An agent runs one prompt at a time: a message sent during a turn waits in
+the daemon (`pending_messages`) and runs as the next turn. `unqueue` takes
+one back (or drops it), `queue_move` reorders them, and `steer` (or
+`interrupt` with `index`), which an agent cannot do mid-turn, cancels the
+turn (`session/cancel`) and runs the picked message first as soon as it
+settles. A plain `interrupt` drops the waiting messages.
+
 The session id is the engine's conversation id (Claude Code's session id,
 Codex's thread id), so reopening a closed session resumes the same
 conversation (`--resume`, `thread/resume`), and `session_open` with `cwd`
 and `engine` opens any conversation the engine saved for that directory
 (`~/.claude/projects`, `~/.codex/sessions`). `session_history` lists those
-too, with their `engine`. `session_created` for Codex comes once its thread
+too, with their `engine`.
+
+Claude Code keeps its conversations in its config directory: `~/.claude`,
+or `CLAUDE_CONFIG_DIR`. The daemon looks for a session's conversation where
+that session's Claude Code keeps it: `CLAUDE_CONFIG_DIR` in the session's
+`env`, else the daemon's own. When `bin` is a program of the user's that
+sets the directory itself (an account switcher), the daemon runs it once
+without a conversation and reads the directory from Claude Code's
+`initialize` reply, remembers it for that program and environment, and asks
+again when the conversation is not where it was seen. A running session
+takes the directory Claude Code reports, and keeps it across restarts and
+the TUI handoff. So a saved conversation is resumed, never started again
+under its id (which Claude Code refuses: "Session ID … is already in use"),
+and its history shows. `session_created` for Codex comes once its thread
 is open.
 Every session in `session_list` carries its `engine` (and an ACP session
-the `acp_agent` it was created with).
+the `acp_agent` it was created with: the desktop's `{id, name}`, or a
+built-in agent's `{id, name, builtin: true}`), and a Claude Code / Codex
+session on a custom provider its `tool_provider` (the id).
 
-OpenCode (`opencode acp`, 1.x; the command's program is `opencode`) gets
-more from the daemon (`engines/opencode.rs`):
+OpenCode (`opencode acp`, 1.x: the built-in `opencode`, or a registered
+command whose program is `opencode`) gets more from the daemon
+(`engines/opencode.rs`):
 
 - `approval_mode` works: the modes are OpenCode agents, switched with
   `session/set_config_option`, or `session/set_mode` when OpenCode has no
@@ -420,11 +665,101 @@ more from the daemon (`engines/opencode.rs`):
   (`session/resume`, no replay).
 - OpenCode 2.x is refused with an error.
 
+### The ACP client
+
+The daemon speaks the stable ACP v1 schema as a full client (`engines/acp.rs`).
+`initialize` offers form elicitations, boolean config options and notices,
+and names the client `lynshen`; it offers no file system or terminal (an
+agent that asks anyway gets `-32601`).
+
+- **Sessions.** `session/new` (or `session/load` / `session/resume` /
+  `session/fork`, above) carries the user's enabled MCP servers from
+  config.json as `mcpServers`: stdio ones with their command, args and env,
+  http ones only when the agent says it takes them
+  (`mcpCapabilities.http`). OAuth MCP servers stay out.
+- **Sign-in.** An agent that answers an open with `-32000` is asked once to
+  sign in its own way (`authenticate` with its first method that needs no
+  terminal or environment variable; it may open a browser), with an `info`
+  event (`[acp] signing in to <agent> (<method>)…`); the session then opens
+  again. If it still cannot, an `error` says how (`[acp] <agent> needs
+  sign-in: <the method's description>`). An `engine_probe` never signs in.
+- **Model and effort.** The agent's config options of category `model` and
+  `thought_level` (or its `models`, set with `session/set_model`, when it has
+  no model option) are `model_status` (`model` is the option's value,
+  `model_label` its name without a provider prefix the value has too,
+  `reasoning_effort`, `reasoning_efforts` without the unset value, and
+  `default_effort`: the value that leaves the level to the agent, OpenCode's
+  `default` or oh-my-pi's `auto`, else `""`), `model_view` for `/model`, and
+  `/model <value> [effort]` switches them. `options.model` and
+  `options.effort` are set once the conversation opens (a draft's picks).
+  `context_window` comes from the agent's `usage_update` (`size`).
+- **Other settings.** `session_options` with `options: [{id, name,
+  description, category, type, value, choices?}]`: the agent's config
+  options besides model and effort (and besides OpenCode's `mode`, which is
+  the approval mode), or its legacy `modes` as one `mode` select when it has
+  no config options. `{"op":"set_session_option","session","id","value"}`
+  sets one (a select's value, or `true`/`false`); the agent's answer comes
+  back as `session_options`. Both are state events in a watcher's snapshot.
+- **Capabilities.** `engine_caps` (state event) with `agent: {id, name,
+  version}` (`id`: the built-in agent's, else null), `approvals` (it asks
+  before tools: true, false for Pi, null when unknown), `gateway`, and `caps:
+  {interrupt, approvalModes, modelPicker, contextUsage, slashCommands,
+  transcriptReplay, fork}`. Sent again when it changes.
+- **Questions.** `session/request_permission` is an `approval_request` named
+  by the tool's kind, answered with the offered option the decision picks.
+  A form elicitation (`elicitation/create`, mode `form`; oh-my-pi asks its
+  approvals this way) is an `approval_request` named `mcp_elicitation` with
+  `questions` (as Claude Code's MCP elicitations): `approve` with `answers`
+  accepts with the form's content, `deny` declines. Other modes get
+  `-32601`. A question the agent withdraws (`$/cancel_request`) is dropped;
+  `interrupt` and `steer` answer open ones as cancelled.
+- **Turns.** `user_message` is echoed as `user_message` (with `images` and
+  `files`) when it goes to the agent. Images go as base64 blocks when the
+  agent takes them (`promptCapabilities.image`, 20 MB each; an `info` says
+  what was not sent), other files as `resource_link`s. A terminal tool call
+  is a `bash` card with its `command` and `stdout`; replayed tool calls keep
+  `is_error`. `usage_update` is `context_usage` (with `cost` when in USD),
+  `notice` an `info` or `error`, `available_commands_update` the
+  `command_list` (an agent command runs as a prompt). A turn that ends with
+  no reply says so (`info`); a cancelled one says `interrupted`. Text the
+  agent sends outside a turn (a banner) is dropped.
+
+### Built-in ACP agents
+
+`options.agent` names one of the agents the daemon starts itself
+(`engines/acp_presets.rs`). It finds the program (on PATH, the usual install
+folders and the agent's own), checks its version, and builds the command
+line, so a client never names one. The user's own agent config is never
+written.
+
+| id | Program | Versions | Approval modes | LynShen gateway |
+| --- | --- | --- | --- | --- |
+| `opencode` | `opencode acp` | 1.x (2.x is another program: refused, `npm i -g opencode-ai@1`) | OpenCode agents, switched live (above) | a `lynshen` provider in `OPENCODE_CONFIG_CONTENT` |
+| `omp` | `omp acp --approval-mode <always-ask\|write\|yolo>` | any | a launch flag: another mode restarts the agent on the same conversation (`approval_mode_pending` while a turn runs) | `~/.lynshen/daemon/acp/omp/models.yml`: providers `lynshen` (Responses) and `lynshen-claude` (Anthropic Messages) on the local gateway, the key in `LYNSHEN_GATEWAY_TOKEN`; its sessions stay in `~/.omp/agent/sessions` |
+| `pi` | `npx -y pi-acp@0.0.34` with `PI_ACP_PI_COMMAND=<pi>` | ≥ 0.81.0 | none: Pi never asks, so it runs in 全自动 only (another mode is refused with an error; a phone needs the `full_auto` scope to start it) | `~/.lynshen/daemon/acp/pi/{models.json,settings.json}`, same provider; its sessions stay in `~/.pi/agent/sessions` |
+
+A built-in agent that is missing or of a version it does not run on fails
+the start with an error naming what to install. Each has a TUI (`session_tui`):
+OpenCode's `--session <id> --agent <the mode's agent>`, oh-my-pi's
+`--approval-mode <mode> --resume <id>`, Pi's `--session <id>`, on the same
+gateway setup as the session. A registered OpenCode has the same TUI; other
+registered agents have none.
+
+A `transcript` item is `user`/`assistant`/`reasoning` with `content`, `tool`
+with `name` and `output`, `branch`, `plan` or `turn_stats`. Items carry
+`at` (ms) when it is known when they were written: Claude Code's saved rows,
+a LynShen session's entries and the daemon's own snapshot do; a resumed
+Codex thread and an ACP replay do not. A `tool` item carries
+`is_error: true` when the call failed and its `call_id` when the replay
+knows it. A reopened Claude Code conversation has every tool call of its
+turns, as the cards the live turn showed (not the todo list or the plan),
+not only its text.
+
 Differences from a lynshen session:
 
 - A watching client gets a snapshot rebuilt by the daemon: the latest state
   events, the conversation so far (text and tool results; a reopened
-  session starts from the text Claude Code saved) and any open permission
+  session starts from what Claude Code saved) and any open permission
   prompts. Prompts wait for whichever client answers them first; an
   unwatched session is not switched to deferred actions. The snapshot's
   `model_status` names the engine's state at the time of the snapshot
@@ -437,10 +772,14 @@ Differences from a lynshen session:
   conversation (it only honors that mode as a start flag), after the running
   turn. Codex applies a new mode, and a model picked with `/model`, from the
   next turn.
-- `steer`, `decide_action`, `mcp_set`/`mcp_remove` and the lynshen-only
+- `decide_action`, `mcp_set`/`mcp_remove` and the lynshen-only
   commands (`/resume`, `/rewind`, `/tree`, ...) are refused with an `error`
   event. Other slash commands go to Claude Code as a user message, as Claude
   Code expects.
+- Queued messages take the same ops on every engine (`steer`, `unqueue`
+  with `discard`, `queue_move`, `interrupt` with `index`; see "Picking a
+  queued message" in docs/serve-protocol.md), each engine its own way
+  (below). The hello's `features` has `queue` when the daemon does.
 
 Claude Code sessions take more:
 
@@ -462,7 +801,10 @@ Codex sessions take the same `steer`, `/fast`, `/thinking`, `rename`,
 `mcp_login` `name` (answered by `mcp_login` with the server's sign-in `url`)
 and `/login` (a device code to sign Codex in to ChatGPT, as an `info`). A
 message sent mid-turn waits in the daemon (`pending_messages`) and starts the
-next turn; `steer` sends it into the running one (`turn/steer`). Approval
+next turn; `steer` sends it into the running one (`turn/steer`): the
+picked message, or every one that waits when the op names none.
+`interrupt` with `index` stops the turn and starts that message next.
+Approval
 mode `plan` is Codex's plan collaboration mode and `auto` its `auto_review`
 reviewer. Codex's own requests for permissions, for the user's answers
 (`ask_question` with `questions`) and MCP elicitations come as approval
@@ -470,6 +812,47 @@ cards; a command card with `scopes: ["session", "rule"]` can be allowed
 always with `always_scope: "rule"` (a Codex exec rule). Subagents are
 threads of their own: their events feed `agent_runs` and
 `subagent_lifecycle`, never the conversation.
+
+A message sent while a Claude Code turn runs waits in the daemon, listed in
+`pending_messages` (also part of a watcher's snapshot), and starts the next
+turn when this one ends; until then it can be taken back, dropped or moved.
+`steer` writes it to Claude Code now with priority `now`: the running turn
+stops what it does (its generation and tool calls; a subagent it runs in the
+foreground is moved to the background first and reports back as a task
+notification) and takes the message in at once; the turn it cuts short ends
+without an error. Without an index every waiting message goes. A message
+Claude Code has but has not taken in yet stays first in the list, counted
+in `pending_messages`'s `fixed`, and can no longer be taken back, steered or
+moved. Its `user_message` comes when it is taken in, one each for messages
+taken in together. A plain `interrupt` keeps the waiting messages: the next
+one starts once the turn has stopped; with `index` that one goes first. A
+reopened conversation keeps these messages
+(Claude Code saves them as `queued_command` rows), the images of every user
+message (written once under `~/.lynshen/uploads/claude` and named by path in
+`images`) and a `/goal <condition>` command as the user wrote it; other
+slash commands stay out of the conversation.
+
+Usage that Claude Code's stream does not show (Task subagents, Workflow
+agents, compaction) comes at the end of a turn as `usage` with
+`aggregate: true` and the `model` it ran on: one per model, the sum of
+several requests, counted toward the turn (so not one request's cache
+figures). Background work that ends after a turn lands in the next one's.
+For billing the local gateway charges a session's requests to its last turn
+until the next one opens, so background work after a turn ends is that
+turn's cost.
+
+A usage limit comes as `rate_limit`, never as a reply or an `error`:
+`level` (`ok`, `warning` or `limited`), `message` (the engine's words for
+the user, or empty), `resets_at` (ms), `window` (which limit:
+`five_hour`, `seven_day`, `seven_day_opus`, `overage`…, when known), `used`
+(percent of it, when known) and, from Claude Code, `overage` (extra usage
+is on). Claude Code sends one when its limits change; the "You've hit your
+limit" reply it makes up for a turn stopped by a limit is that turn's
+`limited` notice, with no `error` after it, and a reopened conversation
+leaves it out. Codex has no warning of its own: from 90% of its fullest
+plan window the notice is a `warning`, at 100% `limited`, and a turn that
+fails for usage ends with a `limited` notice. `plan_usage` (`plan`,
+`windows: [{key, used, resets_at, minutes}]`) comes with it.
 
 And sends more events: `background_tasks` (`tasks: [{id, kind,
 description}]`, the live set: replace yours), `task_progress` (`task_id`,
@@ -607,7 +990,13 @@ agent's tasks are saved in `~/.lynshen/agents/<id>/schedules.json`.
   "created_at": 1790812800,
   "last_run_at": null,
   "last_session": null,
-  "next_run_at": 1790996400
+  "next_run_at": 1790996400,
+  "worktree": false,
+  "budget": null,
+  "failures": 0,
+  "skipped": 0,
+  "last_run": null,
+  "history": []
 }
 ```
 
@@ -620,6 +1009,15 @@ agent's tasks are saved in `~/.lynshen/agents/<id>/schedules.json`.
 | `new_session` | `true`: each run starts a new session. `false`: a run continues `last_session`, or starts a new one when that session is gone or no longer the agent's. |
 | `created_at`, `last_run_at`, `next_run_at` | Unix **seconds** (other daemon times are milliseconds). `next_run_at` is null for a disabled task and for a `once` task whose time has passed. |
 | `last_session` | The session the last run was delivered to, filled in once it is delivered. |
+| `worktree` | A run that starts a new session starts it in a new git worktree of the agent's repository (below). Saving it on is refused when the agent's folder is not in a repository. |
+| `budget` | What one run may cost, with the sessions it started (`start_session`), or null: gateway points when the run's session goes through the LynShen gateway, else estimated US dollars. Above 0; `null` clears it. |
+| `failures` | Runs failed in a row while the task was on. A run that ends well, or switching the task on, sets it back to 0. |
+| `skipped` | Times skipped in a row because the last run was not over. |
+| `last_run` | The latest run, null before the first: `{at, ended_at, session, status, error, message, started, followed_up, worktree, cwd}`. `at` and `ended_at` are unix seconds; `status` is `preparing` (its worktree is being made), `running`, `waiting` (an approval waits), `background` (its turn ended; subagents or workflows it left going will come back to it), `done` or `failed` (with `error`); `message` is the message it sent; `followed_up` once someone else wrote in its session after it was done. |
+| `history` | The runs before `last_run`, newest first, up to 20, shaped as `last_run`. |
+
+A task saved before run records existed loads with `last_run` null, empty
+`history`, no failures, `worktree` false and no `budget`.
 
 Times follow this machine's time zone, daylight saving included: a local
 time skipped by a clock change runs an hour later, one that occurs twice
@@ -642,11 +1040,58 @@ The agent receives the prompt after one line naming the task:
 Every client receives the full `schedules` list after any change, run or
 delivery.
 
+A run is `running` from when it fires until the turn its message starts
+ends. A time that comes while the last run is not over is skipped (the
+first in a row is told). The run fails when its turn ends on an error, it
+goes past 2 hours (working, waiting or on background work), it passes its
+`budget`, its worktree cannot be made, its message cannot be delivered, its
+session closes while it works, or the daemon stopped while it worked (a run
+waiting on a deferred action, or not delivered yet, goes on). A run past
+its time or budget has its turn interrupted and the work it left going
+stopped (`stop_background`: LynShen subagents and background shells,
+Claude Code's background tasks), with the sessions it started. After 3
+failures in a row the task switches itself off (`enabled` false, no
+`next_run_at`). A run done when its turn ended waits as `background` while
+subagents or workflows it left going come back to it (a turn they start is
+the run's again); a background command (a dev server) never does, so it
+holds no run. A message someone else sends in a run's session after it is
+done is theirs (`followed_up`): nothing that happens there since counts.
+
+Every client gets
+`{"type":"schedule_event","schedule":"sch-…","agent":"ops","name":"…","kind":"failed","detail":"…","session":"s…"}`
+when a run fails (the first in a row; `kind` `failed`), the task switches
+itself off (`stopped`), a run waits for an approval (`waiting`) or a time is
+skipped (`skipped`, the first in a row). The paired phones get a notice for
+`stopped`, `skipped` and the first failure in a row; a failed turn is the
+agent's report with its own notice, and an approval has its own.
+
+A `worktree` run's new session starts in
+`<repo parent>/.lynshen-worktrees/<repo name>/<task id>-MMDD-HHmm` (a free
+name) on a new branch `task/<that name>` from the branch the repository has
+checked out (its commit when detached), the layout of the desktop's
+parallel tasks, and works in the agent folder's place inside it; it keeps
+the agent's project, and the main checkout is not one of its extra
+directories. While the worktree is made the run is `preparing` and its
+message waits. When the run is archived (a newer run started), its
+worktree and branch are removed if nothing was left in them (no
+uncommitted or untracked files, no commit past `base`); while its engine is
+still open, when the engine closes; at the next start for one the last
+daemon left. A run that continues its last session works where that
+session does.
+
+While a run is `preparing`, `running` or `background` the daemon keeps the
+computer from idle sleep: macOS `caffeinate -i -w <daemon pid>`, Linux
+`systemd-inhibit --what=idle:sleep`, Windows `SetThreadExecutionState`. One
+hold covers every run; it ends when no run works, and with the daemon (the
+macOS and Linux holders end when the daemon dies). Closing the lid or
+choosing Sleep still sleeps.
+
 `schedule_delete` and `schedule_run` also take the task's id as `id` when
 `schedule` is absent; that `id` is then the request id too, echoed in the
 reply.
 
-`schedule_usage` joins the task's delivered sessions with persisted turns in
+`schedule_usage` joins the task's delivered sessions, and the sessions they
+started (rows with `parent`), with persisted turns in
 `usage.jsonl`, including any turn still running. Each unique session is counted
 once, including follow-up turns. `totals` and each row in `sessions` carry the
 five token counters, `turns`, `gateway_cost` (settled points, including group
@@ -727,66 +1172,122 @@ in its text. The session's `user_message` event, and the user items of its
 
 ## Terminals
 
-A client (local or a paired device) may run the user's login shell on a pty
-on this computer. `term` is the terminal's id; `data` is base64 (standard
-alphabet) of raw bytes.
+Terminals run on a pty of this computer. `term` is the terminal's id;
+`data` is base64 (standard alphabet) of raw bytes. There are two kinds:
+
+- a **session's TUI** (`session_tui`, below) belongs to its session: any
+  client (local, or paired over the LAN or the relay) views it, and one that
+  leaves is only detached;
+- a **shell** (`term_open`: the user's shell in a known directory) belongs to
+  the client that opened it: that client is its only viewer, and it is
+  killed once that client stops viewing it (detaches or disconnects).
 
 | Op | Reply | |
 | --- | --- | --- |
-| `{"op":"term_open","cwd":"/path","cols":80,"rows":24}` | `term_opened` with `term` | `cwd` must lie in a known directory, as for `fs_*` (`~` is the home directory). `cols` and `rows` default to 80 × 24 and are kept within 2–1000. |
-| `{"op":"term_input","term":"t-…","data":"<base64>"}` | none | Written to the shell in order. |
-| `{"op":"term_resize","term":"t-…","cols":120,"rows":40}` | none | |
-| `{"op":"term_close","term":"t-…"}` | none | Kills the shell; `term_exit` follows. |
+| `{"op":"term_open","cwd":"/path","cols":80,"rows":24}` | `term_opened` with `term` | A shell. `cwd` must lie in a known directory, as for `fs_*` (`~` is the home directory). `cols` and `rows` default to 80 × 24 and are kept within 2–1000. A client may have 4 shells; a fifth is an error. |
+| `{"op":"term_attach","term":"t-…","cols":100,"rows":30}` | `term_attached` with `term`, `cols`, `rows` | Views a session's TUI (an unknown id or another client's shell: `unknown terminal`). The latest 256 KiB of its output follows as `term_output` frames with `"replay": true`, then live output. The pty takes the viewer's size (and is nudged so the TUI repaints); without `cols`/`rows` it keeps its own. A device without the `terminal` scope attaches read-only: its size is ignored. Attaching again restarts the replay. |
+| `{"op":"term_detach","term":"t-…"}` | none | Stops this client's output. A TUI runs on; a shell this client owns is killed. |
+| `{"op":"term_input","term":"t-…","data":"<base64>"}` | none | Written to the program in order. Any viewer may type (a device needs the `terminal` scope). |
+| `{"op":"term_resize","term":"t-…","cols":120,"rows":40}` | none | (`terminal` scope for a device) |
+| `{"op":"term_ack","term":"t-…","bytes":123456}` | none | A paired device's flow control: `bytes` is how much of this terminal's output (decoded, replay included, counted from its `term_attach`) it has written to its screen. See below. |
+| `{"op":"term_close","term":"t-…"}` | none | Kills the program; `term_exit` follows to every viewer. (`terminal` scope for a device) |
 
-Only the client that opened a terminal receives its events:
+Ops on a terminal the client does not view are errors (`not attached to
+terminal …`). Every viewer gets:
 
-- `{"type":"term_output","term":"t-…","data":"<base64>"}`: the shell's
-  output, sent after 10 ms without more output, at most 64 KiB before
-  encoding per frame. A frame may end inside a UTF-8 character or an
-  escape sequence.
-- `{"type":"term_exit","term":"t-…","code":3}`: the shell has exited and
+- `{"type":"term_output","term":"t-…","data":"<base64>"}` (with
+  `"replay": true` for the scrollback after `term_attach`): output sent after
+  10 ms without more, at most 64 KiB before encoding per frame. A frame may
+  end inside a UTF-8 character or an escape sequence.
+- `{"type":"term_exit","term":"t-…","code":3}`: the program has exited and
   been reaped; `code` is null when it was killed by a signal.
+- `{"type":"term_detached","term":"t-…","reason":"slow"}`: this device was
+  detached for not keeping up (below).
 
-A client may have 4 terminals open; a fifth `term_open` is an error. Ops on
-another client's terminal or an unknown one are errors. A terminal belongs to
-its connection: when the client disconnects its shells are killed (SIGHUP,
-then SIGKILL), and there is no reattaching. The shell is the one
-`terminal_shell`, else `shell`, in config.json names (see "Shell" in
-`docs/sandbox.md`): by default `$SHELL -l` (else `/bin/zsh` on macOS,
-`/bin/bash`, then `/bin/sh`), and on Windows Git Bash, PowerShell 7 or
-Windows PowerShell, else `%COMSPEC%`. It has the daemon's environment plus
-`TERM=xterm-256color`, `COLORTERM=truecolor` and `LANG=en_US.UTF-8` when
-`LANG` is unset.
+**Flow control.** Output to a paired device (LAN or relay) is held to what it
+can take: at most 512 KiB may be sent and not yet acknowledged with
+`term_ack`. While any device's window is full, the daemon stops reading the
+pty, and the program waits on its writes as on a slow terminal (every
+viewer sees the same output). A device whose window stays full for 15 s is
+detached (`term_detached`, `reason: "slow"`), and the others go on. Local
+clients are not flow-controlled and need not send `term_ack`. A device should
+acknowledge as it writes (every 64 KiB or so); after a `term_detached` it may
+`term_attach` again, which replays the latest 256 KiB.
+
+The shell is the one `terminal_shell`, else `shell`, in config.json names
+(see "Shell" in `docs/sandbox.md`): by default `$SHELL -l` (else `/bin/zsh`
+on macOS, `/bin/bash`, then `/bin/sh`), and on Windows Git Bash, PowerShell 7
+or Windows PowerShell, else `%COMSPEC%`. A shell and a TUI have the daemon's
+environment (a TUI also its session's) plus `TERM=xterm-256color`,
+`COLORTERM=truecolor` and `LANG=en_US.UTF-8` when `LANG` is unset.
 
 ### A conversation in its TUI
 
 `{"op":"session_tui","session":"<id>","cols":120,"rows":40}` moves a
-claude, codex or lynshen conversation from the client's chat view into the
-engine's own terminal interface, on a pty of the daemon. The reply is
-`term_opened`; the terminal then works like one from `term_open` (only the
-requesting client gets its output and may type into it, `term_close` ends
-it). It is refused while a turn runs unless the op has `"force":true`
-(the user agreed to stop it: a lynshen turn is interrupted, a claude or codex
-engine is killed and every client gets `{"type":"status","message":"interrupted"}`),
-for an ACP engine, and for an agent's session.
+claude, codex, lynshen or built-in ACP agent's conversation (and a
+registered OpenCode's) from the chat view into the engine's own terminal
+interface, on a pty of the daemon. The reply is `term_opened`; the
+requesting client is the TUI's first viewer. Asking again while the TUI runs
+(another window, a client that lost its view) attaches to it instead: the
+reply is `term_attached`, then the replay. It is refused while a turn runs
+unless the op has `"force":true` (the user agreed to stop it: a lynshen turn
+is interrupted, another engine is killed and every client gets
+`{"type":"status","message":"interrupted"}`), for a registered ACP agent
+other than OpenCode, and for an agent's session.
 
 The engine process stops first, background tasks with it (clients get an
 empty `background_tasks`), and the TUI resumes the same conversation
-(`claude --resume <id>`, `codex resume <id>`, `lynshen --resume <id>`); a
-conversation the engine has not saved yet starts there instead (`claude
---session-id <id>`, plain `codex`, whose new thread the daemon finds in the
-directory when the TUI exits) with
-the session's approval mode and model; under the gateway it gets its own
-key. Every client of the session gets
-`{"type":"surface","session":"<id>","surface":"tui","term":"t-…","client":1}`.
-While the TUI runs, ops on the session other than `snapshot` are errors.
+(`claude --resume <id>`, `codex resume <id>`, `lynshen --resume <id>`, an
+ACP agent's own session id: see "Built-in ACP agents"); a conversation the
+engine has not saved yet starts there instead (`claude --session-id <id>`,
+plain `codex`, whose new thread the daemon finds in the directory when the
+TUI exits) with the session's approval mode and model; under the gateway or
+a custom provider it gets its own key. Every client of the session gets
+`{"type":"surface","session":"<id>","surface":"tui","term":"t-…","client":1}`,
+also in a watcher's snapshot: that is the terminal to `term_attach` (a phone
+views the TUI this way). While the TUI runs, ops on the session other than
+`snapshot` are errors.
 
 When the TUI exits (the user quits it, or `term_close`) the engine starts
 again on the conversation, now including the turns typed in the TUI, and
 the session publishes `{"type":"surface","session":"<id>","surface":"gui"}`
-and a fresh `transcript`. Variables that would mark the TUI as a nested
-Claude Code session (`CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, …) are
-removed so it saves its transcript.
+and a fresh `transcript` (an ACP agent replays it). A viewer that
+disconnects or detaches does not end the TUI. Variables that would mark the
+TUI as a nested Claude Code session (`CLAUDECODE`,
+`CLAUDE_CODE_CHILD_SESSION`, …) are removed so it saves its transcript.
+
+## Dev servers
+
+A shell command in any session, on any engine, makes the daemon look for
+the web servers it starts (`npm run dev`, `python -m http.server`) for 90
+seconds, every 2 seconds; while servers are up it looks every 10 seconds
+to see them stop. A server counts when:
+
+- it listens on a TCP port on a loopback or wildcard address
+  (`127.0.0.1`, `::1`, `0.0.0.0`, `::`) that was not listening, for the
+  same process, when the daemon first looked;
+- its process works in an open session's directory (the deepest one; the
+  most recently active on a tie). Windows reports no working directory:
+  there the port must also appear in a URL a command printed, and the
+  server goes to the most recently active session;
+- `GET /` answers with `text/html` or a redirect (a database, a debugger or
+  a language server never does).
+
+Clients get the whole list on connect and on every change, broadcast to
+every client:
+
+```json
+{"type":"dev_servers","servers":[{"port":5173,"url":"http://localhost:5173/app/","pid":4242,"name":"node","session":"s…"}]}
+```
+
+`url` is the one a command printed for that port (colour codes removed,
+`0.0.0.0` and `[::]` shown as `localhost`), else `http://localhost:<port>/`
+(`http://[::1]:<port>/` for a server bound only to `::1`). `name` is the
+process name (empty on Windows). An empty `servers` means none are up. The
+daemon only reports servers; it never stops them. Shell commands are a
+LynShen `bash`, `exec_command` or `write_stdin` call, a Claude Code or Codex
+command (`bash`, `BashOutput`, `TaskOutput`), an ACP agent's `execute` call,
+and a change to a session's `background_tasks`.
 
 ## Requirements
 
@@ -810,7 +1311,7 @@ where the last one stopped. The requirement's id comes as `requirement`
 | `{"op":"requirement_image","requirement":"R-1","index":0}` | `requirement_image` with `data` (a data URL) | |
 | `{"op":"requirement_begin","requirement":"R-1","session":"s…","plan":false,"mode":"edits","text":"…","lang":"zh"}` | `requirement_begun` with `requirement`, `session` | Starts work behind the gate (below): links the session, switches it to read-only and sends the requirement with the ask to only explain its understanding. `text`: the user's added words (optional). `lang`: `zh` (default) or `en`. |
 | `{"op":"requirement_confirm","requirement":"R-1","text":"…","lang":"zh"}` | `requirement_confirmed` with `requirement`, `stage` (`plan` or `go`) | The user confirms the gate's current step; an error without a gate or while its session runs a turn. `text` (optional) goes with the next message. |
-| `{"op":"requirement_reply","requirement":"R-1","text":"…","new_session":false,"cwd":"/path","engine":"claude","plan":false,"mode":"auto","lang":"zh"}` | `requirement_replied` with `session` | Sends `text` to its latest session (reopened if closed). With `new_session`, or no session yet, starts one in `cwd` (default: the latest session's, else the project's main directory; neither is an error) on `engine` (default: the latest session's, else lynshen) and runs `requirement_begin` on it with `plan` (default `false`), `mode` (default `auto`) and `text`. |
+| `{"op":"requirement_reply","requirement":"R-1","text":"…","new_session":false,"cwd":"/path","engine":"claude","plan":false,"mode":"auto","lang":"zh"}` | `requirement_replied` with `session` | Sends `text` to its latest session (reopened if closed). With `new_session`, or no session yet, starts one in `cwd` (default: the latest session's, else the project's main directory; neither is an error), belonging to `project` (default: the requirement's), on `engine` (default: the latest session's, else lynshen) and runs `requirement_begin` on it with `plan` (default `false`), `mode` (default `auto`) and `text`. |
 | `{"op":"requirement_proposal","requirement":"R-1","accept":true}` | `requirement_proposal_decided` with `requirement`, `accept` | Decides an agent's proposal: a proposed requirement accepted becomes `idea`, turned down is deleted; a close proposal accepted sets `state` to its `outcome` (and ends any gate), turned down is dropped. The agent is not told. |
 
 `dispatch_send` also takes `requirement`: its tasks' sessions are linked to it.
@@ -897,24 +1398,79 @@ Requirements saved before projects had ids carry `projects: ["/path"]`;
 once the workspaces have projects, the daemon replaces it with the `project`
 whose main directory is the first path (or `null`).
 
+## App tools
+
+The daemon gives every session it hosts the app's own tools, in three
+groups the user switches on and off (config.json, read when an engine
+starts; `app_tools` / `app_tools_set`):
+
+| Group | Key | Tools |
+| --- | --- | --- |
+| Deliverables | `app_tools.present_files` (default `true`) | `present_files` |
+| Scheduled tasks | `app_tools.propose_schedule` (default `true`) | `propose_schedule` (not in an agent's sessions: an agent has its own `schedule` tool) |
+| Conversations | `sessions.messages` (`off`, `ask`, `on`, default `on`) | `list_sessions`, `read_session`, `start_session`, `send_to_session`, `wait_session` (see "Messages between conversations") |
+
+How each engine gets them:
+
+- LynShen: host tools of the session (not the dispatcher's).
+- Claude Code: an in-process MCP server named `lynshen` on the control
+  channel (`--mcp-config` with `{"type":"sdk"}`, `sdkMcpServers` in
+  `initialize`); the tools are always loaded (`_meta.anthropic/alwaysLoad`)
+  and pre-allowed (`--allowedTools mcp__lynshen__<tool>`): the daemon asks
+  where a LynShen session would (below). With every group off there is no
+  server.
+- Codex: `dynamicTools` on `thread/start`, answered on `item/tool/call`. A
+  resumed thread keeps the tools it started with.
+- ACP agents: none.
+
+Every engine's events name the tools by their own names (`present_files`,
+not `mcp__lynshen__present_files`), live and in a replayed transcript. A
+group switched off reaches engines started after the switch; a call to a
+tool switched off since its engine started fails with `<tool> is turned off
+in LynShen's settings`.
+
+`present_files` only shows the user something: it never asks, also in plan
+mode. Its arguments are `files: [{path, description}]` (at most 12; a path
+is absolute or relative to the session's directory). The output, which
+clients draw as cards:
+
+```json
+{"files":[{"path":"/abs/report.html","description":"Q3 report","size":20480,"kind":"file"},{"path":"/abs/demo.mp4","description":"","size":5242880,"kind":"video"}],"missing":["gone.png"]}
+```
+
+`kind` is `image` (png, jpg, jpeg, gif, webp), `video` (mp4, m4v, webm,
+mov) or `file`; a client shows images and videos inline through `fs_image`
+(up to 16 MiB). `missing` lists the paths that are not files (left out when
+none); when none of the paths is a file, the call fails.
+
+`propose_schedule` creates nothing: the user creates the task from its card
+with `schedule_save` (with `origin` set to the proposal's `id`), or not.
+Arguments: `name`, `prompt`, `repeat` (`once`, `hourly`, `daily`,
+`weekdays`, `weekly`), `time` (`HH:MM`), `days` (weekly; 0 is Sunday),
+`date` (once; `YYYY-MM-DD`). The output:
+
+```json
+{"id":"prop-1a2b3c4d5e6f","name":"Tests","prompt":"Run the tests and report failures","repeat":"weekdays","time":"09:00","note":"Shown to the user as a card; nothing is scheduled until they create it."}
+```
+
 ## Messages between conversations
 
-Every LynShen session the daemon hosts (an agent's too, besides its own
-tools; not the dispatcher's) has four tools for the user's other
-conversations on this daemon:
+Every session the daemon hosts (a LynShen agent's too, besides its own
+tools; not the dispatcher's; Claude Code and Codex sessions as above) has
+five tools for the user's other conversations on this daemon:
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
 | `list_sessions` | optional `query` (matches title or directory) | `sessions: [{session, title, cwd, engine, state, updated_at}]`: the other sessions, not archived or hidden, most recently active first, at most 30. `state` is `idle`, `busy` or `closed`. |
 | `read_session` | `session`, optional `turns` (1–10, default 3) | `{session, title, state, turns: [{user, reply}]}`: the latest requests and the reply text to each (tool calls left out). A request keeps its first 1000 characters, a reply its last 3000, all turns together about 12000 (the oldest go first). |
 | `send_to_session` | `session`, `message`, optional `wait_reply` | `{id, session, title, status}` with `status` `delivered` (the receiver was idle and starts on it) or `queued` (it runs after the receiver's current work). With `wait_reply: true` the call waits until the receiver has handled the message and returns `status: "replied"` with `reply` (the last 4000 characters of its reply); it gives up after 10 minutes (the result then has a `note`) or when the sender's turn is stopped (an error; the message stays sent). |
-
 | `start_session` | `message`, optional `engine` (`lynshen`, `claude`, `codex`), `model`, `effort`, `approval_mode` (`plan`, `manual`, `auto-edit`, `auto`), `title`, `wait_reply` | as `send_to_session`, to a new conversation: started in the sender's project on that engine, model and effort, in the sender's approval mode or a stricter one (never full access), listed for the user; the message is its first. Aogiri ticket #48 |
+| `wait_session` | `session`, optional `timeout_seconds` (10–1800, default 600) | Waits for the reply to the last message this session sent `session` (with `send_to_session` or `start_session`, since the daemon started): `{id, session, title, status: "replied", reply}` once it has handled it (again when it already had); `status: "waiting_approval"` (with a `note`) as soon as the receiver waits for the user to approve a step; `status: "running"` when the wait ends first. An error when nothing was sent, the receiver closed before replying, or the sender's turn is stopped. |
 
 A closed receiver is opened first. The message is the receiver's next user
 message (it starts a run, or queues behind the running one), so a Claude
-Code, Codex or ACP session receives it as well; only LynShen sessions can
-send. It arrives wrapped:
+Code, Codex or ACP session receives it as well; LynShen, Claude Code and
+Codex sessions can send. It arrives wrapped:
 
 ```
 <session_message from="s…" title="项目 A：重构接口" hop="1">
@@ -946,20 +1502,24 @@ nothing):
 - `wait_reply` is refused when the receiver waits (directly or down a chain)
   for the sender's reply.
 
-`send_to_session` reaches outside its conversation, so the approval mode
-gates it like web access: `manual` and `plan` ask first (an unattended
-session defers it as an action), the other modes send at once. Its approval
-card's `summary` is `<receiver title> (<receiver id>)\n<message>`.
-`list_sessions` and `read_session` only read: they never ask and run in plan
-mode too.
+`send_to_session` and `start_session` reach outside their conversation, so
+the approval mode gates them like web access: `manual` and `plan` ask first
+(an unattended LynShen session defers it as an action), the other modes send
+at once. A Claude Code or Codex session asks the same way (in its `default`
+/ `read-only` and `plan` modes), with an `approval_request` the daemon makes
+(`call_id` `app-approval-<n>`, `kind` `tool`, `scopes: ["once"]`) and
+answers itself on `approve`. The approval card's `summary` is `<receiver
+title> (<receiver id>)\n<message>` (`start_session`: `<engine>
+<model>\n<message>`). `list_sessions`, `read_session` and `wait_session`
+only read: they never ask and run in plan mode too.
 
 `sessions.messages` in config.json (read on every call):
 
 | Value | Meaning |
 | --- | --- |
 | `on` (default) | As above. |
-| `ask` | Every `send_to_session` asks the user, in every mode (full access too), and approving it for the session does not stop the next one asking. The approval stands in for the approval-mode rule, which is not checked. |
-| `off` | Sessions opened from then on get none of the three tools; a session opened earlier gets an error from them. Turned on again, it reaches the sessions opened after that. |
+| `ask` | Every `send_to_session` and `start_session` asks the user, in every mode (full access too, also while a switch to it waits; `must_ask: true`), and approving it for the session does not stop the next one asking. The approval stands in for the approval-mode rule, which is not checked. |
+| `off` | Sessions opened from then on get none of the five tools; a session opened earlier gets an error from them. Turned on again, it reaches the sessions opened after that. |
 
 Both sides' clients receive `session_message` (once with `session` set to
 the sender, once to the receiver):
@@ -1131,6 +1691,30 @@ Differences from `lynshen serve`:
   `approval_request` into a deferred action.
 - `decide_action` is recorded in `actions.jsonl` before the engine acts on
   it, so an approved action is never offered again after a restart.
+- An idle engine session (Claude Code, Codex, an ACP agent) closes by itself
+  too, when no client watches it: 30 minutes after its last activity (an op
+  from a client, a turn starting or ending, a watcher leaving, held work
+  ending), or sooner, least recently active first, while more than 16 engine
+  processes run (never one active in the last 2 minutes or opened in the last
+  30 seconds). It is idle when no turn runs, no message waits or is being
+  delivered, no background task, subagent, workflow or approval is open, its
+  TUI is not open, no title is being written and no other session waits on
+  its reply. Clients receive `session_closed` with `reason: "idle"`; the
+  session stays listed. The next `session_open` without `options`, `watch`,
+  delivery or message opens it as it last ran (model, approval mode, effort
+  and the other settings it kept), resuming its whole conversation. A
+  `user_message`, `command`, `continue` or `approve_plan` sent to such a
+  session opens it first, the sender watches it again, and every client
+  receives `session_reopened` with `session`.
+- Each engine runs in its own process group (Windows: a job object):
+  stopping the engine ends what it started (MCP servers, shells), and the
+  daemon ends them all when it exits, after `restart_when_idle` too.
+  `restart_when_idle` also waits, up to 10 minutes, for held work (an
+  engine's TUI or background work, a LynShen session's background shell or
+  subagent) besides running turns.
+- A connection that falls 10,000 frames behind (a stalled network) is
+  dropped instead of queued for without end; it reconnects and gets a fresh
+  snapshot.
 - An idle LynShen session closes by itself. It closes when nobody has
   watched it and nothing has happened in it for 10 minutes, and its engine
   is idle: no turn, queued message, prompt, deferred action or approved

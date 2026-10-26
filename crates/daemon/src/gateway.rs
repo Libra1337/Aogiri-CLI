@@ -9,6 +9,12 @@
 //!   the requested model; else the model's default group from `lynshen_groups`
 //!   in config.json; else none, and the gateway routes on its own.
 //!
+//! A session on a custom provider (crate::tool_providers) passes here too,
+//! with a key of its own: its requests go to the provider's URL with the
+//! provider's key alone. They never carry the LynShen token, the session's
+//! group, its turn or any other `X-LynShen-*` header, and are not LynShen
+//! gateway use (crate::usage keeps them local).
+//!
 //! Only engines the daemon started pass here: native tools keep their own
 //! settings. An engine holds a per-session local key the daemon swaps for the
 //! real token, so the token never reaches its environment or disk. A request
@@ -39,7 +45,11 @@ struct State {
     keys: HashMap<String, String>,
     /// Session → the group it routes to.
     groups: HashMap<String, String>,
-    /// Session → its running turn (`X-LynShen-Turn`, see crate::usage).
+    /// Local key → the custom provider its requests go to (`base_url`,
+    /// `format`, `key`, `tool`, `id`), instead of the LynShen gateway.
+    custom: HashMap<String, Value>,
+    /// Session → the turn its requests are charged to (`X-LynShen-Turn`, see
+    /// crate::usage): the running one, else the last until the next opens.
     turns: HashMap<String, String>,
     /// The gateway's groups (`/v1/open/groups`), and when they were read.
     catalog: Option<(Instant, Vec<Value>)>,
@@ -85,7 +95,15 @@ pub fn bind(key: &str, session: &str) {
 
 /// The engine holding `key` is gone.
 pub fn revoke(key: &str) {
-    state().keys.remove(key);
+    let mut state = state();
+    state.keys.remove(key);
+    state.custom.remove(key);
+}
+
+/// Requests with `key` go to `provider` (`base_url`, `format`, `key`) and
+/// nowhere else.
+pub fn set_custom(key: &str, provider: Value) {
+    state().custom.insert(key.to_string(), provider);
 }
 
 /// `session` routes to `group` (None or empty: no choice).
@@ -97,7 +115,7 @@ pub fn set_group(session: &str, group: Option<&str>) {
     };
 }
 
-/// `session`'s requests belong to `turn` (None: between turns).
+/// `session`'s requests belong to `turn` (None: its engine stopped).
 pub fn set_turn(session: &str, turn: Option<&str>) {
     let mut state = state();
     match turn {
@@ -202,11 +220,16 @@ pub fn catalog_json() -> Value {
     let models: Vec<Value> = lynshen_agent_core::lynshen_visible_models()
         .into_iter()
         .map(|model| {
-            json!({
+            let mut entry = json!({
                 "name": model.name,
                 "display_name": model.display_name,
                 "context_window": model.context_window,
-            })
+            });
+            // Kept callable by name; pickers leave it out.
+            if model.hidden {
+                entry["hidden"] = json!(true);
+            }
+            entry
         })
         .collect();
     let groups = live_upstream()
@@ -317,27 +340,28 @@ struct Request {
 }
 
 /// Request headers not passed on: hop-by-hop, the client's credential and
-/// framing (the daemon sets its own), and encodings (the reply is relayed as
-/// is, so it must come uncompressed).
+/// framing (the daemon sets its own), encodings (the reply is relayed as
+/// is, so it must come uncompressed), and any of LynShen's own: the daemon
+/// sets those it means to, and only towards the LynShen gateway.
 fn dropped_request_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "host"
-            | "authorization"
-            | "x-api-key"
-            | "content-length"
-            | "transfer-encoding"
-            | "connection"
-            | "keep-alive"
-            | "proxy-connection"
-            | "proxy-authorization"
-            | "te"
-            | "upgrade"
-            | "expect"
-            | "accept-encoding"
-            | "x-lynshen-group"
-            | "x-lynshen-turn"
-    )
+    let name = name.to_ascii_lowercase();
+    name.starts_with("x-lynshen-")
+        || matches!(
+            name.as_str(),
+            "host"
+                | "authorization"
+                | "x-api-key"
+                | "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "keep-alive"
+                | "proxy-connection"
+                | "proxy-authorization"
+                | "te"
+                | "upgrade"
+                | "expect"
+                | "accept-encoding"
+        )
 }
 
 /// Reply headers not passed back: hop-by-hop and framing (the daemon closes
@@ -403,7 +427,20 @@ fn serve_with(
         },
         Err((status, message)) => return reply_error(&mut out, status, &message),
     };
-    let upstream = match upstream() {
+    // A custom provider's session: its own URL and key, nothing of LynShen's
+    // (no login needed, no group, no turn).
+    let custom = state().custom.get(&presented).cloned();
+    let upstream = match &custom {
+        Some(provider) => Ok(Upstream {
+            api: provider["base_url"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            token: provider["key"].as_str().unwrap_or_default().to_string(),
+        }),
+        None => upstream(),
+    };
+    let upstream = match upstream {
         Ok(upstream) => upstream,
         // "not logged in to LynShen …": the desktop reads it as a sign-in error.
         Err(message) => return reply_error(&mut out, 401, &message),
@@ -412,11 +449,14 @@ fn serve_with(
         .ok()
         .and_then(|body| body["model"].as_str().map(str::to_string))
         .unwrap_or_default();
-    let chosen = state().groups.get(&session).cloned();
-    let default = if model.is_empty() {
-        None
-    } else {
-        defaults().get(&model).cloned()
+    let (chosen, default) = match &custom {
+        Some(_) => (None, None),
+        None => (
+            state().groups.get(&session).cloned(),
+            Some(&model)
+                .filter(|model| !model.is_empty())
+                .and_then(|model| defaults().get(model).cloned()),
+        ),
     };
     // Nothing chosen: no catalog lookup on the way.
     let group = if model.is_empty() || (chosen.is_none() && default.is_none()) {
@@ -430,21 +470,35 @@ fn serve_with(
         )
     };
 
-    let url = format!("{}{}", upstream.api.trim_end_matches('/'), request.target);
-    let mut call = agent()
-        .request(&request.method, &url)
-        .set("Authorization", &format!("Bearer {}", upstream.token))
-        .set("Accept-Encoding", "identity");
+    let url = match &custom {
+        Some(_) => custom_url(&upstream.api, &request.target),
+        None => format!("{}{}", upstream.api.trim_end_matches('/'), request.target),
+    };
+    let mut call = match &custom {
+        Some(_) => custom_agent(&url).request(&request.method, &url),
+        None => agent().request(&request.method, &url),
+    }
+    .set("Accept-Encoding", "identity");
+    // An Anthropic-format provider takes its key as Claude Code's own client
+    // sends an API key; the others a bearer token.
+    call = match &custom {
+        Some(provider) if provider["format"] == "anthropic" => {
+            call.set("x-api-key", &upstream.token)
+        }
+        _ => call.set("Authorization", &format!("Bearer {}", upstream.token)),
+    };
     for (name, value) in &request.headers {
         if !dropped_request_header(name) {
             call = call.set(name, value);
         }
     }
-    if let Some(group) = &group {
-        call = call.set("X-LynShen-Group", group);
-    }
-    if let Some(turn) = state().turns.get(&session).cloned() {
-        call = call.set("X-LynShen-Turn", &turn);
+    if custom.is_none() {
+        if let Some(group) = &group {
+            call = call.set("X-LynShen-Group", group);
+        }
+        if let Some(turn) = state().turns.get(&session).cloned() {
+            call = call.set("X-LynShen-Turn", &turn);
+        }
     }
     let result = if request.body.is_empty() && request.method.eq_ignore_ascii_case("GET") {
         call.call()
@@ -454,11 +508,14 @@ fn serve_with(
     let response = match result {
         Ok(response) | Err(ureq::Error::Status(_, response)) => response,
         Err(ureq::Error::Transport(error)) => {
-            return reply_error(
-                &mut out,
-                502,
-                &format!("cannot reach the LynShen gateway: {error}"),
-            );
+            let target = match &custom {
+                Some(provider) => format!(
+                    "the custom provider {}",
+                    provider["name"].as_str().unwrap_or_default()
+                ),
+                None => "the LynShen gateway".to_string(),
+            };
+            return reply_error(&mut out, 502, &format!("cannot reach {target}: {error}"));
         }
     };
     let mut head = format!(
@@ -475,6 +532,28 @@ fn serve_with(
         }
     }
     head.push_str("Connection: close\r\n\r\n");
+    // A custom Anthropic-format API that refuses Claude Code's
+    // mid-conversation system messages: told as Claude Code's gateway
+    // contract names it (same status), so it resends without them.
+    if custom
+        .as_ref()
+        .is_some_and(|p| p["format"] == "anthropic" && matches!(response.status(), 400 | 422))
+    {
+        let mut body = Vec::new();
+        let _ = response.into_reader().take(1 << 20).read_to_end(&mut body);
+        if let Some(class) = capability_rejected(&request.body, &body) {
+            body = json!({ "type": "error", "error": {
+                "type": "invalid_request_error",
+                "message": format!("capability_rejected: {class}"),
+            } })
+            .to_string()
+            .into_bytes();
+        }
+        return out
+            .write_all(head.as_bytes())
+            .and_then(|()| out.write_all(&body))
+            .map_err(|error| error.to_string());
+    }
     out.write_all(head.as_bytes())
         .map_err(|error| error.to_string())?;
     // Relayed as it arrives (server-sent events); a client that hangs up
@@ -496,6 +575,58 @@ fn serve_with(
         }
     }
     Ok(())
+}
+
+/// A custom provider's URL for `target` (`/v1/…` and its query): its base
+/// may name the version (`…/v1`) or not.
+fn custom_url(api: &str, target: &str) -> String {
+    let api = api.trim_end_matches('/');
+    match api.ends_with("/v1") {
+        true => format!("{api}{}", target.strip_prefix("/v1").unwrap_or(target)),
+        false => format!("{api}{target}"),
+    }
+}
+
+/// The client for a custom provider: through the user's proxy, as the tool
+/// would have called it, never following a redirect (the key goes to the
+/// configured host only).
+fn custom_agent(url: &str) -> ureq::Agent {
+    let builder = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(READ_TIMEOUT)
+        .redirects(0);
+    match lynshen_agent_core::env_proxy(url).and_then(|proxy| ureq::Proxy::new(proxy).ok()) {
+        Some(proxy) => builder.proxy(proxy).build(),
+        None => builder.build(),
+    }
+}
+
+/// The capability class (Claude Code's `capability_rejected: <class>`) an
+/// upstream's 400 refuses, when it is one the client can recover from. Only
+/// `mid_conv_system`: the request has a `{role: "system"}` message and the
+/// error names that message's path or a system role.
+fn capability_rejected(request: &[u8], reply: &[u8]) -> Option<&'static str> {
+    let body: Value = serde_json::from_slice(request).ok()?;
+    let system: Vec<usize> = body["messages"]
+        .as_array()?
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m["role"] == "system")
+        .map(|(i, _)| i)
+        .collect();
+    if system.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(reply).to_ascii_lowercase();
+    // `messages.1` / `messages[1]`, not `messages.12`.
+    let names = |path: &str| {
+        text.match_indices(path)
+            .any(|(at, _)| !text[at + path.len()..].starts_with(|c: char| c.is_ascii_digit()))
+    };
+    let at_path = system
+        .iter()
+        .any(|i| names(&format!("messages.{i}")) || names(&format!("messages[{i}]")));
+    (at_path || (text.contains("role") && text.contains("system"))).then_some("mid_conv_system")
 }
 
 fn loopback_host(host: &str) -> bool {
@@ -717,7 +848,7 @@ mod tests {
     fn fake_upstream() -> (String, thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let handle = thread::spawn(move || {
+        let handle = thread::spawn(move || loop {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut received = String::new();
@@ -733,6 +864,13 @@ mod tests {
                     break;
                 }
             }
+            // A local dev-server scanner may probe the test's port.
+            if !received.starts_with("POST ") {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
             let mut body = vec![0u8; length];
             reader.read_exact(&mut body).unwrap();
             received.push_str(&String::from_utf8_lossy(&body));
@@ -746,7 +884,7 @@ mod tests {
                 stream.flush().unwrap();
             }
             stream.write_all(b"0\r\n\r\n").unwrap();
-            received
+            break received;
         });
         (format!("http://{addr}"), handle)
     }
@@ -869,6 +1007,90 @@ mod tests {
             .contains("x-lynshen-group"));
         assert!(reply.starts_with("HTTP/1.1 200"));
         revoke(&key);
+    }
+
+    #[test]
+    fn a_custom_provider_gets_its_own_key_and_nothing_of_lynshen() {
+        let key = issue("s-custom").unwrap();
+        let (api, upstream) = fake_upstream();
+        set_custom(
+            &key,
+            json!({"tool":"claude","id":"private","name":"Private","base_url":format!("{api}/v1"),"key":"own-secret","format":"anthropic"}),
+        );
+        // The session has a group and a turn: neither goes to the provider.
+        set_turn("s-custom", Some("t-private"));
+        set_group("s-custom", Some("g1"));
+        let body = r#"{"model":"m1","stream":true}"#;
+        let request = format!("POST /gw/v1/messages?beta=true HTTP/1.1\r\nHost: localhost:7788\r\nAuthorization: Bearer {key}\r\nX-LynShen-Group: forged\r\nX-LynShen-Device: v1;hw=forged\r\nX-LynShen-Turn: forged\r\nanthropic-version: 2023-06-01\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        // `through_gateway` offers a LynShen login ("real-token") and a group
+        // that serves m1: a custom route must use neither.
+        let reply = through_gateway(&request, "http://127.0.0.1:9".into(), Some("g1"));
+        let received = upstream.join().unwrap().to_ascii_lowercase();
+        assert!(reply.ends_with("data: one\n\ndata: two\n\n"), "{reply}");
+        assert!(
+            received.starts_with("post /v1/messages?beta=true "),
+            "{received}"
+        );
+        assert!(received.contains("x-api-key: own-secret"), "{received}");
+        assert!(received.contains("anthropic-version: 2023-06-01"));
+        assert!(!received.contains("authorization:"), "{received}");
+        assert!(!received.contains("real-token"), "{received}");
+        assert!(!received.contains(&key), "{received}");
+        assert!(!received.contains("x-lynshen-"), "{received}");
+        assert!(!received.contains("forged"), "{received}");
+        revoke(&key);
+        set_group("s-custom", None);
+        set_turn("s-custom", None);
+        assert!(!state().custom.contains_key(&key));
+    }
+
+    #[test]
+    fn a_responses_provider_gets_a_bearer_key_on_its_own_base() {
+        let key = issue("s-custom-codex").unwrap();
+        let (api, upstream) = fake_upstream();
+        set_custom(
+            &key,
+            json!({"tool":"codex","id":"relay","name":"Relay","base_url":format!("{api}/openai"),"key":"relay-key","format":"responses"}),
+        );
+        let body = r#"{"model":"gpt-x"}"#;
+        let request = format!("POST /gw/v1/responses HTTP/1.1\r\nHost: 127.0.0.1:7788\r\nAuthorization: Bearer {key}\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        through_gateway(&request, "http://127.0.0.1:9".into(), None);
+        let received = upstream.join().unwrap().to_ascii_lowercase();
+        assert!(
+            received.starts_with("post /openai/v1/responses "),
+            "{received}"
+        );
+        assert!(received.contains("authorization: bearer relay-key"));
+        assert!(!received.contains("x-api-key") && !received.contains("x-lynshen-"));
+        revoke(&key);
+        assert_eq!(
+            custom_url("https://h/v1/", "/v1/models"),
+            "https://h/v1/models"
+        );
+        assert_eq!(
+            custom_url("https://h/api", "/v1/models"),
+            "https://h/api/v1/models"
+        );
+    }
+
+    #[test]
+    fn a_refused_mid_conversation_system_message_is_named_for_claude_code() {
+        let request =
+            br#"{"messages":[{"role":"user","content":"hi"},{"role":"system","content":"env"}]}"#;
+        let refused = br#"{"type":"error","error":{"message":"Invalid input at messages.1.role"}}"#;
+        assert_eq!(
+            capability_rejected(request, refused),
+            Some("mid_conv_system")
+        );
+        let worded = br#"{"error":{"message":"Unexpected role 'system' in messages"}}"#;
+        assert_eq!(
+            capability_rejected(request, worded),
+            Some("mid_conv_system")
+        );
+        let other = br#"{"error":{"message":"Invalid input at messages.12.content"}}"#;
+        assert_eq!(capability_rejected(request, other), None);
+        let plain = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        assert_eq!(capability_rejected(plain, refused), None);
     }
 
     #[test]

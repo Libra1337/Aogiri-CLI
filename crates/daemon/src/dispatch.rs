@@ -548,6 +548,7 @@ fn start_task(hub: &Arc<Hub>, session: &str, args: &Value) -> Result<Value, Stri
             false,
             engine,
             options(),
+            None,
         )?,
     };
     // The user's mode, whatever the session ran in before (the lynshen
@@ -774,7 +775,7 @@ mod tests {
     /// A session hosted on a channel instead of an engine.
     fn hosted(hub: &Arc<Hub>, id: &str, cwd: &Path, agent: Option<&str>) -> mpsc::Receiver<Value> {
         hub.store
-            .record_engine_session(id, cwd, agent, None, false)
+            .record_engine_session(id, cwd, agent, None, false, None)
             .unwrap();
         let (ops, rx) = mpsc::channel();
         hub.host(

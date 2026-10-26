@@ -20,6 +20,7 @@ use crate::{
         discover_project_instructions, discover_skills, skill_commands, skill_message,
         skill_pin_message, PromptContext, SessionPrompt,
     },
+    queue::{queue_move_target, QueuePick},
     session::{
         compaction_summary_item, ContextStatistics, EntryKind, SessionLock, SessionStore,
         SessionSummary, ThreadGoal, ThreadGoalStatus,
@@ -580,7 +581,7 @@ impl AgentCore {
     /// The current branch as a transcript, for a client that attaches to a
     /// running session and needs the conversation so far.
     pub fn transcript_event(&self) -> AgentEvent {
-        AgentEvent::Transcript(self.session.transcript_items())
+        AgentEvent::Transcript(self.session.transcript_stamped())
     }
 
     /// Startup batch: the session state plus the trust prompt and the
@@ -883,26 +884,28 @@ impl AgentCore {
         self.queued.iter().map(|(text, _)| text.clone()).collect()
     }
 
-    /// Takes a queued message back before it runs: the one at `index`, when
-    /// its text is `text` (the queue may have moved on since the client saw
-    /// it), else the first one with that text. The updated queue comes back
-    /// either way, so the client shows what is really waiting.
-    pub fn unqueue(&mut self, index: usize, text: Option<&str>) -> Vec<AgentEvent> {
-        let at = match text {
-            None => (index < self.queued.len()).then_some(index),
-            Some(text) => self
-                .queued
-                .get(index)
-                .filter(|(queued, _)| queued == text)
-                .map(|_| index)
-                .or_else(|| self.queued.iter().position(|(queued, _)| queued == text)),
-        };
-        let taken = at.and_then(|at| self.queued.remove(at));
+    /// The queued texts as a client sees them in `pending_messages`
+    /// (without attached-file lines), for finding the one an op picks.
+    fn queue_texts(&self) -> Vec<String> {
+        self.queued
+            .iter()
+            .map(|(text, _)| crate::attachments::split_files(text).0)
+            .collect()
+    }
+
+    /// Takes a queued message back before it runs (`QueuePick`); with
+    /// `discard` it is dropped instead of going back to the client's box.
+    /// The updated queue comes back either way, so the client shows what is
+    /// really waiting.
+    pub fn unqueue(&mut self, pick: &QueuePick, discard: bool) -> Vec<AgentEvent> {
+        let taken = pick
+            .find(&self.queue_texts())
+            .and_then(|at| self.queued.remove(at));
         let mut events = vec![AgentEvent::PendingMessages(self.pending_texts())];
         // Only a message really taken back goes back to the client's box: one
         // that started running meanwhile is not there to take.
-        if let Some((text, _)) = taken {
-            events.push(AgentEvent::Unqueued(text));
+        if let Some((content, images)) = taken.filter(|_| !discard) {
+            events.push(AgentEvent::Unqueued { content, images });
         }
         if !self.running {
             events.push(self.model_status_event());
@@ -910,15 +913,33 @@ impl AgentCore {
         events
     }
 
-    /// Sends the next queued message into the running turn, and running
-    /// tools and subagents keep going. A model response still streaming
-    /// (reasoning, text, tool-call arguments) is cut off and sent again with
-    /// the message (`ResponseInterrupted`); while tools run, the model reads
-    /// it in the request after them. A message with images, or one sent
-    /// while nothing runs, starts a turn of its own as before.
-    pub fn steer(&mut self) -> Vec<AgentEvent> {
-        if !self.running || self.queued.is_empty() {
+    /// Queued message `pick` moves to place `to` (negative from the last).
+    pub fn queue_move(&mut self, pick: &QueuePick, to: Option<i64>) -> Vec<AgentEvent> {
+        let Some((from, to)) = queue_move_target(pick, to, &self.queue_texts()) else {
             return Vec::new();
+        };
+        if let Some(item) = self.queued.remove(from) {
+            self.queued.insert(to, item);
+        }
+        vec![AgentEvent::PendingMessages(self.pending_texts())]
+    }
+
+    /// Sends a queued message (`pick`, the next one by default) into the
+    /// running turn, and running tools and subagents keep going. A model
+    /// response still streaming (reasoning, text, tool-call arguments) is cut
+    /// off and sent again with the message (`ResponseInterrupted`); while
+    /// tools run, the model reads it in the request after them. A message
+    /// with images, or one sent while nothing runs, starts a turn of its own
+    /// as before.
+    pub fn steer(&mut self, pick: &QueuePick) -> Vec<AgentEvent> {
+        if !self.running {
+            return Vec::new();
+        }
+        let Some(at) = pick.find(&self.queue_texts()) else {
+            return Vec::new();
+        };
+        if let Some(chosen) = self.queued.remove(at) {
+            self.queued.push_front(chosen);
         }
         if self
             .queued
@@ -935,6 +956,26 @@ impl AgentCore {
                 AgentEvent::PendingMessages(self.pending_texts()),
             ];
         }
+        self.restart_with_first()
+    }
+
+    /// Stops the running turn and starts queued message `pick` now, ahead of
+    /// the others: the user's "interrupt and send".
+    pub fn interrupt_send(&mut self, pick: &QueuePick) -> Vec<AgentEvent> {
+        if !self.running {
+            return Vec::new();
+        }
+        let Some(at) = pick.find(&self.queue_texts()) else {
+            return Vec::new();
+        };
+        if let Some(chosen) = self.queued.remove(at) {
+            self.queued.push_front(chosen);
+        }
+        self.restart_with_first()
+    }
+
+    /// The running turn stops; the first queued message starts the next.
+    fn restart_with_first(&mut self) -> Vec<AgentEvent> {
         let mut events = self.stop_current_turn();
         let Some((next, images)) = self.queued.pop_front() else {
             return events;
@@ -1082,7 +1123,7 @@ impl AgentCore {
                             let plan_event = self.plan_from_branch();
                             let save_event = self.save_session_event();
                             let mut events =
-                                vec![AgentEvent::Transcript(self.session.transcript_items())];
+                                vec![AgentEvent::Transcript(self.session.transcript_stamped())];
                             events.extend(plan_event);
                             if let Some(content) = fill {
                                 events.push(AgentEvent::FillInput(content));
@@ -1101,7 +1142,7 @@ impl AgentCore {
                         let plan_event = self.plan_from_branch();
                         let save_event = self.save_session_event();
                         vec![
-                            AgentEvent::Transcript(self.session.transcript_items()),
+                            AgentEvent::Transcript(self.session.transcript_stamped()),
                             AgentEvent::TreeView(self.session.tree_view()),
                         ]
                         .into_iter()
@@ -1122,7 +1163,7 @@ impl AgentCore {
                     Ok(()) => {
                         let save_event = self.save_session_event();
                         vec![
-                            AgentEvent::Transcript(self.session.transcript_items()),
+                            AgentEvent::Transcript(self.session.transcript_stamped()),
                             AgentEvent::TreeView(self.session.tree_view()),
                             AgentEvent::Status(format!("deleted branch {label}")),
                         ]
@@ -3452,6 +3493,36 @@ impl AgentCore {
             && !self.tool_state.has_live_shells()
     }
 
+    /// Work still going outside a turn: a background shell running or a
+    /// subagent not finished. A host waits for it before it restarts.
+    pub fn has_background_work(&self) -> bool {
+        self.tool_state.has_running_shell() || self.subagent_manager.has_unfinished()
+    }
+
+    /// Background work that comes back to the conversation: a subagent not
+    /// finished, or its result waiting to wake the engine. A background
+    /// shell (a dev server) does not: it never reports back by itself.
+    pub fn awaits_background_work(&self) -> bool {
+        self.subagent_manager.has_unfinished() || self.subagent_manager.pending_wake().is_some()
+    }
+
+    /// Stops the work a turn left going: its subagents, background ones
+    /// too, and its background shells (a scheduled run past its budget or
+    /// its time).
+    pub fn stop_background_work(&mut self) -> Vec<AgentEvent> {
+        self.subagent_manager
+            .close_everything("stopped: the scheduled run passed its limit");
+        let shells = self.tool_state.stop_shells();
+        let mut events = self.drain_subagent_events();
+        events.push(self.agent_runs_event());
+        if shells > 0 {
+            events.push(AgentEvent::Info(format!(
+                "stopped {shells} background command(s)"
+            )));
+        }
+        events
+    }
+
     /// What this engine holds of its session only in memory, for the
     /// session's next engine (`restore_kept_state`) when a host closes this
     /// one while the session stays in use.
@@ -5107,7 +5178,7 @@ impl AgentCore {
         let session_id = self.session.session_id().to_string();
         let save_event = self.save_session_event();
         vec![
-            AgentEvent::Transcript(self.session.transcript_items()),
+            AgentEvent::Transcript(self.session.transcript_stamped()),
             AgentEvent::PendingMessages(Vec::new()),
             self.model_status_event(),
             self.context_usage_event(),
@@ -5499,7 +5570,15 @@ impl AgentCore {
             .iter()
             .any(|m| m.name == self.config.model)
         {
-            if let Some(model) = self.config.models.first().map(|m| m.name.clone()) {
+            // A login never starts on a hidden model.
+            if let Some(model) = self
+                .config
+                .models
+                .iter()
+                .find(|m| !m.hidden)
+                .or_else(|| self.config.models.first())
+                .map(|m| m.name.clone())
+            {
                 self.config.model = model.clone();
                 let supported = self.reasoning_efforts_for_model(&model);
                 if !supported
@@ -5602,7 +5681,7 @@ impl AgentCore {
                     crate::tools::restore_conflicts_note(&result),
                 ),
                 Err(error) => {
-                    return [AgentEvent::Transcript(self.session.transcript_items())]
+                    return [AgentEvent::Transcript(self.session.transcript_stamped())]
                         .into_iter()
                         .chain(plan_event)
                         .chain([AgentEvent::Error(format!(
@@ -5616,7 +5695,7 @@ impl AgentCore {
         if let Some(conflicts) = conflicts {
             message.push_str(&format!(" · {conflicts}"));
         }
-        [AgentEvent::Transcript(self.session.transcript_items())]
+        [AgentEvent::Transcript(self.session.transcript_stamped())]
             .into_iter()
             .chain(plan_event)
             .chain([AgentEvent::Info(message)])
@@ -5701,7 +5780,7 @@ impl AgentCore {
                 self.model_plan = self.plan.clone();
                 self.plan_set_back.clear();
                 let mut events = vec![
-                    AgentEvent::Transcript(self.session.transcript_items()),
+                    AgentEvent::Transcript(self.session.transcript_stamped()),
                     AgentEvent::PendingMessages(Vec::new()),
                     self.model_status_event(),
                     self.context_usage_event(),
@@ -6139,6 +6218,7 @@ impl AgentCore {
         self.config
             .models
             .iter()
+            .filter(|model_config| in_model_picker(model_config, &self.config.model))
             .map(|model_config| {
                 let active = model_config.name == self.config.model;
                 ModelOptionView {
@@ -6203,7 +6283,7 @@ fn compacted(
 }
 
 /// The steps of an `update_plan` call; None without a `plan` array.
-fn parse_plan(args: &Value) -> Option<Vec<PlanItem>> {
+pub(crate) fn parse_plan(args: &Value) -> Option<Vec<PlanItem>> {
     let items = args.get("plan").and_then(Value::as_array)?;
     let mut plan = Vec::new();
     for item in items {
@@ -6286,7 +6366,6 @@ fn current_utc_date() -> String {
 /// models instead.
 const DEFAULT_LYNSHEN_MODELS: &[&str] = &[
     "gpt-6.1-sol",
-    "codex-auto-review",
     "gpt-6-astra",
     "gpt-6-sol",
     "gpt-6-luna",
@@ -6305,15 +6384,32 @@ const DEFAULT_LYNSHEN_MODELS: &[&str] = &[
 ];
 
 fn default_lynshen_models(available: &[ModelConfig]) -> Vec<ModelConfig> {
+    // A model the gateway hides from pickers is never a default.
     let picked: Vec<ModelConfig> = DEFAULT_LYNSHEN_MODELS
         .iter()
-        .filter_map(|name| available.iter().find(|m| m.name == *name).cloned())
+        .filter_map(|name| {
+            available
+                .iter()
+                .find(|m| m.name == *name && !m.hidden)
+                .cloned()
+        })
         .collect();
     if picked.is_empty() {
-        available.iter().take(6).cloned().collect()
+        available
+            .iter()
+            .filter(|m| !m.hidden)
+            .take(6)
+            .cloned()
+            .collect()
     } else {
         picked
     }
+}
+
+/// A model the gateway hides stays callable by name; the picker lists it
+/// only while it is the active model.
+fn in_model_picker(model: &ModelConfig, active: &str) -> bool {
+    !model.hidden || model.name == active
 }
 
 /// A gateway model as the engine runs it. Values the gateway leaves unset stay
@@ -6349,6 +6445,7 @@ fn lynshen_model_config(model: &OAuthModel) -> ModelConfig {
         group_windows: model.group_windows.clone(),
         reasoning: None,
         input_modalities: None,
+        hidden: model.hidden,
     }
 }
 
@@ -7373,6 +7470,7 @@ mod model_config_tests {
             reasoning_efforts: None,
             display_name: None,
             group_windows: Default::default(),
+            hidden: false,
         }
     }
 
@@ -7403,7 +7501,6 @@ mod model_config_tests {
     fn default_lynshen_models_preserve_original_catalog_order() {
         let requested = [
             "gpt-6.1-sol",
-            "codex-auto-review",
             "gpt-6-astra",
             "gpt-6-sol",
             "gpt-6-luna",
@@ -7438,6 +7535,33 @@ mod model_config_tests {
         assert_eq!(default_lynshen_models(&subset)[0].name, "claude-fable-5");
         let other = vec![lynshen_model_config(&oauth_model("private-model"))];
         assert_eq!(default_lynshen_models(&other)[0].name, "private-model");
+        // A model the gateway hides from pickers is never a default.
+        let mut hidden = oauth_model("gpt-6.1-sol");
+        hidden.hidden = true;
+        let mixed = vec![
+            lynshen_model_config(&hidden),
+            lynshen_model_config(&oauth_model("private-model")),
+        ];
+        let names: Vec<_> = default_lynshen_models(&mixed)
+            .into_iter()
+            .map(|model| model.name)
+            .collect();
+        assert_eq!(names, ["private-model"]);
+    }
+
+    #[test]
+    fn a_hidden_gateway_model_is_left_out_of_the_picker_unless_active() {
+        let hidden = lynshen_model_config(&OAuthModel {
+            hidden: true,
+            ..oauth_model("codex-auto-review")
+        });
+        assert!(hidden.hidden);
+        assert!(!in_model_picker(&hidden, "gpt-6-sol"));
+        assert!(in_model_picker(&hidden, "codex-auto-review"));
+        assert!(in_model_picker(
+            &lynshen_model_config(&oauth_model("gpt-6-sol")),
+            "x"
+        ));
     }
 
     #[test]
@@ -7560,6 +7684,7 @@ mod model_config_tests {
             reasoning_efforts: Some(vec!["low".to_string(), "high".to_string()]),
             display_name: None,
             group_windows: Default::default(),
+            hidden: false,
         };
         let config = lynshen_model_config(&model);
         assert_eq!(config.reasoning_efforts, vec!["low", "high"]);

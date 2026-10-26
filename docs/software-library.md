@@ -104,7 +104,9 @@ file it uses, and falls back to GitHub when the mirror fails or lacks a skill.
 Anthropic's skills are read at the commit the bundled index pins, and only
 the ones it marks redistributable are packed. A community skill is packed
 only with a license (its own or its repository's); without one it is listed
-and the engine installs it from GitHub. The community list is
+and the engine installs it from GitHub. One whose frontmatter `license` says
+proprietary or source-available is listed with it and never packed, as the
+engine lists it. The community list is
 `deploy/skills-mirror/sources.json`, which a test keeps equal to
 `COMMUNITY_SKILL_SOURCES`.
 
