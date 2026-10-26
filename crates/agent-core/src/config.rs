@@ -1162,6 +1162,10 @@ impl AuthStore {
         self.keys.insert(provider.to_string(), key);
     }
 
+    pub fn remove_key(&mut self, provider: &str) {
+        self.keys.remove(provider);
+    }
+
     /// The current LynShen OAuth token bundle, if logged in on this computer.
     /// A login copied from another computer is not one: refreshing it would
     /// sign that computer out.
