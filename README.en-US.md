@@ -9,9 +9,9 @@
   <p>A coding agent in your terminal, and the engine behind the Aogiri desktop and phone apps.</p>
 
   <p>
-    <a href="https://github.com/Libra1337/LynShen-CLI/releases/latest">Download</a> ·
-    <a href="https://github.com/Libra1337/LynShen-CLI/releases">All releases</a> ·
-    <a href="https://github.com/Libra1337/LynShen-CLI/issues">Report an issue</a>
+    <a href="https://github.com/Libra1337/Aogiri-CLI/releases/latest">Download</a> ·
+    <a href="https://github.com/Libra1337/Aogiri-CLI/releases">All releases</a> ·
+    <a href="https://github.com/Libra1337/Aogiri-CLI/issues">Report an issue</a>
   </p>
 
   <p><a href="README.md">简体中文</a> · <strong>English</strong></p>
@@ -31,7 +31,7 @@ The command is `lynshen`, written in Rust. Start it in a project directory and a
 Download the file and put it in a directory on your PATH. For example, on an Apple silicon Mac:
 
 ```sh
-curl -fLo lynshen https://github.com/Libra1337/LynShen-CLI/releases/latest/download/lynshen-aarch64-apple-darwin
+curl -fLo lynshen https://github.com/Libra1337/Aogiri-CLI/releases/latest/download/lynshen-aarch64-apple-darwin
 chmod +x lynshen
 mkdir -p ~/.local/bin && mv lynshen ~/.local/bin/
 lynshen --version
@@ -149,15 +149,15 @@ Relay connections are end-to-end encrypted (Noise); the relay cannot read them. 
 - **Every shell command fails on Linux:** install `bubblewrap`. On Ubuntu 24.04 and later, also allow unprivileged user namespaces (`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, or an AppArmor profile for bwrap), or switch to `full-access`.
 - **macOS blocks a binary downloaded in a browser:** run `xattr -d com.apple.quarantine <file>`. A download with `curl` is not blocked.
 
-For other problems, open a [GitHub issue](https://github.com/Libra1337/LynShen-CLI/issues) with the output of `lynshen --version`, your operating system, and the relevant part of the log. Do not paste API keys or access tokens. Desktop users can also use Settings → General → Report Issue.
+For other problems, open a [GitHub issue](https://github.com/Libra1337/Aogiri-CLI/issues) with the output of `lynshen --version`, your operating system, and the relevant part of the log. Do not paste API keys or access tokens. Desktop users can also use Settings → General → Report Issue.
 
 ## Build from source
 
 You need stable Rust. `crates/llm-provider-kit` is a git submodule, so clone with `--recurse-submodules`:
 
 ```sh
-git clone --recurse-submodules https://github.com/Libra1337/LynShen-CLI.git
-cd LynShen-CLI
+git clone --recurse-submodules https://github.com/Libra1337/Aogiri-CLI.git
+cd Aogiri-CLI
 cargo build --release
 ./target/release/lynshen --version
 ```
