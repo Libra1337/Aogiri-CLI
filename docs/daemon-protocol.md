@@ -158,7 +158,8 @@ A relay stream then behaves exactly like a device's local WebSocket.
 ### Relay v2: remote access through the account
 
 A computer signed in to LynShen (a device key in auth.json: the desktop's
-`providers.monoize`, else the CLI's `providers.lynshen-cli`) uses relay v2
+`providers.monoize`, else the CLI's `providers.lynshen-cli`, which
+`lynshen login --device` writes on a computer without the desktop) uses relay v2
 (`docs/relay-protocol.md` §7) while the relay is on:
 
 - It gets a 10-minute relay token from the gateway, connects to

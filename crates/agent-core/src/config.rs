@@ -1073,7 +1073,11 @@ impl Config {
 
 impl AuthStore {
     pub fn load_or_create(encrypt_secrets: bool) -> io::Result<Self> {
-        let path = auth_path()?;
+        Self::load_or_create_at(auth_path()?, encrypt_secrets)
+    }
+
+    /// `load_or_create` for the auth.json at `path` (tests use their own).
+    pub(crate) fn load_or_create_at(path: PathBuf, encrypt_secrets: bool) -> io::Result<Self> {
         if !path.exists() {
             let auth = Self {
                 keys: BTreeMap::new(),

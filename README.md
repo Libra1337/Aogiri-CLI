@@ -137,9 +137,10 @@ lynshen daemon                   # 前台运行
 lynshen daemon install           # 登录时自动启动（macOS 用 launchd，Linux 用 systemd 用户服务）
 lynshen daemon relay on          # 打开中继连接（off 关闭，status 查看）
 lynshen daemon pair              # 打印一次性配对链接，5 分钟内在手机上打开
+lynshen login --device           # 没有桌面端的电脑：在浏览器里确认设备码，把这台电脑登录到 LynShen 账号（logout --device 退出）
 ```
 
-手机通过中继 `wss://app.lynshen.org/relay/v1` 连接 daemon，内容端到端加密，中继看不到内容。中继默认关闭，可以在桌面端打开，也可以用上面的 `relay on`。协议见 [docs/daemon-protocol.md](docs/daemon-protocol.md) 和 [docs/relay-protocol.md](docs/relay-protocol.md)。
+手机通过中继 `wss://app.lynshen.org/relay/v1` 连接 daemon，内容端到端加密，中继看不到内容。中继默认关闭，可以在桌面端打开，也可以用上面的 `relay on`。电脑登录 LynShen 账号后，同一账号的手机和网页能在电脑列表里看到它并请求连接；只装了 CLI 的电脑用 `lynshen login --device` 登录。协议见 [docs/daemon-protocol.md](docs/daemon-protocol.md) 和 [docs/relay-protocol.md](docs/relay-protocol.md)。
 
 **`lynshen serve`** 从标准输入读命令、向标准输出写事件，都是一行一个 JSON，事件格式和 `--headless` 相同。见 [docs/serve-protocol.md](docs/serve-protocol.md)。
 
@@ -290,7 +291,7 @@ LynShen CLI is a terminal coding agent written in Rust. The command is `lynshen`
 
 **Your own provider.** `provider`, `base_url`, `protocol` and `models` in `config.json` describe the provider in use. Each model entry takes `name`, `display_name`, `context_window` (sets the compaction point), `max_output_tokens` (sent as the request's output cap), `reasoning` (`false`: no reasoning settings are sent and clients show no effort), `reasoning_efforts` (the tiers clients offer: `none`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`) and `input_modalities` (`text`, `image`; without `image`, images are replaced by a note). A missing field keeps the earlier behavior. `ultra` is GPT's name for the top tier: requests send the model's highest other listed tier, or `max`. Some catalog providers serve each protocol at a URL of its own (zenmux: Chat Completions under `/api/v1`, Messages under `/api/anthropic`). Their `base_url` can be any of their catalog URLs, with placeholders such as Cloudflare's `<account>` filled in. Each request then goes to the URL of its model's protocol, with the same key: after `/model`, in subagents, and for the compaction, title and safety models. A `base_url` that is none of the provider's catalog URLs (a proxy of your own) is used for every model.
 
-**Modes.** `lynshen --headless "<task>"` runs one task and prints JSONL events. It denies approvals unless you pass `--approval-mode`. `lynshen serve` speaks newline JSON over stdio for GUIs, `lynshen acp` speaks ACP for editors such as Zed, and `lynshen daemon` hosts many sessions on `ws://127.0.0.1:7788` for Desktop and paired phones.
+**Modes.** `lynshen --headless "<task>"` runs one task and prints JSONL events. It denies approvals unless you pass `--approval-mode`. `lynshen serve` speaks newline JSON over stdio for GUIs, `lynshen acp` speaks ACP for editors such as Zed, and `lynshen daemon` hosts many sessions on `ws://127.0.0.1:7788` for Desktop and paired phones. On a computer without Desktop, `lynshen login --device` signs it in to the LynShen account (a device code approved in the browser), so phones and the web page of the same account list it and can ask to connect through the relay.
 
 **Safety.** The approval modes are `manual` (default), `auto-edit`, `auto` (a safety model approves safe commands) and `full-access`. On macOS and Linux, shell commands run in an OS sandbox ([docs/sandbox.md](docs/sandbox.md)). Windows has no sandbox yet.
 
