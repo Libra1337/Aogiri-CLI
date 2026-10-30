@@ -786,7 +786,12 @@ impl Codex {
     }
 
     /// The commands a Codex session runs through the app-server (its other
-    /// slash commands belong to its TUI), then its skills.
+    /// slash commands belong to its TUI), then its skills, each name once.
+    /// Codex lists every skill it finds: two folders can hold a skill of the
+    /// same name (`~/.codex/skills`, `~/.agents/skills`, the project's), and
+    /// a skill can be named like a built-in. A typed name runs the built-in,
+    /// else the first skill of that name (`skill`), so that is the one
+    /// listed; clients key their lists by name (ticket #60).
     fn command_list(&self) -> Value {
         let builtin = [
             ("/model", "", "Choose the model and reasoning effort"),
@@ -813,7 +818,14 @@ impl Codex {
             .map(|(command, args, description)| json!({ "command": command, "marker": null, "args": args, "description": description }))
             .collect();
         for (name, _, description) in &self.skills {
-            commands.push(json!({ "command": format!("/{name}"), "marker": "SKILL", "args": "", "description": description }));
+            let command = format!("/{name}");
+            if commands
+                .iter()
+                .any(|listed| listed["command"] == command.as_str())
+            {
+                continue;
+            }
+            commands.push(json!({ "command": command, "marker": "SKILL", "args": "", "description": description }));
         }
         json!({ "type": "command_list", "commands": commands })
     }
@@ -3206,6 +3218,41 @@ mod tests {
         assert_eq!(first["input_tokens"], 2_000);
         let second = update(&mut c, 503_000, 3_000);
         assert_eq!(second["input_tokens"], 3_000);
+    }
+
+    #[test]
+    fn a_skill_name_found_twice_is_listed_once() {
+        // Codex 0.166 lists a skill of each folder that holds one: `fmt` in
+        // ~/.agents/skills and ~/.codex/skills, and a `review` skill beside
+        // the built-in /review (ticket #60).
+        let mut c = opened();
+        let listed = frame(
+            &mut c,
+            json!({ "id": 4, "result": { "data": [{ "cwd": "/p", "errors": [], "skills": [
+                { "name": "fmt", "path": "/h/.agents/skills/fmt/SKILL.md", "description": "Format (agents)", "enabled": true },
+                { "name": "fmt", "path": "/h/.codex/skills/fmt/SKILL.md", "description": "Format (codex)", "enabled": true },
+                { "name": "review", "path": "/h/.codex/skills/review/SKILL.md", "description": "My review", "enabled": true }
+            ] }] } }),
+        );
+        let commands = listed.events[0]["commands"].as_array().unwrap();
+        let names: Vec<&str> = commands
+            .iter()
+            .map(|c| c["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["/model", "/resume", "/compact", "/review", "/goal", "/login", "/fmt"]
+        );
+        // The listed one is the one a typed name runs.
+        assert_eq!(commands[3]["marker"], Value::Null);
+        assert_eq!(commands[6]["description"], "Format (agents)");
+        let skill = c
+            .encode(&json!({ "op": "command", "input": "/fmt" }))
+            .unwrap();
+        assert_eq!(
+            sent(&skill.frames)[0]["params"]["input"][0]["path"],
+            "/h/.agents/skills/fmt/SKILL.md"
+        );
     }
 
     #[test]
