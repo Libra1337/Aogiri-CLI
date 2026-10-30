@@ -996,12 +996,20 @@ impl Acp {
         json!({ "type": "session_options", "options": options })
     }
 
+    /// The agent's commands, each name once (the first): clients key their
+    /// lists by name (ticket #60).
     fn command_list(&self) -> Value {
-        let commands: Vec<Value> = self
-            .commands
-            .iter()
-            .map(|c| json!({ "command": format!("/{}", text(&c["name"])), "marker": null, "args": text(&c["input"]["hint"]), "description": c["description"] }))
-            .collect();
+        let mut commands: Vec<Value> = Vec::new();
+        for c in &self.commands {
+            let command = format!("/{}", text(&c["name"]));
+            if commands
+                .iter()
+                .any(|listed| listed["command"] == command.as_str())
+            {
+                continue;
+            }
+            commands.push(json!({ "command": command, "marker": null, "args": text(&c["input"]["hint"]), "description": c["description"] }));
+        }
         json!({ "type": "command_list", "commands": commands })
     }
 
@@ -3109,7 +3117,8 @@ mod tests {
         let out = up(
             &mut a,
             json!({ "sessionUpdate": "available_commands_update", "availableCommands": [
-                { "name": "review", "description": "Review changes", "input": { "hint": "path" } }] }),
+                { "name": "review", "description": "Review changes", "input": { "hint": "path" } },
+                { "name": "review", "description": "A second review" }] }),
         );
         assert_eq!(
             out.events[0]["commands"],
