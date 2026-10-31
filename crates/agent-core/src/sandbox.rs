@@ -873,7 +873,7 @@ impl SandboxPolicy {
             format!(" Read-only: {}.", list(&self.readable_dirs))
         };
         let escalate =
-            "with `escalate: true` and a one-line `justification`; it may need approval.";
+            "with `escalate: true` and a one-line `justification`; the user may be asked.";
         let (tag, shell) = if !self.is_sandboxed() {
             (
                 format!("<sandbox mode=\"{}\">", self.mode.as_str()),
@@ -883,7 +883,7 @@ impl SandboxPolicy {
             (
                 format!("<sandbox mode=\"{}\" enforced=\"false\">", self.mode.as_str()),
                 format!(
-                    "No OS sandbox on this platform: commands run with the user's permissions. Your boundary is the working directory{extra}, temp and package caches.{read_only} Run a command that writes outside it, installs software or changes settings {escalate}"
+                    "No OS sandbox on this platform: commands run as the user. Stay in the working directory{extra}, temp and package caches.{read_only} Run a command that writes elsewhere, installs software or changes settings {escalate}"
                 ),
             )
         } else {
@@ -908,13 +908,13 @@ impl SandboxPolicy {
             (
                 format!("<sandbox mode=\"{}\">", self.mode.as_str()),
                 format!(
-                    "Commands run in an OS sandbox. {writable}{read_only} {network}; credentials such as ~/.ssh are unreadable. For more (git commit, installing software, writing elsewhere{}), run the command {escalate}",
+                    "Commands run in an OS sandbox. {writable}{read_only} {network}; login and key files (such as ~/.ssh) are not readable. To commit, install software or write elsewhere{}, run the command {escalate}",
                     if self.network || windows { "" } else { ", network" },
                 ),
             )
         };
         format!(
-            "{tag}\n{shell}\nFile tools read anywhere but credentials; writing outside the writable directories may need approval. Always asked, in every mode: sudo, git push, deleting outside the workspace, system settings, credentials.\n</sandbox>"
+            "{tag}\n{shell}\nFile tools read anywhere except login and key files; writes outside the writable directories may need approval. The user is always asked first for: sudo, git push, deletes outside the workspace, system settings, login and key files.\n</sandbox>"
         )
     }
 }
@@ -1556,8 +1556,8 @@ mod tests {
         assert!(full.contains("No sandbox"), "{full}");
         // Every mode says what file tools may do and what always asks.
         for prompt in [&prompt, &full] {
-            assert!(prompt.contains("File tools read anywhere but credentials"));
-            assert!(prompt.contains("Always asked, in every mode: sudo, git push"));
+            assert!(prompt.contains("File tools read anywhere except login and key files"));
+            assert!(prompt.contains("always asked first for: sudo, git push"));
             assert!(prompt.ends_with("</sandbox>"));
         }
     }

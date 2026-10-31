@@ -101,7 +101,7 @@ Allow the action when ALL of these hold:
 
 Deny when ANY of these hold:
 - destructive or hard to reverse (rm -rf, dropping data, force-push, history rewrite, killing processes, chmod/chown on system paths);
-- reads or exfiltrates secrets, credentials, or local data to the network (curl/wget posting files, env dumps piped out);
+- reads secrets or login data, or sends local files or data over the network (curl/wget uploading files, printing the environment to a URL);
 - touches systems or places outside the working directory that the user did not ask for, or requires elevated privileges;
 - the user did not ask for it, the goal is unclear, or you are unsure — when in doubt, deny.
 
@@ -708,7 +708,7 @@ pub(crate) fn request_tool_definitions(offer: &ToolOffer<'_>) -> Vec<Value> {
                     "escalate".to_string(),
                     json!({
                         "type": "boolean",
-                        "description": "Run outside the sandbox; may need approval."
+                        "description": "Run without the sandbox; the user may be asked."
                     }),
                 );
                 properties.insert(
@@ -3683,7 +3683,7 @@ fn subagent_definitions(
 ) -> Vec<Value> {
     let choosable = models.iter().any(|spec| spec.name != own_model);
     let mut description = format!(
-        "Start a subagent on a self-contained task and return at once; collect it with wait_agent. It has your tools, prompt and skills, starts with only your message, and works in your cwd. At most {} live agents and {} levels of nesting. Fan out only for truly independent parts; retry a failed task at most once.{}",
+        "Start a subagent on a self-contained task; it returns at once, collect it with wait_agent. It has your tools and skills, sees only your message, and works in your cwd. At most {} live agents, {} levels deep. Split only truly independent parts; retry a failed task once at most.{}",
         config.max_live,
         config.max_depth,
         subagent_model_guide(own_model, own_efforts, models)
@@ -4659,6 +4659,15 @@ fn has_visible_answer(items: &[Value]) -> bool {
 /// refusal. Other errors pass through. The kit's details stay at the end for
 /// diagnosis; `model_context_window_exceeded` there lets the core compact
 /// and retry (`is_context_overflow`).
+/// Whether a turn's error says the model answered without an answer: a
+/// refusal, an empty reply, or thinking that ran out of output or context
+/// (`user_facing_error`, `NO_ANSWER_ERROR`). The same request gets the same.
+pub fn is_unanswered(error: &str) -> bool {
+    error.starts_with(NO_ANSWER_ERROR)
+        || error.starts_with("模型拒绝回答了这个请求。")
+        || error.starts_with("模型只输出了思考，没有给出回答")
+}
+
 fn user_facing_error(error: String) -> String {
     let Some((kind, details)) = NoAnswer::from_error(&error) else {
         return error;
@@ -5828,7 +5837,7 @@ mod tests {
             .position(|d| d["name"] == "spawn_agent")
             .unwrap()];
         let description = spawn["description"].as_str().unwrap();
-        assert!(description.contains("At most 4 live agents and 2 levels"));
+        assert!(description.contains("At most 4 live agents, 2 levels deep"));
         assert!(description.contains("\n- tester: runs tests"));
         assert!(description.contains("\n- worker: writes in its own worktree"));
         assert!(description.contains("\n- odd") && !description.contains("- odd:"));
