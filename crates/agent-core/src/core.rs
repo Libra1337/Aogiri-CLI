@@ -2131,8 +2131,13 @@ impl AgentCore {
                         self.running = false;
                         disconnected = true;
                         self.goal_tool_receiver = None;
-                        self.unanswered_at = crate::llm::is_unanswered(&error)
-                            .then(|| (self.session.mark(), self.config.model.clone(), error.clone()));
+                        self.unanswered_at = crate::llm::is_unanswered(&error).then(|| {
+                            (
+                                self.session.mark(),
+                                self.config.model.clone(),
+                                error.clone(),
+                            )
+                        });
                         events.push(AgentEvent::Error(error));
                         events.push(self.context_usage_event());
                         for message in self.hooks.stop(&self.cwd) {

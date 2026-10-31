@@ -207,12 +207,19 @@ fn continue_after_a_refusal_is_refused_until_the_conversation_changes() {
     let refused = core.continue_turn();
     let message = errors(&refused);
     assert_eq!(message.len(), 1, "{refused:#?}");
-    assert!(message[0].starts_with("模型拒绝回答了这个请求。"), "{message:?}");
+    assert!(
+        message[0].starts_with("模型拒绝回答了这个请求。"),
+        "{message:?}"
+    );
     assert!(message[0].contains("换一个模型"), "{message:?}");
     assert!(core.is_idle());
     thread::sleep(Duration::from_millis(200));
     core.poll_events();
-    assert_eq!(requests_for("THINK_FILTER"), before, "the refused request was sent again");
+    assert_eq!(
+        requests_for("THINK_FILTER"),
+        before,
+        "the refused request was sent again"
+    );
 
     // A new message changes the conversation: it is sent.
     let next = run_turn(&mut core, "after the refusal");
