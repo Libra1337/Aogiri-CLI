@@ -313,6 +313,13 @@ pub struct AgentCore {
     force_compaction: bool,
     overflow_retry_pending: bool,
     overflow_retried: bool,
+    /// The conversation's mark (`Session::mark`) when its last turn ended
+    /// with a reply the model gave no answer in (a refusal, an empty reply,
+    /// thinking only), and that error. `continue_turn` does not send the
+    /// same conversation again: it would get the same reply, billed again.
+    /// Another model may answer (Anthropic's advice for a refusal), so the
+    /// model is part of it.
+    unanswered_at: Option<(Option<crate::session::EntryId>, String, String)>,
     /// The propose_plan call being written: its call id, its arguments so
     /// far and how much of the plan text clients were sent.
     plan_draft: Option<PlanDraft>,
@@ -482,6 +489,7 @@ impl AgentCore {
             force_compaction: false,
             overflow_retry_pending: false,
             overflow_retried: false,
+            unanswered_at: None,
             plan_draft: None,
             resume_summary_running: false,
             resume_summary_retry_at: None,
@@ -853,6 +861,16 @@ impl AgentCore {
         }
         if self.session.user_turns().is_empty() {
             return vec![AgentEvent::Error("nothing to continue".to_string())];
+        }
+        if let Some((_, _, error)) = self
+            .unanswered_at
+            .as_ref()
+            .filter(|(mark, model, _)| *mark == self.session.mark() && *model == self.config.model)
+        {
+            return vec![AgentEvent::Error(format!(
+                "{} 同样的请求再发一次只会得到同样的结果，并再次计费：请改写或补充消息，或换一个模型。",
+                error.split(" (stop reason").next().unwrap_or(error).trim_end()
+            ))];
         }
         self.overflow_retried = false;
         self.append_due_notes(false);
@@ -2099,12 +2117,22 @@ impl AgentCore {
                             .close_all_with_message("parent turn failed");
                         events.extend(self.record_turn_stats());
                         events.extend(self.finish_goal_turn());
-                        if error.starts_with(crate::loop_guard::STOP_PREFIX) {
-                            events.extend(self.pause_goal("the loop guard stopped the turn"));
-                        }
+                        // A failed turn pauses the goal: continuing it would
+                        // send the same conversation again at once, and a
+                        // refusal, an empty reply or a rejected request
+                        // fails the same way each time. A person resumes it.
+                        events.extend(self.pause_goal(
+                            if error.starts_with(crate::loop_guard::STOP_PREFIX) {
+                                "the loop guard stopped the turn"
+                            } else {
+                                "the turn failed"
+                            },
+                        ));
                         self.running = false;
                         disconnected = true;
                         self.goal_tool_receiver = None;
+                        self.unanswered_at = crate::llm::is_unanswered(&error)
+                            .then(|| (self.session.mark(), self.config.model.clone(), error.clone()));
                         events.push(AgentEvent::Error(error));
                         events.push(self.context_usage_event());
                         for message in self.hooks.stop(&self.cwd) {

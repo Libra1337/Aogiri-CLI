@@ -573,6 +573,12 @@ impl SessionStore {
         self.leaf_id
     }
 
+    /// Where the conversation stands: its last entry. Two equal marks mean
+    /// nothing was added in between (`AgentCore::continue_turn`).
+    pub fn mark(&self) -> Option<EntryId> {
+        self.leaf_id
+    }
+
     /// User message content for an entry label (e.g. "e3"), if it names a user node.
     pub fn user_content(&self, label: &str) -> Option<String> {
         let id = parse_entry_id(label)?;

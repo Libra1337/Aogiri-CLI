@@ -337,7 +337,7 @@ const HOST_EMPTY_NOTE: &str =
 
 /// The note when the shell runs without a sandbox now.
 const SANDBOX_OFF_NOTE: &str =
-    "The shell sandbox is off now: commands run without one (full access), as the approval mode allows.";
+    "The shell sandbox is off now: commands run directly, as the approval mode allows.";
 
 /// The note when the reply style goes back to the default (none).
 const STYLE_OFF_NOTE: &str =

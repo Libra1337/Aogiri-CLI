@@ -100,12 +100,12 @@ pub fn propose_plan_definition() -> Value {
     json!({
         "type": "function",
         "name": TOOL_NAME,
-        "description": "Plan mode only: present your finished plan to the user for approval. This ends your turn; the user approves the plan (then you implement it) or asks for changes (then you propose a complete revised plan).",
+        "description": "Plan mode only: give the user your finished plan to approve. This ends your turn; the user approves it (then you carry it out) or asks for changes (then you propose a complete new plan).",
         "parameters": {
             "type": "object",
             "properties": {
                 "title": { "type": "string", "description": "Short title of the plan, in the user's language." },
-                "plan": { "type": "string", "description": "The full plan in Markdown: goal & principles, a File | Change | Why table, numbered steps, risks, verification." }
+                "plan": { "type": "string", "description": "The full plan in Markdown: goal, a File | Change | Why table, numbered steps, risks, checks." }
             },
             "required": ["title", "plan"],
             "additionalProperties": false
