@@ -5837,7 +5837,7 @@ mod tests {
             .position(|d| d["name"] == "spawn_agent")
             .unwrap()];
         let description = spawn["description"].as_str().unwrap();
-        assert!(description.contains("At most 4 live agents and 2 levels"));
+        assert!(description.contains("At most 4 live agents, 2 levels deep"));
         assert!(description.contains("\n- tester: runs tests"));
         assert!(description.contains("\n- worker: writes in its own worktree"));
         assert!(description.contains("\n- odd") && !description.contains("- odd:"));
