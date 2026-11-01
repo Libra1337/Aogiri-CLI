@@ -140,9 +140,9 @@ pub struct OpenAiClient {
     allow_subagents: bool,
     max_tool_calls: Option<u64>,
     deadline: Option<Instant>,
-    /// Input tokens past which the main turn stops between requests so the
-    /// conversation can be compacted and the turn continued; 0 = never.
-    context_budget: u64,
+    /// When the main turn stops between requests so the conversation can be
+    /// compacted and the turn continued.
+    context_budget: ContextBudget,
     provider_kind: Protocol,
     goal_tool_tx: Option<Sender<GoalToolRequest>>,
     /// Offers propose_plan with the goal tools (see `OpenAiClientConfig`).
@@ -372,10 +372,25 @@ pub struct ToolGoalResponse {
 }
 
 /// The error `run_turn_events` ends the main turn with when the context passed
-/// the compaction threshold mid-turn. It reads as a context overflow, so the
-/// core compacts and continues the turn (`is_context_overflow`).
+/// the compaction threshold between two requests. The core compacts and
+/// continues the turn; nobody sees it.
 pub const MID_TURN_COMPACTION: &str =
     "context_length_exceeded: the conversation passed the compaction threshold mid-turn";
+
+/// When the main turn stops between requests to be compacted. All of it in the
+/// same count as the context gauge (`core::request_tokens`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContextBudget {
+    /// The compaction threshold the gauge shows; 0 = unknown window.
+    pub threshold: u64,
+    /// The size past which it stops: the threshold, or more after a compaction
+    /// tried (`core::compaction_limit`); 0 = never.
+    pub limit: u64,
+    /// What a request carries besides the conversation.
+    pub overhead: u64,
+    /// How far the provider's last count of a request was over ours.
+    pub provider_excess: u64,
+}
 
 /// How the main agent's stream is stopped when the user steers a message in
 /// (see `OpenAiClient::stream_turn_request`); never shown. Nothing in it may
@@ -908,7 +923,7 @@ impl OpenAiClient {
             allow_subagents: true,
             max_tool_calls: None,
             deadline: None,
-            context_budget: 0,
+            context_budget: ContextBudget::default(),
             provider_kind,
             goal_tool_tx: config.goal_tool_tx,
             propose_plan: config.propose_plan,
@@ -938,10 +953,26 @@ impl OpenAiClient {
         self.interrupt_flag = flag;
     }
 
-    /// Sets the input size at which `run_turn_events` hands the turn back for
-    /// compaction (see [`MID_TURN_COMPACTION`]); 0 turns it off.
-    pub fn set_context_budget(&mut self, tokens: u64) {
-        self.context_budget = tokens;
+    /// Sets when `run_turn_events` hands the turn back for compaction (see
+    /// [`MID_TURN_COMPACTION`]).
+    pub fn set_context_budget(&mut self, budget: ContextBudget) {
+        self.context_budget = budget;
+    }
+
+    /// A compaction was tried on `input`, what the turn now goes on from.
+    /// However it went, the turn does not stop for another until the context
+    /// has grown (`core::compaction_limit`). The provider's last count was
+    /// of the conversation a summary now replaces.
+    pub fn compaction_tried(&mut self, input: &[Value], succeeded: bool) {
+        if succeeded {
+            self.context_budget.provider_excess = 0;
+        }
+        let budget = self.context_budget;
+        let tokens = crate::tokens::count_values(&self.model, input.iter()).tokens as u64
+            + budget.overhead
+            + budget.provider_excess;
+        self.context_budget.limit =
+            crate::core::compaction_limit(budget.threshold as usize, tokens as usize) as u64;
     }
 
     /// Sets the system prompt the main agent's subagents start from: the
@@ -970,10 +1001,14 @@ impl OpenAiClient {
         cwd: &Path,
         mut outer_emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<(), String> {
-        let last_input = std::cell::Cell::new(0u64);
+        let budget = self.context_budget;
+        // The last request as counted here, and how far over that the
+        // provider's count of it came.
+        let counted = std::cell::Cell::new(0u64);
+        let provider_excess = std::cell::Cell::new(budget.provider_excess);
         let mut emit = |event: StreamEvent| {
             if let StreamEvent::Usage { input_tokens, .. } = &event {
-                last_input.set(*input_tokens);
+                provider_excess.set(input_tokens.saturating_sub(counted.get()));
             }
             outer_emit(event)
         };
@@ -993,12 +1028,6 @@ impl OpenAiClient {
             {
                 return Err("subagent timed out".to_string());
             }
-            // The last request already passed the compaction threshold and its
-            // tool results are recorded: stop before the next request so the
-            // conversation is compacted and the turn continues from there.
-            if self.context_budget > 0 && last_input.get() > self.context_budget {
-                return Err(MID_TURN_COMPACTION.to_string());
-            }
             // The team's token budget is used up: a subagent stops here and
             // keeps what it produced so far.
             if self.agent_depth > 0
@@ -1015,6 +1044,23 @@ impl OpenAiClient {
                 .and_then(|plan| crate::plan_reminder::stale_reminder(input, &plan))
             {
                 inject_input_item(input, note, &mut emit)?;
+            }
+            // The next request would pass the compaction threshold the gauge
+            // shows, tool results of the last round included, and all of
+            // this is recorded: stop here so the conversation is compacted
+            // and the turn continues from there. The count is made here and
+            // not by the core, which sees these items only when it is polled.
+            if budget.limit > 0 {
+                counted.set(
+                    crate::tokens::count_values(&self.model, input.iter()).tokens as u64
+                        + budget.overhead,
+                );
+                if crate::core::should_auto_compact(
+                    (counted.get() + provider_excess.get()) as usize,
+                    budget.limit as usize,
+                ) {
+                    return Err(MID_TURN_COMPACTION.to_string());
+                }
             }
             emit(StreamEvent::CallStart)?;
             let quiet = std::mem::take(&mut answering_reminder);
@@ -2526,7 +2572,7 @@ impl OpenAiClient {
             allow_subagents: spec.depth < manager.config().max_depth,
             max_tool_calls: spec.max_tool_calls,
             deadline: spec.timeout.map(|timeout| started + timeout),
-            context_budget: 0,
+            context_budget: ContextBudget::default(),
             // Each model speaks its own wire protocol (on the LynShen gateway
             // Claude uses Anthropic Messages, the rest Responses).
             provider_kind: self.connection.protocol(&spec.model),

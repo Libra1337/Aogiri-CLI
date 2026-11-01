@@ -165,7 +165,8 @@ fn start_fake_model() -> String {
     format!("http://{address}/v1")
 }
 
-fn read_request_body(stream: &mut std::net::TcpStream) -> Value {
+#[allow(dead_code)]
+pub fn read_request_body(stream: &mut std::net::TcpStream) -> Value {
     let mut reader = BufReader::new(stream);
     let mut length = 0usize;
     loop {
