@@ -83,6 +83,12 @@ fn sse_responses(reply: &Reply, usage: Option<u64>) -> String {
         response["usage"] = json!({ "input_tokens": input, "output_tokens": 1 });
     }
     let mut out = String::new();
+    if matches!(reply, Reply::Call(..)) {
+        let reasoning =
+            json!({ "type": "reasoning", "summary": [], "encrypted_content": "opaque" });
+        let done = json!({ "type": "response.output_item.done", "item": reasoning });
+        out.push_str(&format!("data: {done}\n\n"));
+    }
     if let Reply::Text(text) = reply {
         let delta = json!({ "type": "response.output_text.delta", "delta": text });
         out.push_str(&format!("data: {delta}\n\n"));
@@ -441,27 +447,135 @@ fn one_long_turn_compacts_at_the_threshold_shown_on_every_wire_whatever_the_usag
     }
 }
 
-#[test]
-fn a_kept_tool_round_keeps_its_call_after_a_compaction() {
-    let _guard = setup();
-    let upstream = Upstream::start("responses");
-    let dir = temp_dir("pairs");
-    big_files(&dir, 60);
-    upstream.script().steps = read_steps(60, Some(100));
-    let mut core = open(&dir);
-    core.submit_user_message(ASK.to_string());
-    pump(&mut core);
+/// What each wire's API refuses: a tool result without its call right before
+/// it, a call left without its result, reasoning with nothing after it.
+fn assert_valid_request(wire: &str, body: &Value) {
+    let items = items(body);
+    let text = || body.to_string();
+    let mut waiting: Vec<String> = Vec::new();
+    for (at, item) in items.iter().enumerate() {
+        match wire {
+            "responses" => match item["type"].as_str() {
+                Some("function_call") => waiting.push(item["call_id"].as_str().unwrap().into()),
+                Some("function_call_output") => {
+                    let id = item["call_id"].as_str().unwrap();
+                    assert!(waiting.iter().any(|w| w == id), "orphan {id}: {}", text());
+                    waiting.retain(|w| w != id);
+                }
+                Some("reasoning") => {
+                    let next = items.get(at + 1).map(|next| &next["type"]);
+                    assert!(
+                        next.is_some_and(|next| next == "function_call" || next == "message"),
+                        "reasoning at {at} leads to nothing: {}",
+                        text()
+                    );
+                }
+                _ => assert!(waiting.is_empty(), "calls unanswered at {at}: {}", text()),
+            },
+            "chat" => {
+                if item["role"] == "tool" {
+                    let id = item["tool_call_id"].as_str().unwrap();
+                    assert!(waiting.iter().any(|w| w == id), "orphan {id}: {}", text());
+                    waiting.retain(|w| w != id);
+                    continue;
+                }
+                assert!(waiting.is_empty(), "calls unanswered at {at}: {}", text());
+                for call in item["tool_calls"].as_array().into_iter().flatten() {
+                    waiting.push(call["id"].as_str().unwrap().into());
+                }
+            }
+            _ => {
+                let parts = item["content"].as_array().cloned().unwrap_or_default();
+                let results: Vec<String> = parts
+                    .iter()
+                    .filter(|part| part["type"] == "tool_result")
+                    .map(|part| part["tool_use_id"].as_str().unwrap().to_string())
+                    .collect();
+                // The calls of a reply are answered by the very next message.
+                assert_eq!(waiting, results, "at {at}: {}", text());
+                waiting = parts
+                    .iter()
+                    .filter(|part| part["type"] == "tool_use")
+                    .map(|part| part["id"].as_str().unwrap().to_string())
+                    .collect();
+            }
+        }
+    }
+    assert!(
+        waiting.is_empty(),
+        "calls unanswered at the end: {}",
+        text()
+    );
+    if wire == "anthropic" {
+        assert_eq!(items[0]["role"], "user", "{}", text());
+    }
+}
 
-    for body in &upstream.script().turns {
-        let items = items(body);
-        let id_of = |wanted: &str| -> Vec<String> {
-            items
-                .iter()
-                .filter(|item| item["type"] == wanted)
-                .filter_map(|item| item["call_id"].as_str().map(str::to_string))
-                .collect()
+#[test]
+fn the_request_check_refuses_what_the_apis_refuse() {
+    let refused = |wire: &'static str, items: Value| {
+        let body = json!({ "input": items });
+        std::panic::catch_unwind(|| assert_valid_request(wire, &body)).is_err()
+    };
+    let user = json!({ "role": "user", "content": [{ "type": "text", "text": "hi" }] });
+    let call =
+        json!({ "type": "function_call", "call_id": "a", "name": "read", "arguments": "{}" });
+    let output = json!({ "type": "function_call_output", "call_id": "a", "output": "x" });
+    let reasoning = json!({ "type": "reasoning", "summary": [] });
+    assert!(!refused(
+        "responses",
+        json!([user, reasoning, call, output])
+    ));
+    assert!(refused("responses", json!([user, output])));
+    assert!(refused("responses", json!([user, call])));
+    assert!(refused("responses", json!([user, reasoning])));
+
+    let asks = json!({ "role": "assistant", "tool_calls": [{ "id": "a" }] });
+    let result = json!({ "role": "tool", "tool_call_id": "a", "content": "x" });
+    assert!(!refused("chat", json!([user, asks, result])));
+    assert!(refused("chat", json!([user, result])));
+    assert!(refused("chat", json!([user, asks, user])));
+
+    let uses = json!({ "role": "assistant", "content": [{ "type": "tool_use", "id": "a" }] });
+    let answers =
+        json!({ "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "a" }] });
+    assert!(!refused("anthropic", json!([user, uses, answers])));
+    assert!(refused("anthropic", json!([user, answers])));
+    assert!(refused("anthropic", json!([user, uses, user])));
+    assert!(refused("anthropic", json!([uses, answers])));
+}
+
+#[test]
+fn every_request_around_a_compaction_is_one_the_api_accepts() {
+    let _guard = setup();
+    for wire in ["responses", "chat", "anthropic"] {
+        let upstream = Upstream::start(wire);
+        let dir = temp_dir("valid-requests");
+        big_files(&dir, 60);
+        upstream.script().steps = read_steps(60, Some(100));
+        let mut core = open(&dir);
+        core.submit_user_message(ASK.to_string());
+        let events = pump(&mut core);
+        assert!(errors(&events).is_empty(), "{wire}: {}", brief(&events));
+
+        let script = upstream.script();
+        assert!(!script.summaries.is_empty(), "{wire}: {}", brief(&events));
+        for body in script.turns.iter().chain(&script.summaries) {
+            assert_valid_request(wire, body);
+        }
+        // A kept tool round goes on behind the summary, as this wire writes it.
+        let result_key = match wire {
+            "responses" => "function_call_output",
+            "chat" => "tool_call_id",
+            _ => "tool_use_id",
         };
-        assert_eq!(id_of("function_call"), id_of("function_call_output"));
+        assert!(
+            script.turns.iter().any(|body| {
+                let text = body.to_string();
+                text.contains(SUMMARY) && text.contains(result_key)
+            }),
+            "{wire}: nothing went on from the summary with a tool round"
+        );
     }
 }
 
