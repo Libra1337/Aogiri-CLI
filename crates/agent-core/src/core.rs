@@ -11,8 +11,8 @@ use crate::{
     },
     hooks::Hooks,
     llm::{
-        ApprovalDecision, ApprovalRequest, GoalToolRequest, OpenAiClient, OpenAiClientConfig,
-        StreamEvent, ToolGoalResponse,
+        ApprovalDecision, ApprovalRequest, ContextBudget, GoalToolRequest, OpenAiClient,
+        OpenAiClientConfig, StreamEvent, ToolGoalResponse,
     },
     mcp::McpManager,
     oauth::{self, OAuthLoginResult, OAuthModel},
@@ -49,6 +49,12 @@ use std::{
 /// Recent context (in tokenizer-counted tokens) kept verbatim when compacting; older
 /// turns are folded into the summary.
 const COMPACTION_KEEP_RECENT_TOKENS: usize = 20_000;
+/// How much the context grows before compaction is tried again without the
+/// user sending anything, after one that failed or left it over the threshold.
+const COMPACTION_RETRY_GROWTH_TOKENS: usize = 20_000;
+/// A compaction's failure when there is nothing to fold.
+const NOTHING_TO_FOLD: &str =
+    "the context is over the compaction threshold, but all of it is too recent to fold";
 const RESUME_SUMMARY_IDLE_SECONDS: u64 = 5 * 60;
 /// How long a resume summary that could not start waits before another try.
 const RESUME_SUMMARY_RETRY: Duration = Duration::from_secs(10 * 60);
@@ -306,13 +312,20 @@ pub struct AgentCore {
     /// request to its end; carried over a compact-and-retry.
     turn_figures: Option<TurnFigures>,
     goal_continuation_running: bool,
-    /// Set when the upstream rejected a turn as over the context window: the
-    /// next spawn compacts first (`force_compaction`) and the turn is retried
-    /// once (`overflow_retry_pending`). `overflow_retried` stops a second
-    /// retry until the user sends a new message.
+    /// Set when the turn stopped between requests at the compaction threshold,
+    /// or the upstream rejected it as over the context window: the next spawn
+    /// compacts first (`force_compaction`) and the turn goes on
+    /// (`overflow_retry_pending`). `overflow_retried` stops a second retry of
+    /// a rejected request until the user sends a new message.
     force_compaction: bool,
     overflow_retry_pending: bool,
     overflow_retried: bool,
+    /// How far the provider's count of the last request was over ours (see
+    /// `request_tokens`). Gone with the conversation it counted.
+    provider_excess: u64,
+    /// The context's size after the last compaction tried since the user's
+    /// last message, 0 if none (see `compaction_limit`).
+    compaction_tried_at: usize,
     /// The conversation's mark (`Session::mark`) when its last turn ended
     /// with a reply the model gave no answer in (a refusal, an empty reply,
     /// thinking only), and that error. `continue_turn` does not send the
@@ -489,6 +502,8 @@ impl AgentCore {
             force_compaction: false,
             overflow_retry_pending: false,
             overflow_retried: false,
+            provider_excess: 0,
+            compaction_tried_at: 0,
             unanswered_at: None,
             plan_draft: None,
             resume_summary_running: false,
@@ -663,7 +678,7 @@ impl AgentCore {
     }
 
     /// Token count at which auto-compaction triggers — the honest denominator for
-    /// the UI context gauge. Matches `should_auto_compact`.
+    /// the UI context gauge. The turn compares `request_tokens` with it.
     fn effective_context_limit(&self) -> u64 {
         target_context_budget(
             &self.config.current_model_config(),
@@ -1138,6 +1153,7 @@ impl AgentCore {
                     let fill = self.session.user_content(label);
                     match self.session.checkout(label) {
                         Ok(()) => {
+                            self.forget_provider_count();
                             let plan_event = self.plan_from_branch();
                             let save_event = self.save_session_event();
                             let mut events =
@@ -1915,11 +1931,15 @@ impl AgentCore {
                     } => {
                         self.session
                             .apply_compaction(summary.clone(), replaced_through);
+                        self.provider_excess = 0;
+                        self.compaction_tried_at = self.current_request_tokens();
                         events.extend(self.save_session_event());
                         events.push(AgentEvent::CompactionEnd { summary });
                         events.push(self.context_usage_event());
                     }
                     WorkerEvent::CompactionFailed(error) => {
+                        self.compaction_tried_at = self.current_request_tokens();
+                        crate::log_warn!("compaction", "compaction failed", error = error);
                         events.push(AgentEvent::CompactionFailed(error));
                     }
                     // Resume-summary events arrive only on resume_summary_receiver.
@@ -2029,6 +2049,13 @@ impl AgentCore {
                         // Both providers deliver OpenAI subset semantics here
                         // (cached_input_tokens ⊆ input_tokens); the Anthropic
                         // parser normalizes its disjoint counts in llm.rs.
+                        // Usage comes ahead of the response's items: the
+                        // session is what this request carried.
+                        let excess = provider_excess(input_tokens, self.local_request_tokens());
+                        if excess != self.provider_excess {
+                            self.provider_excess = excess;
+                            events.push(self.context_usage_event());
+                        }
                         self.total_input_tokens += input_tokens;
                         self.total_cached_input_tokens += cached_input_tokens;
                         self.total_output_tokens += output_tokens;
@@ -2079,13 +2106,24 @@ impl AgentCore {
                             format!("queued: {}", self.queued.len())
                         }));
                     }
+                    // The turn stopped between requests at the threshold. It
+                    // goes on after the compaction, with what it started: a
+                    // subagent keeps working, its team budget keeps counting.
+                    WorkerEvent::Error(error) if error == crate::llm::MID_TURN_COMPACTION => {
+                        self.running = false;
+                        disconnected = true;
+                        self.goal_tool_receiver = None;
+                        self.wake_turn = true;
+                        self.overflow_retry_pending = true;
+                        self.force_compaction = true;
+                    }
                     WorkerEvent::Error(error)
                         if is_context_overflow(&error)
                             && !self.overflow_retried
                             && self
                                 .session
                                 .plan_compaction(
-                                    COMPACTION_KEEP_RECENT_TOKENS,
+                                    keep_recent_tokens(self.effective_context_limit() as usize),
                                     &self.config.model,
                                     &self.cwd,
                                 )
@@ -2094,22 +2132,18 @@ impl AgentCore {
                         // Over the window (unknown, or raised past what this
                         // route serves): compact and retry once instead of
                         // failing the turn. The retry spawns from the idle
-                        // branch below, once this worker is drained.
-                        self.subagent_manager
-                            .close_all_with_message("parent turn hit the context window");
+                        // branch below, once this worker is drained. As
+                        // above, what the turn started keeps going.
                         self.running = false;
                         disconnected = true;
                         self.goal_tool_receiver = None;
+                        self.wake_turn = true;
                         self.overflow_retried = true;
                         self.overflow_retry_pending = true;
                         self.force_compaction = true;
                         events.push(AgentEvent::Info(
-                            if error == crate::llm::MID_TURN_COMPACTION {
-                                "context reached the compaction threshold; compacting and continuing"
-                            } else {
-                                "request exceeded the model's context window; compacting and retrying"
-                            }
-                            .to_string(),
+                            "request exceeded the model's context window; compacting and retrying"
+                                .to_string(),
                         ));
                     }
                     WorkerEvent::Error(error) => {
@@ -2604,6 +2638,7 @@ impl AgentCore {
 
     fn start_turn(&mut self, message: String, images: Vec<String>) -> Vec<AgentEvent> {
         self.overflow_retried = false;
+        self.compaction_tried_at = 0;
         // Notes come first: the user's message stays the last one.
         self.append_due_notes(true);
         self.session.append(EntryKind::User { content: message });
@@ -2859,25 +2894,45 @@ impl AgentCore {
         self.context_overhead = Some(overhead);
         let request_items = self.session.request_context_items();
         let count = crate::tokens::count_values(&self.config.model, request_items.iter());
-        let (context_tokens, context_tokenizer) = (count.tokens, count.tokenizer);
+        let (context_tokens, context_tokenizer) = (
+            count.tokens + self.provider_excess as usize,
+            count.tokenizer,
+        );
         let model_context_budget = target_context_budget(
             &self.config.current_model_config(),
             self.config.compaction_threshold_percent,
         );
-        client.set_context_budget(model_context_budget as u64);
         client.set_subagent_prompt(subagent_prompt);
         let forced = std::mem::take(&mut self.force_compaction);
         // The request is the conversation plus the prompt and tool definitions.
         let request_tokens = context_tokens + overhead_tokens(&overhead) as usize;
-        let compaction = if forced || should_auto_compact(request_tokens, model_context_budget) {
+        let compact = forced
+            || should_auto_compact(
+                request_tokens,
+                compaction_limit(model_context_budget, self.compaction_tried_at),
+            );
+        let compaction = if compact {
             self.session.plan_compaction(
-                COMPACTION_KEEP_RECENT_TOKENS,
+                keep_recent_tokens(model_context_budget),
                 &self.config.model,
                 &self.cwd,
             )
         } else {
             None
         };
+        // Over the threshold with nothing to fold: the user sees that, and
+        // the turn does not stop for it again until the context has grown.
+        let nothing_to_fold = compact && compaction.is_none();
+        if nothing_to_fold {
+            self.compaction_tried_at = request_tokens;
+            crate::log_warn!("compaction", NOTHING_TO_FOLD, tokens = request_tokens);
+        }
+        client.set_context_budget(ContextBudget {
+            threshold: model_context_budget as u64,
+            limit: compaction_limit(model_context_budget, self.compaction_tried_at) as u64,
+            overhead: overhead_tokens(&overhead),
+            provider_excess: self.provider_excess,
+        });
         let compaction = match compaction
             .map(|plan| {
                 self.compaction_client()
@@ -2908,6 +2963,9 @@ impl AgentCore {
                 ..overhead
             }),
         });
+        if nothing_to_fold {
+            events.push(AgentEvent::CompactionFailed(NOTHING_TO_FOLD.to_string()));
+        }
         let cwd = self.cwd.clone();
         let current_plan = self.plan.clone();
         let (tx, rx) = mpsc::channel();
@@ -2922,15 +2980,21 @@ impl AgentCore {
         self.running = true;
 
         thread::spawn(move || {
+            let mut client = client;
             let input = if let Some((plan, summarizer)) = compaction {
                 let _ = tx.send(WorkerEvent::CompactionStart);
                 match client.summarize_conversation(&plan, &summarizer, |output_tokens| {
                     tx.send(WorkerEvent::CompactionProgress { output_tokens })
                         .map_err(|error| error.to_string())
                 }) {
-                    Ok(summary) => compacted(plan, summary, &current_plan, &tx),
+                    Ok(summary) => {
+                        let input = compacted(plan, summary, &current_plan, &tx);
+                        client.compaction_tried(&input, true);
+                        input
+                    }
                     Err(error) => {
                         let _ = tx.send(WorkerEvent::CompactionFailed(error));
+                        client.compaction_tried(&request_items, false);
                         request_items
                     }
                 }
@@ -3041,7 +3105,7 @@ impl AgentCore {
         }
 
         let Some(plan) = self.session.plan_compaction(
-            COMPACTION_KEEP_RECENT_TOKENS,
+            keep_recent_tokens(self.effective_context_limit() as usize),
             &self.config.model,
             &self.cwd,
         ) else {
@@ -5143,7 +5207,12 @@ impl AgentCore {
         );
         categories.retain(|c| c.tokens > 0);
 
-        let total: u64 = categories.iter().map(|c| c.tokens).sum();
+        // The size the gauge shows, the provider's excess included (it has no
+        // category of its own).
+        let total = request_tokens(
+            categories.iter().map(|c| c.tokens).sum(),
+            self.provider_excess,
+        );
         let window = self.config.current_model_config().context_window;
         let limit = self.effective_context_limit().min(window);
         if window > 0 {
@@ -5172,14 +5241,37 @@ impl AgentCore {
         }
     }
 
+    /// The conversation or the model changed: the provider's last count was
+    /// not of this, and neither was the last compaction tried.
+    fn forget_provider_count(&mut self) {
+        self.provider_excess = 0;
+        self.compaction_tried_at = 0;
+    }
+
+    /// The next request as counted here: the conversation, the prompt and
+    /// the tool definitions.
+    fn local_request_tokens(&self) -> u64 {
+        let (tokens, _) = self.session.context_token_usage(&self.config.model);
+        tokens as u64 + self.context_overhead.as_ref().map_or(0, overhead_tokens)
+    }
+
+    /// The next request's size as the gauge shows it and the engine compares
+    /// it with the threshold (`request_tokens`).
+    fn current_request_tokens(&self) -> usize {
+        request_tokens(self.local_request_tokens(), self.provider_excess) as usize
+    }
+
     fn context_usage_event(&self) -> AgentEvent {
         let (tokens, tokenizer) = self.session.context_token_usage(&self.config.model);
+        // What the provider counted beyond ours goes with the conversation:
+        // the parts of the event add up to `request_tokens`.
+        let tokens = tokens as u64 + self.provider_excess;
         AgentEvent::ContextUsage {
-            tokens: tokens as u64,
+            tokens,
             tokenizer,
             cost: self.total_cost,
             breakdown: self.context_overhead.map(|overhead| ContextBreakdown {
-                messages: tokens as u64,
+                messages: tokens,
                 ..overhead
             }),
         }
@@ -5198,6 +5290,7 @@ impl AgentCore {
         self.resume_summary_running = false;
         self.resume_summary_retry_at = None;
         self.turn_figures = None;
+        self.forget_provider_count();
         self.session = SessionStore::new();
         self.tool_state.set_session_id(self.session.session_id());
         self.reset_team();
@@ -5697,6 +5790,7 @@ impl AgentCore {
                 "failed to rewind conversation: {error}"
             ))];
         }
+        self.forget_provider_count();
         let plan_event = self.plan_from_branch();
         let (restored, removed, conflicts) =
             match crate::tools::restore_to_timestamp(&self.cwd, t, &self.tool_state) {
@@ -5803,6 +5897,7 @@ impl AgentCore {
                 self.turn_started_at = None;
                 self.turn_goal_tokens = 0;
                 self.turn_figures = None;
+                self.forget_provider_count();
                 self.session = session;
                 self.tool_state.set_session_id(self.session.session_id());
                 // Release the previous session's lock only after the switch.
@@ -6234,6 +6329,7 @@ impl AgentCore {
             Ok(resolved) => resolved,
             Err(error) => return vec![AgentEvent::Error(error)],
         };
+        self.forget_provider_count();
         match self.change_config(|config| {
             config.model = model.clone();
             config.reasoning_effort = effort.clone();
@@ -6548,10 +6644,45 @@ struct TurnPrompt {
     model_headers: std::collections::HashMap<String, Vec<(String, String)>>,
 }
 
+/// The one size of a request: the context gauge shows it and auto-compaction
+/// compares it with the threshold the gauge shows. It is the local count
+/// (`tokens`: the conversation, the prompt and the tool definitions) plus
+/// `provider_excess`, so neither the local count nor a provider's can pass the
+/// threshold unseen. A provider that reports less, or nothing, holds nothing
+/// back, on any model.
+fn request_tokens(local: u64, provider_excess: u64) -> u64 {
+    local + provider_excess
+}
+
+/// How far a provider's count of a request is over the local count of it.
+fn provider_excess(provider_input: u64, local: u64) -> u64 {
+    provider_input.saturating_sub(local)
+}
+
+/// Recent context a compaction keeps verbatim: never so much that a small
+/// window's whole context counts as recent and nothing folds.
+fn keep_recent_tokens(threshold: usize) -> usize {
+    match threshold {
+        0 => COMPACTION_KEEP_RECENT_TOKENS,
+        _ => COMPACTION_KEEP_RECENT_TOKENS.min(threshold / 4),
+    }
+}
+
+/// The size past which to compact now: the threshold; after a compaction that
+/// left the context over it at `tried_at` tokens (it failed, or folded too
+/// little), somewhat more than that, so it is not tried again on every round.
+pub(crate) fn compaction_limit(threshold: usize, tried_at: usize) -> usize {
+    if threshold > 0 && tried_at > threshold {
+        tried_at + COMPACTION_RETRY_GROWTH_TOKENS.min(threshold / 4)
+    } else {
+        threshold
+    }
+}
+
 /// A budget of 0 means the window is unknown: never compact on a guess. An
 /// over-long request is then caught by the upstream's rejection instead
 /// (`is_context_overflow`).
-fn should_auto_compact(context_tokens: usize, model_context_budget: usize) -> bool {
+pub(crate) fn should_auto_compact(context_tokens: usize, model_context_budget: usize) -> bool {
     model_context_budget > 0 && context_tokens > model_context_budget
 }
 
@@ -7651,6 +7782,36 @@ mod model_config_tests {
             140_000 + overhead_tokens(&overhead) as usize,
             150_000
         ));
+    }
+
+    #[test]
+    fn the_provider_counting_more_or_less_never_lowers_the_size_of_a_request() {
+        // The ticket: the gauge at 269k, the provider's count of it 220k.
+        assert_eq!(provider_excess(220_000, 269_000), 0);
+        assert_eq!(request_tokens(269_000, 0), 269_000);
+        // A provider that counts more moves it up, and what comes later adds on.
+        assert_eq!(provider_excess(269_000, 220_000), 49_000);
+        assert_eq!(request_tokens(230_000, 49_000), 279_000);
+    }
+
+    #[test]
+    fn a_compaction_tried_waits_for_the_context_to_grow() {
+        assert_eq!(compaction_limit(266_000, 0), 266_000);
+        // Folded under the threshold: the threshold again.
+        assert_eq!(compaction_limit(266_000, 60_000), 266_000);
+        assert_eq!(compaction_limit(11_400, 4_700), 11_400);
+        // Failed or folded too little: not again on the next round.
+        assert_eq!(compaction_limit(266_000, 270_000), 290_000);
+        assert_eq!(compaction_limit(11_400, 12_000), 14_850);
+        // An unknown window stays off.
+        assert_eq!(compaction_limit(0, 270_000), 0);
+    }
+
+    #[test]
+    fn a_small_window_still_has_something_to_fold() {
+        assert_eq!(keep_recent_tokens(266_000), COMPACTION_KEEP_RECENT_TOKENS);
+        assert_eq!(keep_recent_tokens(6_000), 1_500);
+        assert_eq!(keep_recent_tokens(0), COMPACTION_KEEP_RECENT_TOKENS);
     }
 
     #[test]

@@ -800,6 +800,14 @@ impl SessionStore {
         if let Some(summary) = &summary {
             items.push(compaction_summary_item(summary));
             items.extend(carried_notes(&branch[..keep_after], &branch[keep_after..]));
+            append_projected_entries(
+                &mut items,
+                carried_request(
+                    &branch[..keep_after],
+                    before_last_compaction(&branch[keep_after..]),
+                )
+                .into_iter(),
+            );
         }
         let entries = branch
             .iter()
@@ -858,20 +866,15 @@ impl SessionStore {
             fold_end = index;
         }
 
-        // The latest user message must stay verbatim: auto-compaction runs on
-        // the turn that carries it, and folding it would answer a summary
-        // instead of the actual prompt.
-        if let Some(last_user) = kept
-            .iter()
-            .rposition(|entry| matches!(entry.kind, EntryKind::User { .. }))
-        {
-            fold_end = fold_end.min(last_user);
-        }
-
+        // A long turn is nearly all tool rounds after one user message, so the
+        // fold goes past it: the message itself stays, word for word, right
+        // behind the summary (`carried_request`).
+        //
         // Never split a tool group: a function_call and its output must fold or
         // stay together, including parallel groups where the boundary could land
         // between two calls of the same batch. Retreat the boundary to before
-        // any call whose output would remain in the kept tail.
+        // any call whose output would remain in the kept tail. Reasoning stays
+        // with the call or message it leads to.
         let call_output_pairs: Vec<(usize, usize)> = {
             let mut call_index: HashMap<&str, usize> = HashMap::new();
             let mut pairs = Vec::new();
@@ -894,17 +897,37 @@ impl SessionStore {
             }
             pairs
         };
-        while let Some(retreat) = call_output_pairs
-            .iter()
-            .filter(|(call, output)| fold_end > *call && fold_end <= *output)
-            .map(|(call, _)| *call)
-            .min()
-        {
-            fold_end = retreat;
+        loop {
+            if let Some(retreat) = call_output_pairs
+                .iter()
+                .filter(|(call, output)| fold_end > *call && fold_end <= *output)
+                .map(|(call, _)| *call)
+                .min()
+            {
+                fold_end = retreat;
+            } else if fold_end > 0 && is_reasoning(kept[fold_end - 1]) {
+                fold_end -= 1;
+            } else {
+                break;
+            }
         }
 
         let fold = &kept[..fold_end];
         let replaced_through = fold.last()?.id.0;
+
+        let fold_point = branch
+            .iter()
+            .position(|entry| entry.id.0 == replaced_through)
+            .map_or(0, |index| index + 1);
+        // Only the request a summary would carry anyway, and notes: a summary
+        // of that frees nothing.
+        let carried = carried_request(&branch[..fold_point], &branch[fold_point..]);
+        if fold
+            .iter()
+            .all(|entry| note_in(entry).is_some() || carried.iter().any(|kept| kept.id == entry.id))
+        {
+            return None;
+        }
 
         // The folded part as the last request began: the prior summary and
         // the notes it carried, then the folded entries.
@@ -912,16 +935,25 @@ impl SessionStore {
         if let Some(summary) = &summary {
             folded.push(compaction_summary_item(summary));
             folded.extend(carried_notes(&branch[..keep_after], &branch[keep_after..]));
+            append_projected_entries(
+                &mut folded,
+                carried_request(
+                    &branch[..keep_after],
+                    before_last_compaction(&branch[keep_after..]),
+                )
+                .into_iter(),
+            );
         }
         append_projected_entries(&mut folded, fold.iter().copied());
         let folded_items = sanitize_tool_pairs(folded);
 
-        let fold_point = branch
-            .iter()
-            .position(|entry| entry.id.0 == replaced_through)
-            .map_or(0, |index| index + 1);
         let mut kept_projected = carried_notes(&branch[..fold_point], &branch[fold_point..]);
-        append_projected_entries(&mut kept_projected, kept[fold_end..].iter().copied());
+        append_projected_entries(
+            &mut kept_projected,
+            carried_request(&branch[..fold_point], &branch[fold_point..])
+                .into_iter()
+                .chain(kept[fold_end..].iter().copied()),
+        );
         let kept_items = sanitize_tool_pairs(kept_projected);
 
         Some(CompactionPlan {
@@ -2147,6 +2179,48 @@ fn carried_notes(folded: &[&SessionEntry], kept: &[&SessionEntry]) -> Vec<Value>
         .into_iter()
         .map(|(_, content)| context_item(content))
         .collect()
+}
+
+/// What was kept of the conversation when its last compaction ran. Later
+/// messages do not count: a carried request stays where it is until the next
+/// compaction, so the requests keep their prefix for the provider's cache.
+fn before_last_compaction<'a, 'b>(kept: &'b [&'a SessionEntry]) -> &'b [&'a SessionEntry] {
+    let last = kept
+        .iter()
+        .rposition(|entry| matches!(entry.kind, EntryKind::Compaction { .. }));
+    &kept[..last.unwrap_or(kept.len())]
+}
+
+/// The user's latest message when a compaction folds it and keeps nothing the
+/// user said after it: the turn answering it is still going, so it stays word
+/// for word behind the summary, with its images. A summary is no substitute
+/// for what was asked.
+fn carried_request<'a>(
+    folded: &[&'a SessionEntry],
+    kept: &[&'a SessionEntry],
+) -> Vec<&'a SessionEntry> {
+    let is_user = |entry: &&SessionEntry| matches!(entry.kind, EntryKind::User { .. });
+    if kept.iter().any(is_user) {
+        return Vec::new();
+    }
+    let Some(at) = folded.iter().rposition(is_user) else {
+        return Vec::new();
+    };
+    folded[at..]
+        .iter()
+        .take_while(|entry| {
+            matches!(
+                entry.kind,
+                EntryKind::User { .. } | EntryKind::UserImage { .. }
+            )
+        })
+        .copied()
+        .collect()
+}
+
+fn is_reasoning(entry: &SessionEntry) -> bool {
+    matches!(&entry.kind, EntryKind::ResponseItem { item }
+        if item.get("type").and_then(Value::as_str) == Some("reasoning"))
 }
 
 /// Projects entries into request items. Images extracted from tool outputs
@@ -3994,6 +4068,115 @@ mod tests {
     }
 
     #[test]
+    fn a_long_turn_folds_its_tool_rounds_and_keeps_what_was_asked() {
+        let mut session = SessionStore::new();
+        session.append(EntryKind::User {
+            content: "THE ONLY QUESTION".to_string(),
+        });
+        session.append(EntryKind::UserImage { paths: Vec::new() });
+        for round in 0..6 {
+            session.append(EntryKind::ResponseItem {
+                item: json!({ "type": "reasoning", "summary": [], "encrypted_content": "x" }),
+            });
+            session.append(EntryKind::ResponseItem {
+                item: json!({ "type": "function_call", "call_id": format!("c{round}"), "name": "read", "arguments": "{}" }),
+            });
+            session.append(EntryKind::ToolOutput {
+                call_id: format!("c{round}"),
+                name: "read".to_string(),
+                output: format!("ROUND{round} {}", "y".repeat(300)),
+                image: None,
+            });
+        }
+        let before = session.request_context_items();
+
+        let plan = session
+            .plan_compaction(150, "gpt-5", Path::new("/work"))
+            .expect("the turn's own rounds fold");
+        // As the last request started, for the provider's cache.
+        assert_eq!(
+            plan.folded_items,
+            before[..plan.folded_items.len()],
+            "the fold is the start of the last request"
+        );
+        assert!(item_text(&plan.folded_items).contains("ROUND0"));
+        assert!(!item_text(&plan.kept_items).contains("ROUND0"));
+        assert!(item_text(&plan.kept_items).contains("ROUND5"));
+        assert!(tool_pairs_balanced(&plan.kept_items));
+        // Reasoning stays with its call.
+        let first_of_tail = plan
+            .kept_items
+            .iter()
+            .position(|item| item["type"] != "message" && item["role"] != "user");
+        assert_eq!(plan.kept_items[first_of_tail.unwrap()]["type"], "reasoning");
+
+        // The request after it: the summary, the question, the tail; the same
+        // when the session is read again and when the turn goes on from the plan.
+        session.apply_compaction("ROLLED UP".to_string(), plan.replaced_through);
+        let items = session.request_context_items();
+        assert!(item_text(&items[..1]).contains("ROLLED UP"));
+        assert!(item_text(&items[1..2]).contains("THE ONLY QUESTION"));
+        assert_eq!(items[1..], plan.kept_items[..]);
+
+        // Folded again the question is still there, once.
+        for round in 6..12 {
+            session.append(EntryKind::ResponseItem {
+                item: json!({ "type": "function_call", "call_id": format!("c{round}"), "name": "read", "arguments": "{}" }),
+            });
+            session.append(EntryKind::ToolOutput {
+                call_id: format!("c{round}"),
+                name: "read".to_string(),
+                output: format!("ROUND{round} {}", "y".repeat(300)),
+                image: None,
+            });
+        }
+        let before = session.request_context_items();
+        let next = session
+            .plan_compaction(150, "gpt-5", Path::new("/work"))
+            .expect("foldable again");
+        assert_eq!(next.folded_items, before[..next.folded_items.len()]);
+        session.apply_compaction("ROLLED UP AGAIN".to_string(), next.replaced_through);
+        let again = item_text(&session.request_context_items());
+        assert_eq!(again.matches("THE ONLY QUESTION").count(), 1, "{again}");
+        assert!(again.contains("ROLLED UP AGAIN"));
+
+        // The user's next message changes nothing before it, for the
+        // provider's cache; it is what stays from the next compaction on.
+        let before = session.request_context_items();
+        session.append(EntryKind::User {
+            content: "A NEW QUESTION".to_string(),
+        });
+        assert_eq!(session.request_context_items()[..before.len()], before[..]);
+        let plan = session
+            .plan_compaction(1, "gpt-5", Path::new("/work"))
+            .expect("foldable");
+        session.apply_compaction("THIRD".to_string(), plan.replaced_through);
+        let last = item_text(&session.request_context_items());
+        assert!(last.contains("A NEW QUESTION"));
+        assert!(!last.contains("THE ONLY QUESTION"), "{last}");
+    }
+
+    #[test]
+    fn a_fold_of_only_the_question_is_no_compaction() {
+        let mut session = SessionStore::new();
+        session.append(EntryKind::User {
+            content: "THE ONLY QUESTION".to_string(),
+        });
+        session.append(EntryKind::ResponseItem {
+            item: json!({ "type": "function_call", "call_id": "c1", "name": "read", "arguments": "{}" }),
+        });
+        session.append(EntryKind::ToolOutput {
+            call_id: "c1".to_string(),
+            name: "read".to_string(),
+            output: "y ".repeat(2000),
+            image: None,
+        });
+        assert!(session
+            .plan_compaction(10, "gpt-5", Path::new("/work"))
+            .is_none());
+    }
+
+    #[test]
     fn compaction_never_folds_latest_user_message() {
         let mut session = SessionStore::new();
         for turn in 0..3 {
@@ -4015,7 +4198,6 @@ mod tests {
             .plan_compaction(1, "gpt-5", Path::new("/work"))
             .expect("older turns should be foldable");
 
-        assert!(!item_text(&plan.folded_items).contains("CURRENT QUESTION"));
         assert!(plan
             .kept_items
             .iter()
