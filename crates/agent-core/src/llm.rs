@@ -37,7 +37,11 @@ use std::{
 
 /// Wire protocol for a model. The LynShen gateway serves each model in its own
 /// dialect (Claude over Anthropic Messages, the rest over Responses), so the
-/// config-wide `protocol` applies to other providers only.
+/// config-wide `protocol` applies to other providers only. The Monoize gateway
+/// (the desktop's `monoize`, configured "chat") takes Claude over Messages
+/// too, at its `/v1/messages`: only there do the prompt-cache breakpoints
+/// reach the upstream, and some Claude pools cache nothing without them. Its
+/// other models keep the configured protocol.
 pub(crate) fn protocol_for(provider: &str, protocol: &str, model: &str) -> Protocol {
     protocol_in(omp::catalog(), provider, protocol, model)
 }
@@ -45,6 +49,9 @@ pub(crate) fn protocol_for(provider: &str, protocol: &str, model: &str) -> Proto
 fn protocol_in(catalog: &OmpCatalog, provider: &str, protocol: &str, model: &str) -> Protocol {
     if provider == "lynshen" {
         return Protocol::resolve("", model);
+    }
+    if provider == "monoize" && llm_provider_kit::is_anthropic_model(model) {
+        return Protocol::AnthropicMessages;
     }
     catalog
         .protocol_for(provider, model)
@@ -6221,6 +6228,25 @@ mod tests {
     /// else. Returns its two base URLs (Chat Completions, Messages) and the
     /// requests it got.
     fn split_provider() -> (String, String, Arc<std::sync::Mutex<Vec<SeenRequest>>>) {
+        let (host, seen) =
+            model_server("/split/v1/chat/completions", "/split/anthropic/v1/messages");
+        (
+            format!("http://{host}/split/v1"),
+            format!("http://{host}/split/anthropic"),
+            seen,
+        )
+    }
+
+    /// A model server that answers "OK" on `chat_path` (Chat Completions)
+    /// and `messages_path` (Messages), 404 anywhere else. Returns its
+    /// address and the requests it got.
+    fn model_server(
+        chat_path: &'static str,
+        messages_path: &'static str,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<std::sync::Mutex<Vec<SeenRequest>>>,
+    ) {
         const CHAT: &str = concat!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\n",
@@ -6269,10 +6295,12 @@ mod tests {
                         }
                     };
                     let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
-                    let answer = match path.as_str() {
-                        "/split/v1/chat/completions" => CHAT,
-                        "/split/anthropic/v1/messages" => MESSAGES,
-                        _ => MISSING,
+                    let answer = if path == chat_path {
+                        CHAT
+                    } else if path == messages_path {
+                        MESSAGES
+                    } else {
+                        MISSING
                     };
                     let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
                     log.lock().unwrap().push((path, head, body));
@@ -6281,11 +6309,7 @@ mod tests {
                 });
             }
         });
-        (
-            format!("http://{host}/split/v1"),
-            format!("http://{host}/split/anthropic"),
-            seen,
-        )
+        (host, seen)
     }
 
     /// A client of the split provider on `model`, configured with `base_url`
@@ -6401,6 +6425,156 @@ mod tests {
         // An endpoint of the user's own is kept for every model.
         let own = split_client("claude-helper", "http://127.0.0.1:9/proxy");
         assert_eq!(own.base_url, "http://127.0.0.1:9/proxy");
+    }
+
+    #[test]
+    fn the_monoize_gateway_takes_claude_over_messages_and_the_rest_as_configured() {
+        let catalog = omp::catalog();
+        for protocol in ["chat", "", "responses"] {
+            assert_eq!(
+                protocol_in(catalog, "monoize", protocol, "claude-opus-5-5"),
+                Protocol::AnthropicMessages,
+                "{protocol}"
+            );
+        }
+        assert_eq!(
+            protocol_in(catalog, "monoize", "chat", "deepseek-v4.1-flash"),
+            Protocol::OpenAiChatCompletions
+        );
+        assert_eq!(
+            protocol_in(catalog, "monoize", "chat", "gpt-5.5"),
+            Protocol::OpenAiChatCompletions
+        );
+        // Another endpoint configured for Chat Completions may not serve
+        // Messages: it keeps what it was given.
+        assert_eq!(
+            protocol_in(catalog, "my-proxy", "chat", "claude-opus-5-5"),
+            Protocol::OpenAiChatCompletions
+        );
+        assert_eq!(
+            protocol_in(catalog, "lynshen", "chat", "claude-opus-5-5"),
+            Protocol::AnthropicMessages
+        );
+    }
+
+    /// A client of the Monoize gateway as the desktop configures it
+    /// (protocol "chat") on `model`, which may spawn the other models.
+    fn monoize_client(name: &str, base_url: &str) -> OpenAiClient {
+        let mut config = test_client_config();
+        config.provider = "monoize".to_string();
+        config.protocol = "chat".to_string();
+        config.model = name.to_string();
+        config.base_url = base_url.to_string();
+        config.api_key = Some("device-key");
+        config.reasoning_effort = "high".to_string();
+        config.models = vec![
+            model("claude-opus-5-5", &["low", "high"], 4000),
+            model("claude-haiku-5-5", &["low", "high"], 4000),
+            model("deepseek-v4.1-flash", &["low", "high"], 4000),
+        ];
+        config.safety_model = Some("claude-haiku-5-5".to_string());
+        config.subagent_manager = Some(SubagentManager::new(
+            Default::default(),
+            crate::subagents::TeamShared::default(),
+        ));
+        OpenAiClient::from_config(config).unwrap()
+    }
+
+    #[test]
+    fn claude_on_the_monoize_gateway_goes_to_its_messages_endpoint_with_breakpoints() {
+        let (host, seen) = model_server("/gw/v1/chat/completions", "/gw/v1/messages");
+        let base_url = format!("http://{host}/gw/v1");
+        let claude = monoize_client("claude-opus-5-5", &base_url);
+        assert_eq!(claude.provider_kind, Protocol::AnthropicMessages);
+        assert_eq!(claude.request_url(), format!("{base_url}/messages"));
+        let input =
+            vec![json!({ "role": "user", "content": [{ "type": "input_text", "text": "hi" }] })];
+        claude
+            .run_turn_events(input, &std::env::temp_dir(), |_| Ok(()))
+            .unwrap();
+        // Compaction's plain-text summary and the title go the same way.
+        assert_eq!(
+            claude.summarize_text("system", "hi", |_| Ok(())).unwrap(),
+            "OK"
+        );
+        // A model the gateway serves over Chat Completions stays there; its
+        // Claude subagent and safety model take Messages.
+        let deepseek = monoize_client("deepseek-v4.1-flash", &base_url);
+        assert_eq!(deepseek.provider_kind, Protocol::OpenAiChatCompletions);
+        let safety = deepseek.safety.as_ref().unwrap();
+        assert_eq!(safety.protocol, Protocol::AnthropicMessages);
+        assert_eq!(safety.base_url, base_url);
+        assert_eq!(
+            deepseek.summarize_text("system", "hi", |_| Ok(())).unwrap(),
+            "OK"
+        );
+        let manager = deepseek.subagent_manager.clone().unwrap();
+        let dir = test_dir("monoize-messages");
+        fs::create_dir_all(&dir).unwrap();
+        deepseek
+            .spawn_agent(
+                "call_m",
+                &json!({ "task_name": "helper", "message": "say OK", "model": "claude-haiku-5-5" })
+                    .to_string(),
+                &dir,
+                &[],
+                &HashSet::new(),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let row = loop {
+            let row = manager.runs_json()[0].clone();
+            if row["state"] != "running" && row["state"] != "pending" {
+                break row;
+            }
+            assert!(Instant::now() < deadline, "the agent did not end");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(row["state"], "completed", "{row}");
+        let _ = fs::remove_dir_all(dir);
+
+        let seen = seen.lock().unwrap();
+        let sent: Vec<(&str, &str)> = seen
+            .iter()
+            .map(|(path, _, body)| (path.as_str(), body["model"].as_str().unwrap_or("")))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                ("/gw/v1/messages", "claude-opus-5-5"),
+                ("/gw/v1/messages", "claude-opus-5-5"),
+                ("/gw/v1/chat/completions", "deepseek-v4.1-flash"),
+                ("/gw/v1/messages", "claude-haiku-5-5"),
+            ]
+        );
+        // The turn: the device key as Bearer, the Messages version, and the
+        // breakpoints on the system prompt and the (first and last) user
+        // message; none on the tools.
+        let (_, head, turn) = &seen[0];
+        assert!(head.contains("authorization: bearer device-key"), "{head}");
+        assert!(head.contains("anthropic-version: "), "{head}");
+        assert_eq!(turn["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            turn["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(turn["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool.get("cache_control").is_none()));
+        assert_eq!(turn["thinking"]["type"], "adaptive");
+        // The subagent's turn carries them too.
+        let (_, _, child) = &seen[3];
+        assert_eq!(child["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            child["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        // Chat Completions is unchanged: no breakpoints.
+        let (_, chat_head, chat) = &seen[2];
+        assert!(!chat_head.contains("anthropic-version"), "{chat_head}");
+        assert!(!chat.to_string().contains("cache_control"));
     }
 
     #[test]
