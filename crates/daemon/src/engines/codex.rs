@@ -2566,7 +2566,7 @@ pub fn saved(cwd: &Path) -> Vec<(String, String, u64)> {
 
 fn saved_in(home: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
     let real = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let mut found = Vec::new();
+    let mut found: Vec<(String, String, u64)> = Vec::new();
     for path in rollouts(home) {
         let Some(meta) = lines(&path, 64 * 1024)
             .next()
@@ -2580,6 +2580,13 @@ fn saved_in(home: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
         }
         let id = text(&meta["payload"]["id"]).to_string();
         if id.is_empty() {
+            continue;
+        }
+        // One thread can have several rollout files: a reverted thread
+        // (`/rewind`) goes on in `rollout-<time>-<thread>_<rollout>.jsonl`
+        // under the same thread id (ticket #72). Newest first, so the first
+        // file met is the one the thread uses now; it is listed once.
+        if found.iter().any(|(seen, _, _)| *seen == id) {
             continue;
         }
         let title = lines(&path, 512 * 1024)
@@ -4032,6 +4039,24 @@ mod tests {
         let found = saved_in(&home, Path::new("/work/app"));
         let helper = found.iter().find(|(id, _, _)| id == "c").unwrap();
         assert_eq!(helper.1, "审查计时器改动");
+        // Ticket #72: a reverted thread's later rollout files carry the
+        // same thread id after `_`: one entry, not three.
+        for (stamp, suffix) in [
+            ("2026-10-18T04-52-57", ""),
+            ("2026-10-26T18-41-27", "_01a177cd"),
+            ("2026-10-26T21-19-37", "_01a1785d"),
+        ] {
+            fs::write(
+                day.join(format!("rollout-{stamp}-01a14ba3{suffix}.jsonl")),
+                rows("01a14ba3", "/work/app", "long task"),
+            )
+            .unwrap();
+        }
+        let found = saved_in(&home, Path::new("/work/app"));
+        assert_eq!(
+            found.iter().filter(|(id, _, _)| id == "01a14ba3").count(),
+            1
+        );
         let _ = fs::remove_dir_all(&home);
     }
 
