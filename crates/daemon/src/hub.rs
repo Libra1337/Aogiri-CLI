@@ -1362,6 +1362,42 @@ impl Hub {
         closed
     }
 
+    /// An archived engine session's process stops when nothing runs in it
+    /// (no turn, no held work, no message on its way): closed as idle, so
+    /// opening it again resumes it as it ran. A busy one stops at its next
+    /// idle close as before. Returns whether it was closed.
+    pub(crate) fn release_archived_engine(&self, id: &str) -> bool {
+        let engine = self
+            .store
+            .sessions()
+            .into_iter()
+            .find(|record| record.id == id)
+            .and_then(|record| record.engine);
+        if !matches!(engine.as_deref(), Some("claude" | "codex")) {
+            return false;
+        }
+        if crate::session_messages::awaited(self, id) {
+            return false;
+        }
+        let hosted = {
+            let mut sessions = lock(&self.sessions);
+            let quiet = sessions.get(id).is_some_and(|hosted| {
+                !hosted.held
+                    && !lock(&self.busy).contains(id)
+                    && !lock(&self.claims).contains_key(id)
+                    && !lock(&self.titling).contains(id)
+            });
+            if !quiet {
+                return false;
+            }
+            let hosted = sessions.remove(id);
+            lock(&self.asleep).insert(id.to_string(), engines::Options::default());
+            lock(&self.close_reasons).insert(id.to_string(), "idle");
+            hosted
+        };
+        hosted.is_some_and(|hosted| self.shut(id, hosted).is_ok())
+    }
+
     /// The options an engine closed as idle ran with (sent by its thread as
     /// it stops), for its next open.
     pub(crate) fn keep_options(&self, id: &str, options: engines::Options) {
@@ -3292,6 +3328,45 @@ mod tests {
 
     fn set(ids: &[&str]) -> HashSet<String> {
         ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    /// Ticket #71: archiving a Codex conversation lets go of its engine,
+    /// which holds the thread's writer lock (the Codex app's archive then
+    /// works); one with a turn running keeps it until it is idle.
+    #[test]
+    fn archiving_an_engine_session_lets_go_of_its_engine() {
+        let (hub, dir) = engine_hub("archive");
+        let start = Instant::now();
+        for id in ["codex-idle", "codex-busy", "lynshen"] {
+            let engine = (id != "lynshen").then_some("codex");
+            hub.store
+                .record_engine_session(id, std::path::Path::new("/tmp"), None, engine, false, None)
+                .unwrap();
+        }
+        let idle = host_engine(&hub, "codex-idle", start);
+        let _busy = host_engine(&hub, "codex-busy", start);
+        let _own = host_engine(&hub, "lynshen", start);
+        lock(&hub.busy).insert("codex-busy".into());
+        assert!(hub.release_archived_engine("codex-idle"));
+        let shutdown = idle.try_recv().unwrap();
+        assert_eq!(
+            (shutdown["op"].as_str(), shutdown["keep"].as_bool()),
+            (Some("shutdown"), Some(true))
+        );
+        assert!(
+            lock(&hub.asleep).contains_key("codex-idle"),
+            "opens again as it ran"
+        );
+        assert!(
+            !hub.release_archived_engine("codex-busy"),
+            "a running turn keeps it"
+        );
+        assert!(
+            !hub.release_archived_engine("lynshen"),
+            "only Claude Code / Codex"
+        );
+        assert!(lock(&hub.sessions).contains_key("codex-busy"));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

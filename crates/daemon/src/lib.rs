@@ -743,6 +743,14 @@ pub(crate) fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 if let Some(group) = op["group"].as_str() {
                     gateway::set_group(&session, Some(group));
                 }
+                // An archived Claude Code / Codex conversation lets go of its
+                // engine once nothing runs in it: a Codex app-server holds the
+                // thread's writer lock while it runs, so archiving it in the
+                // Codex app failed with "already has an active writer" for
+                // as long as Aogiri kept it open (ticket #71).
+                if op["archived"] == true {
+                    hub.release_archived_engine(&session);
+                }
                 // Claude Code and Codex keep the name too, for their own lists.
                 if let Some(title) = op["title"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
                     let named = hub

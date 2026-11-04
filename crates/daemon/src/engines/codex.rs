@@ -652,6 +652,10 @@ pub struct Codex {
     /// -32601): their error, answered from here instead of asking again
     /// (ticket #72: a client re-read one every 2.5 s for hours).
     unlistable: HashMap<String, String>,
+    /// A name given before the thread opened: set on it once it does
+    /// (ticket #71: a helper conversation's name was dropped, so the Codex
+    /// app titled it by its first message, the `<session_message>` wrapper).
+    pending_name: Option<String>,
 }
 
 impl Codex {
@@ -714,6 +718,7 @@ impl Codex {
             mcp_watched: false,
             mcp_relist: false,
             unlistable: HashMap::new(),
+            pending_name: None,
         }
     }
 
@@ -964,6 +969,13 @@ impl Codex {
             json!({ "type": "status", "message": "ready" }),
         ]);
         let mut frames = Vec::new();
+        if let (Some(thread), Some(name)) = (self.thread.clone(), self.pending_name.take()) {
+            frames.push(self.request(
+                "thread/name/set",
+                json!({ "threadId": thread, "name": name }),
+                "",
+            ));
+        }
         if self.thread.is_some() && !self.queued.is_empty() {
             let input = std::mem::take(&mut self.queued);
             frames.push(self.turn_start(input));
@@ -2182,7 +2194,14 @@ impl Adapter for Codex {
                     json!({ "threadId": thread, "name": op["title"] }),
                     "",
                 )],
-                None => vec![],
+                None => {
+                    self.pending_name = op["title"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string);
+                    vec![]
+                }
             },
             "agent_runs" => return Ok(Output::events(vec![self.agent_runs()])),
             "subagent_transcript" => {
@@ -2571,7 +2590,13 @@ fn saved_in(home: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
                     .cloned()
                     .unwrap_or_default()
             })
-            .map(|block| text(&block["text"]).to_string())
+            .map(|block| {
+                let text = text(&block["text"]);
+                // Another conversation's message: titled by what it says.
+                crate::session_messages::unwrapped(text)
+                    .unwrap_or(text)
+                    .to_string()
+            })
             .find(|text| !text.trim().is_empty() && !is_injected(text))
             .map(|text| {
                 text.lines()
@@ -3135,6 +3160,34 @@ mod tests {
         .events;
         let runs = read.iter().find(|e| e["type"] == "agent_runs").unwrap();
         assert_eq!(runs["agents"][1]["status"], "stopped");
+    }
+
+    /// Ticket #71: a helper conversation is named before Codex opened its
+    /// thread; the name reaches the thread once it does, so the Codex app
+    /// does not title it by the `<session_message>` wrapper.
+    #[test]
+    fn ticket_71_a_name_given_before_the_thread_opens_is_set_on_it() {
+        let mut c = Codex::new(Path::new("/p"), &Options::default());
+        c.start();
+        frame(&mut c, json!({ "id": 1, "result": {} }));
+        let early = c
+            .encode(&json!({ "op": "rename", "title": "审查定时器改动" }))
+            .unwrap();
+        assert!(early.frames.is_empty());
+        let opened = frame(
+            &mut c,
+            json!({ "id": 2, "result": { "thread": { "id": "th-helper" } } }),
+        );
+        let named = sent(&opened.frames);
+        assert_eq!(named[0]["method"], "thread/name/set");
+        assert_eq!(named[0]["params"]["threadId"], "th-helper");
+        assert_eq!(named[0]["params"]["name"], "审查定时器改动");
+        // Once only.
+        let later = frame(
+            &mut c,
+            json!({ "method": "turn/completed", "params": { "turn": { "status": "completed" } } }),
+        );
+        assert!(later.frames.is_empty());
     }
 
     #[test]
@@ -3965,6 +4018,21 @@ mod tests {
             (found[0].0.as_str(), found[0].1.as_str()),
             ("a", "fix login")
         );
+        // Ticket #71: a helper conversation started by another one's
+        // message is titled by what the message says, not its wrapper.
+        fs::write(
+            day.join("rollout-2026-09-30T12-00-00-c.jsonl"),
+            rows(
+                "c",
+                "/work/app",
+                "<session_message from=\"s6ae7455\" title=\"主会话\" hop=\"1\">\n审查计时器改动\n</session_message>\n(From the AI of another conversation)",
+            ),
+        )
+        .unwrap();
+        let found = saved_in(&home, Path::new("/work/app"));
+        let helper = found.iter().find(|(id, _, _)| id == "c").unwrap();
+        assert_eq!(helper.1, "审查计时器改动");
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
