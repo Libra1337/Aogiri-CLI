@@ -600,6 +600,13 @@ fn start(hub: &Arc<Hub>, me: &str, args: &Value) -> Result<String, String> {
             error = error.to_string()
         );
     }
+    // Claude Code and Codex keep the name in their own lists too: without
+    // it the Codex app titled a helper by its first message, this
+    // conversation's `<session_message>` wrapper (ticket #71). Codex sets it
+    // once its thread opens.
+    if engine.is_some() {
+        let _ = hub.forward(&id, json!({ "op": "rename", "title": title }));
+    }
     Ok(id)
 }
 
