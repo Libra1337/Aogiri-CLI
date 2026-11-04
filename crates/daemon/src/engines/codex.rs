@@ -484,6 +484,39 @@ fn user_input(content: &Value) -> (String, Vec<String>, Vec<String>) {
     (text_part, images, files)
 }
 
+/// What an engine error says before Codex's own words when another Codex
+/// process writes the thread; clients offer a restart of the engine on it.
+const WRITER_CONFLICT: &str = "Codex could not open this conversation: another Codex process is writing it (the Codex app, a terminal, or an engine that did not exit). Close it there, then restart the engine. Codex said: ";
+
+/// Codex refused to open or write a thread another process writes
+/// (`thread … already has an active writer`, `thread-store conflict`).
+fn writer_conflict(message: &str) -> bool {
+    message.contains("already has an active writer")
+        || message.contains("already has a live local writer")
+        || message.contains("thread-store conflict")
+}
+
+/// An error asking again will not change: the thread cannot be listed
+/// (`-32601 list_turns is not supported yet`, no rollout for the id).
+fn unlistable_error(error: &Value) -> bool {
+    let message = text(&error["message"]);
+    error["code"] == -32601
+        || message.contains("not supported yet")
+        || message.contains("no rollout found")
+}
+
+/// The state a subagent's thread is in by its turns (oldest first): None
+/// while its last turn runs, else how that turn ended.
+fn settled_state(turns: &Value) -> Option<&'static str> {
+    let last = turns.as_array()?.last()?;
+    match text(&last["status"]) {
+        "completed" => Some("completed"),
+        "interrupted" => Some("stopped"),
+        "failed" => Some("failed"),
+        _ => None,
+    }
+}
+
 /// A subagent's short name from its path (`/root/pong` → `pong`).
 fn agent_label(path: &str, thread: &str) -> String {
     match path.rsplit('/').find(|part| !part.is_empty()) {
@@ -615,6 +648,10 @@ pub struct Codex {
     /// A client looked at the MCP servers: their changes are sent on.
     mcp_watched: bool,
     mcp_relist: bool,
+    /// Subagent threads Codex cannot list (`thread/turns/list` answered
+    /// -32601): their error, answered from here instead of asking again
+    /// (ticket #72: a client re-read one every 2.5 s for hours).
+    unlistable: HashMap<String, String>,
 }
 
 impl Codex {
@@ -676,6 +713,7 @@ impl Codex {
             warned: Default::default(),
             mcp_watched: false,
             mcp_relist: false,
+            unlistable: HashMap::new(),
         }
     }
 
@@ -906,6 +944,14 @@ impl Codex {
                     }
                 }
             }
+            // A resumed thread runs in a new Codex process: no subagent of
+            // its history is at work now, whatever its last record says (a
+            // process killed mid-turn never wrote its end; ticket #72).
+            for agent in &mut self.agents {
+                if agent["status"] == "running" {
+                    agent["status"] = json!("stopped");
+                }
+            }
             if !self.agents.is_empty() {
                 events.push(self.agent_runs());
             }
@@ -944,17 +990,30 @@ impl Codex {
             ]);
         }
         if method == "thread/turns/list" {
-            let rows = if error.is_null() {
-                transcript(&result["data"])
-            } else {
-                Vec::new()
-            };
-            let mut event =
-                json!({ "type": "subagent_transcript", "agent_id": tag, "items": rows });
             if !error.is_null() {
-                event["error"] = json!(text(&error["message"]));
+                let message = text(&error["message"]).to_string();
+                if unlistable_error(error) {
+                    self.unlistable.insert(tag.clone(), message.clone());
+                }
+                return Output::events(vec![
+                    json!({ "type": "subagent_transcript", "agent_id": tag, "items": [], "error": message }),
+                ]);
             }
-            return Output::events(vec![event]);
+            let mut events = vec![
+                json!({ "type": "subagent_transcript", "agent_id": tag, "items": transcript(&result["data"]) }),
+            ];
+            // Its state is its turns', not the last record of it this
+            // thread saw: a subagent shown running whose turns all ended has
+            // ended (its end was never seen here).
+            if let Some(state) = settled_state(&result["data"]) {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a["id"] == tag.as_str()) {
+                    if agent["status"] == "running" {
+                        agent["status"] = json!(state);
+                        events.push(self.agent_runs());
+                    }
+                }
+            }
+            return Output::events(events);
         }
         if method == "mcpServerStatus/list" {
             if !error.is_null() {
@@ -1037,6 +1096,20 @@ impl Codex {
                     "message": format!("cannot fork the thread: {message}"),
                     "fatal": true,
                 })]);
+            }
+            // Another Codex process holds the thread (the Codex app, a
+            // terminal, an engine that did not exit): a new thread would
+            // leave the conversation behind, and resuming works again once
+            // that process lets go of it (ticket #72).
+            if matches!(method.as_str(), "thread/resume" | "turn/start")
+                && writer_conflict(&message)
+            {
+                self.busy = false;
+                self.queued.clear();
+                return Output::events(vec![
+                    json!({ "type": "error", "message": format!("{WRITER_CONFLICT}{message}"), "engine_conflict": true }),
+                    json!({ "type": "status", "message": "ready" }),
+                ]);
             }
             if method == "thread/resume" && self.open_params.is_object() {
                 let params = self.open_params.clone();
@@ -2114,6 +2187,25 @@ impl Adapter for Codex {
             "agent_runs" => return Ok(Output::events(vec![self.agent_runs()])),
             "subagent_transcript" => {
                 let id = text(&op["agent_id"]).to_string();
+                // A thread Codex cannot list is not asked again, unless a
+                // client asks to retry.
+                if op["retry"] == true {
+                    self.unlistable.remove(&id);
+                }
+                if let Some(error) = self.unlistable.get(&id) {
+                    return Ok(Output::events(vec![
+                        json!({ "type": "subagent_transcript", "agent_id": id, "items": [], "error": error }),
+                    ]));
+                }
+                // One read of a thread at a time, however many clients ask:
+                // its answer goes to all of them.
+                let asking = self
+                    .pending
+                    .values()
+                    .any(|(method, tag)| method == "thread/turns/list" && *tag == id);
+                if asking {
+                    return Ok(Output::default());
+                }
                 vec![self.request(
                     "thread/turns/list",
                     json!({ "threadId": id, "itemsView": "full", "sortDirection": "asc", "limit": 200 }),
@@ -2955,6 +3047,140 @@ mod tests {
         assert_eq!(read[0]["type"], "subagent_transcript");
         assert_eq!(read[0]["agent_id"], "child");
         assert_eq!(read[0]["items"][1]["content"], "PONG");
+    }
+
+    /// Ticket #72's state, without its data: a thread resumed after its
+    /// process was killed mid-turn (a subagent whose start is recorded and
+    /// whose end is not), a subagent thread Codex cannot list (-32601, as
+    /// for a reverted thread's `_<rollout id>` file), and a thread another
+    /// Codex process still writes.
+    #[test]
+    fn ticket_72_a_resumed_thread_settles_and_stops_asking() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                resume: Some("01a1-parent".into()),
+                ..Options::default()
+            },
+        );
+        c.start();
+        frame(&mut c, json!({ "id": 1, "result": {} }));
+        let resumed = frame(
+            &mut c,
+            json!({ "id": 2, "result": { "thread": { "id": "01a1-parent", "turns": [
+            { "id": "t-killed", "status": "inProgress", "items": [
+                { "type": "userMessage", "content": [{ "type": "text", "text": "go" }] },
+                { "type": "subAgentActivity", "id": "sa1", "kind": "started", "agentThreadId": "01a1-ghost", "agentPath": "/root/ghost" },
+            ] },
+            { "id": "t-next", "status": "completed", "items": [
+                { "type": "userMessage", "content": [{ "type": "text", "text": "next" }] },
+                { "type": "subAgentActivity", "id": "sa2", "kind": "started", "agentThreadId": "01a1-live", "agentPath": "/root/live" },
+            ] },
+        ] } } }),
+        )
+        .events;
+        // Nothing of the history runs in the new process: no subagent shows
+        // as running, and the session is not busy.
+        let runs = resumed.iter().find(|e| e["type"] == "agent_runs").unwrap();
+        assert!(runs["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["status"] == "stopped"));
+        assert!(!c.busy());
+        // The unlistable thread: asked once, then answered from here.
+        let ask = sent(
+            &c.encode(&json!({ "op": "subagent_transcript", "agent_id": "01a1-ghost" }))
+                .unwrap()
+                .frames,
+        );
+        assert_eq!(ask[0]["method"], "thread/turns/list");
+        // A second ask while the first is out is not sent again.
+        assert!(c
+            .encode(&json!({ "op": "subagent_transcript", "agent_id": "01a1-ghost" }))
+            .unwrap()
+            .frames
+            .is_empty());
+        let refused = frame(
+            &mut c,
+            json!({ "id": ask[0]["id"], "error": { "code": -32601, "message": "list_turns is not supported yet" } }),
+        )
+        .events;
+        assert_eq!(refused[0]["error"], "list_turns is not supported yet");
+        for _ in 0..50 {
+            let again = c
+                .encode(&json!({ "op": "subagent_transcript", "agent_id": "01a1-ghost" }))
+                .unwrap();
+            assert!(again.frames.is_empty(), "never asked again");
+            assert_eq!(again.events[0]["error"], "list_turns is not supported yet");
+        }
+        // A retry asks once more.
+        let retry = c
+            .encode(
+                &json!({ "op": "subagent_transcript", "agent_id": "01a1-ghost", "retry": true }),
+            )
+            .unwrap();
+        assert_eq!(sent(&retry.frames)[0]["method"], "thread/turns/list");
+        // A subagent whose turns all ended has ended.
+        c.agents[1]["status"] = json!("running");
+        let ask = sent(
+            &c.encode(&json!({ "op": "subagent_transcript", "agent_id": "01a1-live" }))
+                .unwrap()
+                .frames,
+        );
+        let read = frame(
+            &mut c,
+            json!({ "id": ask[0]["id"], "result": { "data": [{ "id": "l1", "status": "interrupted", "items": [] }] } }),
+        )
+        .events;
+        let runs = read.iter().find(|e| e["type"] == "agent_runs").unwrap();
+        assert_eq!(runs["agents"][1]["status"], "stopped");
+    }
+
+    #[test]
+    fn ticket_72_another_writer_is_an_engine_error_not_a_new_thread() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                resume: Some("01a1-parent".into()),
+                ..Options::default()
+            },
+        );
+        c.start();
+        frame(&mut c, json!({ "id": 1, "result": {} }));
+        c.encode(&json!({ "op": "user_message", "content": "hi" }))
+            .unwrap();
+        let out = frame(
+            &mut c,
+            json!({ "id": 2, "error": { "code": -32600, "message": "thread-store conflict: thread 01a1-parent already has an active writer" } }),
+        );
+        assert!(out.frames.is_empty(), "no thread/start on a conflict");
+        assert_eq!(types(&out.events), ["error", "status"]);
+        assert_eq!(out.events[0]["engine_conflict"], true);
+        assert!(out.events[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already has an active writer"));
+        assert!(!c.busy());
+        assert!(
+            c.queued.is_empty(),
+            "the waiting message is not sent elsewhere"
+        );
+        // Any other resume failure still falls back to a new thread.
+        let mut other = Codex::new(
+            Path::new("/p"),
+            &Options {
+                resume: Some("gone".into()),
+                ..Options::default()
+            },
+        );
+        other.start();
+        frame(&mut other, json!({ "id": 1, "result": {} }));
+        let out = frame(
+            &mut other,
+            json!({ "id": 2, "error": { "code": -32600, "message": "no rollout found for thread id gone" } }),
+        );
+        assert_eq!(sent(&out.frames)[0]["method"], "thread/start");
     }
 
     fn request(c: &mut Codex, method: &str, params: Value) -> Value {
