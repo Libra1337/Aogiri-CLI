@@ -17,10 +17,10 @@ use crate::{
     tools,
 };
 use llm_provider_kit::omp::{self, OmpCatalog};
-use llm_provider_kit::websocket::{TransportInfo, TransportMode};
 use llm_provider_kit::transport::{
     self, Client as TransportClient, ClientConfig as TransportConfig, StreamEvent as TransportEvent,
 };
+use llm_provider_kit::websocket::{TransportInfo, TransportMode};
 use llm_provider_kit::{anthropic, chat, responses, NoAnswer, Protocol, WireEvent};
 use serde_json::{json, Value};
 use std::{
@@ -6536,13 +6536,20 @@ mod tests {
                             seen.push(create.clone());
                             seen.len()
                         };
-                        let send = |socket: &mut tungstenite::WebSocket<std::net::TcpStream>, event: Value| {
+                        let send = |socket: &mut tungstenite::WebSocket<std::net::TcpStream>,
+                                    event: Value| {
                             socket.send(Message::text(event.to_string()))
                         };
                         let call = json!({ "type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "ls", "arguments": "{\"path\":\".\"}" });
-                        let _ = send(&mut socket, json!({ "type": "response.created", "response": { "id": format!("resp_{count}") } }));
+                        let _ = send(
+                            &mut socket,
+                            json!({ "type": "response.created", "response": { "id": format!("resp_{count}") } }),
+                        );
                         if count <= 2 {
-                            let _ = send(&mut socket, json!({ "type": "response.output_item.done", "item": call }));
+                            let _ = send(
+                                &mut socket,
+                                json!({ "type": "response.output_item.done", "item": call }),
+                            );
                         }
                         if count == 1 {
                             // Cut before the terminal event: the call must
@@ -6552,12 +6559,21 @@ mod tests {
                         let output = if count == 2 {
                             vec![call]
                         } else {
-                            let text = format!("got {} items", create["input"].as_array().map_or(0, Vec::len));
+                            let text = format!(
+                                "got {} items",
+                                create["input"].as_array().map_or(0, Vec::len)
+                            );
                             let message = json!({ "type": "message", "id": "msg_1", "role": "assistant", "content": [{ "type": "output_text", "text": text }] });
-                            let _ = send(&mut socket, json!({ "type": "response.output_item.done", "item": message }));
+                            let _ = send(
+                                &mut socket,
+                                json!({ "type": "response.output_item.done", "item": message }),
+                            );
                             vec![message]
                         };
-                        let _ = send(&mut socket, json!({ "type": "response.completed", "response": { "id": format!("resp_{count}"), "output": output, "usage": { "input_tokens": 5, "output_tokens": 1 } } }));
+                        let _ = send(
+                            &mut socket,
+                            json!({ "type": "response.completed", "response": { "id": format!("resp_{count}"), "output": output, "usage": { "input_tokens": 5, "output_tokens": 1 } } }),
+                        );
                     }
                 });
             }
