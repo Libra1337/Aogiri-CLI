@@ -6509,6 +6509,102 @@ mod tests {
         OpenAiClient::from_config(config).unwrap()
     }
 
+    /// A Responses WebSocket server for one conversation: the first request
+    /// is answered with an `ls` call and then cut (no terminal event, the
+    /// connection dropped), every later one with text naming what it got.
+    /// Returns the base URL and each `response.create` it received.
+    fn websocket_model() -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
+        use tungstenite::Message;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let creates = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let seen = Arc::clone(&creates);
+        thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                let seen = Arc::clone(&seen);
+                thread::spawn(move || {
+                    let Ok(mut socket) = tungstenite::accept(stream) else {
+                        return;
+                    };
+                    while let Ok(message) = socket.read() {
+                        let Message::Text(text) = message else {
+                            continue;
+                        };
+                        let create: Value = serde_json::from_str(text.as_str()).unwrap();
+                        let count = {
+                            let mut seen = seen.lock().unwrap();
+                            seen.push(create.clone());
+                            seen.len()
+                        };
+                        let send = |socket: &mut tungstenite::WebSocket<std::net::TcpStream>, event: Value| {
+                            socket.send(Message::text(event.to_string()))
+                        };
+                        let call = json!({ "type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "ls", "arguments": "{\"path\":\".\"}" });
+                        let _ = send(&mut socket, json!({ "type": "response.created", "response": { "id": format!("resp_{count}") } }));
+                        if count <= 2 {
+                            let _ = send(&mut socket, json!({ "type": "response.output_item.done", "item": call }));
+                        }
+                        if count == 1 {
+                            // Cut before the terminal event: the call must
+                            // not run from this response.
+                            return;
+                        }
+                        let output = if count == 2 {
+                            vec![call]
+                        } else {
+                            let text = format!("got {} items", create["input"].as_array().map_or(0, Vec::len));
+                            let message = json!({ "type": "message", "id": "msg_1", "role": "assistant", "content": [{ "type": "output_text", "text": text }] });
+                            let _ = send(&mut socket, json!({ "type": "response.output_item.done", "item": message }));
+                            vec![message]
+                        };
+                        let _ = send(&mut socket, json!({ "type": "response.completed", "response": { "id": format!("resp_{count}"), "output": output, "usage": { "input_tokens": 5, "output_tokens": 1 } } }));
+                    }
+                });
+            }
+        });
+        (base_url, creates)
+    }
+
+    #[test]
+    fn a_tool_turn_over_websocket_runs_each_call_once_and_sends_only_new_items() {
+        let (base_url, creates) = websocket_model();
+        let mut config = test_client_config();
+        config.base_url = base_url;
+        config.transport = TransportMode::WebSocket;
+        config.prompt_cache_key = "ws-agent-turn".to_string();
+        config.retry_attempts = 2;
+        config.read_timeout = Duration::from_secs(5);
+        let client = OpenAiClient::from_config(config).unwrap();
+        let input =
+            vec![json!({ "role": "user", "content": [{ "type": "input_text", "text": "list" }] })];
+        let mut tool_starts = 0;
+        let (mut retries, mut transports) = (0, Vec::new());
+        client
+            .run_turn_events(input, &std::env::temp_dir(), |event| {
+                match event {
+                    StreamEvent::ToolStart { .. } => tool_starts += 1,
+                    StreamEvent::Retrying { .. } => retries += 1,
+                    StreamEvent::Transport(info) => transports.push(info),
+                    _ => {}
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(tool_starts, 1, "the cut response's call never ran");
+        assert_eq!(retries, 1);
+        let creates = creates.lock().unwrap();
+        assert_eq!(creates.len(), 3);
+        // The retry went whole, on a new connection; the tool round only
+        // its result after the previous response.
+        assert!(creates[1].get("previous_response_id").is_none());
+        assert_eq!(creates[2]["previous_response_id"], "resp_2");
+        let items = creates[2]["input"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "function_call_output");
+        assert_eq!(transports.last().unwrap().transport, "websocket");
+        assert!(transports.last().unwrap().incremental);
+    }
+
     #[test]
     fn claude_on_the_monoize_gateway_goes_to_its_messages_endpoint_with_breakpoints() {
         let (host, seen) = model_server("/gw/v1/chat/completions", "/gw/v1/messages");

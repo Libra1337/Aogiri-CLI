@@ -34,3 +34,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_JobObjects",
     "Win32_System_SystemInformation",
 ] }
+
+[dev-dependencies]
+# A local Responses WebSocket server for the agent loop's tests; already in
+# the build through llm-provider-kit.
+tungstenite = "0.30"

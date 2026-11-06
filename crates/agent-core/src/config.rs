@@ -3815,6 +3815,37 @@ mod tests {
     }
 
     #[test]
+    fn transport_defaults_to_auto_saves_and_follows_desktop_live() {
+        use llm_provider_kit::websocket::TransportMode;
+        let dir = std::env::temp_dir().join(format!("lynshen-transport-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let mut config = Config::from_value("{}", path.clone()).unwrap();
+        assert_eq!(config.transport, TransportMode::Auto);
+        config.save().unwrap();
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["transport"], "auto");
+
+        for (value, mode) in [
+            ("http", TransportMode::Http),
+            ("websocket", TransportMode::WebSocket),
+            // A newer version's value is not an error: auto.
+            ("quic", TransportMode::Auto),
+        ] {
+            fs::write(&path, json!({ "transport": value }).to_string()).unwrap();
+            config.reload_live_settings().unwrap();
+            assert_eq!(config.transport, mode, "{value}");
+            assert_eq!(
+                Config::from_value(&json!({ "transport": value }).to_string(), path.clone())
+                    .unwrap()
+                    .transport,
+                mode
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn image_model_defaults_empty_and_survives_a_save() {
         let dir = std::env::temp_dir().join(format!("lynshen-image-model-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
