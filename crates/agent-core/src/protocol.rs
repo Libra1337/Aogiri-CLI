@@ -399,6 +399,18 @@ pub fn event_json(event: AgentEvent) -> Value {
             with_files_json(json!({ "type": "fill_input" }), &content)
         }
         AgentEvent::Connecting => json!({ "type": "connecting" }),
+        AgentEvent::Transport {
+            transport,
+            reused,
+            incremental,
+            fallback,
+        } => json!({
+            "type": "transport",
+            "transport": transport,
+            "reused": reused,
+            "incremental": incremental,
+            "fallback": fallback,
+        }),
         AgentEvent::CompactionStart => json!({ "type": "compaction_start" }),
         AgentEvent::CompactionProgress { output_tokens } => {
             json!({ "type": "compaction_progress", "output_tokens": output_tokens })

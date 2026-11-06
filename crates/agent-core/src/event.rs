@@ -270,6 +270,17 @@ pub enum AgentEvent {
     /// Pre-fill the input box (e.g. with a checked-out user message).
     FillInput(String),
     Connecting,
+    /// How the model request that just connected travels: `transport`
+    /// "websocket" or "https"; `reused`, a connection kept from an earlier
+    /// request; `incremental`, only the new input after the previous
+    /// response; `fallback`, why HTTPS carried a request the `auto` setting
+    /// would have sent over WebSocket. Responses-protocol requests only.
+    Transport {
+        transport: String,
+        reused: bool,
+        incremental: bool,
+        fallback: Option<String>,
+    },
     CompactionStart,
     CompactionProgress {
         output_tokens: u64,

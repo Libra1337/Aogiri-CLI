@@ -395,6 +395,12 @@ pub struct Config {
     pub shell: String,
     /// Subagent limits and policy (`agents` in config.json).
     pub agents: AgentsConfig,
+    /// How OpenAI Responses (and Codex) requests travel (`transport`):
+    /// `auto` (the default) uses the WebSocket mode where the endpoint
+    /// serves it and HTTPS otherwise, `http` HTTPS only, `websocket`
+    /// WebSocket only. Other protocols always use HTTPS. Desktop changes it
+    /// while engines run; each turn reads it again.
+    pub transport: llm_provider_kit::websocket::TransportMode,
     path: PathBuf,
 }
 
@@ -696,6 +702,7 @@ impl Config {
                 auto_update: true,
                 shell: "auto".to_string(),
                 agents: AgentsConfig::default(),
+                transport: Default::default(),
                 path,
             };
             config.save()?;
@@ -879,6 +886,7 @@ impl Config {
             auto_update: read_bool(&value, "auto_update", true),
             shell: crate::shell::Settings::from_config(&value).shell,
             agents: read_agents(&value)?,
+            transport: read_transport(&value),
             path,
         };
         Ok(config)
@@ -936,6 +944,7 @@ impl Config {
             "web_fetch_engine": self.web_fetch_engine,
             "auto_update": self.auto_update,
             "agents": self.agents.to_json(),
+            "transport": self.transport.as_str(),
         });
         // Keys this version does not know stay as they are: LynShen Desktop's
         // own settings, and a newer CLI's when an older one saves.
@@ -986,6 +995,7 @@ impl Config {
         self.context_window_overrides = read_context_window_overrides(&value);
         self.lynshen_groups = read_lynshen_groups(&value);
         self.shell = crate::shell::Settings::from_config(&value).shell;
+        self.transport = read_transport(&value);
         if let Ok(agents) = read_agents(&value) {
             self.agents = agents;
         }
@@ -1643,6 +1653,16 @@ fn read_web_engine(
             ),
         )),
     }
+}
+
+/// `transport` in config.json; absent or unknown (a newer version's value):
+/// `auto`.
+fn read_transport(value: &Value) -> llm_provider_kit::websocket::TransportMode {
+    value
+        .get("transport")
+        .and_then(Value::as_str)
+        .and_then(llm_provider_kit::websocket::TransportMode::parse)
+        .unwrap_or_default()
 }
 
 /// `agents` in config.json. Absent keys take the defaults; an unknown
@@ -3525,6 +3545,7 @@ mod tests {
             auto_update: true,
             shell: "auto".to_string(),
             agents: AgentsConfig::default(),
+            transport: Default::default(),
             lynshen_models: Vec::new(),
             lynshen_groups: BTreeMap::new(),
             monoize_providers: BTreeMap::new(),

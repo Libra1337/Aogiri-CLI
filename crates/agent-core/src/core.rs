@@ -31,6 +31,7 @@ use crate::{
     update::{self, UpdateNotice},
 };
 use llm_provider_kit::auth::{self as provider_auth, LoginContext, LoginOutcome};
+use llm_provider_kit::Protocol;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -172,6 +173,7 @@ enum WorkerEvent {
     ResumeSummaryFailed(String),
     CallStart,
     Connected,
+    Transport(llm_provider_kit::websocket::TransportInfo),
     ReasoningDelta(String),
     Delta(String),
     Retrying {
@@ -252,6 +254,8 @@ pub struct AgentCore {
     /// Tag each turn's LynShen gateway requests (`X-LynShen-Turn`) so the
     /// gateway can put their cost on the turn the daemon records.
     tag_turns: bool,
+    /// How the last model request travelled (`/doctor`).
+    last_transport: Option<llm_provider_kit::websocket::TransportInfo>,
     /// The current turn's tag, new for every turn.
     turn_tag: Option<String>,
     session: SessionStore,
@@ -489,6 +493,7 @@ impl AgentCore {
             omp_login_receiver: None,
             omp_login_code_tx: None,
             tag_turns: false,
+            last_transport: None,
             turn_tag: None,
             context_overhead: None,
             total_input_tokens: 0,
@@ -1947,6 +1952,15 @@ impl AgentCore {
                     }
                     WorkerEvent::CallStart => events.push(AgentEvent::Connecting),
                     WorkerEvent::Connected => events.push(AgentEvent::ThinkingStart),
+                    WorkerEvent::Transport(info) => {
+                        self.last_transport = Some(info.clone());
+                        events.push(AgentEvent::Transport {
+                            transport: info.transport.to_string(),
+                            reused: info.reused,
+                            incremental: info.incremental,
+                            fallback: info.fallback,
+                        });
+                    }
                     WorkerEvent::ReasoningDelta(delta) => {
                         self.turn_output_started();
                         events.push(AgentEvent::ReasoningDelta(delta))
@@ -3008,6 +3022,7 @@ impl AgentCore {
                 let mapped = match event {
                     StreamEvent::CallStart => WorkerEvent::CallStart,
                     StreamEvent::Connected => WorkerEvent::Connected,
+                    StreamEvent::Transport(info) => WorkerEvent::Transport(info),
                     StreamEvent::ReasoningDelta(delta) => WorkerEvent::ReasoningDelta(delta),
                     StreamEvent::Delta(delta) => WorkerEvent::Delta(delta),
                     StreamEvent::Retrying {
@@ -3215,6 +3230,7 @@ impl AgentCore {
             subagent_manager: Some(self.subagent_manager.clone()),
             roles,
             hooks: self.hooks.clone(),
+            transport: self.config.transport,
         })
         .map_err(|_| "missing API key in auth.json or env".to_string())
     }
@@ -3256,6 +3272,7 @@ impl AgentCore {
             subagent_manager: None,
             roles: Vec::new(),
             hooks: Hooks::default(),
+            transport: self.config.transport,
         })
     }
 
@@ -3311,6 +3328,7 @@ impl AgentCore {
             subagent_manager: None,
             roles: Vec::new(),
             hooks: Hooks::default(),
+            transport: self.config.transport,
         })
     }
 
@@ -6019,7 +6037,53 @@ impl AgentCore {
             Err(error) => lines.push(format!("project instructions: error: {error}")),
         }
         lines.push(self.mcp.doctor_line());
+        lines.push(self.transport_doctor_line());
         vec![AgentEvent::Info(lines.join("\n"))]
+    }
+
+    /// `/doctor`'s transport line: the setting, how the last request went,
+    /// and the endpoints `auto` keeps on HTTPS for now.
+    fn transport_doctor_line(&self) -> String {
+        let protocol = crate::llm::protocol_for(
+            &self.config.provider,
+            &self.config.protocol,
+            &self.config.model,
+        );
+        let mut line = format!("transport: {}", self.config.transport.as_str());
+        if !matches!(
+            protocol,
+            Protocol::OpenAiResponses
+                | Protocol::OpenAiCodexResponses
+                | Protocol::AzureOpenAiResponses
+        ) {
+            line.push_str(&format!(
+                " (not used: {} speaks {}, always over HTTPS)",
+                self.config.model,
+                protocol.as_str()
+            ));
+        }
+        if let Some(info) = &self.last_transport {
+            line.push_str(&format!(
+                "; last request: {}{}{}",
+                info.transport,
+                if info.reused { ", kept connection" } else { "" },
+                if info.incremental {
+                    ", new items only"
+                } else {
+                    ""
+                }
+            ));
+            if let Some(reason) = &info.fallback {
+                line.push_str(&format!(" (WebSocket not used: {reason})"));
+            }
+        }
+        for (url, reason, left) in llm_provider_kit::websocket::fallbacks_now() {
+            line.push_str(&format!(
+                "\n  {url}: HTTPS for {} more min ({reason})",
+                left.as_secs().div_ceil(60)
+            ));
+        }
+        line
     }
 
     /// `/mcp` — list servers; `tools <server>`, `reload <server>`,
@@ -7240,6 +7304,7 @@ fn title_request(
         subagent_manager: None,
         roles: Vec::new(),
         hooks: Hooks::default(),
+        transport: config.transport,
     })?;
     client.summarize_text(system, user, |_| Ok(()))
 }

@@ -17,6 +17,7 @@ use crate::{
     tools,
 };
 use llm_provider_kit::omp::{self, OmpCatalog};
+use llm_provider_kit::websocket::{TransportInfo, TransportMode};
 use llm_provider_kit::transport::{
     self, Client as TransportClient, ClientConfig as TransportConfig, StreamEvent as TransportEvent,
 };
@@ -279,6 +280,8 @@ pub struct OpenAiClientConfig<'a> {
     /// Roles spawn_agent offers (see `roles::discover`).
     pub roles: Vec<Role>,
     pub hooks: Hooks,
+    /// How Responses requests travel (config `transport`).
+    pub transport: TransportMode,
 }
 
 #[derive(Debug)]
@@ -454,6 +457,8 @@ pub enum StreamEvent {
         name: String,
         delta: String,
     },
+    /// How the request travels (sent after `Connected`, Responses only).
+    Transport(TransportInfo),
 }
 
 /// Maps a protocol parser's [`WireEvent`] onto the engine's [`StreamEvent`].
@@ -879,6 +884,11 @@ impl OpenAiClient {
             cache_debug: cache_debug_enabled(),
             model_headers: config.model_headers,
             headers: crate::device_id::gateway_headers(&config.provider),
+            transport: config.transport,
+            // Model requests go direct, over HTTPS and WebSocket alike: the
+            // app's proxy (`network_proxy`) is for the tools' own requests.
+            proxy: None,
+            lane: String::new(),
         });
         // Azure is the one provider whose endpoint the catalog cannot supply —
         // deployments live at a per-resource host — so fail with the reason
@@ -2557,7 +2567,8 @@ impl OpenAiClient {
         }
         OpenAiClient {
             api_key: self.api_key.clone(),
-            transport: self.transport.clone(),
+            // A conversation of its own: a WebSocket connection of its own.
+            transport: self.transport.with_lane(path),
             model: spec.model.clone(),
             reasoning_effort: spec.reasoning_effort.clone(),
             reasoning_efforts: spec.efforts.clone(),
@@ -4769,6 +4780,23 @@ fn retry_attempts_from_env(configured: usize) -> usize {
 fn map_transport_event(event: TransportEvent) -> Result<StreamEvent, String> {
     Ok(match event {
         TransportEvent::Connected => StreamEvent::Connected,
+        TransportEvent::Transport(info) => {
+            match &info.fallback {
+                Some(reason) => crate::log_warn!(
+                    "llm",
+                    "request over https instead of websocket",
+                    reason = reason.clone()
+                ),
+                None => crate::log_info!(
+                    "llm",
+                    "request transport",
+                    transport = info.transport,
+                    reused = info.reused,
+                    incremental = info.incremental
+                ),
+            }
+            StreamEvent::Transport(info)
+        }
         TransportEvent::Retrying {
             attempt,
             max_attempts,
@@ -5242,6 +5270,7 @@ mod tests {
             subagent_manager: None,
             roles: Vec::new(),
             hooks: Hooks::default(),
+            transport: Default::default(),
         }
     }
 

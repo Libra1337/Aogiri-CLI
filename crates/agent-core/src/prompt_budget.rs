@@ -115,6 +115,7 @@ fn client_with(system_prompt: String, agents: AgentsConfig) -> OpenAiClient {
         subagent_manager: Some(SubagentManager::new(agents, Default::default())),
         roles: crate::roles::builtin(),
         hooks: Hooks::default(),
+        transport: Default::default(),
     })
     .expect("default client")
 }

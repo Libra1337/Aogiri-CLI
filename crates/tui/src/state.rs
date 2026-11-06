@@ -335,6 +335,8 @@ impl TuiState {
                     self.activity.start_connecting();
                     true
                 }
+                // Shown by /doctor and in the log, not in the transcript.
+                AgentEvent::Transport { .. } => false,
                 AgentEvent::CompactionStart => {
                     self.activity.start_compacting();
                     self.chat.push(ChatLine::System(

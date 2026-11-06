@@ -854,6 +854,7 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
         AgentEvent::UserMessage(_) => "user_message",
         AgentEvent::FillInput(_) => "fill_input",
         AgentEvent::Connecting => "connecting",
+        AgentEvent::Transport { .. } => "transport",
         AgentEvent::CompactionStart => "compaction_start",
         AgentEvent::CompactionProgress { .. } => "compaction_progress",
         AgentEvent::CompactionEnd { .. } => "compaction_end",
