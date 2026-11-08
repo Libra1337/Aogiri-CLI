@@ -812,7 +812,14 @@ reviewer. Codex's own requests for permissions, for the user's answers
 cards; a command card with `scopes: ["session", "rule"]` can be allowed
 always with `always_scope: "rule"` (a Codex exec rule). Subagents are
 threads of their own: their events feed `agent_runs` and
-`subagent_lifecycle`, never the conversation.
+`subagent_lifecycle`, never the conversation. A subagent's state is its
+own thread's: the latest turn of that thread (`thread_status` in its
+`agent_runs` row once known: `inProgress`, `completed`, `interrupted` or
+`failed`, as Codex reports it) decides it. The records of it on the parent
+thread only stand in until then: on a resumed thread (taken in the order
+they happened; a message sent to a subagent never makes it running) and
+for a subagent still shown running when the parent's turn ends, the daemon
+reads its thread's latest turn.
 
 A message sent while a Claude Code turn runs waits in the daemon, listed in
 `pending_messages` (also part of a watcher's snapshot), and starts the next

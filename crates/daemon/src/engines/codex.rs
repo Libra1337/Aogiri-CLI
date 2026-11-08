@@ -505,16 +505,69 @@ fn unlistable_error(error: &Value) -> bool {
         || message.contains("no rollout found")
 }
 
-/// The state a subagent's thread is in by its turns (oldest first): None
-/// while its last turn runs, else how that turn ended.
-fn settled_state(turns: &Value) -> Option<&'static str> {
-    let last = turns.as_array()?.last()?;
-    match text(&last["status"]) {
+/// The pending-request tag of a read of a subagent thread's state (its
+/// newest turn, `thread/turns/list` without items), as against a read of
+/// its conversation.
+const AGENT_STATE: &str = "agent_state";
+
+/// A subagent's state by the status of its own thread's latest turn.
+/// Codex answers `inProgress` only for a turn that runs now: a thread no
+/// process runs has its unfinished turn reported `interrupted`.
+fn turn_state(status: &str) -> Option<&'static str> {
+    match status {
+        "inProgress" => Some("running"),
         "completed" => Some("completed"),
         "interrupted" => Some("stopped"),
         "failed" => Some("failed"),
         _ => None,
     }
+}
+
+/// Sets a subagent's state from its own thread's latest turn status, and
+/// keeps that status (`thread_status`). Returns whether its entry changed.
+fn set_thread_status(agent: &mut Value, status: &str) -> bool {
+    let Some(state) = turn_state(status) else {
+        return false;
+    };
+    let changed = agent["status"] != state || agent["thread_status"] != status;
+    agent["status"] = json!(state);
+    agent["thread_status"] = json!(status);
+    changed
+}
+
+/// When a thread item happened: its completion time, else its start
+/// (epoch ms; absent from older records).
+fn item_time(item: &Value) -> Option<u64> {
+    item["completedAtMs"]
+        .as_u64()
+        .or_else(|| item["startedAtMs"].as_u64())
+        .filter(|ms| *ms > 0)
+}
+
+/// A thread history's subagent records (`subAgentActivity`, in the order
+/// of its turns and their items) in the order they happened. Codex files
+/// a subagent's completion under the turn that gave it the task, so a
+/// completion can come in an earlier turn than a message sent to it
+/// before it ended (ticket #78): each subagent's records go by their time
+/// when they all have one; otherwise they keep the history's order.
+fn history_order(records: Vec<&Value>) -> Vec<&Value> {
+    // Per subagent: where its first record is (subagents stay listed in
+    // the order they appear) and whether every record of it has a time.
+    let mut agents: HashMap<String, (usize, bool)> = HashMap::new();
+    for (seq, item) in records.iter().enumerate() {
+        let entry = agents
+            .entry(text(&item["agentThreadId"]).to_string())
+            .or_insert((seq, true));
+        entry.1 &= item_time(item).is_some();
+    }
+    let mut ordered: Vec<(usize, &Value)> = records.into_iter().enumerate().collect();
+    // A record at the same time keeps its place among its subagent's.
+    ordered.sort_by_key(|(seq, item)| {
+        let (first, timed) = agents[text(&item["agentThreadId"])];
+        let at = if timed { item_time(item) } else { None };
+        (first, at, *seq)
+    });
+    ordered.into_iter().map(|(_, item)| item).collect()
 }
 
 /// A subagent's short name from its path (`/root/pong` → `pong`).
@@ -652,6 +705,16 @@ pub struct Codex {
     /// -32601): their error, answered from here instead of asking again
     /// (ticket #72: a client re-read one every 2.5 s for hours).
     unlistable: HashMap<String, String>,
+    /// Subagents whose own thread's state is to be read (a resumed thread's,
+    /// those still running when this thread's turn ended): sent with the
+    /// frame being answered.
+    state_reads: Vec<String>,
+    /// Each subagent's count of its own thread's turn notifications.
+    child_turns: HashMap<String, u64>,
+    /// A read of a subagent thread out (request id) → that count when it
+    /// was sent: an answer computed before a later turn notification of the
+    /// thread is older than what is known here.
+    read_marks: HashMap<u64, u64>,
     /// A name given before the thread opened: set on it once it does
     /// (ticket #71: a helper conversation's name was dropped, so the Codex
     /// app titled it by its first message, the `<session_message>` wrapper).
@@ -718,6 +781,9 @@ impl Codex {
             mcp_watched: false,
             mcp_relist: false,
             unlistable: HashMap::new(),
+            state_reads: Vec::new(),
+            child_turns: HashMap::new(),
+            read_marks: HashMap::new(),
             pending_name: None,
         }
     }
@@ -728,6 +794,68 @@ impl Codex {
             .insert(self.next_id, (method.to_string(), tag.to_string()));
         json!({ "jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params })
             .to_string()
+    }
+
+    /// `thread/turns/list` of a subagent's thread, its answer awaited as
+    /// `label` (its conversation, or [`AGENT_STATE`]).
+    fn read_agent_thread(&mut self, label: &str, params: Value, agent: &str) -> String {
+        self.next_id += 1;
+        self.pending
+            .insert(self.next_id, (label.to_string(), agent.to_string()));
+        let seen = self.child_turns.get(agent).copied().unwrap_or(0);
+        self.read_marks.insert(self.next_id, seen);
+        json!({ "jsonrpc": "2.0", "id": self.next_id, "method": "thread/turns/list", "params": params })
+            .to_string()
+    }
+
+    /// Asks for a subagent thread's state: its newest turn. None for a
+    /// thread Codex cannot list, or one being asked already.
+    fn read_agent_state(&mut self, agent: &str) -> Option<String> {
+        let asking = self
+            .pending
+            .values()
+            .any(|(label, tag)| label == AGENT_STATE && tag == agent);
+        if asking || self.unlistable.contains_key(agent) {
+            return None;
+        }
+        Some(self.read_agent_thread(
+            AGENT_STATE,
+            json!({ "threadId": agent, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded" }),
+            agent,
+        ))
+    }
+
+    /// Whether the answer to read `id` is as new as what this connection
+    /// saw of the thread: no turn of it started or ended since it was sent.
+    fn read_is_current(&mut self, id: u64, agent: &str) -> bool {
+        let seen = self.child_turns.get(agent).copied().unwrap_or(0);
+        self.read_marks.remove(&id) == Some(seen)
+    }
+
+    /// A subagent's state from its own thread's latest turn (`status`):
+    /// the trace if that changed it.
+    /// One shown running that ended also gets its lifecycle end (its
+    /// strip entry and tool cards stop).
+    fn settle_agent(&mut self, agent: &str, status: &str) -> Vec<Value> {
+        let Some(entry) = self.agents.iter_mut().find(|a| a["id"] == agent) else {
+            return vec![];
+        };
+        let was_running = entry["status"] == "running";
+        if !set_thread_status(entry, status) {
+            return vec![];
+        }
+        let mut events = Vec::new();
+        if was_running && entry["status"] != "running" {
+            events.push(json!({
+                "type": "subagent_lifecycle",
+                "path": entry["id"],
+                "label": entry["label"],
+                "status": entry["status"],
+                "message": entry["summary"].as_str().unwrap_or_default(),
+            }));
+        }
+        events.push(self.agent_runs());
+        events
     }
 
     fn turn_start(&mut self, input: Vec<Value>) -> String {
@@ -938,23 +1066,40 @@ impl Codex {
             }
             self.user_turns.clear();
             self.agents.clear();
+            self.child_turns.clear();
+            let mut activity: Vec<&Value> = Vec::new();
             for turn in turns.as_array().into_iter().flatten() {
                 for item in turn["items"].as_array().into_iter().flatten() {
                     match text(&item["type"]) {
                         "userMessage" => self.user_turns.push(text(&turn["id"]).to_string()),
-                        "subAgentActivity" => {
-                            self.agent_activity(item);
-                        }
+                        "subAgentActivity" => activity.push(item),
                         _ => {}
                     }
                 }
             }
+            let mut last: HashMap<String, String> = HashMap::new();
+            for item in history_order(activity) {
+                self.agent_activity(item);
+                last.insert(
+                    text(&item["agentThreadId"]).to_string(),
+                    text(&item["kind"]).to_string(),
+                );
+            }
+            self.state_reads.clear();
             // A resumed thread runs in a new Codex process: no subagent of
             // its history is at work now, whatever its last record says (a
             // process killed mid-turn never wrote its end; ticket #72).
+            // Each one whose last record is not its completion is settled by
+            // its own thread (ticket #78): Codex records no end on this
+            // thread for a subagent whose turn was interrupted or failed, nor
+            // for one that ran again after a message.
             for agent in &mut self.agents {
                 if agent["status"] == "running" {
                     agent["status"] = json!("stopped");
+                }
+                let id = text(&agent["id"]);
+                if last.get(id).map(String::as_str) != Some("completed") {
+                    self.state_reads.push(id.to_string());
                 }
             }
             if !self.agents.is_empty() {
@@ -1001,29 +1146,41 @@ impl Codex {
                 self.pending_event(),
             ]);
         }
-        if method == "thread/turns/list" {
+        if method == "thread/turns/list" || method == AGENT_STATE {
+            let current = self.read_is_current(id, &tag);
             if !error.is_null() {
                 let message = text(&error["message"]).to_string();
                 if unlistable_error(error) {
                     self.unlistable.insert(tag.clone(), message.clone());
                 }
+                if method == AGENT_STATE {
+                    return Output::default();
+                }
                 return Output::events(vec![
                     json!({ "type": "subagent_transcript", "agent_id": tag, "items": [], "error": message }),
                 ]);
             }
-            let mut events = vec![
-                json!({ "type": "subagent_transcript", "agent_id": tag, "items": transcript(&result["data"]) }),
-            ];
-            // Its state is its turns', not the last record of it this
-            // thread saw: a subagent shown running whose turns all ended has
-            // ended (its end was never seen here).
-            if let Some(state) = settled_state(&result["data"]) {
-                if let Some(agent) = self.agents.iter_mut().find(|a| a["id"] == tag.as_str()) {
-                    if agent["status"] == "running" {
-                        agent["status"] = json!(state);
-                        events.push(self.agent_runs());
-                    }
-                }
+            // Its state is its own thread's latest turn's, not the last
+            // record of it this thread saw (tickets #72, #78): unless a turn
+            // of it started or ended here since the read was sent.
+            let turns = result["data"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let latest = match method.as_str() {
+                // Newest first, one turn.
+                AGENT_STATE => turns.first(),
+                // Oldest first: the last turn is the newest when no page
+                // follows.
+                _ if result["nextCursor"].is_null() => turns.last(),
+                _ => None,
+            };
+            let mut events = Vec::new();
+            if method != AGENT_STATE {
+                events.push(json!({ "type": "subagent_transcript", "agent_id": tag, "items": transcript(&result["data"]) }));
+            }
+            if let Some(turn) = latest.filter(|_| current) {
+                events.extend(self.settle_agent(&tag, text(&turn["status"])));
             }
             return Output::events(events);
         }
@@ -1459,12 +1616,18 @@ impl Codex {
         if thread.is_empty() {
             return false;
         }
-        let status = match text(&item["kind"]) {
+        let kind = text(&item["kind"]);
+        let status = match kind {
             "completed" => "completed",
             "interrupted" => "stopped",
             _ => "running",
         };
         match self.agents.iter_mut().find(|a| a["id"] == thread.as_str()) {
+            // A message sent to a subagent does not say it runs: one that
+            // takes it up starts a turn of its own thread (`turn/started`
+            // there), one that only queues it does not (ticket #78: an
+            // `interacted` record after its end showed it running for good).
+            Some(_) if kind == "interacted" => return false,
             Some(agent) => {
                 if agent["status"] != "failed" {
                     agent["status"] = json!(status);
@@ -1490,16 +1653,21 @@ impl Codex {
         let Some(agent) = self.agents.iter_mut().find(|a| a["id"] == thread) else {
             return vec![];
         };
+        if matches!(method, "turn/started" | "turn/completed") {
+            *self.child_turns.entry(thread.to_string()).or_default() += 1;
+        }
         match method {
-            "turn/started" => agent["status"] = json!("running"),
+            "turn/started" => {
+                set_thread_status(agent, "inProgress");
+            }
             "turn/completed" => {
                 let turn = &params["turn"];
                 // Stopped by the user: not done.
-                agent["status"] = json!(match text(&turn["status"]) {
-                    "failed" => "failed",
-                    "interrupted" => "stopped",
+                let status = match text(&turn["status"]) {
+                    status @ ("failed" | "interrupted") => status,
                     _ => "completed",
-                });
+                };
+                set_thread_status(agent, status);
                 if let Some(ms) = turn["durationMs"].as_u64() {
                     agent["duration_ms"] = json!(agent["duration_ms"].as_u64().unwrap_or(0) + ms);
                 }
@@ -1822,6 +1990,15 @@ impl Codex {
             "turn/completed" => {
                 self.active_turn = None;
                 self.busy = false;
+                // A subagent still shown running is asked how its own thread
+                // is (ticket #78): it may run on after this turn, or have
+                // ended unseen here (an interrupted or failed subagent turn
+                // leaves no record on this thread).
+                for agent in &self.agents {
+                    if agent["status"] == "running" {
+                        self.state_reads.push(text(&agent["id"]).to_string());
+                    }
+                }
                 let turn = &params["turn"];
                 let mut events = Vec::new();
                 if turn["status"] == "failed" && turn["error"].is_object() {
@@ -2093,6 +2270,9 @@ impl Adapter for Codex {
                 "",
             ));
         }
+        for agent in std::mem::take(&mut self.state_reads) {
+            out.frames.extend(self.read_agent_state(&agent));
+        }
         out
     }
 
@@ -2225,7 +2405,7 @@ impl Adapter for Codex {
                 if asking {
                     return Ok(Output::default());
                 }
-                vec![self.request(
+                vec![self.read_agent_thread(
                     "thread/turns/list",
                     json!({ "threadId": id, "itemsView": "full", "sortDirection": "asc", "limit": 200 }),
                     &id,
@@ -3167,6 +3347,248 @@ mod tests {
         .events;
         let runs = read.iter().find(|e| e["type"] == "agent_runs").unwrap();
         assert_eq!(runs["agents"][1]["status"], "stopped");
+    }
+
+    /// A subagent record on the parent thread (`subAgentActivity`), at `at`
+    /// ms (0: an older record without a time).
+    fn activity(kind: &str, agent: &str, at: u64) -> Value {
+        let mut item = json!({ "type": "subAgentActivity", "id": format!("{kind}-{agent}-{at}"), "kind": kind, "agentThreadId": agent, "agentPath": format!("/root/{agent}") });
+        if at > 0 {
+            item["completedAtMs"] = json!(at);
+        }
+        item
+    }
+
+    fn resumed(turns: Value) -> (Codex, Output) {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                resume: Some("01a1-parent".into()),
+                ..Options::default()
+            },
+        );
+        c.start();
+        frame(&mut c, json!({ "id": 1, "result": {} }));
+        let out = frame(
+            &mut c,
+            json!({ "id": 2, "result": { "thread": { "id": "01a1-parent", "turns": turns } } }),
+        );
+        (c, out)
+    }
+
+    /// The subagents whose own thread an output asks for its state.
+    fn state_reads(frames: &[String]) -> Vec<(Value, String)> {
+        sent(frames)
+            .into_iter()
+            .filter(|f| f["method"] == "thread/turns/list" && f["params"]["limit"] == 1)
+            .map(|f| {
+                assert_eq!(f["params"]["sortDirection"], "desc");
+                assert_eq!(f["params"]["itemsView"], "notLoaded");
+                (f["id"].clone(), text(&f["params"]["threadId"]).to_string())
+            })
+            .collect()
+    }
+
+    fn agent<'a>(runs: &'a Value, id: &str) -> &'a Value {
+        runs["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == id)
+            .unwrap()
+    }
+
+    /// Ticket #78's four shapes, without its data. On the parent thread:
+    /// (1) `interrupted`, then `interacted` in the same turn; (2) a
+    /// completion Codex filed under the earlier turn that gave the task,
+    /// after an `interacted` of a later turn; (3) only `started`, its
+    /// parent turn interrupted; (4) `started` + `interacted`. Each own
+    /// thread says how it ended.
+    #[test]
+    fn ticket_78_a_resumed_thread_takes_each_subagents_state_from_its_own_thread() {
+        let (mut c, out) = resumed(json!([
+            { "id": "t-3951", "status": "completed", "items": [
+                { "type": "userMessage", "content": [{ "type": "text", "text": "review" }] },
+                activity("started", "c-revived", 100),
+                activity("interrupted", "c-revived", 140),
+                activity("interacted", "c-revived", 150),
+                activity("started", "c-plan", 200),
+                activity("completed", "c-plan", 400),
+            ] },
+            { "id": "t-3990", "status": "completed", "items": [
+                { "type": "userMessage", "content": [{ "type": "text", "text": "more" }] },
+                activity("interacted", "c-plan", 300),
+            ] },
+            { "id": "t-01a15c0a", "status": "interrupted", "items": [
+                { "type": "userMessage", "content": [{ "type": "text", "text": "read" }] },
+                activity("started", "c-started", 500),
+                activity("started", "c-talked", 510),
+                activity("interacted", "c-talked", 520),
+            ] },
+        ]));
+        let runs = out
+            .events
+            .iter()
+            .find(|e| e["type"] == "agent_runs")
+            .unwrap();
+        // Listed in the order they appear.
+        let ids: Vec<&str> = runs["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| text(&a["id"]))
+            .collect();
+        assert_eq!(ids, ["c-revived", "c-plan", "c-started", "c-talked"]);
+        // (2) by time its completion is its last record: done, not asked.
+        assert_eq!(agent(runs, "c-plan")["status"], "completed");
+        // Nothing is shown running; the rest are asked.
+        for id in ["c-revived", "c-started", "c-talked"] {
+            assert_eq!(agent(runs, id)["status"], "stopped", "{id}");
+        }
+        let reads = state_reads(&out.frames);
+        let asked: Vec<&str> = reads.iter().map(|(_, a)| a.as_str()).collect();
+        assert_eq!(asked, ["c-revived", "c-started", "c-talked"]);
+        // Their threads: Codex reports an unfinished turn of a thread no
+        // process runs as interrupted.
+        let answer = |c: &mut Codex, id: &Value, status: &str| {
+            frame(c, json!({ "id": id, "result": { "data": [{ "id": "x", "status": status, "items": [] }], "nextCursor": null } })).events
+        };
+        assert!(answer(&mut c, &reads[0].0, "interrupted")
+            .iter()
+            .all(|e| e["type"] == "agent_runs"));
+        answer(&mut c, &reads[1].0, "interrupted");
+        let last = answer(&mut c, &reads[2].0, "completed");
+        let runs = last.iter().find(|e| e["type"] == "agent_runs").unwrap();
+        assert_eq!(agent(runs, "c-talked")["status"], "completed");
+        assert_eq!(agent(runs, "c-talked")["thread_status"], "completed");
+        assert_eq!(agent(runs, "c-revived")["status"], "stopped");
+        assert_eq!(agent(runs, "c-revived")["thread_status"], "interrupted");
+        assert_eq!(agent(runs, "c-started")["status"], "stopped");
+        assert_eq!(agent(runs, "c-plan")["status"], "completed");
+        assert!(runs["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["status"] != "running"));
+    }
+
+    /// Ticket #78 shape (2) in records without times: the history's order
+    /// puts the later turn's `interacted` last; it does not make the
+    /// subagent run again, and its own thread is asked.
+    #[test]
+    fn ticket_78_an_untimed_message_after_a_completion_does_not_revive_it() {
+        let (mut c, out) = resumed(json!([
+            { "id": "t1", "status": "completed", "items": [
+                activity("started", "c-plan", 0),
+                activity("completed", "c-plan", 0),
+            ] },
+            { "id": "t2", "status": "completed", "items": [activity("interacted", "c-plan", 0)] },
+        ]));
+        let runs = out
+            .events
+            .iter()
+            .find(|e| e["type"] == "agent_runs")
+            .unwrap();
+        assert_eq!(agent(runs, "c-plan")["status"], "completed");
+        let reads = state_reads(&out.frames);
+        assert_eq!(reads.len(), 1);
+        // A thread Codex cannot list: nothing changes, it is not asked again.
+        let refused = frame(
+            &mut c,
+            json!({ "id": reads[0].0, "error": { "code": -32601, "message": "list_turns is not supported yet" } }),
+        );
+        assert!(refused.events.is_empty());
+        let reopened = c
+            .encode(&json!({ "op": "subagent_transcript", "agent_id": "c-plan" }))
+            .unwrap();
+        assert!(reopened.frames.is_empty());
+    }
+
+    /// Ticket #78 in a live engine: a message to a subagent that ended does
+    /// not show it running; a subagent still shown running when the parent
+    /// turn ends is settled by its own thread, unless that thread's turn
+    /// changed since the read was sent.
+    #[test]
+    fn ticket_78_the_parent_turn_end_settles_subagents_by_their_threads() {
+        let mut c = opened();
+        busy(&mut c);
+        let started = |c: &mut Codex, kind: &str, agent: &str| {
+            frame(
+                c,
+                json!({ "method": "item/started", "params": { "threadId": "th-1", "turnId": "turn-1", "item": activity(kind, agent, 0) } }),
+            )
+        };
+        started(&mut c, "started", "kid-a");
+        started(&mut c, "started", "kid-b");
+        started(&mut c, "started", "kid-c");
+        started(&mut c, "started", "kid-d");
+        // kid-a's own turn ends; then the parent sends it a message that
+        // only queues (no turn of its thread starts).
+        frame(
+            &mut c,
+            json!({ "method": "turn/completed", "params": { "threadId": "kid-a", "turn": { "id": "a1", "status": "completed" } } }),
+        );
+        let talked = started(&mut c, "interacted", "kid-a").events;
+        let runs = talked.iter().find(|e| e["type"] == "agent_runs").unwrap();
+        assert_eq!(agent(runs, "kid-a")["status"], "completed");
+        // The parent turn ends: kid-b, kid-c and kid-d show running, their
+        // threads are asked; kid-a is not.
+        let ended = frame(
+            &mut c,
+            json!({ "method": "turn/completed", "params": { "threadId": "th-1", "turn": { "id": "turn-1", "status": "completed" } } }),
+        );
+        let reads = state_reads(&ended.frames);
+        let asked: Vec<&str> = reads.iter().map(|(_, a)| a.as_str()).collect();
+        assert_eq!(asked, ["kid-b", "kid-c", "kid-d"]);
+        // Asked again before the answer: not sent twice.
+        frame(
+            &mut c,
+            json!({ "method": "turn/started", "params": { "threadId": "th-1", "turn": { "id": "turn-2" } } }),
+        );
+        let again = frame(
+            &mut c,
+            json!({ "method": "turn/completed", "params": { "threadId": "th-1", "turn": { "id": "turn-2", "status": "completed" } } }),
+        );
+        assert!(state_reads(&again.frames).is_empty());
+        // kid-b runs on (a background subagent): still running.
+        let b = frame(&mut c, json!({ "id": reads[0].0, "result": { "data": [{ "id": "b1", "status": "inProgress", "items": [] }] } })).events;
+        let runs = b.iter().find(|e| e["type"] == "agent_runs").unwrap();
+        assert_eq!(agent(runs, "kid-b")["status"], "running");
+        assert_eq!(agent(runs, "kid-b")["thread_status"], "inProgress");
+        assert_eq!(types(&b), ["agent_runs"]);
+        // kid-d's turn was interrupted (no record of that on this thread):
+        // it stops, its strip entry too.
+        let d = frame(&mut c, json!({ "id": reads[2].0, "result": { "data": [{ "id": "d1", "status": "interrupted", "items": [] }] } })).events;
+        assert_eq!(types(&d), ["subagent_lifecycle", "agent_runs"]);
+        assert_eq!(d[0]["path"], "kid-d");
+        assert_eq!(d[0]["status"], "stopped");
+        assert_eq!(agent(&d[1], "kid-d")["thread_status"], "interrupted");
+        // kid-c's turn started after the read went out: that answer is
+        // older than what is known here, and changes nothing.
+        frame(
+            &mut c,
+            json!({ "method": "turn/started", "params": { "threadId": "kid-c", "turn": { "id": "c2" } } }),
+        );
+        let stale = frame(
+            &mut c,
+            json!({ "id": reads[1].0, "result": { "data": [{ "id": "c1", "status": "interrupted", "items": [] }] } }),
+        );
+        assert!(stale.events.is_empty());
+        assert_eq!(c.agents[2]["status"], "running");
+        // A transcript page with more pages after it does not say the
+        // thread's latest state either.
+        let ask = sent(
+            &c.encode(&json!({ "op": "subagent_transcript", "agent_id": "kid-c" }))
+                .unwrap()
+                .frames,
+        );
+        let page = frame(&mut c, json!({ "id": ask[0]["id"], "result": { "data": [{ "id": "c1", "status": "interrupted", "items": [] }], "nextCursor": "more" } })).events;
+        assert_eq!(types(&page), ["subagent_transcript"]);
+        // Its thread's own end settles it.
+        let done = frame(&mut c, json!({ "method": "turn/completed", "params": { "threadId": "kid-c", "turn": { "id": "c2", "status": "interrupted" } } })).events;
+        let runs = done.iter().find(|e| e["type"] == "agent_runs").unwrap();
+        assert_eq!(agent(runs, "kid-c")["status"], "stopped");
+        assert_eq!(agent(runs, "kid-c")["thread_status"], "interrupted");
     }
 
     /// Ticket #71: a helper conversation is named before Codex opened its
