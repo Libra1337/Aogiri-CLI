@@ -1774,11 +1774,11 @@ fn read_reasoning_effort(
         .find(|entry| entry.name == model)
         .map(|entry| entry.reasoning_efforts.as_slice())
         .unwrap_or(&[]);
-    if supported.iter().any(|entry| entry == &effort) {
-        effort
-    } else {
-        default_effort(supported).unwrap_or("medium").to_string()
-    }
+    // A saved effort the model lacks runs at its nearest tier ("max" on a
+    // model that stops at "high": "high"), not back at "medium".
+    nearest_effort(&effort, supported)
+        .or_else(|| default_effort(supported).map(str::to_string))
+        .unwrap_or_else(|| "medium".to_string())
 }
 
 /// True when config.json lists `model` as engines up to 0.7.0 wrote every
@@ -2263,10 +2263,10 @@ pub(crate) fn is_effort_name(value: &str) -> bool {
 
 /// The effort a request for `requested` runs at on a model offering
 /// `offered`: `requested` when offered, else the next higher tier, else the
-/// highest. "default" (the provider's own setting) on a model without it, or
-/// a tier on a model that lists no tiers, gets the model's start effort
-/// (`default_effort`). None when `requested` is no effort name at all, or
-/// `offered` is empty.
+/// highest other than "none". "default" (the provider's own setting) on a
+/// model without it, a tier on a model that lists no tiers, or a model whose
+/// only tier is "none", gets the model's start effort (`default_effort`).
+/// None when `requested` is no effort name at all, or `offered` is empty.
 pub(crate) fn nearest_effort(requested: &str, offered: &[String]) -> Option<String> {
     if offered.iter().any(|effort| effort == requested) {
         return Some(requested.to_string());
@@ -2279,10 +2279,16 @@ pub(crate) fn nearest_effort(requested: &str, offered: &[String]) -> Option<Stri
                 .iter()
                 .filter_map(|effort| Some((rank(effort)?, effort)))
         };
+        // Rounding down never lands on "none": thinking stays on, at the
+        // model's highest tier (or its start effort when "none" is all it has).
         let pick = ranked()
             .filter(|(at, _)| *at > wanted)
             .min_by_key(|(at, _)| *at)
-            .or_else(|| ranked().max_by_key(|(at, _)| *at));
+            .or_else(|| {
+                ranked()
+                    .filter(|(_, effort)| effort.as_str() != "none")
+                    .max_by_key(|(at, _)| *at)
+            });
         if let Some((_, effort)) = pick {
             return Some(effort.clone());
         }
@@ -3351,6 +3357,16 @@ mod tests {
         );
         // A model that cannot think runs without.
         assert_eq!(nearest("medium", &["none"]).as_deref(), Some("none"));
+        // Rounding down keeps thinking on: the highest tier other than "none",
+        // else the start effort.
+        assert_eq!(
+            nearest("max", &["none", "low", "high"]).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            nearest("high", &["default", "none"]).as_deref(),
+            Some("default")
+        );
         // No tiers, or "default" asked of a model without it: its start effort.
         assert_eq!(nearest("high", &["default"]).as_deref(), Some("default"));
         assert_eq!(

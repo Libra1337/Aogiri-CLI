@@ -298,6 +298,9 @@ pub struct AgentCore {
     action_tx: Sender<ActionOutcome>,
     action_rx: Receiver<ActionOutcome>,
     update_receiver: Option<Receiver<UpdateNotice>>,
+    /// The efforts the gateway's model catalog states for the LynShen models
+    /// (by lowercased name), read once at startup.
+    gateway_efforts_receiver: Option<Receiver<HashMap<String, Vec<String>>>>,
     login_receiver: Option<Receiver<Result<OAuthLoginResult, String>>>,
     omp_login_receiver: Option<Receiver<OmpLoginEvent>>,
     /// Feeds pasted redirect URLs/codes into a manual-callback login worker.
@@ -485,6 +488,7 @@ impl AgentCore {
             resume_summary_receiver: None,
             goal_tool_receiver: None,
             update_receiver: None,
+            gateway_efforts_receiver: None,
             login_receiver: None,
             omp_login_receiver: None,
             omp_login_code_tx: None,
@@ -677,6 +681,82 @@ impl AgentCore {
         }
     }
 
+    /// Reads the efforts the gateway's model catalog states for the LynShen
+    /// models, in the background, when this engine runs on the LynShen
+    /// gateway with a login of its own. A login stores the models' efforts
+    /// once; the catalog names each model's ladder ("max" where the model
+    /// takes it) and can learn more since.
+    pub fn start_gateway_efforts_refresh(&mut self) {
+        if self.gateway_efforts_receiver.is_some()
+            || self.config.provider != "lynshen"
+            || self.config.lynshen_models.is_empty()
+            || self.auth.lynshen_tokens().is_none()
+        {
+            return;
+        }
+        let api_url = self.config.lynshen_api_url.clone();
+        let encrypt_secrets = self.config.encrypt_secrets;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let efforts = oauth::ensure_session(&api_url, encrypt_secrets)
+                .and_then(|auth| {
+                    auth.lynshen_tokens()
+                        .map(|tokens| tokens.access_token.clone())
+                        .ok_or_else(|| "not logged in to LynShen".to_string())
+                })
+                .and_then(|token| oauth::fetch_catalog_efforts(&api_url, &token));
+            match efforts {
+                Ok(efforts) => {
+                    let _ = tx.send(efforts);
+                }
+                Err(error) => {
+                    crate::log_warn!("oauth", "reading the model catalog failed", error = error)
+                }
+            }
+        });
+        self.gateway_efforts_receiver = Some(rx);
+    }
+
+    /// Takes the catalog's efforts for the LynShen models (`efforts`, by
+    /// lowercased name) in memory and in config.json: only those lists, and
+    /// the saved effort when the model in use no longer offers it (its
+    /// nearest tier), so nothing another writer saved since is lost.
+    fn apply_gateway_efforts(&mut self, efforts: &HashMap<String, Vec<String>>) -> Vec<AgentEvent> {
+        if self.config.provider != "lynshen" || efforts.is_empty() {
+            return Vec::new();
+        }
+        let updated = take_catalog_efforts(
+            self.config
+                .lynshen_models
+                .iter_mut()
+                .chain(self.config.models.iter_mut()),
+            efforts,
+        );
+        if updated.is_empty() {
+            return Vec::new();
+        }
+        let offered = self.config.current_model_config().reasoning_efforts;
+        let effort = (!offered.is_empty()
+            && !offered.iter().any(|e| e == &self.config.reasoning_effort))
+        .then(|| crate::config::nearest_effort(&self.config.reasoning_effort, &offered))
+        .flatten();
+        if let Some(effort) = &effort {
+            self.config.reasoning_effort = effort.clone();
+        }
+        let saved = crate::config::edit_config_json(self.config.path(), |config| {
+            write_catalog_efforts(config, &updated, effort.as_deref());
+            Ok(())
+        });
+        if let Err(error) = saved {
+            crate::log_warn!(
+                "config",
+                "saving the catalog's efforts failed",
+                error = error
+            );
+        }
+        vec![self.model_status_event()]
+    }
+
     /// Token count at which auto-compaction triggers — the honest denominator for
     /// the UI context gauge. The turn compares `request_tokens` with it.
     fn effective_context_limit(&self) -> u64 {
@@ -694,6 +774,11 @@ impl AgentCore {
         let efforts = self.config.current_model_config().reasoning_efforts;
         if efforts.is_empty() || efforts.iter().any(|e| e == &self.config.reasoning_effort) {
             return self.config.reasoning_effort.clone();
+        }
+        if let Some(nearest) =
+            crate::config::nearest_effort(&self.config.reasoning_effort, &efforts)
+        {
+            return nearest;
         }
         [crate::config::DEFAULT_EFFORT, "high"]
             .into_iter()
@@ -2199,6 +2284,13 @@ impl AgentCore {
             match rx.try_recv() {
                 Ok(notice) => events.push(AgentEvent::Info(notice.message())),
                 Err(mpsc::TryRecvError::Empty) => self.update_receiver = Some(rx),
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+        if let Some(rx) = self.gateway_efforts_receiver.take() {
+            match rx.try_recv() {
+                Ok(efforts) => events.extend(self.apply_gateway_efforts(&efforts)),
+                Err(mpsc::TryRecvError::Empty) => self.gateway_efforts_receiver = Some(rx),
                 Err(mpsc::TryRecvError::Disconnected) => {}
             }
         }
@@ -5711,7 +5803,10 @@ impl AgentCore {
                     .iter()
                     .any(|effort| effort == &self.config.reasoning_effort)
                 {
-                    self.config.reasoning_effort = self.default_reasoning_effort_for_model(&model);
+                    // The saved effort runs at the new model's nearest tier.
+                    self.config.reasoning_effort =
+                        crate::config::nearest_effort(&self.config.reasoning_effort, &supported)
+                            .unwrap_or_else(|| self.default_reasoning_effort_for_model(&model));
                 }
             }
         }
@@ -6539,6 +6634,55 @@ fn default_lynshen_models(available: &[ModelConfig]) -> Vec<ModelConfig> {
 /// only while it is the active model.
 fn in_model_picker(model: &ModelConfig, active: &str) -> bool {
     !model.hidden || model.name == active
+}
+
+/// Gives each model the efforts the gateway's catalog states for it
+/// (`efforts`, by lowercased name); a model that does not reason keeps none.
+/// Returns the lists that changed, by model name.
+fn take_catalog_efforts<'a>(
+    models: impl Iterator<Item = &'a mut ModelConfig>,
+    efforts: &HashMap<String, Vec<String>>,
+) -> HashMap<String, Vec<String>> {
+    let mut updated = HashMap::new();
+    for model in models {
+        let Some(levels) = efforts.get(&model.name.to_ascii_lowercase()) else {
+            continue;
+        };
+        if model.reasoning == Some(false) || model.reasoning_efforts == *levels {
+            continue;
+        }
+        model.reasoning_efforts = levels.clone();
+        updated.insert(model.name.clone(), levels.clone());
+    }
+    updated
+}
+
+/// `take_catalog_efforts`' lists (and the saved effort, when it changed) in
+/// a parsed config.json: only those keys, so nothing else on disk moves.
+fn write_catalog_efforts(
+    config: &mut serde_json::Map<String, Value>,
+    updated: &HashMap<String, Vec<String>>,
+    effort: Option<&str>,
+) {
+    for key in ["models", "lynshen_models"] {
+        let Some(Value::Array(entries)) = config.get_mut(key) else {
+            continue;
+        };
+        for entry in entries {
+            let levels = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .and_then(|name| updated.get(name))
+                .filter(|_| entry.get("reasoning") != Some(&Value::Bool(false)))
+                .cloned();
+            if let Some(levels) = levels {
+                entry["reasoning_efforts"] = json!(levels);
+            }
+        }
+    }
+    if let Some(effort) = effort {
+        config.insert("reasoning_effort".to_string(), json!(effort));
+    }
 }
 
 /// A gateway model as the engine runs it. Values the gateway leaves unset stay
@@ -7884,6 +8028,66 @@ mod model_config_tests {
         assert_eq!(config.reasoning_efforts, vec!["low", "high"]);
         assert_eq!(config.max_output_tokens, 64_000);
         assert_eq!(config.context_window, 1_000_000);
+    }
+
+    #[test]
+    fn the_catalogs_efforts_replace_what_a_login_stored() {
+        let efforts: HashMap<String, Vec<String>> = [
+            (
+                "gpt-6.1-sol",
+                vec!["low", "medium", "high", "xhigh", "max", "ultra"],
+            ),
+            ("kimi-k3", vec!["low", "high", "max"]),
+        ]
+        .into_iter()
+        .map(|(name, levels)| {
+            (
+                name.to_string(),
+                levels.into_iter().map(str::to_string).collect(),
+            )
+        })
+        .collect();
+        // What a login stored: "none" for a model /v1/models named no efforts for.
+        let mut models = [
+            lynshen_model_config(&oauth_model("GPT-6.1-Sol")),
+            lynshen_model_config(&oauth_model("kimi-k3")),
+            lynshen_model_config(&oauth_model("minimax-m3")),
+        ];
+        models[1].reasoning_efforts = vec!["low".into(), "high".into(), "max".into()];
+        let updated = take_catalog_efforts(models.iter_mut(), &efforts);
+        // Matched regardless of case; an unchanged list and an unknown model stay.
+        assert_eq!(updated.keys().collect::<Vec<_>>(), vec!["GPT-6.1-Sol"]);
+        assert_eq!(
+            models[0].reasoning_efforts,
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(models[2].reasoning_efforts, vec!["none"]);
+        // A model that does not reason keeps none.
+        let mut plain = lynshen_model_config(&oauth_model("kimi-k3"));
+        plain.reasoning = Some(false);
+        assert!(take_catalog_efforts(std::iter::once(&mut plain), &efforts).is_empty());
+
+        // On disk: only those lists and the saved effort move.
+        let mut config = json!({
+            "provider": "lynshen",
+            "reasoning_effort": "medium",
+            "lynshen_models_seen": ["GPT-6.1-Sol"],
+            "models": [
+                { "name": "GPT-6.1-Sol", "reasoning_efforts": ["none"], "context_window": 1050000 },
+                { "name": "minimax-m3", "reasoning_efforts": ["none"] },
+                { "name": "GPT-6.1-Sol-off", "reasoning": false, "reasoning_efforts": ["none"] }
+            ],
+            "lynshen_models": [{ "name": "GPT-6.1-Sol", "reasoning_efforts": ["none"] }]
+        });
+        write_catalog_efforts(config.as_object_mut().unwrap(), &updated, Some("high"));
+        let ladder = json!(["low", "medium", "high", "xhigh", "max", "ultra"]);
+        assert_eq!(config["models"][0]["reasoning_efforts"], ladder);
+        assert_eq!(config["models"][0]["context_window"], json!(1050000));
+        assert_eq!(config["models"][1]["reasoning_efforts"], json!(["none"]));
+        assert_eq!(config["models"][2]["reasoning_efforts"], json!(["none"]));
+        assert_eq!(config["lynshen_models"][0]["reasoning_efforts"], ladder);
+        assert_eq!(config["reasoning_effort"], json!("high"));
+        assert_eq!(config["lynshen_models_seen"], json!(["GPT-6.1-Sol"]));
     }
 
     #[test]

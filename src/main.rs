@@ -289,6 +289,7 @@ fn main() -> io::Result<()> {
         apply_style_flag(&mut core, style);
     }
     core.start_update_check();
+    core.start_gateway_efforts_refresh();
     let app = TuiApp::new(Runtime(core));
     let result = match args.iter().position(|arg| arg == "--resume") {
         // The resumed conversation takes the style too.
@@ -732,6 +733,7 @@ fn run_serve(
         apply_style_flag(&mut core, style);
     }
     core.start_update_check();
+    core.start_gateway_efforts_refresh();
     let mut stdout = io::stdout();
 
     write_json_value(&mut stdout, protocol::hello_json(env!("CARGO_PKG_VERSION")))?;
