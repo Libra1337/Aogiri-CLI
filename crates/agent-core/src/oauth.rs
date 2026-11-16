@@ -13,6 +13,7 @@ use llm_provider_kit::oauth::{
 };
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     io::{BufRead, BufReader},
     net::TcpListener,
     process::Command,
@@ -142,7 +143,11 @@ pub fn login(web_url: &str, api_url: &str) -> Result<OAuthLoginResult, String> {
     write_callback_response(&mut stream, CALLBACK_LOGIN_COMPLETE)?;
 
     let tokens = exchange_code(&api_url, code, &redirect_uri, &verifier, &device_name())?;
-    let models = fetch_models(&api_url, &tokens.access_token).unwrap_or_default();
+    let mut models = fetch_models(&api_url, &tokens.access_token).unwrap_or_default();
+    match fetch_catalog_efforts(&api_url, &tokens.access_token) {
+        Ok(efforts) => fill_catalog_efforts(&mut models, &efforts),
+        Err(error) => crate::log_warn!("oauth", "reading the model catalog failed", error = error),
+    }
     Ok(OAuthLoginResult {
         web_url,
         api_url,
@@ -490,6 +495,85 @@ fn parse_model(item: &Value) -> Option<OAuthModel> {
     })
 }
 
+/// The reasoning efforts the gateway's model catalog states for each model
+/// (`GET /api/desktop/models/catalog`, `capabilities.effort_levels`: the
+/// model family's ladder, "max" where the model takes it), under every name
+/// of the model (id, request model, aliases) lowercased. /v1/models names no
+/// efforts. An older gateway without the catalog answers 404: no efforts.
+pub fn fetch_catalog_efforts(
+    api_url: &str,
+    access_token: &str,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    let url = format!(
+        "{}/api/desktop/models/catalog",
+        api_url.trim().trim_end_matches('/')
+    );
+    // ureq::Error is large; it is ureq's own type, passed through as is.
+    #[allow(clippy::result_large_err)]
+    let response = send_with_retry(|| {
+        ureq::get(&url)
+            .timeout(REQUEST_TIMEOUT)
+            .set("Authorization", &format!("Bearer {access_token}"))
+            .call()
+    });
+    if let Err(ureq::Error::Status(404, _)) = response {
+        return Ok(HashMap::new());
+    }
+    json_response(response).map(|body| parse_catalog_efforts(&body))
+}
+
+fn parse_catalog_efforts(body: &Value) -> HashMap<String, Vec<String>> {
+    let mut efforts = HashMap::new();
+    for model in body
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let levels: Vec<String> = model
+            .pointer("/capabilities/effort_levels")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            // The gateway's spelling of OpenAI's "minimal".
+            .map(|level| if level == "minimum" { "minimal" } else { level })
+            .map(str::to_string)
+            .collect();
+        if crate::config::is_thinking_disabled(&levels) {
+            continue;
+        }
+        let names = ["id", "request_model"]
+            .iter()
+            .filter_map(|key| model.get(*key).and_then(Value::as_str))
+            .chain(
+                model
+                    .get("aliases")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            );
+        for name in names {
+            efforts
+                .entry(name.trim().to_ascii_lowercase())
+                .or_insert_with(|| levels.clone());
+        }
+    }
+    efforts
+}
+
+/// Gives each model the efforts the catalog states for it (see
+/// `fetch_catalog_efforts`); a model the catalog says nothing about keeps
+/// what /v1/models sent.
+pub fn fill_catalog_efforts(models: &mut [OAuthModel], efforts: &HashMap<String, Vec<String>>) {
+    for model in models {
+        if let Some(levels) = efforts.get(&model.id.to_ascii_lowercase()) {
+            model.reasoning_efforts = Some(levels.clone());
+        }
+    }
+}
+
 /// A positive count under the first of `keys` present; 0 reads as unset.
 fn read_u64_field(value: &Value, keys: &[&str]) -> Option<u64> {
     keys.iter()
@@ -564,6 +648,79 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    #[test]
+    fn the_catalog_names_each_models_efforts_under_all_its_names() {
+        let body = json!({
+            "schema_version": 1,
+            "models": [
+                {
+                    "id": "deepseek-v4.1-flash",
+                    "request_model": "DeepSeek-V4.1-Flash",
+                    "aliases": ["deepseek-v4.1-flash-0910"],
+                    "capabilities": { "effort_levels": ["low", "high", "max"] }
+                },
+                {
+                    "id": "gpt-5.4-nano",
+                    "request_model": "gpt-5.4-nano",
+                    "aliases": [],
+                    "capabilities": { "effort_levels": ["minimum", "low"] }
+                },
+                { "id": "plain", "request_model": "plain", "capabilities": { "effort_levels": [] } },
+                { "id": "off", "request_model": "off", "capabilities": { "effort_levels": ["none"] } }
+            ]
+        });
+        let efforts = parse_catalog_efforts(&body);
+        let deepseek = Some(&vec![
+            "low".to_string(),
+            "high".to_string(),
+            "max".to_string(),
+        ]);
+        assert_eq!(efforts.get("deepseek-v4.1-flash"), deepseek);
+        assert_eq!(efforts.get("deepseek-v4.1-flash-0910"), deepseek);
+        // The gateway's "minimum" is OpenAI's "minimal".
+        assert_eq!(
+            efforts.get("gpt-5.4-nano"),
+            Some(&vec!["minimal".to_string(), "low".to_string()])
+        );
+        // A list that offers no thinking says nothing.
+        assert!(!efforts.contains_key("plain") && !efforts.contains_key("off"));
+
+        let mut models = vec![
+            OAuthModel {
+                id: "DeepSeek-V4.1-Flash".to_string(),
+                context_window: None,
+                max_context_window: None,
+                max_output_tokens: None,
+                reasoning_efforts: None,
+                display_name: None,
+                group_windows: Default::default(),
+                hidden: false,
+            },
+            OAuthModel {
+                id: "plain".to_string(),
+                context_window: None,
+                max_context_window: None,
+                max_output_tokens: None,
+                reasoning_efforts: Some(vec!["low".to_string()]),
+                display_name: None,
+                group_windows: Default::default(),
+                hidden: false,
+            },
+        ];
+        fill_catalog_efforts(&mut models, &efforts);
+        assert_eq!(models[0].reasoning_efforts.as_ref(), deepseek);
+        assert_eq!(models[1].reasoning_efforts, Some(vec!["low".to_string()]));
+    }
+
+    #[test]
+    fn a_gateway_without_the_catalog_names_no_efforts() {
+        assert_eq!(
+            fetch_catalog_efforts(&answering(404), "at"),
+            Ok(HashMap::new())
+        );
+        assert!(fetch_catalog_efforts(&answering(500), "at").is_err());
     }
 
     #[test]
