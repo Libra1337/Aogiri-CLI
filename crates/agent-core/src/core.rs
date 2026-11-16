@@ -8048,7 +8048,7 @@ mod model_config_tests {
         })
         .collect();
         // What a login stored: "none" for a model /v1/models named no efforts for.
-        let mut models = vec![
+        let mut models = [
             lynshen_model_config(&oauth_model("GPT-6.1-Sol")),
             lynshen_model_config(&oauth_model("kimi-k3")),
             lynshen_model_config(&oauth_model("minimax-m3")),
