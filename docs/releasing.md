@@ -87,20 +87,40 @@ removes direct publishing with granular tokens ([About access tokens](https://do
   when `repository.url` doesn't match the repository the workflow ran in.
 - `NODE_AUTH_TOKEN` still comes from `NPM_TOKEN`, as the fallback described above.
 
-### On npmjs.com (the owner, once, within 2 days before a release)
+### On npmjs.com (done 2026-11-18)
 
-Add a trusted publisher to each of the five packages (package → Settings → Trusted publishing → GitHub Actions):
+Each of the five packages has a trusted publisher, added on 2026-11-18 at about 15:30 UTC:
 
 | Package | Workflow filename |
 | --- | --- |
 | `@lynshen/cli-linux-x64`, `@lynshen/cli-win32-x64` | `release.yml` |
 | `@lynshen/cli`, `@lynshen/cli-darwin-arm64`, `@lynshen/cli-darwin-x64` | `release-macos.yml` |
 
-- Organization or user `LynShen-Team`, repository `Aogiri-CLI`, environment empty. The fields are case-sensitive and
-  npm does not check them when saved. A connection can't be edited; to fix one, delete it and add it again.
-- Under allowed actions, also allow `npm publish`. A trusted publisher created after 2026-09-03 allows only
-  `npm stage publish` by default, which would make every release wait for a 2FA approval on npmjs.com.
-- A new trusted publisher expires unless it publishes successfully within 2 days, so add them just before a release.
+All five use repository `LynShen-Team/Aogiri-CLI` and no environment. They allow `npm publish` as well as
+`npm stage publish`; a trusted publisher created after 2026-09-03 allows only `npm stage publish` unless told
+otherwise, which would make every release wait for a 2FA approval on npmjs.com.
+
+A new trusted publisher expires unless it publishes successfully within 2 days, so these must publish by about
+15:30 UTC on 2026-11-20. Add or replace one only just before a release.
+
+#### Adding or replacing one
+
+- The npm account must have two-factor authentication turned on (Account → Two-Factor Authentication). Without it
+  `npm trust` fails with `403 Forbidden`; the registry's own message, `Please enable 2fa for your account`, is not
+  printed. A token with "Bypass 2FA", like `NPM_TOKEN`, can't change trusted publishers either.
+- On the website: package → Settings → Trusted publishing → GitHub Actions. The fields are case-sensitive and npm
+  does not check them when saved.
+- From a terminal (npm 11.15.0 or later), after `npm login`:
+
+  ```sh
+  npm trust github @lynshen/cli --file release-macos.yml --repo LynShen-Team/Aogiri-CLI --allow-publish --yes
+  ```
+
+  The first such command asks for 2FA, and npm's page can skip 2FA for the next 5 minutes. `npm trust list <package>`
+  shows what a package has. Run these in an interactive terminal, where npm can ask for 2FA. Run `npm logout` when
+  done.
+- A trusted publisher can't be edited. To replace one, remove it (`npm trust revoke --id <id> <package>`, the id
+  from `npm trust list`, or delete it on the website) and add it again.
 
 ### After that release
 
