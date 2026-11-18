@@ -3,6 +3,11 @@
   "version": "0.8.7",
   "description": "LynShen native CLI",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LynShen-Team/Aogiri-CLI.git",
+    "directory": "npm/cli"
+  },
   "publishConfig": {
     "access": "public"
   },
