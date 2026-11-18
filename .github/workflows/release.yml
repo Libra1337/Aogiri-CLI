@@ -77,6 +77,11 @@ jobs:
       contents: write
     env:
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Whether to publish to npm. Don't test NODE_AUTH_TOKEN for that:
+      # actions/setup-node (with registry-url) sets it to the placeholder
+      # XXXXX-XXXXX-XXXXX-XXXXX when it is empty, so the publish ran anyway and
+      # failed with npm E404. A step's `if:` can't read secrets, hence this.
+      HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -152,9 +157,13 @@ jobs:
             dist/npm/*.tgz
 
       - name: Publish npm packages
-        if: ${{ env.NODE_AUTH_TOKEN != '' }}
+        if: ${{ env.HAS_NPM_TOKEN == 'true' }}
         shell: bash
         run: |
           version="${{ steps.release_meta.outputs.version }}"
           npm view "@lynshen/cli-linux-x64@${version}" version >/dev/null 2>&1 || npm publish ./npm/cli-linux-x64 --access public
           npm view "@lynshen/cli-win32-x64@${version}" version >/dev/null 2>&1 || npm publish ./npm/cli-win32-x64 --access public
+
+      - name: Note that npm publishing was skipped
+        if: ${{ env.HAS_NPM_TOKEN != 'true' }}
+        run: echo "::warning::NPM_TOKEN is not set, so the Linux and Windows npm packages were not published"

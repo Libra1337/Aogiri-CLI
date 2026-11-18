@@ -41,7 +41,7 @@ lynshen --version
 
 - **已经装了 Aogiri 桌面端：** 桌面端自带一份 CLI（`~/.lynshen/bin`），随应用更新。在「设置 → 编码智能体」里点「在终端中使用 lynshen 命令」即可。
 - **Linux：** 先安装 `bubblewrap`（例如 `sudo apt install bubblewrap`）。智能体的 shell 命令在它的沙箱里运行，没有它命令会失败；LynShen 不会退回到无沙箱运行。
-- **npm：** 发布流程已经会打包 `@lynshen/cli`，但 npm 上还没有这个包。上架前请用上面的二进制。
+- **npm：** `npm i -g @lynshen/cli`（需要 Node.js 18 以上），npm 会按平台装上表里对应的二进制。这样装的不在后台自动替换；`lynshen update` 会替你运行 `npm i -g @lynshen/cli@latest`。
 
 **更新。** `lynshen`（TUI）和 `lynshen serve` 启动时检查软件库。有新版本时，release 构建会在后台下载并替换自己，下次启动生效；debug 构建只提示。版本清单有 Ed25519 签名，文件按 sha256 校验后才替换。手动更新用 `lynshen update`。在 `~/.lynshen/config.json` 里设 `"auto_update": false` 后只提示，不自动安装。桌面端那份 CLI 随桌面端更新。
 
