@@ -21,28 +21,33 @@ publishes the two macOS packages and then `@lynshen/cli`.
 
 1. The npm organization `lynshen` owns the scope `@lynshen`. It was created on 2026-11-18, and all five packages have
    been on npm since 0.8.7.
-2. Store an npm granular access token as the `NPM_TOKEN` Actions secret of `LynShen-Team/Aogiri-CLI`. The first
-   publish showed what it needs:
-   - **Packages and scopes:** Read and write on the scope `@lynshen`. Giving the token access to the organization
-     alone does not let it publish.
-   - **Bypass 2FA** ticked. Without it npm asks for a one-time password, which CI can't give, and the publish fails
-     with E403.
-   - **Expiry:** the token expires on the date chosen when it was created; npm's access tokens page shows it. Note
-     that date, and before it passes create a new token and replace the secret. An expired token fails the npm
-     steps; the GitHub Release is still created.
-   - npm will stop direct publishing with granular tokens in January 2027 (see "Next: trusted publishing" below).
+2. The workflows publish to npm through trusted publishing (OIDC), which each package must trust on npmjs.com. See
+   "Trusted publishing" below.
 3. Confirm the repository has permission to create releases with `GITHUB_TOKEN`.
 
-Without `NPM_TOKEN` both workflows skip the npm steps and leave a warning on the run. They decide this from the
-secret itself (`HAS_NPM_TOKEN`), not from `NODE_AUTH_TOKEN`: `actions/setup-node` fills an empty `NODE_AUTH_TOKEN`
-with the placeholder `XXXXX-XXXXX-XXXXX-XXXXX`, so testing that variable never skipped anything.
+The npm steps run only in `LynShen-Team/Aogiri-CLI`; npm trusts no other repository.
+
+### The `NPM_TOKEN` fallback
+
+Until a release has gone out through OIDC, the `NPM_TOKEN` Actions secret stays as a fallback: npm tries OIDC first
+and uses the token only when that fails. The first publish (0.8.7) showed what the token needs:
+
+- **Packages and scopes:** Read and write on the scope `@lynshen`. Giving the token access to the organization alone
+  does not let it publish.
+- **Bypass 2FA** ticked. Without it npm asks for a one-time password, which CI can't give, and the publish fails with
+  E403.
+- **Expiry:** the token expires on the date chosen when it was created; npm's access tokens page shows it.
+- npm removes direct publishing with granular tokens in January 2027, so after that the fallback stops working.
+
+An expired or missing token only matters when OIDC fails; the npm steps then fail and the GitHub Release is still
+created.
 
 ## Release flow
 
 1. Bump the version in `Cargo.toml`.
 2. Trigger the release workflows with `release_version=X.Y.Z`, or create and push a git tag in the form `vX.Y.Z`.
 3. "Release CLI" builds the Windows and Linux binaries and "Release CLI (macOS)" the two macOS ones, in parallel.
-   Each packs its npm packages, adds its files to the GitHub Release, and publishes to npm when `NPM_TOKEN` is set.
+   Each packs its npm packages, adds its files to the GitHub Release, and publishes to npm.
 4. The macOS workflow publishes `@lynshen/cli` last, once npm serves all four platform packages of this version.
 
 ### npm needs minutes to serve a new version
@@ -66,41 +71,51 @@ serves; that re-run is how `@lynshen/cli` 0.8.7 went out.
 
 The generated npm tarballs are written to `dist/npm/`.
 
-## Next: trusted publishing (not set up yet)
+## Trusted publishing
 
-npm's trusted publishing lets a workflow publish with a short-lived OIDC token instead of `NPM_TOKEN`. It removes
-the expiring token and the secret that could leak, and it keeps working after January 2027, when npm removes direct
-publishing with granular tokens ([About access tokens](https://docs.npmjs.com/about-access-tokens/)). As of
-2026-11-18 nothing below is done.
+npm's trusted publishing lets a workflow publish with a short-lived OIDC token instead of a stored npm token. It
+removes the expiring token and the secret that could leak, and it keeps working after January 2027, when npm
+removes direct publishing with granular tokens ([About access tokens](https://docs.npmjs.com/about-access-tokens/)).
 
-Workflow changes (one PR, safe to merge before the npm side is set up, because npm tries OIDC first and falls back
-to `NODE_AUTH_TOKEN`):
+### In this repository (done)
 
-- Add `id-token: write` to the `permissions` of the `release` and `release-macos` jobs, next to `contents: write`.
-- Use Node 24 in `actions/setup-node`. Trusted publishing needs npm 11.5.1 or later and Node 22.14.0 or later;
-  Node 20, used now, comes with npm 10.
-- Once `NPM_TOKEN` is gone, `HAS_NPM_TOKEN` is always false, so base the publish guard on something else, for
-  example `github.repository == 'LynShen-Team/Aogiri-CLI'`.
-- Provenance comes with it: the repository and the packages are public, so npm attaches a provenance statement to
-  each version without `--provenance`.
+- The `release` and `release-macos` jobs have `id-token: write` next to `contents: write`.
+- `actions/setup-node` installs Node 24. Trusted publishing needs npm 11.5.1 or later and Node 22.14.0 or later;
+  Node 20 came with npm 10.
+- Each `npm/*/package.json` has `repository` pointing at `https://github.com/LynShen-Team/Aogiri-CLI`. npm adds a
+  provenance statement to every version published through OIDC from a public repository, and rejects the publish
+  when `repository.url` doesn't match the repository the workflow ran in.
+- `NODE_AUTH_TOKEN` still comes from `NPM_TOKEN`, as the fallback described above.
 
-On npmjs.com, the owner adds a trusted publisher to each of the five packages (package → Settings → Trusted
-publishing → GitHub Actions):
+### On npmjs.com (the owner, once, within 2 days before a release)
+
+Add a trusted publisher to each of the five packages (package → Settings → Trusted publishing → GitHub Actions):
 
 | Package | Workflow filename |
 | --- | --- |
 | `@lynshen/cli-linux-x64`, `@lynshen/cli-win32-x64` | `release.yml` |
 | `@lynshen/cli`, `@lynshen/cli-darwin-arm64`, `@lynshen/cli-darwin-x64` | `release-macos.yml` |
 
-- Organization or user `LynShen-Team`, repository `Aogiri-CLI`, environment empty. The fields are case-sensitive
-  and npm does not check them when saved; a mismatch shows up as ENEEDAUTH at publish time.
+- Organization or user `LynShen-Team`, repository `Aogiri-CLI`, environment empty. The fields are case-sensitive and
+  npm does not check them when saved. A connection can't be edited; to fix one, delete it and add it again.
 - Under allowed actions, also allow `npm publish`. A trusted publisher created after 2026-09-03 allows only
   `npm stage publish` by default, which would make every release wait for a 2FA approval on npmjs.com.
-- A new trusted publisher must publish successfully within 2 days or it expires, so add them just before a
-  release.
+- A new trusted publisher expires unless it publishes successfully within 2 days, so add them just before a release.
 
-After the first release that publishes through OIDC: set each package's Settings → Publishing access to "Require
-two-factor authentication and disallow tokens", revoke the npm token, and delete the `NPM_TOKEN` secret.
+### After that release
 
-Without OIDC, the other way past January 2027 is a stage-only token with `npm stage publish`, where the owner
-approves every version with 2FA on npmjs.com.
+Check that each package went out through OIDC, once npm serves the version:
+
+```sh
+for p in cli cli-linux-x64 cli-win32-x64 cli-darwin-arm64 cli-darwin-x64; do
+  echo "@lynshen/$p: $(npm view "@lynshen/$p@X.Y.Z" dist.attestations.provenance.predicateType)"
+done
+```
+
+A version published through OIDC has a provenance statement (`https://slsa.dev/provenance/v1`). An empty line means
+that package fell back to `NPM_TOKEN` (the workflows don't pass `--provenance`, so a token publish has none): fix its
+trusted publisher and check again after the next release.
+
+When all five have one: set each package's Settings → Publishing access to "Require two-factor authentication and
+disallow tokens", revoke the npm token, and delete the `NPM_TOKEN` secret. The workflows need no change for that;
+without the secret, `actions/setup-node` puts a placeholder in `NODE_AUTH_TOKEN`, and OIDC publishing doesn't use it.

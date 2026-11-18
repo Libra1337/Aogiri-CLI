@@ -76,13 +76,15 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # npm trusted publishing: npm publish trades this job's OIDC token for a
+      # short-lived npm token, and adds a provenance statement to the version.
+      id-token: write
     env:
+      # Fallback while trusted publishing is being set up: npm tries OIDC
+      # first and uses this token only when that fails. Delete the secret once
+      # a release has gone out through OIDC (docs/releasing.md). Without it,
+      # setup-node puts a placeholder here, which OIDC publishing ignores.
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      # Whether to publish to npm. Don't test NODE_AUTH_TOKEN for that:
-      # actions/setup-node (with registry-url) sets it to the placeholder
-      # XXXXX-XXXXX-XXXXX-XXXXX when it is empty, so the publish ran anyway and
-      # failed with npm E404. A step's `if:` can't read secrets, hence this.
-      HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -92,7 +94,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Trusted publishing needs npm 11.5.1+ and Node 22.14+; Node 20
+          # comes with npm 10.
+          node-version: 24
           registry-url: https://registry.npmjs.org/
 
       - uses: actions/download-artifact@v4
@@ -153,8 +157,10 @@ jobs:
             lynshen-*-apple-darwin
             dist/npm/*darwin*.tgz
 
+      # npm trusts this workflow file in this repository only, so a fork
+      # couldn't publish anyway.
       - name: Publish macOS npm packages
-        if: ${{ env.HAS_NPM_TOKEN == 'true' }}
+        if: ${{ github.repository == 'LynShen-Team/Aogiri-CLI' }}
         shell: bash
         run: |
           version="${{ steps.release_meta.outputs.version }}"
@@ -170,7 +176,7 @@ jobs:
       # then. For 0.8.7 (2026-11-18, the first publish) the platform packages
       # took 2 to 8 minutes, and the old 5-minute wait timed out. Wait 20.
       - name: Publish root npm package after all platforms
-        if: ${{ env.HAS_NPM_TOKEN == 'true' }}
+        if: ${{ github.repository == 'LynShen-Team/Aogiri-CLI' }}
         shell: bash
         run: |
           version="${{ steps.release_meta.outputs.version }}"
@@ -191,7 +197,3 @@ jobs:
             echo "waiting for npm to serve ${version} of${missing}"
             sleep 20
           done
-
-      - name: Note that npm publishing was skipped
-        if: ${{ env.HAS_NPM_TOKEN != 'true' }}
-        run: echo "::warning::NPM_TOKEN is not set, so the macOS and root npm packages were not published"
