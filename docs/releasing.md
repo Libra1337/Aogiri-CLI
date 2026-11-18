@@ -27,8 +27,9 @@ publishes the two macOS packages and then `@lynshen/cli`.
      alone does not let it publish.
    - **Bypass 2FA** ticked. Without it npm asks for a one-time password, which CI can't give, and the publish fails
      with E403.
-   - **Expiry:** npm write tokens last about 90 days at most. Note the date, and before it passes create a new token
-     and replace the secret. An expired token fails the npm steps; the GitHub Release is still created.
+   - **Expiry:** the token expires on the date chosen when it was created; npm's access tokens page shows it. Note
+     that date, and before it passes create a new token and replace the secret. An expired token fails the npm
+     steps; the GitHub Release is still created.
    - npm will stop direct publishing with granular tokens in January 2027 (see "Next: trusted publishing" below).
 3. Confirm the repository has permission to create releases with `GITHUB_TOKEN`.
 
@@ -68,7 +69,7 @@ The generated npm tarballs are written to `dist/npm/`.
 ## Next: trusted publishing (not set up yet)
 
 npm's trusted publishing lets a workflow publish with a short-lived OIDC token instead of `NPM_TOKEN`. It removes
-the 90-day token and the secret that could leak, and it keeps working after January 2027, when npm removes direct
+the expiring token and the secret that could leak, and it keeps working after January 2027, when npm removes direct
 publishing with granular tokens ([About access tokens](https://docs.npmjs.com/about-access-tokens/)). As of
 2026-11-18 nothing below is done.
 
