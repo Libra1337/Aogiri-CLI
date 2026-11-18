@@ -78,6 +78,11 @@ jobs:
       contents: write
     env:
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Whether to publish to npm. Don't test NODE_AUTH_TOKEN for that:
+      # actions/setup-node (with registry-url) sets it to the placeholder
+      # XXXXX-XXXXX-XXXXX-XXXXX when it is empty, so the publish ran anyway and
+      # failed with npm E404. A step's `if:` can't read secrets, hence this.
+      HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -149,25 +154,44 @@ jobs:
             dist/npm/*darwin*.tgz
 
       - name: Publish macOS npm packages
-        if: ${{ env.NODE_AUTH_TOKEN != '' }}
+        if: ${{ env.HAS_NPM_TOKEN == 'true' }}
         shell: bash
         run: |
           version="${{ steps.release_meta.outputs.version }}"
           npm view "@lynshen/cli-darwin-arm64@${version}" version >/dev/null 2>&1 || npm publish ./npm/cli-darwin-arm64 --access public
           npm view "@lynshen/cli-darwin-x64@${version}" version >/dev/null 2>&1 || npm publish ./npm/cli-darwin-x64 --access public
 
+      # The root package lists the four platform packages as optional
+      # dependencies, so it goes out only once npm serves all of them;
+      # otherwise `npm i -g @lynshen/cli` in that window installs no binary.
+      # npm does not serve a version as soon as `npm publish` returns ("Your
+      # package is being processed and may take a few minutes to become
+      # available"); a new package shows only a 0.0.0-stage placeholder until
+      # then. For 0.8.7 (2026-11-18, the first publish) the platform packages
+      # took 2 to 8 minutes, and the old 5-minute wait timed out. Wait 20.
       - name: Publish root npm package after all platforms
-        if: ${{ env.NODE_AUTH_TOKEN != '' }}
+        if: ${{ env.HAS_NPM_TOKEN == 'true' }}
         shell: bash
         run: |
           version="${{ steps.release_meta.outputs.version }}"
-          for _ in {1..30}; do
-            if npm view "@lynshen/cli-linux-x64@${version}" version >/dev/null 2>&1 && \
-               npm view "@lynshen/cli-win32-x64@${version}" version >/dev/null 2>&1; then
+          deadline=$((SECONDS + 20 * 60))
+          while :; do
+            missing=""
+            for platform in linux-x64 win32-x64 darwin-arm64 darwin-x64; do
+              npm view "@lynshen/cli-${platform}@${version}" version >/dev/null 2>&1 || missing="${missing} @lynshen/cli-${platform}"
+            done
+            if [ -z "${missing}" ]; then
               npm view "@lynshen/cli@${version}" version >/dev/null 2>&1 || npm publish ./npm/cli --access public
               exit 0
             fi
-            sleep 10
+            if [ "${SECONDS}" -ge "${deadline}" ]; then
+              echo "::error::npm still does not serve ${version} of${missing} after 20 minutes"
+              exit 1
+            fi
+            echo "waiting for npm to serve ${version} of${missing}"
+            sleep 20
           done
-          echo "::error::Linux/Windows npm packages for ${version} were not published"
-          exit 1
+
+      - name: Note that npm publishing was skipped
+        if: ${{ env.HAS_NPM_TOKEN != 'true' }}
+        run: echo "::warning::NPM_TOKEN is not set, so the macOS and root npm packages were not published"

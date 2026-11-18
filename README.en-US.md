@@ -41,7 +41,7 @@ The same files are in the LynShen software library: `https://software.lynshen.or
 
 - **You already have the Aogiri desktop app:** it ships its own copy of the CLI (`~/.lynshen/bin`) and updates it with the app. Click "Use the lynshen command in a terminal" under Settings → Coding agents.
 - **Linux:** install `bubblewrap` first (for example `sudo apt install bubblewrap`). The agent's shell commands run in its sandbox and fail without it; LynShen never falls back to running them unsandboxed.
-- **npm:** the release workflow already packs `@lynshen/cli`, but the package is not on npm yet. Use the binaries above until it is.
+- **npm:** `npm i -g @lynshen/cli` (Node.js 18 or later). npm installs the binary from the table above that matches your platform. An npm install does not replace itself in the background; `lynshen update` runs `npm i -g @lynshen/cli@latest` for you.
 
 **Updates.** `lynshen` (the TUI) and `lynshen serve` check the software library at startup. When a newer version exists, a release build downloads it in the background and replaces itself; it runs from the next start. A debug build only shows a notice. The version manifest is signed with Ed25519, and each file is checked against its sha256 before it replaces anything. Run `lynshen update` to update by hand. Set `"auto_update": false` in `~/.lynshen/config.json` to get only the notice. The desktop app's copy updates with the desktop app.
 
