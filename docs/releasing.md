@@ -27,20 +27,17 @@ publishes the two macOS packages and then `@lynshen/cli`.
 
 The npm steps run only in `LynShen-Team/Aogiri-CLI`; npm trusts no other repository.
 
-### The `NPM_TOKEN` fallback
+### No npm token
 
-Until a release has gone out through OIDC, the `NPM_TOKEN` Actions secret stays as a fallback: npm tries OIDC first
-and uses the token only when that fails. The first publish (0.8.7) showed what the token needs:
+Since 0.8.8 (2026-11-18) the workflows publish only through trusted publishing, and every package is set to "Require
+two-factor authentication and disallow tokens". There is no `NPM_TOKEN` secret and no npm token to rotate. If the
+OIDC exchange fails, the npm steps fail and the GitHub Release is still created: fix the package's trusted publisher
+(below), then re-run the failed jobs.
 
-- **Packages and scopes:** Read and write on the scope `@lynshen`. Giving the token access to the organization alone
-  does not let it publish.
-- **Bypass 2FA** ticked. Without it npm asks for a one-time password, which CI can't give, and the publish fails with
-  E403.
-- **Expiry:** the token expires on the date chosen when it was created; npm's access tokens page shows it.
-- npm removes direct publishing with granular tokens in January 2027, so after that the fallback stops working.
-
-An expired or missing token only matters when OIDC fails; the npm steps then fail and the GitHub Release is still
-created.
+0.8.7 was published with a granular token. It needed read and write on the scope `@lynshen` (organization access
+alone does not let a token publish) and "Bypass 2FA" (without it npm asks for a one-time password CI can't give, and
+the publish fails with E403). npm removes direct publishing with granular tokens in January 2027, so don't go back to
+one.
 
 ## Release flow
 
@@ -49,6 +46,8 @@ created.
 3. "Release CLI" builds the Windows and Linux binaries and "Release CLI (macOS)" the two macOS ones, in parallel.
    Each packs its npm packages, adds its files to the GitHub Release, and publishes to npm.
 4. The macOS workflow publishes `@lynshen/cli` last, once npm serves all four platform packages of this version.
+5. Once npm serves the version, check that all five packages carry a provenance statement (see "Checking a
+   release" below).
 
 ### npm needs minutes to serve a new version
 
@@ -85,7 +84,10 @@ removes direct publishing with granular tokens ([About access tokens](https://do
 - Each `npm/*/package.json` has `repository` pointing at `https://github.com/LynShen-Team/Aogiri-CLI`. npm adds a
   provenance statement to every version published through OIDC from a public repository, and rejects the publish
   when `repository.url` doesn't match the repository the workflow ran in.
-- `NODE_AUTH_TOKEN` still comes from `NPM_TOKEN`, as the fallback described above.
+- `actions/setup-node@v6`: from v6.1 it no longer writes `always-auth` into `.npmrc`, which npm 11 warns about.
+  `package-manager-cache: false` keeps release builds from restoring a cache. The token line setup-node writes into
+  `.npmrc` holds a placeholder that OIDC publishing doesn't use.
+- No `NODE_AUTH_TOKEN` and no npm secret.
 
 ### On npmjs.com (done 2026-11-18)
 
@@ -100,14 +102,17 @@ All five use repository `LynShen-Team/Aogiri-CLI` and no environment. They allow
 `npm stage publish`; a trusted publisher created after 2026-09-03 allows only `npm stage publish` unless told
 otherwise, which would make every release wait for a 2FA approval on npmjs.com.
 
-A new trusted publisher expires unless it publishes successfully within 2 days, so these must publish by about
-15:30 UTC on 2026-11-20. Add or replace one only just before a release.
+0.8.8 went out through all five on 2026-11-18, which validated them. A new trusted publisher expires unless it
+publishes successfully within 2 days, so add or replace one only just before a release.
+
+Each package's Publishing access is "Require two-factor authentication and disallow tokens" (set on 2026-11-18 with
+`npm access set mfa=publish <package>`, which asks for 2FA once per package). Trusted publishing is not affected.
 
 #### Adding or replacing one
 
 - The npm account must have two-factor authentication turned on (Account → Two-Factor Authentication). Without it
   `npm trust` fails with `403 Forbidden`; the registry's own message, `Please enable 2fa for your account`, is not
-  printed. A token with "Bypass 2FA", like `NPM_TOKEN`, can't change trusted publishers either.
+  printed. A token with "Bypass 2FA" can't change trusted publishers either.
 - On the website: package → Settings → Trusted publishing → GitHub Actions. The fields are case-sensitive and npm
   does not check them when saved.
 - From a terminal (npm 11.15.0 or later), after `npm login`:
@@ -122,9 +127,9 @@ A new trusted publisher expires unless it publishes successfully within 2 days, 
 - A trusted publisher can't be edited. To replace one, remove it (`npm trust revoke --id <id> <package>`, the id
   from `npm trust list`, or delete it on the website) and add it again.
 
-### After that release
+### Checking a release
 
-Check that each package went out through OIDC, once npm serves the version:
+Once npm serves the version:
 
 ```sh
 for p in cli cli-linux-x64 cli-win32-x64 cli-darwin-arm64 cli-darwin-x64; do
@@ -132,10 +137,7 @@ for p in cli cli-linux-x64 cli-win32-x64 cli-darwin-arm64 cli-darwin-x64; do
 done
 ```
 
-A version published through OIDC has a provenance statement (`https://slsa.dev/provenance/v1`). An empty line means
-that package fell back to `NPM_TOKEN` (the workflows don't pass `--provenance`, so a token publish has none): fix its
-trusted publisher and check again after the next release.
-
-When all five have one: set each package's Settings → Publishing access to "Require two-factor authentication and
-disallow tokens", revoke the npm token, and delete the `NPM_TOKEN` secret. The workflows need no change for that;
-without the secret, `actions/setup-node` puts a placeholder in `NODE_AUTH_TOKEN`, and OIDC publishing doesn't use it.
+Each line should end in `https://slsa.dev/provenance/v1`: npm adds that provenance statement to versions published
+through OIDC. The npm steps in the release logs also say "Signed provenance statement with source and build
+information from GitHub Actions". npm serves a version's metadata a little before its tarball: right after
+0.8.8's `@lynshen/cli` was published, `npm install` got a 404 for the tarball for about a minute.

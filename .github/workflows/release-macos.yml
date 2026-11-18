@@ -79,12 +79,8 @@ jobs:
       # npm trusted publishing: npm publish trades this job's OIDC token for a
       # short-lived npm token, and adds a provenance statement to the version.
       id-token: write
-    env:
-      # Fallback while trusted publishing is being set up: npm tries OIDC
-      # first and uses this token only when that fails. Delete the secret once
-      # a release has gone out through OIDC (docs/releasing.md). Without it,
-      # setup-node puts a placeholder here, which OIDC publishing ignores.
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    # No npm token: since 0.8.8 npm publish authenticates with this job's OIDC
+    # token, and the packages refuse tokens (docs/releasing.md).
 
     steps:
       - uses: actions/checkout@v4
@@ -92,12 +88,17 @@ jobs:
           # crates/llm-provider-kit is a public submodule.
           submodules: true
 
-      - uses: actions/setup-node@v4
+      # v6: no longer writes `always-auth`, which npm 11 warns about. Still
+      # sets up the registry in .npmrc; the token there is a placeholder that
+      # OIDC publishing doesn't use.
+      - uses: actions/setup-node@v6
         with:
           # Trusted publishing needs npm 11.5.1+ and Node 22.14+; Node 20
           # comes with npm 10.
           node-version: 24
           registry-url: https://registry.npmjs.org/
+          # Release builds don't restore caches.
+          package-manager-cache: false
 
       - uses: actions/download-artifact@v4
         with:
